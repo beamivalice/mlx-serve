@@ -1353,7 +1353,8 @@ pub fn serve(
     } else {
         const memory_ctx = computeMemoryContext(config);
         const memory_allows = safeAutoContext(memory_ctx);
-        if (config.max_position_embeddings > 0 and pinned >= config.max_position_embeddings) {
+        const rope_ctx = config.contextCap();
+        if (rope_ctx > 0 and pinned >= rope_ctx) {
             // The checkpoint's own maximum binds; memory had room to spare.
             log.info("Context size: {d} tokens (auto: the model's maximum; memory would allow {d}) [pinned]\n", .{ pinned, memory_allows });
         } else {
@@ -1364,7 +1365,7 @@ pub fn serve(
     if (server_config.request_timeout_sec > 0) {
         log.info("Request timeout: {d}s\n", .{server_config.request_timeout_sec});
     }
-    const model_ctx = config.max_position_embeddings;
+    const model_ctx = config.contextCap();
     if (model_ctx > 0) {
         log.info("Model context length: {d} tokens\n", .{model_ctx});
     }
@@ -2509,10 +2510,14 @@ fn safeAutoContext(raw: u32) u32 {
 }
 
 /// This model's auto-context: memory ceiling with headroom, then capped by what
-/// the checkpoint actually supports.
+/// the checkpoint actually supports. `contextCap` is the rope-derived window:
+/// `max_position_embeddings`, or `original_max_position_embeddings × factor` for
+/// a YaRN-scaled checkpoint — the same derivation vLLM applies to
+/// `max_model_len`, because a position past the scaled window aliases back
+/// inside the ramp rather than reading as a longer distance.
 fn autoContextFor(config: *const model_mod.ModelConfig) u32 {
     const with_headroom = safeAutoContext(computeMemoryContext(config));
-    const max_pos = config.max_position_embeddings;
+    const max_pos = config.contextCap();
     return if (max_pos > 0) @min(with_headroom, max_pos) else with_headroom;
 }
 
@@ -2723,7 +2728,7 @@ fn safeContextForBudget(
 /// which reserves headroom below it.
 fn computeMaxSafeContext(config: *const model_mod.ModelConfig) u32 {
     const memory_ctx = computeMemoryContext(config);
-    const max_pos = config.max_position_embeddings;
+    const max_pos = config.contextCap();
     return if (max_pos > 0) @min(memory_ctx, max_pos) else memory_ctx;
 }
 

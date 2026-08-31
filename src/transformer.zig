@@ -6675,12 +6675,16 @@ pub const Transformer = struct {
     // Proportional RoPE frequencies for global/full attention layers (Gemma 4)
     rope_freqs_global: ?mlx.mlx_array,
 
-    // Laguna YaRN (full-attention layers only): the per-dim RoPE denominator
-    // array handed to mlx_fast_rope (rope_freqs_yarn, [rotary_dim/2] f32) and
-    // the mscale vector (yarn_mscale, [head_dim] f32 = attention_factor on the
-    // rotated dims, 1.0 on the pass-through tail). Null on every other arch.
+    // YaRN RoPE scaling. `rope_freqs_yarn` is the per-dim RoPE DENOMINATOR
+    // array handed to mlx_fast_rope (angle = pos/freqs), `yarn_mscale` the
+    // [head_dim] vector carrying attention_factor on the rotated dims (1.0 on
+    // the pass-through tail), and `yarn_inv_freq` the same spectrum as the
+    // HOST inverse frequencies the M-RoPE cos/sin tables and the QSA pooled-key
+    // ladder are filled from (angle = pos×inv_freq). All three null on
+    // unscaled checkpoints. laguna uses them on full-attention layers only.
     rope_freqs_yarn: ?mlx.mlx_array = null,
     yarn_mscale: ?mlx.mlx_array = null,
+    yarn_inv_freq: ?[]const f64 = null,
     // `yarn_mscale` narrowed to the activation dtype, built on first use. See
     // `constTableAs` — the f32 table is what a bf16 forward must NOT multiply
     // by directly.
@@ -7166,26 +7170,38 @@ pub const Transformer = struct {
             rope_freqs_global = freqs_arr;
         }
 
-        // Laguna YaRN (full-attention layers): precompute the mlx_fast_rope
-        // denominator array + the mscale vector (attention_factor on rotated
-        // dims, 1.0 on the pass-through tail). Sliding layers use default RoPE.
+        // YaRN (laguna: full-attention layers only; qwen4_exp: the trunk's one
+        // rope). Precompute the mlx_fast_rope denominator array, the mscale
+        // vector (attention_factor on the rotated dims, 1.0 on the pass-through
+        // tail) and the HOST inverse frequencies the M-RoPE tables and the QSA
+        // pooled-key ladder are filled from. Sliding layers use default RoPE.
         var rope_freqs_yarn: ?mlx.mlx_array = null;
         var yarn_mscale: ?mlx.mlx_array = null;
+        var yarn_inv_freq: ?[]const f64 = null;
         if (config.rope_yarn) {
-            const rotary_dim: u32 = @intFromFloat(@as(f32, @floatFromInt(config.head_dim)) * config.partial_rotary_factor_global);
+            const spec = yarnSpec(&config);
+            const rotary_dim: u32 = config.yarnRotaryDim();
             const half: usize = rotary_dim / 2;
             const freqs_f64 = try allocator.alloc(f64, half);
-            defer allocator.free(freqs_f64);
+            errdefer allocator.free(freqs_f64);
             computeYarnFreqs(
                 freqs_f64,
                 config.head_dim,
-                config.partial_rotary_factor_global,
+                config.yarnPartial(),
                 config.rope_theta,
                 config.yarn_factor,
                 config.yarn_beta_fast,
                 config.yarn_beta_slow,
                 config.yarn_orig_max_pos,
+                config.yarn_truncate,
             );
+            // The same table without the reciprocal: `fillCosSin` and
+            // `ropeAtPositions` multiply positions by inv_freq (host f64), while
+            // mlx_fast_rope divides by freqs — two spellings, one spectrum.
+            const inv_f64 = try allocator.alloc(f64, half);
+            errdefer allocator.free(inv_f64);
+            spec.invFreq(inv_f64);
+            yarn_inv_freq = inv_f64;
             const freqs_f32 = try allocator.alloc(f32, half);
             defer allocator.free(freqs_f32);
             for (freqs_f64, 0..) |v, i| freqs_f32[i] = @floatCast(v);
@@ -7204,6 +7220,16 @@ pub const Transformer = struct {
             _ = mlx.mlx_vector_array_append_value(eval_vec, rope_freqs_yarn.?);
             _ = mlx.mlx_vector_array_append_value(eval_vec, yarn_mscale.?);
             try mlx.check(mlx.mlx_eval(eval_vec));
+            const cr = spec.correctionRange();
+            log.info("[rope] YaRN: factor {d:.4} (window {d} -> {d}), rotary {d} dims, ramp [{d:.0}, {d:.0}], mscale {d:.6}\n", .{
+                config.yarn_factor,
+                config.yarn_orig_max_pos,
+                config.contextCap(),
+                rotary_dim,
+                cr.low,
+                cr.high,
+                config.yarn_attention_factor,
+            });
         }
 
         // Batch eval all weights
@@ -7415,6 +7441,7 @@ pub const Transformer = struct {
             .rope_freqs_global = rope_freqs_global,
             .rope_freqs_yarn = rope_freqs_yarn,
             .yarn_mscale = yarn_mscale,
+            .yarn_inv_freq = yarn_inv_freq,
             .bert_layers = null,
             .bert_pos_w = mlx.mlx_array_new(),
             .bert_pos_s = mlx.mlx_array_new(),
@@ -8144,6 +8171,7 @@ pub const Transformer = struct {
         if (self.output_mult) |m| _ = mlx.mlx_array_free(m);
         if (self.rope_freqs_yarn) |f| _ = mlx.mlx_array_free(f);
         if (self.yarn_mscale) |m| _ = mlx.mlx_array_free(m);
+        if (self.yarn_inv_freq) |f| self.allocator.free(f);
         if (self.suppress_mask) |m| _ = mlx.mlx_array_free(m);
         self.yarn_mscale_cast.deinit();
         if (self.prompt_cache) |*pc| pc.deinit();
@@ -11820,6 +11848,18 @@ pub const Transformer = struct {
     /// (i < n): explicit cos/sin, for position ladders fast_rope can't express.
     fn ropeAtPositions(self: *Transformer, x: mlx.mlx_array, rope_dims: c_int, theta: f32, base: f32, step: f32, n: c_int) !mlx.mlx_array {
         const half = @divExact(rope_dims, 2);
+        // YaRN: the load-time host spectrum (f64 → the tensor dtype), the SAME
+        // table attention and the M-RoPE tables rotate with. Deriving inv_freq
+        // from `theta` in-graph below is the unscaled rope only.
+        if (self.yarnActive()) {
+            const yf = self.yarn_inv_freq.?;
+            std.debug.assert(half == @as(c_int, @intCast(yf.len)));
+            const f32s = try self.allocator.alloc(f32, yf.len);
+            defer self.allocator.free(f32s);
+            for (yf, 0..) |v, i| f32s[i] = @floatCast(v);
+            const shape = [_]c_int{@intCast(yf.len)};
+            return self.ropeAtFreqs(x, rope_dims, mlx.mlx_array_new_data(f32s.ptr, &shape, 1, .float32), base, step, n);
+        }
         var j = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(j);
         try mlx.check(mlx.mlx_arange(&j, 0, @floatFromInt(half), 1.0, .float32, self.s));
@@ -11830,8 +11870,15 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(jl);
         try mlx.check(mlx.mlx_multiply(&jl, j, neg, self.s));
         var inv_freq = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(inv_freq);
         try mlx.check(mlx.mlx_exp(&inv_freq, jl, self.s)); // [half]
+        return self.ropeAtFreqs(x, rope_dims, inv_freq, base, step, n); // takes ownership
+    }
+
+    /// The shared tail of `ropeAtPositions`: rotate `x` at positions
+    /// `base + step*i` using the given inv_freq array (`[half]`, f32).
+    fn ropeAtFreqs(self: *Transformer, x: mlx.mlx_array, rope_dims: c_int, inv_freq: mlx.mlx_array, base: f32, step: f32, n: c_int) !mlx.mlx_array {
+        const half = @divExact(rope_dims, 2);
+        defer _ = mlx.mlx_array_free(inv_freq);
         var pos = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(pos);
         try mlx.check(mlx.mlx_arange(&pos, base, base + step * @as(f32, @floatFromInt(n)) - step * 0.5, step, .float32, self.s)); // [n]
@@ -12031,7 +12078,18 @@ pub const Transformer = struct {
             q_rope = try self.applyMrope(qt, cos, ctx.mrope_sin_cur.?, rope_dims);
         } else {
             const eff_off: c_int = pos_base + offset + (if (ctx.mrope_pos != null) ctx.mrope_delta else 0);
-            try mlx.check(mlx.mlx_fast_rope(&q_rope, qt, rope_dims, false, mlx.mlx_optional_float.some(cfg.rope_theta), 1.0, eff_off, .{ .ctx = null }, self.s));
+            // The SAME spectrum attention rotates with (scaled when the config
+            // says YaRN): the index queries and keys are the only place the
+            // model asks "how far apart are these two blocks", and a block
+            // pick made on unscaled angles at 1M positions would select
+            // against a position notion the attention layers no longer have.
+            // The mscale is deliberately NOT applied here: it multiplies every
+            // relu(q·k) by one positive constant, which cannot change a top-k.
+            const use_yarn = self.yarnActive();
+            try mlx.check(mlx.mlx_fast_rope(&q_rope, qt, rope_dims, false, mlx.mlx_optional_float{
+                .value = cfg.rope_theta,
+                .has_value = !use_yarn,
+            }, 1.0, eff_off, if (use_yarn) self.rope_freqs_yarn.? else .{ .ctx = null }, self.s));
         }
 
         // Pooled block keys: mean of each complete block → norm → RoPE at the
@@ -14243,7 +14301,13 @@ pub const Transformer = struct {
 
         const inv_freq = try self.allocator.alloc(f64, half);
         defer self.allocator.free(inv_freq);
-        mrope.computeInvFreq(inv_freq, rope_dims, cfg.rope_theta);
+        // One spectrum for every rope consumer: the YaRN table built at load
+        // (when the config scales) or the plain theta^(-2j/d) one.
+        if (self.yarnActive()) {
+            const yf = self.yarn_inv_freq.?;
+            std.debug.assert(yf.len == half);
+            @memcpy(inv_freq, yf);
+        } else mrope.computeInvFreq(inv_freq, rope_dims, cfg.rope_theta);
         const sel = try self.allocator.alloc(u8, half);
         defer self.allocator.free(sel);
         mrope.interleavedSelector(sel, cfg.mrope_section);
@@ -14252,7 +14316,7 @@ pub const Transformer = struct {
         defer self.allocator.free(cos_buf);
         const sin_buf = try self.allocator.alloc(f32, n * rope_dims);
         defer self.allocator.free(sin_buf);
-        mrope.fillCosSin(cos_buf, sin_buf, positions, start, stride, n, inv_freq, sel, rope_dims);
+        mrope.fillCosSin(cos_buf, sin_buf, positions, start, stride, n, inv_freq, sel, rope_dims, yarnMscale(cfg));
         const shape = [_]c_int{ 1, 1, @intCast(n), @intCast(rope_dims) };
         const cf = mlx.mlx_array_new_data(cos_buf.ptr, &shape, 4, .float32);
         defer _ = mlx.mlx_array_free(cf);
@@ -14285,6 +14349,14 @@ pub const Transformer = struct {
         if (ctx.mrope_sin_cur) |sn| _ = mlx.mlx_array_free(sn);
         ctx.mrope_cos_cur = null;
         ctx.mrope_sin_cur = null;
+    }
+
+    /// Does this trunk rotate with a YaRN-scaled rope? The DECISION comes from
+    /// the config — every Transformer has one, including the hand-built fixtures
+    /// in the tests, which leave the optionals below undefined. The short-circuit
+    /// means an unscaled model never reads them.
+    fn yarnActive(self: *const Transformer) bool {
+        return self.config.rope_yarn and self.rope_freqs_yarn != null;
     }
 
     /// Apply NeoX RoPE to the first `rope_dims` dims of `arr` [B,H,S,hd] using
@@ -14345,6 +14417,25 @@ pub const Transformer = struct {
         var out = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_concatenate_axis(&out, cat_vec, -1, self.s));
         return out;
+    }
+
+    /// YaRN mscale on rope'd q and k: multiply by the [head_dim] table
+    /// (attention_factor on the rotated slice, 1.0 on the pass-through tail).
+    /// That is the reference's `cos, sin = cos*af, sin*af` — every rotary pair
+    /// shares one frequency and both of its dims carry it, so scaling the
+    /// rotation and scaling q/k are the same product. The table MUST be read in
+    /// the tensors' dtype: an f32 operand promotes the result, and the f32 then
+    /// rides SDPA → o_proj → residual, upcasting every weight read downstream.
+    fn yarnScaleQK(self: *Transformer, q: *mlx.mlx_array, k: *mlx.mlx_array) !void {
+        const ms = try constTableAs(self.yarn_mscale.?, mlx.mlx_array_dtype(q.*), &self.yarn_mscale_cast, self.s);
+        var qs = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_multiply(&qs, q.*, ms, self.s));
+        _ = mlx.mlx_array_free(q.*);
+        q.* = qs;
+        var ks = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_multiply(&ks, k.*, ms, self.s));
+        _ = mlx.mlx_array_free(k.*);
+        k.* = ks;
     }
 
     fn gatedFullAttnWith(
@@ -14437,6 +14528,22 @@ pub const Transformer = struct {
         // it, which is the one extra (tiny) copy this path pays. M-RoPE prefill
         // chunks keep the composed path; decode is scalar rope at
         // offset+delta, which the probe row reproduces exactly.
+        //
+        // YaRN (a `rope_type: "yarn"` rope_parameters): the scaled denominator
+        // array goes to every rope here (mlx_fast_rope takes base OR freqs, so
+        // `has_value` flips) and the mscale rides along — post-rotation on q/k
+        // for the composed arms, folded into the probe's cos|sin rows for the
+        // fused ones (scaling both halves of a rotary pair is the same
+        // multiply). `family` 1 keeps the angle cache from serving an unscaled
+        // row to a scaled layer, exactly as laguna's yarn split does.
+        const use_yarn = self.yarnActive();
+        const rope_family: usize = if (use_yarn) 1 else 0;
+        const rope_base = mlx.mlx_optional_float{
+            .value = self.config.rope_theta,
+            .has_value = !use_yarn,
+        };
+        const rope_freqs: mlx.mlx_array = if (use_yarn) self.rope_freqs_yarn.? else .{ .ctx = null };
+        const rope_mscale: f32 = if (use_yarn) self.config.yarn_attention_factor else 1.0;
         var q_rope = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(q_rope);
         var k_rope = mlx.mlx_array_new();
@@ -14447,8 +14554,12 @@ pub const Transformer = struct {
             self.rms_eps_arr.ctx != null and qkNormRopeFusedEnabled())
         blk: {
             const eff_off: c_int = offset + (if (ctx.mrope_pos != null) ctx.mrope_delta else 0);
-            const angles = self.qkAngleFor(0, rope_dims, mlx.mlx_optional_float.some(self.config.rope_theta), .{ .ctx = null }, eff_off) catch break :blk;
-            const pair = (fusedQkNormRope(self.s, queries, k_r, fa.q_norm, fa.k_norm, angles, null, self.rms_eps_arr, h_count, kv_h, rope_dims) catch null) orelse break :blk;
+            const angles = self.qkAngleFor(rope_family, rope_dims, rope_base, rope_freqs, eff_off, 1.0) catch break :blk;
+            const ms: ?mlx.mlx_array = if (use_yarn)
+                try constTableAs(self.yarn_mscale.?, mlx.mlx_array_dtype(queries), &self.yarn_mscale_cast, self.s)
+            else
+                null;
+            const pair = (fusedQkNormRope(self.s, queries, k_r, fa.q_norm, fa.k_norm, angles, ms, self.rms_eps_arr, h_count, kv_h, rope_dims) catch null) orelse break :blk;
             _ = mlx.mlx_array_free(q_rope);
             _ = mlx.mlx_array_free(k_rope);
             q_rope = pair[0];
@@ -14464,7 +14575,10 @@ pub const Transformer = struct {
             self.rms_eps_arr.ctx != null and qkNormRopeFusedEnabled())
         blk: {
             const eff_off: c_int = offset + (if (ctx.mrope_pos != null) ctx.mrope_delta else 0);
-            const angles = self.qkAngleRowsFor(0, rope_dims, mlx.mlx_optional_float.some(self.config.rope_theta), .{ .ctx = null }, eff_off, seq_len) catch break :blk;
+            // The kernel has no mscale slot: YaRN's factor is uniform across the
+            // rotated slice, so folding it into the angle rows scales exactly the
+            // rotation and nothing else (the pass-through dims never appear).
+            const angles = self.qkAngleRowsFor(rope_family, rope_dims, rope_base, rope_freqs, eff_off, seq_len, rope_mscale) catch break :blk;
             const pair = (fusedQkNormRope256(self.s, queries, k_r, fa.q_norm, fa.k_norm, angles, self.rms_eps_arr, h_count, kv_h, seq_len, rope_dims) catch null) orelse break :blk;
             _ = mlx.mlx_array_free(q_rope);
             _ = mlx.mlx_array_free(k_rope);
@@ -14491,7 +14605,9 @@ pub const Transformer = struct {
             // per-token cos/sin on the prefill chunk (3D t/h/w angles at image
             // tokens), and scalar RoPE at offset+delta on decode (decode tokens are
             // text → t=h=w). Plain scalar partial RoPE otherwise (zero-cost for
-            // text-only qwen3_5).
+            // text-only qwen3_5). YaRN needs nothing here: the M-RoPE tables are
+            // filled from the scaled spectrum + mscale at the one choke point
+            // (`mropeCosSinAt`), and the scalar arms take the freqs array below.
             if (ctx.mrope_cos_cur) |cos| {
                 const sin = ctx.mrope_sin_cur.?;
                 _ = mlx.mlx_array_free(q_rope);
@@ -14502,12 +14618,14 @@ pub const Transformer = struct {
                 // Batched decode: every slot sits at its own position, so the
                 // offset is an [N] array, not a scalar. The driver already
                 // folded each slot's M-RoPE delta into it.
-                try mlx.check(mlx.mlx_fast_rope_dynamic(&q_rope, q_t, rope_dims, false, mlx.mlx_optional_float.some(self.config.rope_theta), 1.0, off_arr, .{ .ctx = null }, self.s));
-                try mlx.check(mlx.mlx_fast_rope_dynamic(&k_rope, k_t, rope_dims, false, mlx.mlx_optional_float.some(self.config.rope_theta), 1.0, off_arr, .{ .ctx = null }, self.s));
+                try mlx.check(mlx.mlx_fast_rope_dynamic(&q_rope, q_t, rope_dims, false, rope_base, 1.0, off_arr, rope_freqs, self.s));
+                try mlx.check(mlx.mlx_fast_rope_dynamic(&k_rope, k_t, rope_dims, false, rope_base, 1.0, off_arr, rope_freqs, self.s));
+                if (use_yarn) try self.yarnScaleQK(&q_rope, &k_rope);
             } else {
                 const eff_offset: c_int = offset + (if (ctx.mrope_pos != null) ctx.mrope_delta else 0);
-                try mlx.check(mlx.mlx_fast_rope(&q_rope, q_t, rope_dims, false, mlx.mlx_optional_float.some(self.config.rope_theta), 1.0, eff_offset, .{ .ctx = null }, self.s));
-                try mlx.check(mlx.mlx_fast_rope(&k_rope, k_t, rope_dims, false, mlx.mlx_optional_float.some(self.config.rope_theta), 1.0, eff_offset, .{ .ctx = null }, self.s));
+                try mlx.check(mlx.mlx_fast_rope(&q_rope, q_t, rope_dims, false, rope_base, 1.0, eff_offset, rope_freqs, self.s));
+                try mlx.check(mlx.mlx_fast_rope(&k_rope, k_t, rope_dims, false, rope_base, 1.0, eff_offset, rope_freqs, self.s));
+                if (use_yarn) try self.yarnScaleQK(&q_rope, &k_rope);
             }
         }
 
@@ -14955,19 +15073,27 @@ pub const Transformer = struct {
 
     /// The angle row for `offset` in the given rope family, rebuilt when the
     /// offset moves (per decode token: 38-of-40 layers hit the cache).
-    fn qkAngleFor(self: *Transformer, family: usize, rd: c_int, base: mlx.mlx_optional_float, freqs: mlx.mlx_array, offset: c_int) !mlx.mlx_array {
-        return self.qkAngleRowsFor(family, rd, base, freqs, offset, 1);
+    fn qkAngleFor(self: *Transformer, family: usize, rd: c_int, base: mlx.mlx_optional_float, freqs: mlx.mlx_array, offset: c_int, mscale: f32) !mlx.mlx_array {
+        return self.qkAngleRowsFor(family, rd, base, freqs, offset, 1, mscale);
     }
 
     /// Multi-row variant for the hd-256 fused path at verify widths: one
     /// [rows, rd] table for positions offset..offset+rows-1, same per-forward
     /// cache (every layer of one verify round shares the table).
-    fn qkAngleRowsFor(self: *Transformer, family: usize, rd: c_int, base: mlx.mlx_optional_float, freqs: mlx.mlx_array, offset: c_int, rows: c_int) !mlx.mlx_array {
+    ///
+    /// `mscale` is the YaRN attention factor folded into the rows (1.0 = no
+    /// scaling). The kernels take cos|sin rows and nothing else, and YaRN's
+    /// mscale is one uniform scalar over the rotated slice, so folding it here
+    /// reaches both halves of every pair — the fused path needs no mscale slot
+    /// of its own. It is baked into the cached rows, which stay keyed by
+    /// family: a scaled model ropes in family 1, so a scaled row and an
+    /// unscaled one can never be served to each other.
+    fn qkAngleRowsFor(self: *Transformer, family: usize, rd: c_int, base: mlx.mlx_optional_float, freqs: mlx.mlx_array, offset: c_int, rows: c_int, mscale: f32) !mlx.mlx_array {
         const slot = &self.qk_angle_cache[family];
         if (slot.arr.ctx != null and slot.offset == offset and slot.rd == rd and slot.rows == rows) return slot.arr;
         if (slot.arr.ctx != null) _ = mlx.mlx_array_free(slot.arr);
         slot.arr = .{ .ctx = null };
-        slot.arr = try ropeAngleRows(self.s, rd, base, freqs, offset, rows, self.allocator);
+        slot.arr = try ropeAngleRows(self.s, rd, base, freqs, offset, rows, self.allocator, mscale);
         slot.offset = offset;
         slot.rd = rd;
         slot.rows = rows;
@@ -15288,7 +15414,7 @@ pub const Transformer = struct {
                 break :msblk try constTableAs(ms_f32, mlx.mlx_array_dtype(q_proj), &self.yarn_mscale_cast, self.s);
             } else null;
             const family: usize = if (use_yarn) 1 else 0;
-            const angles = self.qkAngleFor(family, rope_dims, rope_base, rope_freqs, offset) catch break :blk;
+            const angles = self.qkAngleFor(family, rope_dims, rope_base, rope_freqs, offset, 1.0) catch break :blk;
             const pair = (fusedQkNormRope(self.s, q_proj, k_proj, fa.q_norm, fa.k_norm, angles, ms, self.rms_eps_arr, h_count, kv_h, rope_dims) catch null) orelse break :blk;
             _ = mlx.mlx_array_free(q_rope);
             _ = mlx.mlx_array_free(k_rope);
@@ -18916,39 +19042,41 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
             const v_s = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.v_proj.scales") orelse k_s;
             const v_b = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.v_proj.biases") orelse k_b;
             const v_aliases_k = v_w.ctx == k_w.ctx;
-            lw.attn = .{ .full = .{
-                .q_w = try getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.weight"),
-                .q_s = if (is_laguna)
-                    (getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.q_proj.scales") orelse mlx.mlx_array_new())
-                else
-                    try getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.q_proj.scales", config.quant_bits),
-                .q_b = try getLayerBias(weights, name_buf, prefix, li, "self_attn.q_proj.biases", &config),
-                .k_w = k_w,
-                .k_s = k_s,
-                .k_b = k_b,
-                .v_w = v_w,
-                .v_s = v_s,
-                .v_b = v_b,
-                .o_w = try getLayerWeight(weights, name_buf, prefix, li, "self_attn.o_proj.weight"),
-                .o_s = if (is_laguna)
-                    (getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.o_proj.scales") orelse mlx.mlx_array_new())
-                else
-                    try getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.o_proj.scales", config.quant_bits),
-                .o_b = try getLayerBias(weights, name_buf, prefix, li, "self_attn.o_proj.biases", &config),
-                // An arch that DECLARES QK norm must ship it (a missing weight
-                // there is a broken checkpoint, not a variant). One that
-                // declares it off — gpt_oss — has no q_norm/k_norm tensors at
-                // all, and the mandatory getter's `unreachable` would kill the
-                // process on load rather than report anything.
-                .q_norm = if (config.has_qk_norm)
-                    try getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_norm.weight")
-                else
-                    (getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.q_norm.weight") orelse mlx.mlx_array_new()),
-                .k_norm = if (config.has_qk_norm)
-                    try getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_norm.weight")
-                else
-                    (getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.k_norm.weight") orelse mlx.mlx_array_new()),
-            } };
+            lw.attn = .{
+                .full = .{
+                    .q_w = try getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.weight"),
+                    .q_s = if (is_laguna)
+                        (getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.q_proj.scales") orelse mlx.mlx_array_new())
+                    else
+                        try getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.q_proj.scales", config.quant_bits),
+                    .q_b = try getLayerBias(weights, name_buf, prefix, li, "self_attn.q_proj.biases", &config),
+                    .k_w = k_w,
+                    .k_s = k_s,
+                    .k_b = k_b,
+                    .v_w = v_w,
+                    .v_s = v_s,
+                    .v_b = v_b,
+                    .o_w = try getLayerWeight(weights, name_buf, prefix, li, "self_attn.o_proj.weight"),
+                    .o_s = if (is_laguna)
+                        (getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.o_proj.scales") orelse mlx.mlx_array_new())
+                    else
+                        try getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.o_proj.scales", config.quant_bits),
+                    .o_b = try getLayerBias(weights, name_buf, prefix, li, "self_attn.o_proj.biases", &config),
+                    // An arch that DECLARES QK norm must ship it (a missing weight
+                    // there is a broken checkpoint, not a variant). One that
+                    // declares it off — gpt_oss — has no q_norm/k_norm tensors at
+                    // all, and the mandatory getter's `unreachable` would kill the
+                    // process on load rather than report anything.
+                    .q_norm = if (config.has_qk_norm)
+                        try getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_norm.weight")
+                    else
+                        (getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.q_norm.weight") orelse mlx.mlx_array_new()),
+                    .k_norm = if (config.has_qk_norm)
+                        try getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_norm.weight")
+                    else
+                        (getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.k_norm.weight") orelse mlx.mlx_array_new()),
+                },
+            };
             {
                 // Dense bf16 (null-ctx scales): pre-transpose [out,in]→[in,out] so
                 // qmatmulBits dispatches to a plain matmul. No-op on quantized weights.
@@ -19391,40 +19519,42 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
             // so the additive bias is the ONLY `bias`-ish tensor present on a
             // gpt_oss expert bank, and binding it into `*_b` would hand
             // gather_qmm a zero-point tensor of the wrong rank.
-            lw.mlp = .{ .moe = .{
-                .router_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.router.weight"),
-                .router_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.router.scales") orelse mlx.mlx_array_new(),
-                .router_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.router.biases") orelse mlx.mlx_array_new(),
-                .router_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.router.bias") orelse .{ .ctx = null },
-                .switch_gate_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.experts.gate_proj.weight"),
-                .switch_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.gate_proj.scales") orelse mlx.mlx_array_new(),
-                .switch_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.gate_proj.biases") orelse mlx.mlx_array_new(),
-                .switch_gate_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.gate_proj.bias") orelse .{ .ctx = null },
-                .switch_up_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.experts.up_proj.weight"),
-                .switch_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.up_proj.scales") orelse mlx.mlx_array_new(),
-                .switch_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.up_proj.biases") orelse mlx.mlx_array_new(),
-                .switch_up_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.up_proj.bias") orelse .{ .ctx = null },
-                .switch_down_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.experts.down_proj.weight"),
-                .switch_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.down_proj.scales") orelse mlx.mlx_array_new(),
-                .switch_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.down_proj.biases") orelse mlx.mlx_array_new(),
-                .switch_down_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.down_proj.bias") orelse .{ .ctx = null },
-                // No shared expert: empty handles, and shared_expert_gate_w
-                // stays null so the forward never reads them.
-                .shared_gate_w = mlx.mlx_array_new(),
-                .shared_gate_s = mlx.mlx_array_new(),
-                .shared_gate_b = mlx.mlx_array_new(),
-                .shared_up_w = mlx.mlx_array_new(),
-                .shared_up_s = mlx.mlx_array_new(),
-                .shared_up_b = mlx.mlx_array_new(),
-                .shared_down_w = mlx.mlx_array_new(),
-                .shared_down_s = mlx.mlx_array_new(),
-                .shared_down_b = mlx.mlx_array_new(),
-                .shared_expert_gate_w = null,
-                .shared_expert_gate_s = null,
-                .shared_expert_gate_b = null,
-                .route_norm = config.moe_route_norm,
-                .route_scale = config.router_scaling_factor,
-            } };
+            lw.mlp = .{
+                .moe = .{
+                    .router_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.router.weight"),
+                    .router_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.router.scales") orelse mlx.mlx_array_new(),
+                    .router_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.router.biases") orelse mlx.mlx_array_new(),
+                    .router_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.router.bias") orelse .{ .ctx = null },
+                    .switch_gate_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.experts.gate_proj.weight"),
+                    .switch_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.gate_proj.scales") orelse mlx.mlx_array_new(),
+                    .switch_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.gate_proj.biases") orelse mlx.mlx_array_new(),
+                    .switch_gate_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.gate_proj.bias") orelse .{ .ctx = null },
+                    .switch_up_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.experts.up_proj.weight"),
+                    .switch_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.up_proj.scales") orelse mlx.mlx_array_new(),
+                    .switch_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.up_proj.biases") orelse mlx.mlx_array_new(),
+                    .switch_up_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.up_proj.bias") orelse .{ .ctx = null },
+                    .switch_down_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.experts.down_proj.weight"),
+                    .switch_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.down_proj.scales") orelse mlx.mlx_array_new(),
+                    .switch_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.down_proj.biases") orelse mlx.mlx_array_new(),
+                    .switch_down_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.down_proj.bias") orelse .{ .ctx = null },
+                    // No shared expert: empty handles, and shared_expert_gate_w
+                    // stays null so the forward never reads them.
+                    .shared_gate_w = mlx.mlx_array_new(),
+                    .shared_gate_s = mlx.mlx_array_new(),
+                    .shared_gate_b = mlx.mlx_array_new(),
+                    .shared_up_w = mlx.mlx_array_new(),
+                    .shared_up_s = mlx.mlx_array_new(),
+                    .shared_up_b = mlx.mlx_array_new(),
+                    .shared_down_w = mlx.mlx_array_new(),
+                    .shared_down_s = mlx.mlx_array_new(),
+                    .shared_down_b = mlx.mlx_array_new(),
+                    .shared_expert_gate_w = null,
+                    .shared_expert_gate_s = null,
+                    .shared_expert_gate_b = null,
+                    .route_norm = config.moe_route_norm,
+                    .route_scale = config.router_scaling_factor,
+                },
+            };
             {
                 const mw = &lw.mlp.moe;
                 try maybeTransposeForBf16(&mw.router_w, mw.router_s, &owned_bf16, allocator, s);
@@ -20333,13 +20463,37 @@ fn moeRoutingChain(router_logits: mlx.mlx_array, k: c_int, s: mlx.mlx_stream) !T
     return .{ .inds = inds, .norm_scores = norm_scores };
 }
 
+/// This checkpoint's YaRN spectrum: the config's rope geometry (theta, the
+/// rotating slice, the pre-trained window) resolved into `mrope.Yarn`, the one
+/// implementation of HF's `_compute_yarn_parameters` in the engine. Only
+/// meaningful when `config.rope_yarn`.
+fn yarnSpec(config: *const ModelConfig) mrope.Yarn {
+    return .{
+        .theta = config.rope_theta,
+        .factor = config.yarn_factor,
+        .orig_max = config.yarn_orig_max_pos,
+        .rotary_dim = config.yarnRotaryDim(),
+        .beta_fast = config.yarn_beta_fast,
+        .beta_slow = config.yarn_beta_slow,
+        .truncate = config.yarn_truncate,
+    };
+}
+
+/// The mscale the host cos/sin tables are multiplied by: HF's `attention_factor`
+/// when the checkpoint scales its rope, 1.0 (a no-op) when it does not.
+fn yarnMscale(config: *const ModelConfig) f64 {
+    return if (config.rope_yarn) config.yarn_attention_factor else 1.0;
+}
+
 /// HF `_compute_yarn_parameters` → the per-dim RoPE DENOMINATOR array (`freqs`)
 /// that mlx_fast_rope consumes: mlx computes angle = position / freqs[i], so we
 /// return 1/inv_freq where inv_freq is the YaRN-corrected inverse frequency.
 /// `out.len` must equal the rotary half-dim (= int(head_dim * partial) / 2).
 /// Pure f64 math (no MLX) so it unit-tests directly against reference values.
-/// Mirrors modeling_laguna.py's rope for the full-attention layers verbatim,
-/// with truncate=True (Laguna's rope_parameters omits the flag → default True).
+/// The spectrum itself lives in `mrope.Yarn` — shared with the host cos/sin
+/// tables, which need inv_freq and not the reciprocal — so the device and host
+/// rope paths can never drift apart. `truncate` is the HF flag (laguna's
+/// rope_parameters omits it → true).
 fn computeYarnFreqs(
     out: []f64,
     head_dim: u32,
@@ -20349,38 +20503,19 @@ fn computeYarnFreqs(
     beta_fast: f64,
     beta_slow: f64,
     orig_max: u32,
+    truncate: bool,
 ) void {
-    const dim: f64 = @floor(@as(f64, @floatFromInt(head_dim)) * @as(f64, partial)); // 64
-    const n = out.len; // dim/2 = 32
-    const mp: f64 = @floatFromInt(orig_max);
-    const two_log_base = 2.0 * @log(base);
-    // find_correction_dim(num_rotations) = dim * ln(orig_max/(num_rot*2π)) / (2·ln base)
-    const corr = struct {
-        fn f(num_rot: f64, d: f64, max_pos: f64, tlb: f64) f64 {
-            return (d * @log(max_pos / (num_rot * 2.0 * std.math.pi))) / tlb;
-        }
-    }.f;
-    var low = @floor(corr(beta_fast, dim, mp, two_log_base));
-    var high = @ceil(corr(beta_slow, dim, mp, two_log_base));
-    if (low < 0) low = 0;
-    if (high > dim - 1) high = dim - 1;
-    var ramp_denom = high - low;
-    if (ramp_denom == 0) ramp_denom = 0.001;
-
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
-        // pos_freqs = base^(arange(0,dim,2)[i]/dim) = base^(2i/dim)
-        const pos_freq = std.math.pow(f64, base, @as(f64, @floatFromInt(2 * i)) / dim);
-        const inv_extrapolation = 1.0 / pos_freq;
-        const inv_interpolation = 1.0 / (factor * pos_freq);
-        // linear_ramp_factor(low, high) clamped to [0,1], then extrapolation factor = 1 - ramp
-        var ramp = (@as(f64, @floatFromInt(i)) - low) / ramp_denom;
-        if (ramp < 0) ramp = 0;
-        if (ramp > 1) ramp = 1;
-        const extrapolation_factor = 1.0 - ramp;
-        const inv_freq = inv_interpolation * (1.0 - extrapolation_factor) + inv_extrapolation * extrapolation_factor;
-        out[i] = 1.0 / inv_freq;
-    }
+    const spec = mrope.Yarn{
+        .theta = base,
+        .factor = factor,
+        .orig_max = orig_max,
+        .rotary_dim = @intFromFloat(@floor(@as(f64, @floatFromInt(head_dim)) * @as(f64, partial))),
+        .beta_fast = beta_fast,
+        .beta_slow = beta_slow,
+        .truncate = truncate,
+    };
+    spec.invFreq(out);
+    for (out) |*v| v.* = 1.0 / v.*;
 }
 
 /// Hy3 (hy_v3 / DeepSeek-V3-style) sigmoid routing chain — mirrors the
@@ -21259,7 +21394,9 @@ const Qwen4FwdProf = struct {
 
     fn init(seq_len: c_int, h: mlx.mlx_array) !Qwen4FwdProf {
         const env = std.c.getenv("QWEN4_PROFILE_FWD");
-        const timing = diagEnvOn("QWEN4_PROFILE_FWD") and seq_len <= 16 and (seq_len >= 2 or env.?[0] == 'a');
+        // `=1`: S 2..16 (verify). `=all`: any S, including decode S=1 and prefill.
+        const all = env != null and env.?[0] == 'a';
+        const timing = diagEnvOn("QWEN4_PROFILE_FWD") and (all or (seq_len >= 2 and seq_len <= 16));
         var p: Qwen4FwdProf = .{ .timing = timing, .ops = diagEnvOn("QWEN4_OPCOUNT"), .clock = ProfClock.init() };
         if (timing) {
             try mlx.check(mlx.mlx_array_eval(h));
@@ -21300,13 +21437,29 @@ const Qwen4FwdProf = struct {
                 return @as(f64, @floatFromInt(n)) / 1e6;
             }
         }.f;
-        log.info("[qwen4-prof] S={d} kv={d} capture={} gdn {d:.2} ms ({d} layers, {d:.2}/layer) attn {d:.2} ms ({d} layers, {d:.2}/layer) ple-layer {d:.2} ms\n", .{
-            seq_len,             kv,          capture,
-            ms(self.kind_ns[1]), gdn_layers,  ms(self.kind_ns[1]) / @as(f64, @floatFromInt(@max(gdn_layers, 1))),
-            ms(self.kind_ns[2]), attn_layers, ms(self.kind_ns[2]) / @as(f64, @floatFromInt(@max(attn_layers, 1))),
+        log.info("[qwen4-prof] S={d} kv={d} capture={} gdn {d:.3} ms ({d} us, {d} layers, {d:.3}/layer) attn {d:.3} ms ({d} us, {d} layers, {d:.3}/layer) ple-layer {d:.3} ms ({d} us)\n", .{
+            seq_len,
+            kv,
+            capture,
+            ms(self.kind_ns[1]),
+            self.kind_ns[1] / 1000,
+            gdn_layers,
+            ms(self.kind_ns[1]) / @as(f64, @floatFromInt(@max(gdn_layers, 1))),
+            ms(self.kind_ns[2]),
+            self.kind_ns[2] / 1000,
+            attn_layers,
+            ms(self.kind_ns[2]) / @as(f64, @floatFromInt(@max(attn_layers, 1))),
             ms(self.kind_ns[0]),
+            self.kind_ns[0] / 1000,
         });
-        log.info("[qwen4-prof] blocks (ms, whole forward): ple {d:.2} hcRead {d:.2} gdn {d:.2} attn {d:.2} hcWrite {d:.2} mlp {d:.2}\n", .{ ms(self.ns[0]), ms(self.ns[1]), ms(self.ns[2]), ms(self.ns[3]), ms(self.ns[4]), ms(self.ns[5]) });
+        log.info("[qwen4-prof] blocks (whole forward): ple {d:.3} ms / {d} us  hcRead {d:.3} ms / {d} us  gdn {d:.3} ms / {d} us  attn {d:.3} ms / {d} us  hcWrite {d:.3} ms / {d} us  mlp {d:.3} ms / {d} us\n", .{
+            ms(self.ns[0]), self.ns[0] / 1000,
+            ms(self.ns[1]), self.ns[1] / 1000,
+            ms(self.ns[2]), self.ns[2] / 1000,
+            ms(self.ns[3]), self.ns[3] / 1000,
+            ms(self.ns[4]), self.ns[4] / 1000,
+            ms(self.ns[5]), self.ns[5] / 1000,
+        });
     }
 };
 
@@ -21758,13 +21911,18 @@ pub fn ropeAngleRow(
     offset: c_int,
     allocator: std.mem.Allocator,
 ) !mlx.mlx_array {
-    return ropeAngleRows(s, rd, base, freqs, offset, 1, allocator);
+    return ropeAngleRows(s, rd, base, freqs, offset, 1, allocator, 1.0);
 }
 
 /// Multi-position variant: [rows * rd] f32, row p = the cos|sin row at
 /// position `offset + p` — the probe is a [1,1,rows,rd] stack of ones|zeros
 /// rows, so `mlx_fast_rope` stamps each row at its own position exactly as it
 /// would the real tensor.
+///
+/// `mscale` multiplies the rows (YaRN's attention factor; 1.0 leaves the probe
+/// exactly as the stock kernel computed it). Both halves of a rotary pair tile
+/// the same frequency, so scaling the rows scales the rotation of the pair —
+/// the same product the reference gets from `cos*af, sin*af`.
 pub fn ropeAngleRows(
     s: mlx.mlx_stream,
     rd: c_int,
@@ -21773,6 +21931,7 @@ pub fn ropeAngleRows(
     offset: c_int,
     rows: c_int,
     allocator: std.mem.Allocator,
+    mscale: f32,
 ) !mlx.mlx_array {
     const n: usize = @intCast(rd);
     const nrows: usize = @intCast(rows);
@@ -21785,9 +21944,20 @@ pub fn ropeAngleRows(
     var rotated = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(rotated);
     try mlx.check(mlx.mlx_fast_rope(&rotated, probe, rd, false, base, 1.0, offset, freqs, s));
+    if (mscale == 1.0) {
+        var flat = mlx.mlx_array_new();
+        const flat_shape = [_]c_int{rows * rd};
+        try mlx.check(mlx.mlx_reshape(&flat, rotated, &flat_shape, 1, s));
+        return flat;
+    }
+    var scaled = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(scaled);
+    const ms = mlx.mlx_array_new_float(mscale);
+    defer _ = mlx.mlx_array_free(ms);
+    try mlx.check(mlx.mlx_multiply(&scaled, rotated, ms, s));
     var flat = mlx.mlx_array_new();
     const flat_shape = [_]c_int{rows * rd};
-    try mlx.check(mlx.mlx_reshape(&flat, rotated, &flat_shape, 1, s));
+    try mlx.check(mlx.mlx_reshape(&flat, scaled, &flat_shape, 1, s));
     return flat;
 }
 
@@ -30161,13 +30331,90 @@ test "hy3RoutingChain route_norm=false keeps raw sigmoid weights (scaled only)" 
     try testing.expect(@abs(ss[0] - 3.2237) < 0.02);
 }
 
+test "qwen4_exp yarn: the device denominator and the host spectrum are one spectrum" {
+    // The engine spells the SAME YaRN spectrum twice: mlx_fast_rope and the
+    // fused-angle probe take a DENOMINATOR array (angle = position / freqs),
+    // while the host cos/sin tables (`fillCosSin`, `ropeAtPositions`) take
+    // inv_freq (angle = position × inv_freq). If the two ever drift, prefill and
+    // decode rotate differently — the model would hold one position for the
+    // prompt and another for everything generated after it, and nothing errors.
+    var c = ModelConfig{};
+    c.model_type = "qwen4_exp"; // isQwen4 ⇒ yarnPartial reads partial_rotary_factor
+    c.head_dim = 256;
+    c.partial_rotary_factor = 0.25;
+    c.partial_rotary_factor_global = 1.0;
+    c.rope_theta = 10_000_000.0;
+    c.rope_yarn = true;
+    c.yarn_factor = 4.0;
+    c.yarn_orig_max_pos = 262_144;
+    c.yarn_attention_factor = 1.138629436111989;
+    c.yarn_beta_fast = 32.0;
+    c.yarn_beta_slow = 1.0;
+    c.max_position_embeddings = 1_048_576;
+
+    // qwen4's ONE trunk rope: 64 of 256 dims, 32 frequencies — which is also
+    // the width the QSA indexer rotates (it takes rope_dims from head_dim, not
+    // from indexer_head_dim), so a single table serves every consumer.
+    try testing.expectEqual(@as(u32, 64), c.yarnRotaryDim());
+    try testing.expectApproxEqAbs(@as(f32, 0.25), c.yarnPartial(), 1e-9);
+    try testing.expectEqual(@as(u32, 1_048_576), c.contextCap());
+
+    var inv: [32]f64 = undefined;
+    yarnSpec(&c).invFreq(&inv);
+    var den: [32]f64 = undefined;
+    computeYarnFreqs(
+        &den,
+        c.head_dim,
+        c.yarnPartial(),
+        c.rope_theta,
+        c.yarn_factor,
+        c.yarn_beta_fast,
+        c.yarn_beta_slow,
+        c.yarn_orig_max_pos,
+        c.yarn_truncate,
+    );
+    for (inv, den) |a, b| try testing.expectApproxEqRel(@as(f64, 1.0), a * b, 1e-12);
+    // Wavelengths run from one token (the fastest rotary dim) to the whole
+    // stretched window (the slowest), strictly increasing — the shape every
+    // consumer assumes when it indexes the table by dim.
+    try testing.expectApproxEqRel(@as(f64, 1.0), den[0], 1e-12);
+    for (den[1..], 1..) |b, i| try testing.expect(b > den[i - 1]);
+    // The table's width is what the composed path multiplies: attention_factor
+    // across exactly the first `yarnRotaryDim` dims of the head, 1.0 across the
+    // 192 pass-through dims (scaling those would change values RoPE never wrote).
+    const rotary = c.yarnRotaryDim();
+    try testing.expectEqual(@as(usize, rotary), inv.len * 2);
+    try testing.expect(rotary < c.head_dim); // partial rotary ⇒ a real pass-through tail
+    try testing.expect(c.yarn_attention_factor > 1.0); // factor 4 ⇒ mscale 1.1386…
+
+    // And the laguna geometry the same helper serves must not flip: it scales
+    // its FULL-attention layers only, at `partial_rotary_factor_global`.
+    var l = ModelConfig{};
+    l.model_type = "laguna";
+    l.head_dim = 128;
+    l.partial_rotary_factor = 1.0;
+    l.partial_rotary_factor_global = 0.5;
+    l.rope_theta = 500_000.0;
+    l.rope_yarn = true;
+    l.yarn_factor = 32.0;
+    l.yarn_orig_max_pos = 8192;
+    try testing.expectApproxEqAbs(@as(f32, 0.5), l.yarnPartial(), 1e-9);
+    try testing.expectEqual(@as(u32, 64), l.yarnRotaryDim());
+    var lden: [32]f64 = undefined;
+    computeYarnFreqs(&lden, l.head_dim, l.yarnPartial(), l.rope_theta, l.yarn_factor, l.yarn_beta_fast, l.yarn_beta_slow, l.yarn_orig_max_pos, l.yarn_truncate);
+    // Bit-identical to the golden laguna values the pre-delegation test pins.
+    try testing.expectApproxEqRel(@as(f64, 1.0), lden[0], 1e-9);
+    try testing.expectApproxEqRel(@as(f64, 1.506929076e+00), lden[1], 1e-7);
+    try testing.expectApproxEqRel(@as(f64, 1.061761980e+07), lden[31], 1e-7);
+}
+
 test "computeYarnFreqs matches HF _compute_yarn_parameters (Laguna full-attn rope)" {
     // Golden values from the reference YaRN math (tests/dump_laguna_fixtures.py
     // and the pure-Python cross-check): head_dim 128, partial 0.5 → dim 64 →
     // 32 freqs; base 5e5, factor 32, beta_fast 32, beta_slow 1, orig_max 8192.
     // low/high correction dims truncate to 9/18.
     var freqs: [32]f64 = undefined;
-    computeYarnFreqs(&freqs, 128, 0.5, 500000.0, 32.0, 32.0, 1.0, 8192);
+    computeYarnFreqs(&freqs, 128, 0.5, 500000.0, 32.0, 32.0, 1.0, 8192, true);
     // Spot-check the denominator array mlx_fast_rope consumes (angle = pos/freqs).
     const golden = [_]struct { idx: usize, val: f64 }{
         .{ .idx = 0, .val = 1.000000000e+00 },
@@ -30220,7 +30467,7 @@ test "laguna yarn parity vs modeling_laguna.py (LAGUNA_FIXTURES)" {
     const ref = yarn.get("freqs").?.array;
     const out = try testing.allocator.alloc(f64, ref.items.len);
     defer testing.allocator.free(out);
-    computeYarnFreqs(out, head_dim, partial, base, factor, beta_fast, beta_slow, orig_max);
+    computeYarnFreqs(out, head_dim, partial, base, factor, beta_fast, beta_slow, orig_max, true);
     for (ref.items, 0..) |item, i| {
         try testing.expectApproxEqRel(jsonF64(item), out[i], 1e-6);
     }
@@ -36890,7 +37137,7 @@ test "qk norm rope fused hd-256: bit-identical at qwen 24q/4kv rd=64, S 1..16 in
             const kw = try attn256RandBf16(rnd, &w_shape, s);
             defer _ = mlx.mlx_array_free(kw);
 
-            const angles = try ropeAngleRows(s, rd, base, no_freqs, offset, seq, std.testing.allocator);
+            const angles = try ropeAngleRows(s, rd, base, no_freqs, offset, seq, std.testing.allocator, 1.0);
             defer _ = mlx.mlx_array_free(angles);
             const pair = (try fusedQkNormRope256(s, q_view, k, qw, kw, angles, eps_arr, hq, hk, seq, rd)) orelse return error.FusedDeclined;
             defer _ = mlx.mlx_array_free(pair[0]);
