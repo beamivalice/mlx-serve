@@ -3230,16 +3230,17 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_len:
     // on the gather). Detection mirrors prefillAttnKeys: declared ratios or
     // stay generic.
     const is_dsv4: bool = std.mem.eql(u8, config.model_type, "deepseek_v4") and config.dsv4_n_compress_ratios > 0;
-    // A hot-cache restore materializes a COPY of the matched entry's KV into
-    // the slot while the entry stays resident (~7-8 GB at a 138k match) —
-    // bill the largest resident entry. Conservative (billed even on a miss),
-    // but the honest direction.
-    const hot_restore: u64 = if (lm.prefix_cache) |*pc| pc.largestEntryBytes() else 0;
-    const needed: u64 = hot_restore +| (if (is_dsv4)
+    // RAM hot-cache restores rebind MLX array handles by refcount; they do not
+    // allocate another copy of the cached buffers. `active_mem` below already
+    // includes the resident entry, while `prefillMemoryNeeded` bills the full
+    // destination KV capacity that may be allocated when the restored cache
+    // grows. Adding the resident entry here again would invent a third copy
+    // and reject long warm prompts (and even cache misses) spuriously.
+    const needed: u64 = if (is_dsv4)
         dsv4PrefillMemoryNeeded(seq, layers, kv_heads * hdim, hidden, ffn, dsv4_mod.prefillSub(), config.prefillAttnKeys(seq))
     else
         prefillMemoryNeeded(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, chunk, config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config)) +
-            qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq));
+            qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq);
 
     // Available = GPU allocation ceiling minus current usage (model weights,
     // resident hot-cache KV, etc.). The ceiling is the LESSER of Metal's static
@@ -4872,6 +4873,19 @@ fn resolveEnableThinking(root: std.json.ObjectMap, effort_cfg: ?ReasoningEffort,
     return (et orelse false) or (if (effort_cfg) |e| e.enable else false);
 }
 
+/// A grammar mask constrains from token 0 — it cannot express "think first,
+/// then JSON", so a schema request is a content-only contract and thinking is
+/// enforced OFF in the prompt (the noThinkTailSuffix machinery). Without this
+/// the mask pushes the JSON into the template's open think block and `content`
+/// ships EMPTY (live: qwen3.5 effort high + schema on /v1/messages; issue #331
+/// re-found the same hole on /v1/chat/completions and /v1/responses). Tools
+/// present = no mask (every surface skips it so tool calls stay reachable),
+/// so thinking stays whatever the request resolved. Every surface that builds
+/// a grammar mask consults this — the source scan pins the pairing.
+fn schemaMasksThinking(has_schema: bool, has_tools: bool) bool {
+    return has_schema and !has_tools;
+}
+
 /// `continue_final_message`: extend the trailing assistant message instead of
 /// answering after it. vLLM's spelling, because a client that already knows how
 /// to ask another local server for this should not have to learn a second name.
@@ -5033,7 +5047,16 @@ fn handleChatCompletions(
         content_allocs.deinit(allocator);
     }
 
-    for (messages_val.array.items) |msg_val| {
+    // Decide which raw message owns current-turn media before the parse loop
+    // materializes any attachment. The JSON tree keeps every data URL alive
+    // for the request, so historical attachments can remain borrowed strings
+    // instead of becoming multi-megabyte pixel buffers merely to be ignored by
+    // activeTurnMediaMessage below.
+    const wire_continue_final = wireContinuationRequested(messages_val.array.items, .openai) and
+        (if (root.get("continue_final_message")) |v| v == .bool and v.bool else false);
+    const active_wire_media = activeWireMediaIndex(messages_val.array.items, wire_continue_final, .openai);
+
+    for (messages_val.array.items, 0..) |msg_val, raw_msg_index| {
         // A non-object array element (e.g. `messages:[1,2,3]`) would panic on
         // `.object`. Skip it rather than crash — consistent with how malformed
         // inner fields are already tolerated below.
@@ -5047,6 +5070,8 @@ fn handleChatCompletions(
         var msg_images: ?[]const chat_mod.ImageData = null;
         var msg_videos: ?[]const chat_mod.VideoData = null;
         var msg_audio: ?[]const chat_mod.AudioData = null;
+        const decode_this_message = active_wire_media != null and active_wire_media.? == raw_msg_index;
+        const wire_presence = wireMediaPresence(msg_val, .openai);
         const content: []const u8 = if (content_val) |cv| switch (cv) {
             .string => |s| s,
             .array => |arr| blk: {
@@ -5058,6 +5083,7 @@ fn handleChatCompletions(
                     const ptype = part.object.get("type") orelse continue;
                     if (ptype != .string) continue;
                     if (std.mem.eql(u8, ptype.string, "image_url")) {
+                        if (!decode_this_message) continue;
                         // Parse image_url content block
                         const img_obj = part.object.get("image_url") orelse continue;
                         if (img_obj != .object) continue;
@@ -5065,6 +5091,7 @@ fn handleChatCompletions(
                         if (url_val != .string) continue;
                         appendImageUrlContent(allocator, media.images(img_slot), url_val.string, visionPreprocFromConfig(config));
                     } else if (std.mem.eql(u8, ptype.string, "video_url")) {
+                        if (!decode_this_message) continue;
                         // A video is, on the wire, an ordered array of already-
                         // decoded frame images — no video codec exists anywhere
                         // in this codebase, so frame extraction is the CLIENT's
@@ -5080,6 +5107,7 @@ fn handleChatCompletions(
                         }
                         appendVideoUrlContent(allocator, media.videos(vid_slot), frame_urls.items, visionPreprocFromConfig(config));
                     } else if (std.mem.eql(u8, ptype.string, "input_audio")) {
+                        if (!decode_this_message) continue;
                         // OpenAI-style audio block. For the Gemma 4 12B unified
                         // engine the client sends raw 16 kHz mono float32-LE PCM
                         // (format "mlx_pcm_f32") base64-encoded in `data`.
@@ -5148,7 +5176,7 @@ fn handleChatCompletions(
             null;
 
         // Skip messages with no content, no tool_calls, and no images/videos/audio
-        if (content.len == 0 and msg_tool_calls == null and msg_images == null and msg_videos == null and msg_audio == null and msg_reasoning == null and !std.mem.eql(u8, role_val.string, "tool")) continue;
+        if (content.len == 0 and msg_tool_calls == null and msg_images == null and msg_videos == null and msg_audio == null and msg_reasoning == null and !wire_presence.any() and !std.mem.eql(u8, role_val.string, "tool")) continue;
 
         try messages.append(allocator, .{
             .role = role_val.string,
@@ -5365,7 +5393,8 @@ fn handleChatCompletions(
     // A request naming NEITHER takes the arch default (off for every arch but
     // the ones whose vendor documents thinking-on).
     const effort_cfg = parseReasoningEffort(root, server_config.default_reasoning_budget, if (lm.chat_config) |cc| chat_mod.templateConsumesEffort(cc.chat_template) else false);
-    const enable_thinking = resolveEnableThinking(root, effort_cfg, config.defaultEnableThinking(tools_json != null));
+    var enable_thinking = resolveEnableThinking(root, effort_cfg, config.defaultEnableThinking(tools_json != null));
+    if (schemaMasksThinking(grammar_schema_val != null, has_tools)) enable_thinking = false;
 
     // Reasoning budget (max tokens in <think> block, -1 = unlimited):
     // explicit reasoning_budget_tokens > effort-mapped budget > --reasoning-budget flag
@@ -9573,6 +9602,268 @@ fn parseKvQuantOverride(root: std.json.ObjectMap) ?transformer_mod.KVQuantConfig
 
 // ── Vision Processing ──
 
+/// The two chat wire formats describe the same turn graph with different
+/// shapes: OpenAI uses role=`tool` messages, while Anthropic nests tool_result
+/// blocks inside a user message. This selector reads only JSON metadata. It is
+/// deliberately upstream of image decoding so historical data URLs never have
+/// to become pixel tensors just to discover that they sit behind an assistant
+/// boundary.
+const WireMediaStyle = enum { openai, anthropic };
+
+const WireMediaPresence = struct {
+    images: bool = false,
+    videos: bool = false,
+    audio: bool = false,
+
+    fn any(self: WireMediaPresence) bool {
+        return self.images or self.videos or self.audio;
+    }
+};
+
+fn wireRole(msg: std.json.Value) ?[]const u8 {
+    if (msg != .object) return null;
+    const role = msg.object.get("role") orelse return null;
+    return if (role == .string) role.string else null;
+}
+
+fn wireMediaPresence(msg: std.json.Value, style: WireMediaStyle) WireMediaPresence {
+    if (msg != .object) return .{};
+    const content = msg.object.get("content") orelse return .{};
+    if (content != .array) return .{};
+    var out: WireMediaPresence = .{};
+    for (content.array.items) |part| {
+        if (part != .object) continue;
+        const tv = part.object.get("type") orelse continue;
+        if (tv != .string) continue;
+        if (style == .anthropic) {
+            if (std.mem.eql(u8, tv.string, "image")) out.images = true;
+        } else if (std.mem.eql(u8, tv.string, "image_url")) {
+            out.images = true;
+        } else if (std.mem.eql(u8, tv.string, "video_url")) {
+            out.videos = true;
+        } else if (std.mem.eql(u8, tv.string, "input_audio")) {
+            out.audio = true;
+        }
+    }
+    return out;
+}
+
+fn wireMessageHasToolResult(msg: std.json.Value, style: WireMediaStyle) bool {
+    const role = wireRole(msg) orelse return false;
+    if (style == .openai) return std.mem.eql(u8, role, "tool");
+    if (!std.mem.eql(u8, role, "user") or msg != .object) return false;
+    const content = msg.object.get("content") orelse return false;
+    if (content != .array) return false;
+    for (content.array.items) |part| {
+        if (part != .object) continue;
+        const tv = part.object.get("type") orelse continue;
+        if (tv == .string and std.mem.eql(u8, tv.string, "tool_result")) return true;
+    }
+    return false;
+}
+
+fn wireAssistantHasTools(msg: std.json.Value, style: WireMediaStyle) bool {
+    const role = wireRole(msg) orelse return false;
+    if (!std.mem.eql(u8, role, "assistant") or msg != .object) return false;
+    if (style == .openai) {
+        const calls = msg.object.get("tool_calls") orelse return false;
+        return calls == .array and calls.array.items.len > 0;
+    }
+    const content = msg.object.get("content") orelse return false;
+    if (content != .array) return false;
+    for (content.array.items) |part| {
+        if (part != .object) continue;
+        const tv = part.object.get("type") orelse continue;
+        if (tv == .string and std.mem.eql(u8, tv.string, "tool_use")) return true;
+    }
+    return false;
+}
+
+fn wireMessageHasText(msg: std.json.Value) bool {
+    if (msg != .object) return false;
+    const content = msg.object.get("content") orelse return false;
+    if (content == .string) return std.mem.trim(u8, content.string, " \t\r\n").len > 0;
+    if (content != .array) return false;
+    for (content.array.items) |part| {
+        if (part != .object) continue;
+        const tv = part.object.get("type") orelse continue;
+        const text = part.object.get("text") orelse continue;
+        if (tv == .string and std.mem.eql(u8, tv.string, "text") and text == .string and
+            std.mem.trim(u8, text.string, " \t\r\n").len > 0) return true;
+    }
+    return false;
+}
+
+/// Whether OpenAI's parse loop will retain any content from this wire message.
+/// This deliberately accepts malformed non-empty tool_calls as visible: the
+/// wire gate may be wider than parsing (one wasted decode), never narrower
+/// (pixels missing from a prompt that still renders their placeholder).
+fn wireOpenAiParserSkips(msg: std.json.Value) bool {
+    const role = wireRole(msg) orelse return true;
+    if (std.mem.eql(u8, role, "tool")) return false;
+    if (wireMediaPresence(msg, .openai).any()) return false;
+    if (msg == .object) {
+        if (msg.object.get("content")) |content| switch (content) {
+            .string => |s| if (s.len > 0) return false,
+            .array => |parts| for (parts.items) |part| {
+                if (part != .object) continue;
+                const tv = part.object.get("type") orelse continue;
+                const text = part.object.get("text") orelse continue;
+                if (tv == .string and std.mem.eql(u8, tv.string, "text") and
+                    text == .string and text.string.len > 0) return false;
+            },
+            else => {},
+        };
+        if (std.mem.eql(u8, role, "assistant")) {
+            if (wireAssistantHasTools(msg, .openai)) return false;
+            if (messageReasoningFromObj(msg.object) != null) return false;
+        }
+    }
+    return true;
+}
+
+fn wireParserSkips(msg: std.json.Value, style: WireMediaStyle) bool {
+    // Anthropic appends empty assistant/user strings, so every valid-role
+    // message remains a real boundary on that surface.
+    return style == .openai and wireOpenAiParserSkips(msg);
+}
+
+fn wireContinuationRequested(msgs: []const std.json.Value, style: WireMediaStyle) bool {
+    var i = msgs.len;
+    while (i > 0) {
+        i -= 1;
+        if (wireParserSkips(msgs[i], style)) continue;
+        const role = wireRole(msgs[i]) orelse continue;
+        return std.mem.eql(u8, role, "assistant") and wireMessageHasText(msgs[i]);
+    }
+    return false;
+}
+
+/// Return the raw-message index whose media belongs to the active turn.
+/// Mirrors activeTurnMediaMessage but consults only content-block types. This
+/// is the key ordering guarantee: callers invoke it before their parse loop,
+/// then decode attachments only when the loop reaches the returned index.
+fn activeWireMediaIndex(msgs: []const std.json.Value, continue_final: bool, style: WireMediaStyle) ?usize {
+    var last_valid: ?usize = null;
+    var j = msgs.len;
+    while (j > 0) {
+        j -= 1;
+        if (wireParserSkips(msgs[j], style)) continue;
+        if (wireRole(msgs[j]) != null) {
+            last_valid = j;
+            break;
+        }
+    }
+
+    var i = msgs.len;
+    var follows_tool_result = false;
+    while (i > 0) {
+        i -= 1;
+        if (wireParserSkips(msgs[i], style)) continue;
+        const role = wireRole(msgs[i]) orelse continue;
+        if (style == .openai and std.mem.eql(u8, role, "tool")) {
+            follows_tool_result = true;
+            continue;
+        }
+        if (std.mem.eql(u8, role, "assistant")) {
+            if (continue_final and last_valid != null and i == last_valid.?) continue;
+            if (follows_tool_result and wireAssistantHasTools(msgs[i], style)) {
+                follows_tool_result = false;
+                continue;
+            }
+            break;
+        }
+        if (!std.mem.eql(u8, role, "user")) continue;
+        if (wireMediaPresence(msgs[i], style).any()) return i;
+        if (style == .anthropic and wireMessageHasToolResult(msgs[i], style)) follows_tool_result = true;
+    }
+    return null;
+}
+
+test "activeWireMediaIndex skips historical OpenAI images without decoding" {
+    const body =
+        \\{"messages":[
+        \\  {"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,AAAA"}},{"type":"text","text":"look"}]},
+        \\  {"role":"assistant","content":"seen"},
+        \\  {"role":"user","content":"continue"}
+        \\]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const msgs = parsed.value.object.get("messages").?.array.items;
+    try std.testing.expect(activeWireMediaIndex(msgs, false, .openai) == null);
+}
+
+test "activeWireMediaIndex finds media before trailing injected context" {
+    const body =
+        \\{"messages":[
+        \\  {"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,AAAA"}},{"type":"text","text":"look"}]},
+        \\  {"role":"user","content":"injected context"}
+        \\]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const msgs = parsed.value.object.get("messages").?.array.items;
+    try std.testing.expectEqual(@as(?usize, 0), activeWireMediaIndex(msgs, false, .openai));
+}
+
+test "activeWireMediaIndex crosses Anthropic tool use and result" {
+    const body =
+        \\{"messages":[
+        \\  {"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"AAAA"}},{"type":"text","text":"inspect"}]},
+        \\  {"role":"assistant","content":[{"type":"tool_use","id":"tool-1","name":"inspect","input":{}}]},
+        \\  {"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-1","content":"done"}]}
+        \\]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const msgs = parsed.value.object.get("messages").?.array.items;
+    try std.testing.expectEqual(@as(?usize, 0), activeWireMediaIndex(msgs, false, .anthropic));
+}
+
+test "activeWireMediaIndex keeps media for an assistant-prefix continuation" {
+    const body =
+        \\{"messages":[
+        \\  {"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,AAAA"}},{"type":"text","text":"look"}]},
+        \\  {"role":"assistant","content":"The image shows "}
+        \\]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const msgs = parsed.value.object.get("messages").?.array.items;
+    try std.testing.expect(wireContinuationRequested(msgs, .openai));
+    try std.testing.expectEqual(@as(?usize, 0), activeWireMediaIndex(msgs, true, .openai));
+}
+
+test "activeWireMediaIndex ignores an OpenAI assistant the parser skips" {
+    const body =
+        \\{"messages":[
+        \\  {"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,AAAA"}},{"type":"text","text":"look"}]},
+        \\  {"role":"assistant","content":""},
+        \\  {"role":"user","content":"hi"}
+        \\]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const msgs = parsed.value.object.get("messages").?.array.items;
+    try std.testing.expectEqual(@as(?usize, 0), activeWireMediaIndex(msgs, false, .openai));
+}
+
+test "wireContinuationRequested ignores an OpenAI user the parser skips" {
+    const body =
+        \\{"messages":[
+        \\  {"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,AAAA"}},{"type":"text","text":"look"}]},
+        \\  {"role":"assistant","content":"The image shows "},
+        \\  {"role":"user","content":""}
+        \\]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const msgs = parsed.value.object.get("messages").?.array.items;
+    try std.testing.expect(wireContinuationRequested(msgs, .openai));
+    try std.testing.expectEqual(@as(?usize, 0), activeWireMediaIndex(msgs, true, .openai));
+}
+
 /// Return the newest media-bearing user message in the active turn.
 ///
 /// Agent clients may append user-role context injections after the human's
@@ -11254,14 +11545,22 @@ fn handleAnthropicMessages(
         }
     }
 
+    // Anthropic carries tool results inside user content blocks, but the same
+    // active-turn rule applies: inspect those blocks without decoding their
+    // media, then materialize only the selected raw message below.
+    const wire_continue_final = wireContinuationRequested(messages_val.array.items, .anthropic) and
+        continuationRejectReason(lm.ds4_engine != null) == null;
+    const active_wire_media = activeWireMediaIndex(messages_val.array.items, wire_continue_final, .anthropic);
+
     // Convert Anthropic messages to internal format
-    for (messages_val.array.items) |msg_val| {
+    for (messages_val.array.items, 0..) |msg_val, raw_msg_index| {
         if (msg_val != .object) continue;
         const msg_obj = msg_val.object;
         const role_val = msg_obj.get("role") orelse continue;
         if (role_val != .string) continue;
         const role = role_val.string;
         const content_val = msg_obj.get("content");
+        const decode_this_message = active_wire_media != null and active_wire_media.? == raw_msg_index;
 
         if (std.mem.eql(u8, role, "user")) {
             if (content_val) |cv| switch (cv) {
@@ -11269,6 +11568,7 @@ fn handleAnthropicMessages(
                     try messages.append(allocator, .{ .role = "user", .content = s, .tool_calls = null, .tool_call_id = null });
                 },
                 .array => |arr| {
+                    const wire_presence = wireMediaPresence(msg_val, .anthropic);
                     // Process tool_result blocks first, then text+image blocks.
                     for (arr.items) |block| {
                         if (block != .object) continue;
@@ -11304,6 +11604,7 @@ fn handleAnthropicMessages(
                                 try msg_text.appendSlice(allocator, text);
                             }
                         } else if (std.mem.eql(u8, btype, "image")) {
+                            if (!decode_this_message) continue;
                             // Anthropic image block: source = {type:"base64", media_type, data}
                             //                    or = {type:"url", url}
                             const src_val = block.object.get("source") orelse continue;
@@ -11329,7 +11630,11 @@ fn handleAnthropicMessages(
                             }
                         }
                     }
-                    if (msg_text.items.len > 0 or media.images(img_slot).items.len > 0) {
+                    // Preserve a historical image-only user turn even though
+                    // its pixels were deliberately not materialized. It still
+                    // contributes the same empty user-role template boundary
+                    // as before this optimization.
+                    if (msg_text.items.len > 0 or media.images(img_slot).items.len > 0 or wire_presence.images) {
                         const owned_text = if (msg_text.items.len > 0) blk: {
                             const s = try allocator.dupe(u8, msg_text.items);
                             try content_allocs.append(allocator, s);
@@ -11534,14 +11839,7 @@ fn handleAnthropicMessages(
         if (!budget_explicit) reasoning_budget = cfg.budget;
         enable_thinking = if (root.get("thinking") == null) cfg.enable else (enable_thinking or cfg.enable);
     }
-    // A grammar mask constrains from token 0 — it cannot express "think
-    // first, then JSON", so a schema request is a content-only contract and
-    // thinking is enforced OFF in the prompt (the noThinkTailSuffix
-    // machinery). Without this the mask pushes the JSON into the template's
-    // open think block and `content` ships EMPTY (live: qwen3.5, effort high
-    // + schema). Tools present = no mask (see the grammar block below), so
-    // thinking stays whatever the request resolved.
-    if (output_cfg.schema != null and !has_tools) enable_thinking = false;
+    if (schemaMasksThinking(output_cfg.schema != null, has_tools)) enable_thinking = false;
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
     const model_name = if (root.get("model")) |v| (if (v == .string) v.string else config.model_type) else config.model_type;
@@ -13167,7 +13465,7 @@ fn handleResponses(
     // pass; thinking truncation happens via finish_reason="length" if the model
     // overruns max_output_tokens.
     const reasoning_cfg = responses_mod.parseReasoning(root.get("reasoning"), server_config.default_reasoning_budget);
-    const enable_thinking = reasoning_cfg.enable;
+    var enable_thinking = reasoning_cfg.enable;
     _ = reasoning_cfg.budget;
 
     // ── tools ──
@@ -13201,6 +13499,7 @@ fn handleResponses(
     if (final_answer_mode and has_tools) {
         log.info("[responses] final-answer mode - tools disabled after function_call_output\n", .{});
     }
+    if (schemaMasksThinking(grammar_schema_val != null, active_has_tools)) enable_thinking = false;
 
     // ── model name ──
     const model_name = if (root.get("model")) |v|
@@ -16970,6 +17269,22 @@ test "resolveEnableThinking: an explicit request value outranks the arch default
     }
 }
 
+test "every JSON grammar mask site pairs with the schema thinking-off gate" {
+    // The gate lived only on /v1/messages while chat-completions and responses
+    // built the same token-0 mask against a prompt still inside <think>
+    // (issue #331). A NEW surface that builds a mask without consulting the
+    // gate re-ships the hole, so the pairing is pinned by count: one gate call
+    // per mask-enforcement site.
+    const src = @embedFile("server.zig");
+    const mask_line = "[grammar] enforcing JSON " ++ "schema";
+    const call = "schemaMasks" ++ "Thinking(";
+    const def = "fn schemaMasks" ++ "Thinking(";
+    const masks = std.mem.count(u8, src, mask_line);
+    const calls = std.mem.count(u8, src, call) - std.mem.count(u8, src, def);
+    try std.testing.expect(masks >= 3);
+    try std.testing.expectEqual(masks, calls);
+}
+
 test "resolveSamplingDefault: request > CLI > generation_config > fallback" {
     // Request value always wins.
     try std.testing.expectEqual(@as(f32, 0.2), resolveSamplingDefault(f32, 0.2, 0.7, 1.0, 1.0));
@@ -17708,6 +18023,22 @@ test "checkAttentionMemory routes deepseek_v4 through its own estimator with the
     const call = "dsv4PrefillMemoryNeeded(seq, layers, " ++
         "kv_heads * hdim, hidden, ffn, dsv4_mod.prefillSub(), config.prefillAttnKeys(seq))";
     try t.expect(std.mem.indexOf(u8, src, call) != null);
+}
+
+test "checkAttentionMemory does not bill resident hot-cache buffers twice" {
+    // RAM restore uses refcount-sharing. The resident entry is already inside
+    // `active_mem`, and prefillMemoryNeeded bills the destination KV growth.
+    // Pin the chokepoint so a future cache-accounting change cannot add the
+    // resident entry to `needed` again (the 138k-token false-400 regression).
+    const t = std.testing;
+    const src = @embedFile("server.zig");
+    const start = std.mem.indexOf(u8, src, "fn checkAttention" ++ "Memory(") orelse return error.CallSiteMoved;
+    const tail = src[start..];
+    const end = std.mem.indexOf(u8, tail, "\nextern \"c\" fn sysctlbyname") orelse return error.CallSiteMoved;
+    const body = tail[0..end];
+    try t.expect(std.mem.indexOf(u8, body, "largestEntry" ++ "Bytes") == null);
+    try t.expect(std.mem.indexOf(u8, body, "hot_" ++ "restore") == null);
+    try t.expect(std.mem.indexOf(u8, body, "mlx_get_active_memory(&active_mem)") != null);
 }
 
 test "checkAttentionMemory wires the CONFIG's key bound, not a dense seq" {

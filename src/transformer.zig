@@ -4280,7 +4280,71 @@ pub const KVCacheSnapshot = struct {
         }
         self.allocator.free(self.entries);
     }
+
+    /// Issue #330: a materialized copy of the first `len` tokens (sequence
+    /// axis 2). `KVCache.truncate` is offset-only — the views shrink but a
+    /// refcount-shared snapshot keeps the full buffer alive and
+    /// `snapshotBytes` keeps billing its capacity — so a byte-budget trim
+    /// must be a real slice + copy into fresh buffers. Each array is sliced
+    /// against its OWN shape (affine scales/biases are [B,H,T,D/gs]; the
+    /// packed codes [B,H,T,D*bits/32] — all carry T at axis 2).
+    pub fn trimmedCopy(self: *const KVCacheSnapshot, len: usize, s: mlx.mlx_stream) !KVCacheSnapshot {
+        const out = try self.allocator.alloc(KVCacheEntry, self.entries.len);
+        var built: usize = 0;
+        errdefer {
+            for (out[0..built]) |*e| freeKVEntry(e);
+            self.allocator.free(out);
+        }
+        for (self.entries, 0..) |src, i| {
+            out[i] = newEmptyKVEntry();
+            out[i].initialized = src.initialized;
+            out[i].offset = @min(src.offset, len);
+            if (src.initialized) {
+                const keep = out[i].offset;
+                out[i].keys = try trimRowsOwned(src.keys, keep, s);
+                out[i].values = try trimRowsOwned(src.values, keep, s);
+                if (self.config.scheme != .off) {
+                    out[i].keys_scales = try trimRowsOwned(src.keys_scales, keep, s);
+                    out[i].keys_biases = try trimRowsOwned(src.keys_biases, keep, s);
+                    out[i].values_scales = try trimRowsOwned(src.values_scales, keep, s);
+                    out[i].values_biases = try trimRowsOwned(src.values_biases, keep, s);
+                }
+            }
+            built = i + 1;
+        }
+        // One batched eval, like `captureSsmCheckpoint`: without it the lazy
+        // copy nodes pin the parent buffers — the capacity the trim exists
+        // to release.
+        {
+            const vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(vec);
+            var count: usize = 0;
+            for (out) |*e| {
+                inline for (.{ e.keys, e.values, e.keys_scales, e.keys_biases, e.values_scales, e.values_biases }) |arr| {
+                    if (arr.ctx != null) {
+                        _ = mlx.mlx_vector_array_append_value(vec, arr);
+                        count += 1;
+                    }
+                }
+            }
+            if (count > 0) _ = mlx.mlx_eval(vec);
+        }
+        return .{ .entries = out, .step = @min(self.step, len), .allocator = self.allocator, .config = self.config };
+    }
 };
+
+/// Slice `[0:rows]` on axis 2 and force a real copy (see
+/// `materializedOwnedCopy` for why a plain slice keeps the parent alive).
+fn trimRowsOwned(x: mlx.mlx_array, rows: usize, s: mlx.mlx_stream) !mlx.mlx_array {
+    const sh = mlx.mlx_array_shape(x);
+    var sliced = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sliced);
+    const start = [_]c_int{ 0, 0, 0, 0 };
+    const stop = [_]c_int{ sh[0], sh[1], @intCast(rows), sh[3] };
+    const strides = [_]c_int{ 1, 1, 1, 1 };
+    try mlx.check(mlx.mlx_slice(&sliced, x, &start, 4, &stop, 4, &strides, 4, s));
+    return materializedOwnedCopy(s, sliced);
+}
 
 // ── SSM Cache (for GatedDeltaNet linear attention layers) ──
 

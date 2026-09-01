@@ -4551,14 +4551,10 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
         break :blk .{ .cache = mc.kv() orelse break :blk null, .base_pos = gen_ptr.mtp_position_base };
     };
     hc.commitWithMediaState(&slot.cache, total_tokens, slot.has_tools, slot.vision_key, slot.media_start, ssm_cps_opt, dflash_commit, mtp_commit) catch |err| {
+        // Ownership of the checkpoints transferred to the cache regardless of
+        // the outcome — its error paths free them (#330 adjacent: freeing
+        // here too was a double free, with a different allocator).
         log.warn("[hot-cache] commit failed: {s}\n", .{@errorName(err)});
-        // Commit failed — we still own the checkpoints. Free them so they
-        // don't leak.
-        const a = gen_ptr.ssm_checkpoint_alloc orelse sch.allocator;
-        if (ssm_cps_opt) |cps| {
-            for (cps) |*cp| cp.deinit(a);
-            a.free(cps);
-        }
     };
 }
 
@@ -4600,13 +4596,14 @@ fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache)
     const len = cancelledPrefillCommitLen(salvage.forwarded, slot.full_prompt.len) orelse return;
     const cps: ?[]transformer_mod.SSMCheckpoint = if (salvage.checkpoints.len > 0) salvage.checkpoints else null;
     const media_start = if (slot.media_start) |start| if (start < len) start else null else null;
+    // Ownership of the checkpoints transfers to the cache unconditionally —
+    // its error paths free them (#330 adjacent) — so detach from the slot
+    // BEFORE the call or Slot.deinit frees them a second time.
+    slot.cancelled_prefill = .{};
     hc.commitWithMediaState(&slot.cache, slot.full_prompt[0..len], slot.has_tools, slot.vision_key, media_start, cps, null, null) catch |err| {
         log.warn("[hot-cache] cancelled-prefill commit failed: {s}\n", .{@errorName(err)});
-        // The sink still owns the checkpoints; Slot.deinit frees them.
         return;
     };
-    // Ownership of the checkpoints transferred to the entry.
-    slot.cancelled_prefill = .{};
     log.info("[hot-cache] committed {d}/{d} prompt tokens from a cancelled prefill\n", .{ len, slot.full_prompt.len });
 }
 
@@ -5958,6 +5955,30 @@ test "commitSlotIfApplicable routes a Generator-less slot to the cancelled-prefi
     // 0 on every aborted prefill (found live: step=0 while pos=1536).
     try testing.expect(std.mem.indexOf(u8, cp_body, "salvage.forwarded") != null);
     try testing.expect(std.mem.indexOf(u8, cp_body, "commitWithMediaState") != null);
+}
+
+test "hot-cache commit owns the checkpoints on every outcome (#330 adjacent)" {
+    // Ownership of the SSM checkpoint slice transfers to the cache
+    // UNCONDITIONALLY — commitWithMediaState's error paths free it (and after
+    // a byte-budget trim the slice may be a cache-allocated replacement). A
+    // caller-side free after a failed commit is therefore a double free, with
+    // a different allocator at that (gen_ptr.ssm_checkpoint_alloc vs the
+    // cache's). Live shape: any commit error, e.g. OOM.
+    const source = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, source, "fn commitSlotIfApplicable(") orelse return error.MissingCommitSlot;
+    const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn ") orelse return error.MissingEnd;
+    const body = source[start..end];
+    try testing.expect(std.mem.indexOf(u8, body, "commitWithMediaState") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "cp.deinit") == null);
+
+    // The cancelled-prefill commit detaches the salvage BEFORE the call so
+    // Slot.deinit cannot free what the cache now owns.
+    const cp_start = std.mem.indexOf(u8, source, "fn commitCancelledPrefillSlot(") orelse return error.MissingCancelledPrefillFn;
+    const cp_end = std.mem.indexOfPos(u8, source, cp_start + 1, "\nfn ") orelse return error.MissingCancelledPrefillEnd;
+    const cp_body = source[cp_start..cp_end];
+    const detach = std.mem.indexOf(u8, cp_body, "slot.cancelled_prefill = .{};") orelse return error.MissingDetach;
+    const commit_pos = std.mem.indexOf(u8, cp_body, "hc.commitWithMediaState") orelse return error.MissingCommit;
+    try testing.expect(detach < commit_pos);
 }
 
 test "Generator.initWithOptions hands off checkpoints on cancel" {
