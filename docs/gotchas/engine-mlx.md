@@ -4366,3 +4366,11 @@ Two traps met on the way:
 - `QWEN4_STANDIN=attn_qsa` is not a "no indexer" meter: with the indexer stood in there is no selection, the QSA branch is skipped, and the layer runs DENSE causal attention over the whole cache (67 s at 38k, slower than with QSA). Time the selection in-process instead (`[qsa-prof] select`).
 
 Hermetic bar: `gatherQsa256: block-gathered QSA parity vs composed 'array' SDPA over the expanded mask` (gqa 12, rows straddling the every-block-fits boundary, sentinel rows, both tiles, the expansion helper equal to the host-built mask). The qwen4 text + vision fixtures run T=20/T=28 prefills through the gather path (layer-3 mask EXACT, cos > 0.9999).
+
+## QSA scalar RoPE skipped YaRN mscale; partial rotary ranking can flip (2026-09-01)
+
+`--config-overrides` with `rope_type: yarn` stretches Qwen3.8-Flash-Next to 1M. M-RoPE tables already fold mscale into cos/sin via `fillCosSin(..., yarnMscale)`. The QSA indexer's scalar arm (`mlx_fast_rope` when `mrope_cos_cur == null`) did not: a comment claimed mscale "multiplies every relu(q·k) by one positive constant, which cannot change a top-k." That is true of a FULL-head scale. The indexer is 128-wide and only 64 dims rotate, so score = ms²·A + B, and two synthetic blocks whose unscaled winner is the B-heavy one flip under factor-4 mscale (`YaRN mscale on a 128-wide indexer with 64 rotary dims CAN change top-k`).
+
+Image decode is the mixed-arm case: `beginMropeChunk` at `seq_len <= 1` leaves `mrope_cos_cur` null (unchanged — do not "fix" that), so decode queries take the scalar path while prefill queries and pooled keys ride the already-scaled M-RoPE tables. Prefill and decode then ranked different blocks. Never `yarnScaleQK` on the indexer (`[head_dim]` is 256, not 128); never `mlx_fast_rope` scale as mscale (would also scale the pass-through tail); never `mlx_array_new_float` on bf16. Scalar mscale is `yarnScaleRotated` (queries) and `ropeAtFreqs` × `scalarOf` (pooled keys).
+
+`--config-overrides` now rides `modelFingerprint`, so a YaRN boot cannot restore an unscaled SSD prefix. Wipe `~/.mlx-serve/kv-cache` once after this change if you already served with overrides (old entries were fingerprinted without the JSON). DiskTier version and hash seed stay put.

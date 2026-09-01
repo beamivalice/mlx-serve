@@ -11907,6 +11907,18 @@ pub const Transformer = struct {
         var sinv = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(sinv);
         try mlx.check(mlx.mlx_astype(&sinv, sin_f, dt, self.s));
+        if (self.yarnActive()) {
+            const ms = try scalarOf(self.config.yarn_attention_factor, dt, self.s);
+            defer _ = mlx.mlx_array_free(ms);
+            var cos_s = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_multiply(&cos_s, cosv, ms, self.s));
+            _ = mlx.mlx_array_free(cosv);
+            cosv = cos_s;
+            var sin_s = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_multiply(&sin_s, sinv, ms, self.s));
+            _ = mlx.mlx_array_free(sinv);
+            sinv = sin_s;
+        }
         const sh = mlx.getShape(x);
         const strides = [_]c_int{ 1, 1, 1, 1 };
         var xr = mlx.mlx_array_new();
@@ -12083,13 +12095,16 @@ pub const Transformer = struct {
             // model asks "how far apart are these two blocks", and a block
             // pick made on unscaled angles at 1M positions would select
             // against a position notion the attention layers no longer have.
-            // The mscale is deliberately NOT applied here: it multiplies every
-            // relu(q·k) by one positive constant, which cannot change a top-k.
+            // Indexer is 128-wide / 64 rotated, so score = ms²·A+B and mscale
+            // CAN change a top-k. M-RoPE tables already carry mscale via
+            // fillCosSin; this scalar arm must too. Never yarnScaleQK here
+            // (that table is [head_dim] = 256). Keep mlx_fast_rope scale=1.0.
             const use_yarn = self.yarnActive();
             try mlx.check(mlx.mlx_fast_rope(&q_rope, qt, rope_dims, false, mlx.mlx_optional_float{
                 .value = cfg.rope_theta,
                 .has_value = !use_yarn,
             }, 1.0, eff_off, if (use_yarn) self.rope_freqs_yarn.? else .{ .ctx = null }, self.s));
+            if (use_yarn) try self.yarnScaleRotated(&q_rope, rope_dims);
         }
 
         // Pooled block keys: mean of each complete block → norm → RoPE at the
@@ -14436,6 +14451,34 @@ pub const Transformer = struct {
         try mlx.check(mlx.mlx_multiply(&ks, k.*, ms, self.s));
         _ = mlx.mlx_array_free(k.*);
         k.* = ks;
+    }
+
+    /// YaRN mscale on a rope'd array whose last dim may not be `head_dim`
+    /// (the QSA indexer is 128-wide / 64 rotated). Slice the first `rope_dims`,
+    /// multiply by a same-dtype scalar, concat the pass-through tail. NEVER
+    /// `yarnScaleQK` here: that table is `[head_dim]` (256 on qwen4).
+    fn yarnScaleRotated(self: *Transformer, q: *mlx.mlx_array, rope_dims: c_int) !void {
+        const sh = mlx.getShape(q.*);
+        const dt = mlx.mlx_array_dtype(q.*);
+        const st = [_]c_int{ 1, 1, 1, 1 };
+        var rot = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(rot);
+        try mlx.check(mlx.mlx_slice(&rot, q.*, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ sh[0], sh[1], sh[2], rope_dims }, 4, &st, 4, self.s));
+        var pass = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(pass);
+        try mlx.check(mlx.mlx_slice(&pass, q.*, &[_]c_int{ 0, 0, 0, rope_dims }, 4, &[_]c_int{ sh[0], sh[1], sh[2], sh[3] }, 4, &st, 4, self.s));
+        const ms = try scalarOf(self.config.yarn_attention_factor, dt, self.s);
+        defer _ = mlx.mlx_array_free(ms);
+        var scaled = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(scaled);
+        try mlx.check(mlx.mlx_multiply(&scaled, rot, ms, self.s));
+        const parts = [_]mlx.mlx_array{ scaled, pass };
+        const vec = mlx.mlx_vector_array_new_data(&parts, 2);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        var out = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_concatenate_axis(&out, vec, -1, self.s));
+        _ = mlx.mlx_array_free(q.*);
+        q.* = out;
     }
 
     fn gatedFullAttnWith(
@@ -30406,6 +30449,187 @@ test "qwen4_exp yarn: the device denominator and the host spectrum are one spect
     try testing.expectApproxEqRel(@as(f64, 1.0), lden[0], 1e-9);
     try testing.expectApproxEqRel(@as(f64, 1.506929076e+00), lden[1], 1e-7);
     try testing.expectApproxEqRel(@as(f64, 1.061761980e+07), lden[31], 1e-7);
+}
+
+test "ropeAtPositions YaRN: cos/sin carry mscale on the rotated slice" {
+    // Power-of-two mscale so the rotated slice is an exact doubling of the
+    // mscale-1.0 arm (same yarn_inv_freq, yarnActive stays on). The pass-through
+    // tail must not move: those dims never enter the rotation.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+
+    var c = ModelConfig{};
+    c.model_type = "qwen4_exp";
+    c.head_dim = 256;
+    c.partial_rotary_factor = 0.25;
+    c.rope_theta = 10_000_000.0;
+    c.rope_yarn = true;
+    c.yarn_factor = 4.0;
+    c.yarn_orig_max_pos = 262_144;
+    c.yarn_attention_factor = 2.0;
+    c.yarn_beta_fast = 32.0;
+    c.yarn_beta_slow = 1.0;
+
+    const rotary: c_int = 64;
+    const half: usize = 32;
+    const inv = try testing.allocator.alloc(f64, half);
+    defer testing.allocator.free(inv);
+    yarnSpec(&c).invFreq(inv);
+
+    var den_f32: [half]f32 = undefined;
+    for (inv, 0..) |v, i| den_f32[i] = @floatCast(1.0 / v);
+    const fshape = [_]c_int{@intCast(half)};
+    const freqs = mlx.mlx_array_new_data(&den_f32, &fshape, 1, .float32);
+    defer _ = mlx.mlx_array_free(freqs);
+
+    var t: Transformer = undefined;
+    t.s = s;
+    t.allocator = testing.allocator;
+    t.config = c;
+    t.rope_freqs_yarn = freqs;
+    t.yarn_inv_freq = inv;
+    try testing.expect(t.yarnActive());
+
+    var ones: [256]f32 = @splat(1.0);
+    const xshape = [_]c_int{ 1, 1, 1, 256 };
+    const x = mlx.mlx_array_new_data(&ones, &xshape, 4, .float32);
+    defer _ = mlx.mlx_array_free(x);
+
+    const scaled = try t.ropeAtPositions(x, rotary, c.rope_theta, 1234.0, 1.0, 1);
+    defer _ = mlx.mlx_array_free(scaled);
+
+    t.config.yarn_attention_factor = 1.0;
+    try testing.expect(t.yarnActive());
+    const unscaled = try t.ropeAtPositions(x, rotary, c.rope_theta, 1234.0, 1.0, 1);
+    defer _ = mlx.mlx_array_free(unscaled);
+
+    var sf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sf);
+    var uf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(uf);
+    try mlx.check(mlx.mlx_astype(&sf, scaled, .float32, s));
+    try mlx.check(mlx.mlx_astype(&uf, unscaled, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(sf));
+    try mlx.check(mlx.mlx_array_eval(uf));
+    const sv = mlx.mlx_array_data_float32(sf).?;
+    const uv = mlx.mlx_array_data_float32(uf).?;
+    for (0..64) |i| try testing.expectEqual(uv[i] * 2.0, sv[i]);
+    for (64..256) |i| try testing.expectEqual(uv[i], sv[i]);
+}
+
+test "qsa indexer scalar rope applies yarn mscale to first rope_dims only" {
+    // The QSA indexer is 128-wide with 64 rotary dims. mlx_fast_rope scale
+    // stays 1.0 (never the mscale); yarnScaleRotated then scales the rotated
+    // slice only. NOT applyMrope — that path already carries mscale via
+    // fillCosSin. A 256-wide yarnScaleQK table would silently scale the
+    // pass-through tail (or crash on a shape mismatch).
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+
+    var t: Transformer = undefined;
+    t.s = s;
+    t.config = .{};
+    t.config.yarn_attention_factor = 2.0;
+    t.config.rope_yarn = true;
+    t.config.rope_theta = 10_000_000.0;
+
+    var data: [128]f32 = undefined;
+    for (&data, 0..) |*d, i| d.* = @floatFromInt(i + 1);
+    const shape = [_]c_int{ 1, 1, 1, 128 };
+    const x = mlx.mlx_array_new_data(&data, &shape, 4, .float32);
+    defer _ = mlx.mlx_array_free(x);
+
+    var roped = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(roped);
+    try mlx.check(mlx.mlx_fast_rope(&roped, x, 64, false, mlx.mlx_optional_float{
+        .value = t.config.rope_theta,
+        .has_value = true,
+    }, 1.0, 0, .{ .ctx = null }, s));
+
+    var unscaled = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(unscaled);
+    try mlx.check(mlx.mlx_array_set(&unscaled, roped));
+
+    try t.yarnScaleRotated(&roped, 64);
+
+    var a = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(a);
+    var b = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(b);
+    try mlx.check(mlx.mlx_astype(&a, roped, .float32, s));
+    try mlx.check(mlx.mlx_astype(&b, unscaled, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(a));
+    try mlx.check(mlx.mlx_array_eval(b));
+    const av = mlx.mlx_array_data_float32(a).?;
+    const bv = mlx.mlx_array_data_float32(b).?;
+    for (0..64) |i| try testing.expectEqual(bv[i] * 2.0, av[i]);
+    for (64..128) |i| try testing.expectEqual(bv[i], av[i]);
+}
+
+test "qsaMaskFromQk applies yarnScaleRotated on the scalar rope arm only" {
+    // The QSA indexer's mlx_fast_rope else-arm is the only path that does not
+    // already fold mscale (M-RoPE tables carry it via fillCosSin). A comment
+    // once skipped the scale; deleting the call still left every runtime test
+    // green because they invoke yarnScaleRotated directly. This scan is the
+    // wiring pin. Needles are assembled at comptime so this test's own source
+    // cannot satisfy the scan.
+    const src = @embedFile("transformer.zig");
+    const fn_mark = "    fn qsaMask" ++ "FromQk(";
+    const at = std.mem.indexOf(u8, src, fn_mark) orelse return error.MissingQsaMaskFromQk;
+    const line_end = std.mem.indexOfScalarPos(u8, src, at, '\n') orelse src.len;
+    const next = std.mem.indexOfPos(u8, src, line_end, "\n    fn ") orelse src.len;
+    const body = src[line_end..next];
+
+    const yarn_scale = "yarn" ++ "ScaleRotated";
+    const fast_rope = "mlx_" ++ "fast_rope";
+    const mrope_mark = "ctx.mrope_" ++ "cos_cur";
+    const apply_mrope = "apply" ++ "Mrope";
+    const scale_lit = "}, 1" ++ ".0,";
+    const skip_a = "deliberately NOT" ++ " applied";
+    const skip_b = "cannot change a" ++ " top-k";
+
+    const mrope_at = std.mem.indexOf(u8, body, mrope_mark) orelse return error.MissingMropeArm;
+    const pooled_at = std.mem.indexOfPos(u8, body, mrope_at, "// Pooled block keys") orelse
+        return error.MissingPooledSection;
+    const rope_block = body[mrope_at..pooled_at];
+    const else_at = std.mem.indexOf(u8, rope_block, "} else {") orelse return error.MissingScalarElse;
+    const mrope_arm = rope_block[0..else_at];
+    const scalar_arm = rope_block[else_at..];
+
+    try testing.expect(std.mem.indexOf(u8, mrope_arm, apply_mrope) != null);
+    var mrope_it = std.mem.splitScalar(u8, mrope_arm, '\n');
+    while (mrope_it.next()) |line| {
+        const trimmed = std.mem.trimStart(u8, line, " \t");
+        if (std.mem.startsWith(u8, trimmed, "//")) continue;
+        if (std.mem.indexOf(u8, line, yarn_scale) != null) return error.YarnScaleOnMropeArm;
+    }
+
+    var fast_seen = false;
+    var scale_after = false;
+    var scale_one = false;
+    var scalar_it = std.mem.splitScalar(u8, scalar_arm, '\n');
+    while (scalar_it.next()) |line| {
+        const trimmed = std.mem.trimStart(u8, line, " \t");
+        if (std.mem.startsWith(u8, trimmed, "//")) continue;
+        if (std.mem.indexOf(u8, line, fast_rope) != null) fast_seen = true;
+        if (std.mem.indexOf(u8, line, scale_lit) != null) scale_one = true;
+        if (std.mem.indexOf(u8, line, yarn_scale) != null) {
+            if (!fast_seen) return error.YarnScaleBeforeFastRope;
+            scale_after = true;
+        }
+    }
+    if (!fast_seen) return error.MissingFastRope;
+    if (!scale_one) return error.FastRopeScaleNotOne;
+    if (!scale_after) return error.MissingYarnScaleOnScalarArm;
+
+    var body_it = std.mem.splitScalar(u8, body, '\n');
+    while (body_it.next()) |line| {
+        const trimmed = std.mem.trimStart(u8, line, " \t");
+        if (std.mem.startsWith(u8, trimmed, "//")) continue;
+        if (std.mem.indexOf(u8, line, skip_a) != null or std.mem.indexOf(u8, line, skip_b) != null) {
+            return error.SkipTheoryInProduction;
+        }
+    }
 }
 
 test "computeYarnFreqs matches HF _compute_yarn_parameters (Laguna full-attn rope)" {

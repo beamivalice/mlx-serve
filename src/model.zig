@@ -1513,9 +1513,10 @@ fn parseQwenVisionFields(config: *ModelConfig, root: std.json.ObjectMap, cfg_obj
 ///
 /// `factor` may be omitted, in which case HF derives it from
 /// `max_position_embeddings / original_max_position_embeddings` (as vLLM's
-/// `_get_and_verify_max_len` does). `attention_factor` is HF's key for the
-/// mscale, `attn_factor` vLLM's; neither is present in a vendor config, and per
-/// HF's default the mscale is then COMPUTED as 0.1·ln(factor)+1 — the value the
+/// `_get_and_verify_max_len` does). `attention_factor` is HF's key and
+/// REPLACES the computed mscale; `attn_factor` is vLLM's and MULTIPLIES
+/// `yarnMscale(factor)`. Neither is present in a vendor config, and per HF's
+/// default the mscale is then COMPUTED as 0.1·ln(factor)+1 — the value the
 /// scaling was calibrated with. Nested per-layer-type `rope_parameters`
 /// (laguna/gemma4) never reach here: they have no top-level `rope_type`.
 fn parseYarnRopeParameters(config: *ModelConfig, cfg_obj: std.json.ObjectMap) !void {
@@ -1545,8 +1546,15 @@ fn parseYarnRopeParameters(config: *ModelConfig, cfg_obj: std.json.ObjectMap) !v
         config.yarn_factor = @as(f32, @floatFromInt(config.max_position_embeddings)) /
             @as(f32, @floatFromInt(config.yarn_orig_max_pos));
     }
-    const af = if (rp.get("attention_factor")) |v| v else if (rp.get("attn_factor")) |v| v else null;
-    config.yarn_attention_factor = if (af) |v| jsonFloat(v) else yarnMscale(config.yarn_factor);
+    // HF `attention_factor` replaces; vLLM `attn_factor` multiplies the
+    // computed 0.1·ln(factor)+1. Both present → HF wins.
+    if (rp.get("attention_factor")) |v| {
+        config.yarn_attention_factor = jsonFloat(v);
+    } else if (rp.get("attn_factor")) |v| {
+        config.yarn_attention_factor = yarnMscale(config.yarn_factor) * jsonFloat(v);
+    } else {
+        config.yarn_attention_factor = yarnMscale(config.yarn_factor);
+    }
     config.rope_yarn = true;
 }
 
@@ -6648,8 +6656,7 @@ test "parseConfigFromJson: the shipped (unscaled) qwen4_exp config is untouched"
 
 test "parseConfigFromJson: YaRN reads beta_fast/beta_slow/truncate and honours a pinned mscale" {
     defer setConfigOverrides(null);
-    // HF's key is `attention_factor`; vLLM's reader uses `attn_factor`. Both are
-    // honoured, and a pinned value beats the computed 0.1·ln(factor)+1.
+    // HF's `attention_factor` REPLACES the computed 0.1·ln(factor)+1.
     setConfigOverrides(
         \\{"text_config":{"rope_parameters":{"rope_type":"yarn","factor":4.0,
         \\  "original_max_position_embeddings":262144,"attention_factor":1.25}}}
@@ -6661,12 +6668,22 @@ test "parseConfigFromJson: YaRN reads beta_fast/beta_slow/truncate and honours a
     try testing.expectApproxEqAbs(@as(f32, 0.25), pinned.yarnPartial(), 1e-9);
     try testing.expectApproxEqAbs(@as(f32, 10_000_000.0), pinned.rope_theta, 1.0);
 
+    // vLLM's `attn_factor` MULTIPLIES the computed 0.1·ln(factor)+1.
     setConfigOverrides(
         \\{"text_config":{"rope_parameters":{"rope_type":"yarn","factor":4.0,
         \\  "original_max_position_embeddings":262144,"attn_factor":0.5}}}
     );
     const vl = try parseConfigFromJson(testing.allocator, QWEN4_SHIPPED);
-    try testing.expectApproxEqAbs(@as(f32, 0.5), vl.yarn_attention_factor, 1e-9);
+    try testing.expectApproxEqAbs(@as(f32, 0.5 * 1.138629436111989), vl.yarn_attention_factor, 1e-6);
+
+    // Both keys present: HF's attention_factor wins (replace, not multiply).
+    setConfigOverrides(
+        \\{"text_config":{"rope_parameters":{"rope_type":"yarn","factor":4.0,
+        \\  "original_max_position_embeddings":262144,
+        \\  "attention_factor":1.25,"attn_factor":0.5}}}
+    );
+    const both = try parseConfigFromJson(testing.allocator, QWEN4_SHIPPED);
+    try testing.expectApproxEqAbs(@as(f32, 1.25), both.yarn_attention_factor, 1e-9);
 
     // The ramp knobs are read too — they move the blend, and so every frequency
     // between the bands.

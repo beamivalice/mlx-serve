@@ -719,6 +719,27 @@ test "fillCosSin mscale scales the rotated rows only" {
     }
 }
 
+test "YaRN mscale on a 128-wide indexer with 64 rotary dims CAN change top-k" {
+    // The skip comment in qsaMaskFromQk claimed mscale cannot change a top-k
+    // because it "multiplies every relu(q·k) by one positive constant". That
+    // is true of a FULL-head scale. The indexer is 128-wide and only 64 dims
+    // rotate, so score = ms²·A + B. Two synthetic blocks whose unscaled
+    // winner is the B-heavy one flip under the factor-4 mscale.
+    const ms = Yarn.attentionFactor(4.0);
+    const ms2 = ms * ms;
+    // Block 0: rotary-heavy. Block 1: pass-through-heavy.
+    const a0: f64 = 2.0;
+    const b0: f64 = 0.0;
+    const a1: f64 = 0.0;
+    const b1: f64 = 2.2;
+    const un0 = a0 + b0;
+    const un1 = a1 + b1;
+    const sc0 = ms2 * a0 + b0;
+    const sc1 = ms2 * a1 + b1;
+    try std.testing.expect(un1 > un0); // unscaled winner is block 1
+    try std.testing.expect(sc0 > sc1); // scaled winner is block 0
+}
+
 fn fixtureF64(v: std.json.Value) f64 {
     return switch (v) {
         .integer => |i| @floatFromInt(i),

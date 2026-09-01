@@ -1583,9 +1583,9 @@ Three engine seams, none of them new code paths for text:
    `mropeCosSinAt(start = pos_base + nb_cached*ratio, stride = ratio)` (pure
    host fill in `mrope.fillCosSin`, hermetically pinned as "strided rows ==
    every stride-th row"). Cached pooled rows keep the angles they were built
-   with. The MTP head's ctx carries no table, so its call is unchanged — and
-   image turns decline MTP (`specInitWiring` image_request) rather than draft
-   with a mis-roped head.
+   with. Scalar arms now apply the same mscale `fillCosSin` already baked into
+   the M-RoPE tables (`yarnScaleRotated` / `ropeAtFreqs`, never a second
+   scale on the table path).
 
 Oracle: `dump_qwen4_exp_fixtures.py build|dump --vision` (tiny tower: depth 2,
 hidden 64, 4x4 pos grid; one 6x8-patch image = 12 tokens in a 28-token prompt

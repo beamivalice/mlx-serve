@@ -51,6 +51,7 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const kv_quant = @import("kv_quant.zig");
 const transformer_mod = @import("transformer.zig");
+const model = @import("model.zig");
 const io_util = @import("io_util.zig");
 const log = @import("log.zig");
 
@@ -1742,6 +1743,7 @@ pub fn modelFingerprint(allocator: std.mem.Allocator, io: std.Io, model_dir: []c
         const mt: i128 = st.mtime.nanoseconds;
         h.update(std.mem.asBytes(&mt));
     }
+    if (model.getConfigOverrides()) |raw| h.update(raw);
     return std.fmt.allocPrint(allocator, "{x:0>16}", .{h.final()});
 }
 
@@ -2786,4 +2788,43 @@ test "modelFingerprint: stable per path, rolls with config.json changes" {
 
     try testing.expectError(error.BadModelDir, modelFingerprint(testing.allocator, io, ""));
     try testing.expectError(error.BadModelDir, modelFingerprint(testing.allocator, io, "rel/path"));
+}
+
+test "modelFingerprint: rolls with --config-overrides" {
+    defer model.setConfigOverrides(null);
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    try tmp.dir.createDirPath(io, "model-a");
+    try tmp.dir.writeFile(io, .{ .sub_path = "model-a/config.json", .data = "{\"model_type\":\"x\"}" });
+    const dir_a = try std.fmt.allocPrint(testing.allocator, "{s}/model-a", .{base});
+    defer testing.allocator.free(dir_a);
+
+    model.setConfigOverrides(null);
+    const fp_none = try modelFingerprint(testing.allocator, io, dir_a);
+    defer testing.allocator.free(fp_none);
+
+    const yarn = "{\"text_config\":{\"rope_parameters\":{\"rope_type\":\"yarn\",\"factor\":4.0}}}";
+    model.setConfigOverrides(yarn);
+    const fp_over = try modelFingerprint(testing.allocator, io, dir_a);
+    defer testing.allocator.free(fp_over);
+    try testing.expectEqual(@as(usize, 16), fp_over.len);
+    try testing.expect(!std.mem.eql(u8, fp_none, fp_over));
+
+    model.setConfigOverrides(yarn);
+    const fp_again = try modelFingerprint(testing.allocator, io, dir_a);
+    defer testing.allocator.free(fp_again);
+    try testing.expectEqualStrings(fp_over, fp_again);
+
+    // Raw-bytes pin: a whitespace-different spelling of the same JSON is a
+    // different fingerprint (canonicalizing would hide a YaRN boot restoring
+    // an unscaled SSD prefix if the override was re-spelled).
+    const yarn_ws = "{\"text_config\": {\"rope_parameters\": {\"rope_type\": \"yarn\", \"factor\": 4.0}}}";
+    model.setConfigOverrides(yarn_ws);
+    const fp_ws = try modelFingerprint(testing.allocator, io, dir_a);
+    defer testing.allocator.free(fp_ws);
+    try testing.expect(!std.mem.eql(u8, fp_over, fp_ws));
 }

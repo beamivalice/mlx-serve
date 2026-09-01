@@ -5,10 +5,12 @@
 ### Highlights
 
 - **Watch a video take shape while it renders.** Video Generation has a "Show live preview while generating" toggle: with it on, each denoise step sends back a small still (or a filmstrip of several frames) so you can tell early whether a 6-minute render is going where you wanted. It reads the latent directly — no second decode — using the published colour projection for each model's latent space, so the picture actually resembles the finished clip on both LTX and MiniMax H3. Off by default, and off costs nothing.
+- **`--config-overrides` stretches a checkpoint's context** (vLLM's `--hf-overrides`): YaRN factor 4 turns Qwen 3.8 Flash Next's 262k window into 1M without editing the model dir.
 
 ### Fixes
 
 - Qwen 3.8 Flash Next community/custom packs converted with `--ngram-bits 3/5/6` served a noise n-gram table (#305, thanks @Sinojen). The reader now follows `mx.quantize`'s dense packing; 2/4/8-bit packs are unchanged.
+- QSA scalar RoPE omitted YaRN mscale (partial-rotary ranking can change which blocks win); SSD prefix-cache fingerprint now includes `--config-overrides`.
 
 ## v26.8.11 — Qwen 3.8 Flash Next, MLX 0.32.2
 

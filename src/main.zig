@@ -96,10 +96,12 @@ fn printUsage(io: std.Io) void {
         \\                      network; a future version will default to 127.0.0.1)
         \\  --port <n>          Bind port (default: 11234)
         \\  --ctx-size <n>      Maximum context length (default: model max)
-        \\  --config-overrides <json>   JSON object deep-merged into config.json
-        \\                      before it is parsed (alias: --hf-overrides, as in
-        \\                      vLLM). Launch-time only; the way to scale a rope
-        \\                      and widen the window without editing the model dir.
+        \\  --config-overrides <json>   JSON object deep-merged into EVERY
+        \\                      model's config.json this process loads or
+        \\                      discovers (alias: --hf-overrides). Generic keys
+        \\                      like max_position_embeddings hit everything.
+        \\                      HF attention_factor replaces the computed YaRN
+        \\                      mscale; vLLM attn_factor multiplies it.
         \\                      e.g. '{"text_config":{"rope_parameters":{"rope_type":
         \\                      "yarn","factor":4.0,"original_max_position_embeddings":
         \\                      262144},"max_position_embeddings":1048576}}'
