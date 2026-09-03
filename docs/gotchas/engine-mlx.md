@@ -4517,3 +4517,21 @@ Confirming that reading: the only cells identical everywhere are the ones with n
 ### Harness notes from these runs
 
 Three things cost time and are worth knowing before the next A/B. A binary COPIED out of `zig-out/bin/` cannot resolve its `@rpath` (`@loader_path/../../lib/...`) and dies before "Model ready" with `Library not loaded: @rpath/libllama.dylib` — give each arm a fake root (`root_<arm>/zig-out/bin/mlx-serve` plus a `root_<arm>/lib` symlink). A hand-started server (`mlx-serve serve --model ...`) does not match the harness's `pkill -f "mlx-serve --model"` pattern, so it survives `stop_server` and `wait_ready` will happily benchmark it — check the port is free after the kill and abort the boot if it is not. And the serial drift cell uses nonce `<prompt>_serial` while the MTP reps use `<prompt>_1|2|3`, so no two requests share prompt bytes across the `enable_mtp` boundary: an MTP-vs-serial output comparison is not answerable from that protocol without issuing one rep twice under the same nonce.
+
+## qwen4 drafts read the whole 675 MB lm_head to use one argmax (2026-09-04)
+
+With the verify build no longer serialised (above), a forced-depth-5 round on Flash Next traced at 41.77 ms with a `corr` lap that was not correction work at all — it was the round's first eval waiting for the draft chain to finish on the GPU. The chain was the cost, and the cost was bytes.
+
+`MtpHeadRef.canRerankDrafts` returned false on the `.qwen4` arm and `draftSelect` returned `error.NoDraftRerank`, so `mtpChainBuild` always asked for full logits and every draft step ran the 248320-wide projection. That head is 8-bit: 635.7 MB packed + 39.7 MB of scales/biases = 675 MB, more than everything else in a draft step put together (the head's own layer is ~129 MB at kv 2k, of which the top-10 routed experts are 28 MB). A greedy draft only ever needed the argmax.
+
+The sidecar has answered exactly this for a while, and none of its machinery is head-shaped — it reads the TARGET's lm_head and a vector in that head's input space. So the coarse build, the shortlist select and the full-readout fallback moved out of `MtpModel` into free functions (`buildRerankCoarse` / `rerankSelect` / `fullReadoutArgmax` / `maskAndArgmax`) that both arms call. `MtpModel` keeps its field names and its `draft_head` preference, so the measured sidecar path is unchanged.
+
+Predicted from bytes: 675 MB → 278 MB coarse (3-bit, the `MLX_SERVE_MTP_DRAFT_HEAD_BITS` default) + ~0.09 MB of exact rows, so 5 × (675 − 265) MB / 546 GB/s = 3.75 ms off a depth-5 round. Measured 3.38 ms (41.77 → 38.39). Code ×1.089, prose ×1.085 at forced depth 5; `acc_idx` identical, so the coarse shortlist is not costing acceptance; llmprobe predictable 141 → 153 tok/s.
+
+The load-bearing part is what `x` IS. On the sidecar, `hidden_next` is what the lm_head consumes. On qwen4_exp `hidden_next` is the PRE-mixer `[B,S,hc*H]` stream — 4× the width — and the lm_head's input is the MIXER output. A `want_logits: bool` cannot express that either: a history append and a rerank draft both skip the projection, but the draft still needs the vector it would have consumed. Hence `StepWant{ logits, mixed, none }`, a `.mixed_last_row` projection that runs the mixer on the last row and skips `lmHeadProject`, and `StepOut.rerank_x`. Handing `hidden_next` to `draftSelect` on this arm is a silent shape error, which is why a source scan pins that the chain feeds `rerank_x` and that `.mixed` does not collapse onto `.none`.
+
+The coarse head builds LAZILY on the first draft: `loadQwen4Mtp` runs while the Transformer is still under construction and `lm_head_w` — the very weight it copies — is not assigned yet. `rerank_tried` makes the refusal one-shot. `MLX_SERVE_MTP_DRAFT_RERANK=0` fully restores the full-vocab path, as does a build refusal or a mid-chain shortlist failure; chunk-A confidence and sharp (sampled) proposals still force full logits.
+
+Owed: `MTP_EV_G17_NAX_QWEN4_Q4_GS64_COSTS` was fitted with the full-vocab draft in the round, so its `draft` term is now stale and the surface needs a refit — see the rule about refitting EV cost tables whenever the verify forward changes; this is the same hazard on the draft side.
+
+2-bit is what the sidecar scheme was measured at and is the obvious second arm, untried here.
