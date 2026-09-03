@@ -15,9 +15,12 @@
 - **Chat images are stored on disk**, not base64 in the history file: a typical history shrinks from 1.5 MB to 80 KB, and HEIC/TIFF/raw attachments are converted so the model actually sees them (#313, thanks @lojza3d).
 - **MiniCPM5 V3 tool calls** (`<function name=...><param name=...>`) are parsed natively, including truncated ones (#315, thanks @uncle9x9).
 - **Long-context decode on Qwen 3.8 Flash Next stays fast.** Sparse attention at decode reads only the selected ~2k KV rows instead of the whole cache: a 128k prompt decodes 47 tok/s instead of 40 on an M4 Max, and the gap widens with context (thanks @beamivalice).
+- **Speculative decoding on Flash Next got cheaper per round.** The speculation step used to stall: the model's n-gram lookup needs its draft tokens on the CPU, so the rest of the 48-layer graph waited for the whole draft chain to finish on the GPU before it was even built. It is now built while the drafts are still running, and the draft head only projects the row it actually uses. Code prompts go 111 -> 117 tok/s and prose 56 -> 59 on an M5 Max at a fixed draft depth, with byte-identical output.
+- **Speculation reaches full speed on the first request, not the fifteenth.** Flash Next's draft-depth controller now inherits what it learned from the previous request instead of re-warming from scratch every time, which used to cost roughly the first 15 rounds of every generation. On llmprobe the speculation ratio goes 1.6-1.7x -> 2.0-2.1x, tokens per decode step 3.3 -> 5.5, and the predictable-workload figure 117 -> 144-149 tok/s. Switching between very different prompts (code then prose) still costs one request while it re-adapts.
 
 ### Fixes
 
+- A failure inside Flash Next's draft head could free the same buffer twice and take the server down instead of returning an error. Latent — the path had never failed in practice.
 - Chat templates using `|min` or `|max` on a real array failed to render and silently fell back to the wrong prompt format, so the model lost its stop token. Hit every MiniCPM5 multi-turn tool conversation (#335, thanks @uncle9x9).
 - JSON-schema output with thinking enabled returned the JSON as `reasoning_content` with empty `content` on `/v1/chat/completions` and `/v1/responses` (#331, thanks @perretv). A schema request now forces thinking off on every surface, matching `/v1/messages`.
 - Qwen 3.8 Flash Next packs converted with `--ngram-bits 3/5/6` served a noise n-gram table (#305, thanks @Sinojen). 2/4/8-bit packs are unchanged.
