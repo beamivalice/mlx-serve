@@ -13215,7 +13215,6 @@ pub const Transformer = struct {
         }
 
         const mix = try self.hcRead(h, &m.mixer, batch, out_seq);
-        errdefer _ = mlx.mlx_array_free(h);
         if (mix.inj.ctx != null) _ = mlx.mlx_array_free(mix.inj);
         defer _ = mlx.mlx_array_free(mix.mixed);
         const logits = try self.lmHeadProject(mix.mixed, false);
@@ -40528,6 +40527,36 @@ test "qwen4 MTP head: last-row and no-logits projections match the full block (Q
         defer allocator.free(bare_h);
         try testing.expectEqualSlices(f32, full_h, bare_h);
     }
+}
+
+test "qwen4MtpForward owns its stream once: exactly one errdefer frees `h`" {
+    // `h` is created once and reassigned in place by every hcWrite (and by the
+    // `.last_row` slice, which frees the old handle itself), so ONE errdefer
+    // declared where it is created covers every error path. A second errdefer
+    // on the same variable at the same function scope is not a second guard —
+    // both fire, and an lm_head error then double-frees the array. The head
+    // shipped with exactly that pair for as long as the projection existed;
+    // it never went off because `lmHeadProject` had not failed yet.
+    //
+    // Needle assembled at comptime so this test's own source cannot satisfy
+    // the scan, and the scan is bounded to the function's own body.
+    const src = @embedFile("transformer.zig");
+    const sig = "pub fn qwen4Mtp" ++ "Forward(";
+    const at = std.mem.indexOf(u8, src, sig) orelse return error.MtpForwardMissing;
+    const rest = src[at + sig.len ..];
+    // The next declaration at struct scope ends the body.
+    const end = std.mem.indexOf(u8, rest, "\n    pub ") orelse rest.len;
+    const body = rest[0..end];
+    const needle = "errdefer _ = mlx.mlx_array" ++ "_free(h);";
+    var count: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, body, i, needle)) |p| : (i = p + needle.len) count += 1;
+    try testing.expectEqual(@as(usize, 1), count);
+    // ...and it is the one guarding the freshly reshaped stream, before the
+    // first hcWrite can reassign it.
+    const born = std.mem.indexOf(u8, body, "try mlx.check(mlx.mlx_reshape(&h, x4,") orelse return error.StreamInitMissing;
+    const guard = std.mem.indexOf(u8, body, needle).?;
+    try testing.expect(guard > born and guard - born < 200);
 }
 
 test "gdn gate: compiled closure vs graph chain vs prework kernel (bit-identity probe)" {
