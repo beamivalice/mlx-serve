@@ -5423,7 +5423,13 @@ const PleWeights = struct {
 ///   x = fc_hidden(rms_{4H}(stream)) per stream + fc_embedding(rms_H(embed))
 ///   → one full-attention decoder layer (own hc/QSA/MoE) → mixer → lm_head.
 /// Keeps its own KV cache (index `num_hidden_layers`) + indexer key history.
-const Qwen4Mtp = struct {
+///
+/// Width of the cross-request EV seed below. It must equal `mtp.MAX_DEPTH`,
+/// but transformer.zig cannot import mtp.zig (mtp imports transformer), so
+/// generate.zig — which sees both — asserts they agree at comptime.
+pub const MTP_EV_SEED_DEPTH: u32 = 8;
+
+pub const Qwen4Mtp = struct {
     layer: MoeLayerWeights,
     pre_norm_emb: mlx.mlx_array,
     pre_norm_hidden: mlx.mlx_array,
@@ -5441,6 +5447,18 @@ const Qwen4Mtp = struct {
     /// Absolute position of the head's key row 0 (the first draft position
     /// after a reset).
     pos_base: c_int = 0,
+    /// Cross-request EV controller seed — the in-checkpoint head's twin of
+    /// `mtp.MtpModel.ev_seed_*`: the last HEALTHY request's per-index
+    /// acceptance EMAs and base depth, written by `Generator.deinit` and read
+    /// by the first `nextMtp` round of the next request. Without it every
+    /// request re-warms the controller (MTP_EV_WARMUP_ROUNDS legacy rounds
+    /// plus a +1/round base climb), which is a sizeable share of a short
+    /// generation. Per-LOADED-MODEL state, exactly like the sidecar's: it
+    /// lives on the head, so it dies with the head and can never reach
+    /// another model. `qwen4MtpReset` deliberately does not clear it — a
+    /// reset starts a new REQUEST, which is precisely who should inherit it.
+    ev_seed_accept: ?[MTP_EV_SEED_DEPTH]f32 = null,
+    ev_seed_m_lo: u32 = 1,
 };
 
 const LinearAttnWeights = struct {

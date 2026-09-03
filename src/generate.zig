@@ -302,10 +302,19 @@ pub const MtpHeadRef = union(enum) {
         };
     }
 
+    /// The head's last healthy acceptance surface, or null when it has never
+    /// published one. BOTH arms store it on the head object itself — the
+    /// sidecar `MtpModel` and the in-checkpoint `Qwen4Mtp` — so a seed dies
+    /// with the head and can never cross models.
     pub fn evSeed(self: MtpHeadRef) ?struct { accept: [mtp_mod.MAX_DEPTH]f32, m_lo: u32 } {
         return switch (self) {
             .qwen => |h| if (h.ev_seed_accept) |a| .{ .accept = a, .m_lo = h.ev_seed_m_lo } else null,
-            .qwen4 => null,
+            .qwen4 => |t| blk: {
+                if (t.qwen4_mtp) |*m| {
+                    if (m.ev_seed_accept) |a| break :blk .{ .accept = a, .m_lo = m.ev_seed_m_lo };
+                }
+                break :blk null;
+            },
         };
     }
 
@@ -315,10 +324,22 @@ pub const MtpHeadRef = union(enum) {
                 h.ev_seed_accept = accept;
                 h.ev_seed_m_lo = m_lo;
             },
-            .qwen4 => {},
+            .qwen4 => |t| {
+                // A model served with `--no-mtp` has no head to seed.
+                if (t.qwen4_mtp) |*m| {
+                    m.ev_seed_accept = accept;
+                    m.ev_seed_m_lo = m_lo;
+                }
+            },
         }
     }
 };
+
+comptime {
+    // `Qwen4Mtp.ev_seed_accept` is sized by transformer.zig, which cannot
+    // import mtp.zig (mtp imports transformer). This file sees both.
+    std.debug.assert(transformer_mod.MTP_EV_SEED_DEPTH == mtp_mod.MAX_DEPTH);
+}
 
 /// The head's committed-history cache.
 pub const MtpCacheRef = union(enum) {
@@ -2631,7 +2652,10 @@ pub const Generator = struct {
         // run would poison the next request's plans (inference thread only,
         // same discipline as every other head-state write).
         if (self.mtp) |head| {
-            if (mtpAdaptiveEnabled() and mtpEvSeedEnabled() and
+            // A forced-depth run never consulted the EV plan, so its surface
+            // is not one the controller chose — publishing it would hand a
+            // later ordinary request a diagnostic's numbers.
+            if (mtpAdaptiveEnabled() and mtpEvSeedEnabled() and mtpForcedDepth() == null and
                 !self.spec_disabled_runtime and self.mtp_attempted >= 8)
             {
                 head.setEvSeed(self.mtp_ev_accept, self.mtp_ev_m_lo_prev);
@@ -4941,8 +4965,11 @@ pub const Generator = struct {
         // (~10 legacy rounds + a +1/round base climb — a third of a short
         // generation). Demotion stays instant (EMA decay + sticky disable are
         // per-request), so a workload change costs a few rounds, not the win.
+        // `MLX_SERVE_MTP_FORCE_DEPTH` is a measurement mode: every round drafts
+        // exactly n and the controller never plans, so a seed must not be
+        // applied (nor, at deinit, published).
         if (self.mtp_ev_rounds == 0 and self.mtp_attempted == 0 and
-            mtpAdaptiveEnabled() and mtpEvSeedEnabled())
+            mtpAdaptiveEnabled() and mtpEvSeedEnabled() and mtpForcedDepth() == null)
         {
             if (head.evSeed()) |seed| {
                 self.mtp_ev_accept = seed.accept;
@@ -10861,6 +10888,46 @@ test "mtpDepthDecision: confidence gates on disable, promote, cooldown" {
     try testing.expectEqual(@as(u32, 1), Generator.mtpDepthDecision(1, 3, 0.95, 8, true));
     // Demote reacts on a small sample, even during cooldown.
     try testing.expectEqual(@as(u32, 1), Generator.mtpDepthDecision(2, 3, 0.30, 5, true));
+}
+
+test "MTP EV seed round-trips on the qwen4 head; a fresh or absent head reads null" {
+    // The in-checkpoint head stores the seed on `Qwen4Mtp` — per loaded model,
+    // exactly like the sidecar's `MtpModel.ev_seed_*`. Before this it was a
+    // null/no-op stub, so every qwen4 request re-warmed the controller from
+    // scratch. Only the two seed fields are touched here; the rest of the head
+    // (and of the Transformer) is never read on this path.
+    var t: Transformer = undefined;
+    t.qwen4_mtp = null;
+    const ref = MtpHeadRef{ .qwen4 = &t };
+
+    // `--no-mtp`: no head to seed, and setting one must not fault.
+    try testing.expect(ref.evSeed() == null);
+    var zeros: [mtp_mod.MAX_DEPTH]f32 = @splat(0.5);
+    ref.setEvSeed(zeros, 4);
+    try testing.expect(ref.evSeed() == null);
+
+    var head: transformer_mod.Qwen4Mtp = undefined;
+    head.ev_seed_accept = null;
+    head.ev_seed_m_lo = 1;
+    t.qwen4_mtp = head;
+    // A head that has never published reads null — not a zeroed surface.
+    try testing.expect(ref.evSeed() == null);
+
+    var accept: [mtp_mod.MAX_DEPTH]f32 = @splat(0.0);
+    accept[0] = 0.91;
+    accept[1] = 0.80;
+    accept[2] = 0.68;
+    ref.setEvSeed(accept, 5);
+    const got = ref.evSeed() orelse return error.SeedMissing;
+    try testing.expectEqual(@as(u32, 5), got.m_lo);
+    try testing.expectEqualSlices(f32, &accept, &got.accept);
+
+    // Overwrite, not accumulate: the LAST healthy request wins.
+    zeros[0] = 0.10;
+    ref.setEvSeed(zeros, 2);
+    const again = ref.evSeed() orelse return error.SeedMissing;
+    try testing.expectEqual(@as(u32, 2), again.m_lo);
+    try testing.expectEqualSlices(f32, &zeros, &again.accept);
 }
 
 test "MTP EV seed defaults on and explicit zero disables" {
