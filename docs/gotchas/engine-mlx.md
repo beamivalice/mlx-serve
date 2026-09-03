@@ -4559,7 +4559,7 @@ neighbouring widths are 3-5% apart in tok/ms, all under `SWITCH_MARGIN` (5%), wh
 w1 → w5 is 21%. A hermetic climb sim from base 1 stays at 1 forever. So the
 acceptance arm also scores every width up to the cap and steps ONE width toward the
 winner (demotions stay undamped). Both were prototyped together (`MtpCostSource.plan_accept`, parked on branch
-`worktree-agent-aa9edbab88d74a850`, commit 403bd1f); nothing shipped.
+`parked/mtp-plan-from-acceptance`, commit 403bd1f); nothing shipped.
 
 **The A/B: cand lost the bar.** Four boots, order cand/main/main/cand, the live
 persisted table restored byte-identical before every boot, 100 s thermal settle
