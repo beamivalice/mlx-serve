@@ -511,17 +511,38 @@ pub const SamplingParams = struct {
 
 /// Build the `[vocab]` bool suppression mask (true = never sample) on the
 /// host, once per model load. Caller owns the returned array.
-pub fn buildSuppressMask(ids: []const u32, vocab: usize, s: mlx.mlx_stream) !mlx.mlx_array {
+///
+/// Two disjoint sources of "never sample this row":
+///   - `ids`: the reserved specials (`tokenizer.reservedOutputIds`).
+///   - `[defined_vocab, vocab)`: the checkpoint's PADDING rows. A config's
+///     `vocab_size` is a padded matrix dimension, not a vocabulary — the
+///     tokenizer's highest defined id + 1 is. The rows in between decode to
+///     nothing, so a sample from one emits nothing while consuming a step and
+///     poisoning the KV; they were the one class of unsampleable row this
+///     mask never covered.
+/// `defined_vocab == 0` or `>= vocab` means "no padding known" and adds
+/// nothing — a mask that suppressed the whole vocab is `-inf` everywhere,
+/// which argmaxes to id 0 (the all-false-mask class, from the other side).
+pub fn buildSuppressMask(ids: []const u32, defined_vocab: usize, vocab: usize, s: mlx.mlx_stream) !mlx.mlx_array {
     _ = s;
     const alloc = std.heap.page_allocator;
     const buf = try alloc.alloc(bool, vocab);
     defer alloc.free(buf);
-    @memset(buf, false);
-    for (ids) |id| {
-        if (id < vocab) buf[id] = true;
-    }
+    fillSuppressMask(buf, ids, defined_vocab);
     const shape = [_]c_int{@intCast(vocab)};
     return mlx.mlx_array_new_data(buf.ptr, &shape, 1, .bool_);
+}
+
+/// The host half of `buildSuppressMask`, pure so the row set is testable
+/// without a GPU. `buf.len` is the mask's vocab.
+pub fn fillSuppressMask(buf: []bool, ids: []const u32, defined_vocab: usize) void {
+    @memset(buf, false);
+    for (ids) |id| {
+        if (id < buf.len) buf[id] = true;
+    }
+    if (defined_vocab > 0 and defined_vocab < buf.len) {
+        @memset(buf[defined_vocab..], true);
+    }
 }
 
 /// Derive + install the reserved-token suppression mask on a freshly-built
@@ -543,7 +564,6 @@ pub fn installSuppressMask(xfm: *Transformer, tok: *const Tokenizer, chat_templa
         return;
     };
     defer xfm.allocator.free(ids);
-    if (ids.len == 0) return;
     // The mask's length is the LOGITS dim, not the embedding table's:
     // inkling slices its lm_head to `unpadded_vocab_size`, and a mask sized
     // to the padded vocab would fail the `where` broadcast on every sample.
@@ -551,11 +571,25 @@ pub fn installSuppressMask(xfm: *Transformer, tok: *const Tokenizer, chat_templa
         xfm.config.unpadded_vocab_size
     else
         xfm.config.vocab_size;
-    xfm.suppress_mask = buildSuppressMask(ids, logits_dim, xfm.s) catch |err| {
+    // Padding rows past the tokenizer's last defined id. A checkpoint that
+    // DECLARES `unpadded_vocab_size` has already had those rows sliced off the
+    // lm_head, so `logits_dim` IS the real width there — applying the
+    // tokenizer's cut on top would be a second, different trim of a vocab that
+    // is already trimmed. One trim, whichever the checkpoint provides.
+    const defined_vocab: usize = if (xfm.config.unpadded_vocab_size > 0) 0 else tok.definedVocabSize();
+    const pad_rows: usize = if (defined_vocab > 0 and defined_vocab < logits_dim)
+        logits_dim - defined_vocab
+    else
+        0;
+    if (ids.len == 0 and pad_rows == 0) return;
+    xfm.suppress_mask = buildSuppressMask(ids, defined_vocab, logits_dim, xfm.s) catch |err| {
         log.warn("[suppress] mask build failed ({s}); reserved-token suppression off\n", .{@errorName(err)});
         return;
     };
-    log.info("[suppress] {d} of {d} flagged specials masked from sampling (template + eos exempt)\n", .{ ids.len, tok.flagged_specials.len });
+    log.info(
+        "[suppress] {d} of {d} flagged specials masked from sampling (template + eos exempt); {d} padding rows past id {d} of {d}\n",
+        .{ ids.len, tok.flagged_specials.len, pad_rows, defined_vocab, logits_dim },
+    );
 }
 
 /// `out = where(mask, -inf, logits)` — the masked lanes get EXACTLY -inf
@@ -12489,6 +12523,42 @@ fn evalLazyToken(lazy: mlx.mlx_array) !u32 {
     return @intCast(val);
 }
 
+test "fillSuppressMask: padding rows past the tokenizer's last defined id are suppressed" {
+    // A config's `vocab_size` is a padded matrix dimension, not a vocabulary.
+    // qwen4_exp declares 248320 while the tokenizer defines 248044 + 33 =
+    // 248077 ids: 243 rows that decode to NOTHING, carry whatever the
+    // initializer left, and were sampleable — a drawn one emits no text while
+    // consuming a step and entering the KV. Same mask, second row class.
+    var buf: [16]bool = undefined;
+    fillSuppressMask(&buf, &[_]u32{3}, 12);
+    for (buf, 0..) |v, i| {
+        const want = (i == 3) or (i >= 12);
+        try testing.expectEqual(want, v);
+    }
+
+    // No padding known (0) and a fully-defined vocab (== len) both add
+    // nothing: a mask over the WHOLE vocab is -inf everywhere, and argmax
+    // over that row returns id 0 — the all-false-mask class from the other
+    // side. The reserved id must still be the only true.
+    for ([_]usize{ 0, 16, 99 }) |defined| {
+        fillSuppressMask(&buf, &[_]u32{3}, defined);
+        for (buf, 0..) |v, i| try testing.expectEqual(i == 3, v);
+    }
+}
+
+test "Tokenizer.definedVocabSize: highest defined id + 1, 0 when nothing is defined" {
+    const allocator = testing.allocator;
+    var tok = Tokenizer.initEmptyForTests(allocator, .byte_level_bpe);
+    defer tok.deinit();
+    try testing.expectEqual(@as(usize, 0), tok.definedVocabSize());
+    // Added specials sit ABOVE the base vocab and are not contiguous with it,
+    // so the answer is the maximum key, never the entry count.
+    try tok.id_to_token.put(0, "a");
+    try tok.id_to_token.put(1, "b");
+    try tok.id_to_token.put(11, "<|special|>");
+    try testing.expectEqual(@as(usize, 12), tok.definedVocabSize());
+}
+
 test "suppress_mask: a suppressed id is unreachable from both samplers, everything else stays" {
     // A collapsed distribution can rank `<|fim_hole|>` (a reserved FIM marker) in the
     // top-5 at every degenerate position, and greedy DREW it live. A reserved
@@ -12505,7 +12575,7 @@ test "suppress_mask: a suppressed id is unreachable from both samplers, everythi
     const allocator = testing.allocator;
 
     const V: usize = 8;
-    const mask = try buildSuppressMask(&[_]u32{3}, V, s);
+    const mask = try buildSuppressMask(&[_]u32{3}, 0, V, s);
     defer _ = mlx.mlx_array_free(mask);
 
     // id 3 (suppressed) dominates, id 5 is the runner-up, the rest are so far
