@@ -4386,6 +4386,12 @@ ON is ~flat (51→41); OFF collapses (41→15). Residual ON slope is the indexer
 
 Two footguns: `mlx_take_axis` needs unsigned indices (int32 aborts); quantized kernels misread strided take views (`takeContig` uses `mlx_contiguous`, not `+0`).
 
+## qwen4 QSA history in every SSM checkpoint OOM'd 400k prefills (2026-09-03)
+
+Prefix-cache snapshots copied `aux_state`/`qsa_pooled` (the growing indexer key history) at every stride. 32 copies of a ~273k-row buffer is ~30 GB on top of 70 GB weights — Metal OOM at 400k while auto-context advertised 700k–1M (`--kv-quant 8` made it worse: billed KV shrank, QSA bytes did not).
+
+Fix: stride captures keep GDN/PLE only. `attachQsaHistoryToLatest` puts ONE copy on the latest snap; restore slices it to `cp.pos` (`applyQsaHistoryAt`). A byte-budget trim that would drop that snap first slices the history onto the last kept checkpoint (`sliceQsaHistoryOntoCheckpoint`) — otherwise a 122k trimmed hit left aux empty and the next prefill aborted on `reshape 4096 → (1, nb, 4, 128)` at 77% RAM (not an OOM). `qsaMaskFromQk` returns `error.QsaHistoryGap` if `keys` is shorter than `kv`. Sizer/guard bill live aux once (`qsaHistoryBytesPerToken`). PLE windows stay per-position (they are not a prefix).
+
 ## QSA scalar RoPE skipped YaRN mscale; partial rotary ranking can flip (2026-09-01)
 
 `--config-overrides` with `rope_type: yarn` stretches Qwen3.8-Flash-Next to 1M. M-RoPE tables already fold mscale into cos/sin via `fillCosSin(..., yarnMscale)`. The QSA indexer's scalar arm (`mlx_fast_rope` when `mrope_cos_cur == null`) did not: a comment claimed mscale "multiplies every relu(q·k) by one positive constant, which cannot change a top-k." That is true of a FULL-head scale. The indexer is 128-wide and only 64 dims rotate, so score = ms²·A + B, and two synthetic blocks whose unscaled winner is the B-heavy one flip under factor-4 mscale (`YaRN mscale on a 128-wide indexer with 64 rotary dims CAN change top-k`).

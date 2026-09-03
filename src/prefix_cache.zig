@@ -28,6 +28,9 @@ const KVCacheSnapshot = transformer_mod.KVCacheSnapshot;
 const SSMCacheEntry = transformer_mod.SSMCacheEntry;
 const SSMCheckpoint = transformer_mod.SSMCheckpoint;
 const restoreSsmCheckpoint = transformer_mod.restoreSsmCheckpoint;
+const applyQsaHistoryAt = transformer_mod.applyQsaHistoryAt;
+const checkpointHasQsaHistory = transformer_mod.checkpointHasQsaHistory;
+const sliceQsaHistoryOntoCheckpoint = transformer_mod.sliceQsaHistoryOntoCheckpoint;
 const ssmCheckpointBytes = transformer_mod.ssmCheckpointBytes;
 
 /// Minimum forwarded-prefix length for committing a CANCELLED prefill
@@ -302,6 +305,19 @@ pub const HotPrefixCache = struct {
             picked = cp;
         }
         return picked;
+    }
+
+    /// Latest checkpoint that carries QSA aux, unless it IS `restored`
+    /// (restoreSsmCheckpoint already installed that aux at full length).
+    fn qsaHistorySource(cps: []const SSMCheckpoint, restored: *const SSMCheckpoint) ?*const SSMCheckpoint {
+        var i = cps.len;
+        while (i > 0) {
+            i -= 1;
+            if (!checkpointHasQsaHistory(&cps[i])) continue;
+            if (&cps[i] == restored) return null;
+            return &cps[i];
+        }
+        return null;
     }
 
     /// Reset every SSM entry to the uninitialized (cold) state. Used on every
@@ -654,6 +670,11 @@ pub const HotPrefixCache = struct {
                 if (highestCheckpointAtOrBelow(cps, m.shared)) |cp| {
                     try restoreSsmCheckpoint(entries, cp);
                     effective_matched = cp.pos;
+                    // QSA indexer history is stored once on the latest snap
+                    // (full length). Intermediate restores slice it to cp.pos.
+                    if (qsaHistorySource(cps, cp)) |src| {
+                        try applyQsaHistoryAt(entries, src, cp.pos, s);
+                    }
                 } else {
                     // No checkpoint at or before this prefix length — reset
                     // SSM and treat the match as zero-effective (we have to
@@ -876,6 +897,12 @@ pub const HotPrefixCache = struct {
                     var kept: usize = 0;
                     while (kept < cps.len and cps[kept].pos <= tl) kept += 1;
                     if (kept < cps.len) {
+                        // QSA history lives only on the latest snap. Slicing
+                        // it onto the last KEPT snap before dropping the tail
+                        // is what keeps a trimmed 122k entry restorable.
+                        if (kept > 0 and checkpointHasQsaHistory(&cps[cps.len - 1])) {
+                            sliceQsaHistoryOntoCheckpoint(&cps[kept - 1], &cps[cps.len - 1], cps[kept - 1].pos, mlx.gpuStream()) catch {};
+                        }
                         const shrunk = self.allocator.dupe(SSMCheckpoint, cps[0..kept]) catch break :trim_blk;
                         for (cps[kept..]) |*cp| cp.deinit(self.allocator);
                         self.allocator.free(cps);
@@ -1224,6 +1251,9 @@ pub const HotPrefixCache = struct {
                 break :blk best_at;
             };
             const freed = ssmCheckpointBytes(&cps[drop]);
+            if (drop + 1 == n and drop > 0 and checkpointHasQsaHistory(&cps[drop])) {
+                sliceQsaHistoryOntoCheckpoint(&cps[drop - 1], &cps[drop], cps[drop - 1].pos, mlx.gpuStream()) catch {};
+            }
             cps[drop].deinit(self.allocator);
             var k = drop;
             while (k + 1 < n) : (k += 1) cps[k] = cps[k + 1];

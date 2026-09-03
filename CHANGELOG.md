@@ -14,6 +14,7 @@
 - Qwen 3.8 Flash Next community/custom packs converted with `--ngram-bits 3/5/6` served a noise n-gram table (#305, thanks @Sinojen). The reader now follows `mx.quantize`'s dense packing; 2/4/8-bit packs are unchanged.
 - QSA scalar RoPE omitted YaRN mscale (partial-rotary ranking can change which blocks win); SSD prefix-cache fingerprint now includes `--config-overrides`.
 - JSON-schema output with thinking enabled returned the JSON as `reasoning_content` with empty `content` on `/v1/chat/completions` and `/v1/responses` (#331, thanks @perretv). A schema request now forces thinking off on every surface, matching `/v1/messages`.
+- Qwen 3.8 Flash Next long prefills no longer die around 400k tokens: prefix-cache snapshots were cloning the growing QSA key history at every stride (tens of GB). History is stored once; a 1M prompt prefills and decodes.
 
 ## v26.8.11 — Qwen 3.8 Flash Next, MLX 0.32.2
 

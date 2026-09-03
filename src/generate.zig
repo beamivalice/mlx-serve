@@ -1970,6 +1970,9 @@ pub const Generator = struct {
                         if (options.cancelled_checkpoint_sink) |sink| {
                             sink.forwarded = ssm_cp_offset + pos;
                             if (ssm_checkpoints.items.len > 0) {
+                                if (ctx.ssm_entries) |ents| {
+                                    transformer_mod.attachQsaHistoryToLatest(ssm_checkpoints.items, ents, xfm.s) catch {};
+                                }
                                 if (ssm_checkpoints.toOwnedSlice(allocator)) |owned| {
                                     sink.checkpoints = owned;
                                     sink.alloc = allocator;
@@ -2195,6 +2198,12 @@ pub const Generator = struct {
                         var oldest = ssm_checkpoints.orderedRemove(0);
                         oldest.deinit(allocator);
                     }
+                }
+                // One copy of the QSA key history on the latest snap. Stride
+                // captures skipped it so a 400k prefill is not 32× the
+                // indexer buffer.
+                if (ssm_checkpoints.items.len > 0) {
+                    try transformer_mod.attachQsaHistoryToLatest(ssm_checkpoints.items, ctx.ssm_entries.?, xfm.s);
                 }
             }
         }

@@ -4599,8 +4599,9 @@ pub const SSMCacheEntry = struct {
     spec_conv_input: mlx.mlx_array = .{ .ctx = null },
     /// qwen4_exp per-request state beside the GDN pair: the PLE dilated-conv
     /// window `[B, (K-1)*dilation, hc*hidden]` on the PLE layer, the raw QSA
-    /// indexer key history `[B, kv, idx_hd]` on full-attention layers. Not
-    /// carried by snapshots yet — the arch runs with the prefix cache off.
+    /// indexer key history `[B, kv, idx_hd]` on full-attention layers.
+    /// QSA history is a prefix of ONE buffer — stride checkpoints must NOT
+    /// copy it (attachQsaHistoryToLatest puts one copy on the latest snap).
     aux_state: mlx.mlx_array = .{ .ctx = null },
     /// PLE: the (ngram_size-1) tokens preceding the next forward.
     ple_prev: [8]u32 = @splat(0),
@@ -4936,10 +4937,14 @@ pub fn captureSsmCheckpoint(
             _ = mlx.mlx_array_free(out.ssm_state);
             out.ssm_state = c;
         }
-        // qwen4_exp: the key history is a concat chain and the pooled keys a
-        // slice of it — both own their buffers here for the same reason.
-        if (src.aux_state.ctx != null) out.aux_state = try materializedOwnedCopy(s, src.aux_state);
-        if (src.qsa_pooled.ctx != null) out.qsa_pooled = try materializedOwnedCopy(s, src.qsa_pooled);
+        // PLE conv window (O(1), rides a GDN layer) is per-position state and
+        // belongs in every checkpoint. QSA indexer history (aux && !conv) is
+        // a prefix of one buffer — copying it at every stride is what OOM'd
+        // a 400k prefill while auto-context advertised 700k–1M. One copy is
+        // attached to the latest checkpoint after prefill.
+        if (src.aux_state.ctx != null and !ssmAuxIsQsaHistory(src)) {
+            out.aux_state = try materializedOwnedCopy(s, src.aux_state);
+        }
         out.qsa_ratio = src.qsa_ratio;
         out.ple_prev = src.ple_prev;
         out.ple_prev_valid = src.ple_prev_valid;
@@ -5007,6 +5012,169 @@ pub fn ssmCheckpointBytes(cp: *const SSMCheckpoint) u64 {
         }
     }
     return total;
+}
+
+/// QSA indexer key history lives on full-attention layers: `aux_state` is
+/// `[B, kv, idx_hd]` and there is no conv recurrence (`conv_state` null or
+/// an empty handle). PLE's dilated-conv window is `aux_state` on a GDN
+/// layer that HAS a real `conv_state` — that window is O(1) and stays in
+/// every checkpoint.
+pub fn ssmAuxIsQsaHistory(e: *const SSMCacheEntry) bool {
+    if (e.aux_state.ctx == null) return false;
+    if (e.qsa_pooled.ctx != null) return true;
+    if (e.conv_state.ctx == null) return true;
+    return mlx.mlx_array_size(e.conv_state) == 0;
+}
+
+fn snapshotHasQsaHistory(l: *const SSMCacheEntrySnapshot) bool {
+    if (l.aux_state.ctx == null) return false;
+    if (l.qsa_pooled.ctx != null) return true;
+    if (l.conv_state.ctx == null) return true;
+    return mlx.mlx_array_size(l.conv_state) == 0;
+}
+
+pub fn checkpointHasQsaHistory(cp: *const SSMCheckpoint) bool {
+    for (cp.layers) |*l| {
+        if (snapshotHasQsaHistory(l)) return true;
+    }
+    return false;
+}
+
+/// Copy QSA aux/pooled from the live entries onto the LATEST checkpoint
+/// (one materialized copy of the full history). Stride snapshots stay
+/// GDN/PLE-only. No-op when `cps` is empty or no layer holds QSA history.
+pub fn attachQsaHistoryToLatest(cps: []SSMCheckpoint, live: []const SSMCacheEntry, s: mlx.mlx_stream) !void {
+    if (cps.len == 0) return;
+    const cp = &cps[cps.len - 1];
+    if (cp.layers.len != live.len) return error.SsmCheckpointLayerMismatch;
+    var copied: usize = 0;
+    for (cp.layers, live) |*dst, src| {
+        if (!ssmAuxIsQsaHistory(&src)) continue;
+        if (dst.aux_state.ctx != null) _ = mlx.mlx_array_free(dst.aux_state);
+        dst.aux_state = try materializedOwnedCopy(s, src.aux_state);
+        copied += 1;
+        if (src.qsa_pooled.ctx != null) {
+            if (dst.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(dst.qsa_pooled);
+            dst.qsa_pooled = try materializedOwnedCopy(s, src.qsa_pooled);
+        }
+        dst.qsa_ratio = src.qsa_ratio;
+    }
+    if (copied == 0) return;
+    const vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec);
+    var n: usize = 0;
+    for (cp.layers) |*l| {
+        if (!snapshotHasQsaHistory(l)) continue;
+        inline for (.{ l.aux_state, l.qsa_pooled }) |arr| {
+            if (arr.ctx != null) {
+                _ = mlx.mlx_vector_array_append_value(vec, arr);
+                n += 1;
+            }
+        }
+    }
+    if (n > 0) _ = mlx.mlx_eval(vec);
+}
+
+/// Overlay QSA history from `src_cp` (the entry's latest snap, full length)
+/// onto `entries` already restored to `pos`. Slices aux to `pos` rows and
+/// pooled to `pos/ratio` blocks. No-op on PLE/GDN layers (they already
+/// hold the per-position window from `restoreSsmCheckpoint`).
+pub fn applyQsaHistoryAt(entries: []SSMCacheEntry, src_cp: *const SSMCheckpoint, pos: usize, s: mlx.mlx_stream) !void {
+    if (entries.len != src_cp.layers.len) return error.SsmCheckpointLayerMismatch;
+    const keep: c_int = @intCast(pos);
+    for (entries, src_cp.layers) |*dst, src| {
+        if (!snapshotHasQsaHistory(&src)) continue;
+        // After restoreSsmCheckpoint a QSA layer has no conv window.
+        if (dst.conv_state.ctx != null and mlx.mlx_array_size(dst.conv_state) > 0) continue;
+        if (src.aux_state.ctx == null) continue;
+        const ks = mlx.getShape(src.aux_state);
+        if (ks.len < 2) continue;
+        const rows: c_int = ks[1];
+        const take: c_int = @min(keep, rows);
+        if (dst.aux_state.ctx != null) _ = mlx.mlx_array_free(dst.aux_state);
+        dst.aux_state = .{ .ctx = null };
+        if (take <= 0) {
+            if (dst.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(dst.qsa_pooled);
+            dst.qsa_pooled = .{ .ctx = null };
+            continue;
+        }
+        if (take == rows) {
+            dst.aux_state = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_array_set(&dst.aux_state, src.aux_state));
+            if (src.qsa_pooled.ctx != null) {
+                if (dst.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(dst.qsa_pooled);
+                dst.qsa_pooled = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_array_set(&dst.qsa_pooled, src.qsa_pooled));
+            }
+        } else {
+            const start = [_]c_int{ 0, 0, 0 };
+            const stop = [_]c_int{ ks[0], take, ks[2] };
+            const strides = [_]c_int{ 1, 1, 1 };
+            var view = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(view);
+            try mlx.check(mlx.mlx_slice(&view, src.aux_state, &start, 3, &stop, 3, &strides, 3, s));
+            dst.aux_state = try materializedOwnedCopy(s, view);
+            if (dst.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(dst.qsa_pooled);
+            dst.qsa_pooled = .{ .ctx = null };
+            if (src.qsa_pooled.ctx != null) {
+                dst.qsa_pooled = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_array_set(&dst.qsa_pooled, src.qsa_pooled));
+                try truncatePooled(&dst.qsa_pooled, take, src.qsa_ratio, s);
+            }
+        }
+        dst.qsa_ratio = src.qsa_ratio;
+    }
+}
+
+/// Copy QSA aux/pooled from `src` onto `dst`, sliced to `pos` rows. Used when
+/// a byte-budget trim would drop the latest snap — the only one that carries
+/// the indexer history. A 122880-token trim that freed that snap left aux
+/// empty; the next prefill then reshaped a 4096-row chunk into
+/// `(1, nb, 4, 128)` and aborted (MLX reshape, 77% RAM — not an OOM).
+pub fn sliceQsaHistoryOntoCheckpoint(dst: *SSMCheckpoint, src: *const SSMCheckpoint, pos: usize, s: mlx.mlx_stream) !void {
+    if (dst.layers.len != src.layers.len) return error.SsmCheckpointLayerMismatch;
+    const keep: c_int = @intCast(pos);
+    for (dst.layers, src.layers) |*d, s_l| {
+        if (!snapshotHasQsaHistory(&s_l)) continue;
+        if (d.conv_state.ctx != null and mlx.mlx_array_size(d.conv_state) > 0) continue;
+        if (s_l.aux_state.ctx == null) continue;
+        const ks = mlx.getShape(s_l.aux_state);
+        if (ks.len < 2) continue;
+        const rows: c_int = ks[1];
+        const take: c_int = @min(keep, rows);
+        if (d.aux_state.ctx != null) _ = mlx.mlx_array_free(d.aux_state);
+        d.aux_state = .{ .ctx = null };
+        if (take <= 0) {
+            if (d.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(d.qsa_pooled);
+            d.qsa_pooled = .{ .ctx = null };
+            continue;
+        }
+        if (take == rows) {
+            d.aux_state = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_array_set(&d.aux_state, s_l.aux_state));
+            if (s_l.qsa_pooled.ctx != null) {
+                if (d.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(d.qsa_pooled);
+                d.qsa_pooled = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_array_set(&d.qsa_pooled, s_l.qsa_pooled));
+            }
+        } else {
+            const start = [_]c_int{ 0, 0, 0 };
+            const stop = [_]c_int{ ks[0], take, ks[2] };
+            const strides = [_]c_int{ 1, 1, 1 };
+            var view = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(view);
+            try mlx.check(mlx.mlx_slice(&view, s_l.aux_state, &start, 3, &stop, 3, &strides, 3, s));
+            d.aux_state = try materializedOwnedCopy(s, view);
+            if (d.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(d.qsa_pooled);
+            d.qsa_pooled = .{ .ctx = null };
+            if (s_l.qsa_pooled.ctx != null) {
+                d.qsa_pooled = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_array_set(&d.qsa_pooled, s_l.qsa_pooled));
+                try truncatePooled(&d.qsa_pooled, take, s_l.qsa_ratio, s);
+            }
+        }
+        d.qsa_ratio = s_l.qsa_ratio;
+    }
 }
 
 // ── Prompt Cache (snapshot of KV + SSM state for prefix reuse) ──
@@ -12488,6 +12656,10 @@ pub const Transformer = struct {
         // extended only for the blocks this forward completed.
         const nb: c_int = @divTrunc(kv, ratio);
         entry.qsa_ratio = ratio;
+        {
+            const key_rows = mlx.getShape(keys)[1];
+            if (key_rows < kv) return error.QsaHistoryGap;
+        }
         if (std.c.getenv("QWEN4_NO_POOLED") != null and entry.qsa_pooled.ctx != null) {
             _ = mlx.mlx_array_free(entry.qsa_pooled);
             entry.qsa_pooled = .{ .ctx = null };
@@ -12499,6 +12671,11 @@ pub const Transformer = struct {
             defer _ = mlx.mlx_array_free(kb_flat);
             try mlx.check(mlx.mlx_slice(&kb_flat, keys, &[_]c_int{ 0, nb_cached * ratio, 0 }, 3, &[_]c_int{ batch, nb * ratio, idx_hd }, 3, &strides3, 3, self.s));
             const kb_shape = [_]c_int{ batch, n_new, ratio, idx_hd };
+            const want: usize = @as(usize, @intCast(batch)) * @as(usize, @intCast(n_new)) * @as(usize, @intCast(ratio)) * @as(usize, @intCast(idx_hd));
+            // A trimmed prefix-cache hit that dropped the QSA-history snap
+            // leaves `keys` as just this chunk. Reshape then aborts the
+            // process (MLX default handler) at 77% RAM — not an OOM.
+            if (mlx.mlx_array_size(kb_flat) != want) return error.QsaHistoryGap;
             var kb4 = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(kb4);
             try mlx.check(mlx.mlx_reshape(&kb4, kb_flat, &kb_shape, 4, self.s));
@@ -27702,6 +27879,116 @@ test "captureSsmCheckpoint materializes state copies (parent-buffer retention cl
     try testing.expect(cp.layers[0].ssm_state.ctx == null);
 }
 
+test "captureSsmCheckpoint does not copy QSA aux history" {
+    // QSA indexer keys grow with seq. Copying them into every stride
+    // snapshot is what OOM'd a 400k prefill. Capture must leave them on
+    // the live entry; attachQsaHistoryToLatest puts one copy on the latest.
+    const s = mlx.gpuStream();
+    const aux_shape = [_]c_int{ 1, 2048, 128 };
+    var aux = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(aux);
+    try mlx.check(mlx.mlx_ones(&aux, &aux_shape, 3, .bfloat16, s));
+    var pooled = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(pooled);
+    const pooled_shape = [_]c_int{ 1, 512, 128 };
+    try mlx.check(mlx.mlx_ones(&pooled, &pooled_shape, 3, .bfloat16, s));
+
+    const entry: SSMCacheEntry = .{
+        .conv_state = .{ .ctx = null },
+        .ssm_state = .{ .ctx = null },
+        .initialized = true,
+        .aux_state = aux,
+        .qsa_pooled = pooled,
+        .qsa_ratio = 4,
+    };
+    aux = mlx.mlx_array_new();
+    pooled = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_array_set(&aux, entry.aux_state));
+    try mlx.check(mlx.mlx_array_set(&pooled, entry.qsa_pooled));
+
+    var entries = [_]SSMCacheEntry{entry};
+    defer {
+        if (entries[0].aux_state.ctx != null) _ = mlx.mlx_array_free(entries[0].aux_state);
+        if (entries[0].qsa_pooled.ctx != null) _ = mlx.mlx_array_free(entries[0].qsa_pooled);
+    }
+    var cp = try captureSsmCheckpoint(testing.allocator, &entries, 2048, s);
+    defer cp.deinit(testing.allocator);
+    try testing.expect(!checkpointHasQsaHistory(&cp));
+    try testing.expect(cp.layers[0].aux_state.ctx == null);
+    try testing.expect(cp.layers[0].qsa_pooled.ctx == null);
+    try testing.expect(entries[0].aux_state.ctx != null);
+    try testing.expectEqual(@as(c_int, 2048), mlx.getShape(entries[0].aux_state)[1]);
+}
+
+test "attachQsaHistoryToLatest is one copy; applyQsaHistoryAt slices to pos" {
+    const s = mlx.gpuStream();
+    const n: c_int = 64;
+    const aux_shape = [_]c_int{ 1, n, 8 };
+    var aux = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(aux);
+    {
+        var flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(flat);
+        try mlx.check(mlx.mlx_arange(&flat, 0.0, @floatFromInt(n * 8), 1.0, .float32, s));
+        try mlx.check(mlx.mlx_reshape(&aux, flat, &aux_shape, 3, s));
+        try mlx.check(mlx.mlx_array_eval(aux));
+    }
+    const live: SSMCacheEntry = .{
+        .conv_state = .{ .ctx = null },
+        .ssm_state = .{ .ctx = null },
+        .initialized = true,
+        .aux_state = aux,
+        .qsa_ratio = 4,
+    };
+    aux = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_array_set(&aux, live.aux_state));
+
+    var live_arr = [_]SSMCacheEntry{live};
+    defer {
+        if (live_arr[0].aux_state.ctx != null) _ = mlx.mlx_array_free(live_arr[0].aux_state);
+        if (live_arr[0].qsa_pooled.ctx != null) _ = mlx.mlx_array_free(live_arr[0].qsa_pooled);
+    }
+    const cp_a = try captureSsmCheckpoint(testing.allocator, &live_arr, 32, s);
+    const cp_b = try captureSsmCheckpoint(testing.allocator, &live_arr, 64, s);
+    var cps = [_]SSMCheckpoint{ cp_a, cp_b };
+    defer for (&cps) |*c| c.deinit(testing.allocator);
+
+    try testing.expect(!checkpointHasQsaHistory(&cps[0]));
+    try testing.expect(!checkpointHasQsaHistory(&cps[1]));
+    const bytes_before = ssmCheckpointBytes(&cps[0]) + ssmCheckpointBytes(&cps[1]);
+
+    try attachQsaHistoryToLatest(&cps, &live_arr, s);
+    try testing.expect(!checkpointHasQsaHistory(&cps[0]));
+    try testing.expect(checkpointHasQsaHistory(&cps[1]));
+    const aux_bytes: u64 = @as(u64, @intCast(n)) * 8 * 4;
+    try testing.expectEqual(bytes_before + aux_bytes, ssmCheckpointBytes(&cps[0]) + ssmCheckpointBytes(&cps[1]));
+
+    var dest_arr = [_]SSMCacheEntry{.{
+        .conv_state = .{ .ctx = null },
+        .ssm_state = .{ .ctx = null },
+        .initialized = true,
+    }};
+    defer {
+        if (dest_arr[0].aux_state.ctx != null) _ = mlx.mlx_array_free(dest_arr[0].aux_state);
+        if (dest_arr[0].qsa_pooled.ctx != null) _ = mlx.mlx_array_free(dest_arr[0].qsa_pooled);
+    }
+    try applyQsaHistoryAt(&dest_arr, &cps[1], 32, s);
+    try testing.expect(dest_arr[0].aux_state.ctx != null);
+    try testing.expectEqual(@as(c_int, 32), mlx.getShape(dest_arr[0].aux_state)[1]);
+    var got = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(got);
+    try mlx.check(mlx.mlx_astype(&got, dest_arr[0].aux_state, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(got));
+    const d = mlx.mlx_array_data_float32(got) orelse return error.TestUnexpectedNullData;
+    try testing.expectEqual(@as(f32, 0), d[0]);
+    try testing.expectEqual(@as(f32, 31.0 * 8.0 + 7.0), d[31 * 8 + 7]);
+
+    // Trim drops the latest snap: QSA history must move onto the kept one.
+    try sliceQsaHistoryOntoCheckpoint(&cps[0], &cps[1], 32, s);
+    try testing.expect(checkpointHasQsaHistory(&cps[0]));
+    try testing.expectEqual(@as(c_int, 32), mlx.getShape(cps[0].layers[0].aux_state)[1]);
+}
+
 test "affineParamsFromGeometry: exact per-weight solve for off-config sidecar quants" {
     // Real geometries from the stamsam 35B-A3B MTP sidecar over a 4-bit/gs-64
     // affine trunk: q_proj 5-bit/gs-128, v_proj 6-bit/gs-128, shared expert
@@ -40080,13 +40367,17 @@ test "ssm checkpoint carries the qwen4_exp aux state (key history, pooled keys, 
         if (e.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(e.qsa_pooled);
     };
 
-    var cp = try captureSsmCheckpoint(a, &src_e, 37, s);
-    defer cp.deinit(a);
+    var cps = [_]SSMCheckpoint{try captureSsmCheckpoint(a, &src_e, 37, s)};
+    defer cps[0].deinit(a);
+    // Stride capture keeps PLE (O(1) on the GDN layer) and skips QSA history.
+    try std.testing.expect(cps[0].layers[0].aux_state.ctx == null and cps[0].layers[0].qsa_pooled.ctx == null);
+    try std.testing.expect(cps[0].layers[1].ple_prev_valid and cps[0].layers[1].ple_prev[1] == 22);
+    try std.testing.expect(cps[0].layers[1].aux_state.ctx != null);
+    try attachQsaHistoryToLatest(&cps, &src_e, s);
+    const cp = &cps[0];
     try std.testing.expect(cp.layers[0].aux_state.ctx != null and cp.layers[0].qsa_pooled.ctx != null);
-    try std.testing.expect(cp.layers[1].ple_prev_valid and cp.layers[1].ple_prev[1] == 22);
-    // The checkpoint bills the aux arrays too.
     const expect_bytes: u64 = (37 * 16 + 9 * 16 + 6 * 32 + 3 * 64 + 2 * 8 * 8) * 2;
-    try std.testing.expectEqual(expect_bytes, ssmCheckpointBytes(&cp));
+    try std.testing.expectEqual(expect_bytes, ssmCheckpointBytes(cp));
 
     // A restore target that holds a LATER request's state gets it replaced.
     var dst = [_]SSMCacheEntry{
@@ -40102,7 +40393,8 @@ test "ssm checkpoint carries the qwen4_exp aux state (key history, pooled keys, 
         if (e.aux_state.ctx != null) _ = mlx.mlx_array_free(e.aux_state);
         if (e.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(e.qsa_pooled);
     };
-    try restoreSsmCheckpoint(&dst, &cp);
+    try restoreSsmCheckpoint(&dst, cp);
+    try applyQsaHistoryAt(&dst, cp, 37, s);
     try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(dst[0].aux_state, src_e[0].aux_state, s));
     try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(dst[0].qsa_pooled, src_e[0].qsa_pooled, s));
     try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(dst[1].aux_state, src_e[1].aux_state, s));

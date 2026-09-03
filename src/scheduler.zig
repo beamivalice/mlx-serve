@@ -5989,7 +5989,7 @@ test "Generator.initWithOptions hands off checkpoints on cancel" {
     // abort comment so a decode-loop cancel check can't satisfy it.
     const source = @embedFile("generate.zig");
     const anchor = std.mem.indexOf(u8, source, "Abandoned-request abort") orelse return error.MissingAbortComment;
-    const region = source[anchor..@min(anchor + 1700, source.len)];
+    const region = source[anchor..@min(anchor + 2400, source.len)];
     try testing.expect(std.mem.indexOf(u8, region, "cancelled_checkpoint_sink") != null);
     try testing.expect(std.mem.indexOf(u8, region, "error.Cancelled") != null);
 }
