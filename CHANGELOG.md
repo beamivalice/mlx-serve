@@ -22,6 +22,7 @@
 ### Fixes
 
 - A failure inside Flash Next's draft head could free the same buffer twice and take the server down instead of returning an error. Latent — the path had never failed in practice.
+- Models whose output layer is padded past the end of their tokenizer (Qwen 3.8 Flash Next has 243 such rows) could draw one of those rows: the token decoded to nothing, so a reply lost a step and the wasted token stayed in the context. Those rows are now never sampled; reported log-probabilities are unchanged.
 - Chat templates using `|min` or `|max` on a real array failed to render and silently fell back to the wrong prompt format, so the model lost its stop token. Hit every MiniCPM5 multi-turn tool conversation (#335, thanks @uncle9x9).
 - JSON-schema output with thinking enabled returned the JSON as `reasoning_content` with empty `content` on `/v1/chat/completions` and `/v1/responses` (#331, thanks @perretv). A schema request now forces thinking off on every surface, matching `/v1/messages`.
 - Qwen 3.8 Flash Next packs converted with `--ngram-bits 3/5/6` served a noise n-gram table (#305, thanks @Sinojen). 2/4/8-bit packs are unchanged.
