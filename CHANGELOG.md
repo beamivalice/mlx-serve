@@ -6,6 +6,7 @@
 
 - **Watch a video take shape while it renders.** Video Generation has a "Show live preview while generating" toggle: with it on, each denoise step sends back a small still (or a filmstrip of several frames) so you can tell early whether a 6-minute render is going where you wanted. It reads the latent directly — no second decode — using the published colour projection for each model's latent space, so the picture actually resembles the finished clip on both LTX and MiniMax H3. Off by default, and off costs nothing.
 - **`--config-overrides` stretches a checkpoint's context** (vLLM's `--hf-overrides`): YaRN factor 4 turns Qwen 3.8 Flash Next's 262k window into 1M without editing the model dir.
+- **Long-context decode on Qwen 3.8 Flash Next stays fast.** Sparse attention at decode now reads only the selected ~2k KV rows instead of the whole cache, so a 256k prompt holds about 41 tok/s instead of collapsing to ~15.
 
 ### Fixes
 

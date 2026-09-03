@@ -2704,6 +2704,24 @@ fn qsaGatherBk() c_int {
     return v;
 }
 
+pub var qsa_decode_gather_override: ?bool = null;
+var qsa_decode_gather_env_cached: ?bool = null;
+
+/// Decode-width QSA gather (S==1): reuse the sorted block selection and read
+/// only the selected blocks + incomplete tail instead of the full KV — O(topk)
+/// per step, never O(kv). MLX_SERVE_QSA_DECODE_GATHER=0 restores the dense
+/// bool-mask arm (same selection, full-KV SDPA).
+pub fn qsaDecodeGatherEnabled() bool {
+    if (qsa_decode_gather_override) |v| return v;
+    if (qsa_decode_gather_env_cached) |v| return v;
+    const v = blk: {
+        const raw = std.c.getenv("MLX_SERVE_QSA_DECODE_GATHER") orelse break :blk true;
+        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
+    };
+    qsa_decode_gather_env_cached = v;
+    return v;
+}
+
 /// Virtual key index -> cache position for one query's block selection:
 /// the `sel_len` tokens of its sorted blocks, then its own incomplete tail.
 const ATTN_QSA256_KERNEL_HEADER = ATTN256_KERNEL_HEADER ++
@@ -2954,6 +2972,221 @@ pub fn gatherQsa256(
     if (!qsa_gather_logged) {
         qsa_gather_logged = true;
         log.info("[qsa-gather] engaged: msv_attn_qsa256 qL={d} kL={d} blocks={d} bk={d} (MLX_SERVE_QSA_GATHER=0 restores the dense mask arm)\n", .{ qs[2], ks[2], bs[2], bk });
+    }
+    return out;
+}
+
+var qsa_decode_gather_logged = false;
+
+/// take_axis + materialized copy: quantized kernels (dequantize included)
+/// misread the strided view take hands back, so the gather-then-dequantize
+/// path must own contiguous rows first. NOTE: not the `+0` trick — an
+/// add-materialized take of packed rows still reads back wrong, so this uses
+/// the canonical contiguous primitive.
+fn takeContig(s: mlx.mlx_stream, src: mlx.mlx_array, idx: mlx.mlx_array, axis: c_int) !mlx.mlx_array {
+    var view = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(view);
+    try mlx.check(mlx.mlx_take_axis(&view, src, idx, axis, s));
+    defer _ = mlx.mlx_array_free(view);
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_contiguous(&out, view, false, s));
+    return out;
+}
+
+/// Decode-width QSA gather (S==1, sorted `blocks`, no mask): expand the
+/// selection + incomplete tail into ascending token indices, gather those rows
+/// (quant triples when the view carries them — dequantizing ONLY the subset —
+/// else dense rows), then dense SDPA under an additive validity mask. Null =
+/// declined (kill switch, dtype, geometry) — the caller keeps the dense mask.
+///
+/// Parity argument: the mask arm attends exactly the selected complete blocks'
+/// tokens ∪ the incomplete tail ∧ causal. At decode the query is the last
+/// cache row, so every gathered token is causal-visible and the ascending
+/// gather order matches the masked row's summation order; the masked-out slots
+/// contributed exact zeros there. Remaining deltas are kernel tiling order.
+pub fn qsaDecodeGatherAttn(
+    s: mlx.mlx_stream,
+    q_rope: mlx.mlx_array, // [1,Hq,1,D] bf16
+    kv_view: *const DenseKVView, // full cache AFTER this token's append
+    blocks: mlx.mlx_array, // [1,1,kb] int32 sorted asc, INT_MAX sentinel
+    ratio: c_int,
+    attn_scale: f32,
+) !?mlx.mlx_array {
+    if (!qsaDecodeGatherEnabled()) return null;
+    if (mlx.mlx_array_ndim(q_rope) != 4 or mlx.mlx_array_ndim(blocks) != 3) return null;
+    const qs = mlx.getShape(q_rope);
+    if (qs[0] != 1 or qs[2] != 1) return null;
+    if (mlx.mlx_array_dtype(q_rope) != .bfloat16) return null;
+    if (mlx.mlx_array_dtype(blocks) != .int32) return null;
+    const bs = mlx.getShape(blocks);
+    if (bs[0] != 1 or bs[1] != 1) return null;
+    const kb: c_int = bs[2];
+    if (kb <= 0 or ratio <= 0) return null;
+    const h_q: c_int = qs[1];
+    const head_dim: c_int = qs[3];
+    if (h_q <= 0 or head_dim <= 0) return null;
+
+    // Cache geometry off the dense K (present in every scheme; shapes are
+    // known without executing the lazy dequant graph).
+    if (kv_view.k.ctx == null or kv_view.v.ctx == null) return null;
+    const ks = mlx.getShape(kv_view.k);
+    if (ks.len != 4 or ks[0] != 1) return null;
+    const h_kv: c_int = ks[1];
+    const kv: c_int = ks[2];
+    if (h_kv <= 0 or kv <= 0 or @rem(h_q, h_kv) != 0) return null;
+    if (ks[3] != head_dim) return null;
+    const vs = mlx.getShape(kv_view.v);
+    if (vs.len != 4 or vs[0] != 1 or vs[1] != h_kv or vs[2] != kv or vs[3] != head_dim) return null;
+
+    const nb: c_int = @divTrunc(kv, ratio);
+    const tail_start: c_int = nb * ratio;
+    const tail_len: c_int = kv - tail_start;
+    if (tail_len < 0) return null;
+    const sel_len: c_int = kb * ratio;
+    const gathered_len: c_int = sel_len + tail_len;
+    // No sparsity win (or degenerate): keep the mask arm.
+    if (gathered_len <= 0 or gathered_len >= kv) return null;
+
+    // Token ids: selected blocks' ratio tokens each (sentinel → 0, masked
+    // below) then the incomplete tail. Reachable decode rows have no
+    // sentinels — every complete block is visible from the last position, so
+    // visible == nb >= kb — and this stays ascending; the mask is the
+    // backstop, not the plan.
+    const nb_arr = mlx.mlx_array_new_int(nb);
+    defer _ = mlx.mlx_array_free(nb_arr);
+    var valid_b = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(valid_b);
+    try mlx.check(mlx.mlx_less(&valid_b, blocks, nb_arr, s)); // [1,1,kb] bool
+    const zero_i = mlx.mlx_array_new_int(0);
+    defer _ = mlx.mlx_array_free(zero_i);
+    var safe_b = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(safe_b);
+    try mlx.check(mlx.mlx_where(&safe_b, valid_b, blocks, zero_i, s));
+    var blk4 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(blk4);
+    try mlx.check(mlx.mlx_expand_dims(&blk4, safe_b, -1, s)); // [1,1,kb,1]
+    var rvec = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(rvec);
+    try mlx.check(mlx.mlx_arange(&rvec, 0, @floatFromInt(ratio), 1.0, .int32, s)); // [ratio]
+    var r4 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(r4);
+    try mlx.check(mlx.mlx_reshape(&r4, rvec, &[_]c_int{ 1, 1, 1, ratio }, 4, s));
+    const ratio_arr = mlx.mlx_array_new_int(ratio);
+    defer _ = mlx.mlx_array_free(ratio_arr);
+    var blk_scaled = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(blk_scaled);
+    try mlx.check(mlx.mlx_multiply(&blk_scaled, blk4, ratio_arr, s));
+    var tok4 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(tok4);
+    try mlx.check(mlx.mlx_add(&tok4, blk_scaled, r4, s)); // [1,1,kb,ratio]
+    var tok_flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(tok_flat);
+    try mlx.check(mlx.mlx_reshape(&tok_flat, tok4, &[_]c_int{sel_len}, 1, s));
+    var valid4e = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(valid4e);
+    try mlx.check(mlx.mlx_expand_dims(&valid4e, valid_b, -1, s)); // [1,1,kb,1]
+    var valid4 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(valid4);
+    try mlx.check(mlx.mlx_broadcast_to(&valid4, valid4e, &[_]c_int{ 1, 1, kb, ratio }, 4, s));
+    var valid_flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(valid_flat);
+    try mlx.check(mlx.mlx_reshape(&valid_flat, valid4, &[_]c_int{sel_len}, 1, s));
+    var tail_ids = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(tail_ids);
+    var tail_ok = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(tail_ok);
+    if (tail_len > 0) {
+        try mlx.check(mlx.mlx_arange(&tail_ids, @floatFromInt(tail_start), @floatFromInt(kv), 1.0, .int32, s));
+        try mlx.check(mlx.mlx_ones(&tail_ok, &[_]c_int{tail_len}, 1, .bool_, s));
+    } else {
+        const eshp = [_]c_int{0};
+        try mlx.check(mlx.mlx_zeros(&tail_ids, &eshp, 1, .int32, s));
+        try mlx.check(mlx.mlx_zeros(&tail_ok, &eshp, 1, .bool_, s));
+    }
+    const idx_parts = [_]mlx.mlx_array{ tok_flat, tail_ids };
+    const idx_vec = mlx.mlx_vector_array_new_data(&idx_parts, 2);
+    defer _ = mlx.mlx_vector_array_free(idx_vec);
+    var idx = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(idx);
+    try mlx.check(mlx.mlx_concatenate_axis(&idx, idx_vec, 0, s)); // [K'] int32
+    const vok_parts = [_]mlx.mlx_array{ valid_flat, tail_ok };
+    const vok_vec = mlx.mlx_vector_array_new_data(&vok_parts, 2);
+    defer _ = mlx.mlx_vector_array_free(vok_vec);
+    var vok = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(vok);
+    try mlx.check(mlx.mlx_concatenate_axis(&vok, vok_vec, 0, s)); // [K'] bool
+    // take_axis wants unsigned indices; every id is >= 0 by construction.
+    var idx_u32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(idx_u32);
+    try mlx.check(mlx.mlx_astype(&idx_u32, idx, .uint32, s));
+
+    // Additive validity mask, same bf16 convention as the sliding masks.
+    const zero_f = bf16Scalar(0.0, s);
+    defer _ = mlx.mlx_array_free(zero_f);
+    const neg_inf = bf16Scalar(-std.math.inf(f32), s);
+    defer _ = mlx.mlx_array_free(neg_inf);
+    var addv = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(addv);
+    try mlx.check(mlx.mlx_where(&addv, vok, zero_f, neg_inf, s));
+    var add4 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(add4);
+    try mlx.check(mlx.mlx_reshape(&add4, addv, &[_]c_int{ 1, 1, 1, gathered_len }, 4, s));
+
+    // Gather rows: quant triples when the view carries affine 4/8-bit (then
+    // dequantize ONLY the subset), else dense rows. Dequantize is per-token
+    // along D, so subset-first is exactly full-first-restricted.
+    var gk = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(gk);
+    var gv = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(gv);
+    if (kv_view.has_quant_triple and (kv_view.bits == 4 or kv_view.bits == 8)) {
+        const kq = kv_view.k_triple_q;
+        const vq = kv_view.v_triple_q;
+        if (kq.ctx == null or vq.ctx == null) return null;
+        const kqs = mlx.getShape(kq);
+        const vqs = mlx.getShape(vq);
+        if (kqs.len != 4 or vqs.len != 4 or kqs[0] != 1 or vqs[0] != 1 or
+            kqs[1] != h_kv or vqs[1] != h_kv or kqs[2] != kv or vqs[2] != kv) return null;
+        // Contiguous copies: dequantize misreads the strided take views.
+        const gkq = try takeContig(s, kq, idx_u32, 2);
+        defer _ = mlx.mlx_array_free(gkq);
+        const gks = try takeContig(s, kv_view.k_triple_scales, idx_u32, 2);
+        defer _ = mlx.mlx_array_free(gks);
+        const gkb = try takeContig(s, kv_view.k_triple_biases, idx_u32, 2);
+        defer _ = mlx.mlx_array_free(gkb);
+        const gvq = try takeContig(s, vq, idx_u32, 2);
+        defer _ = mlx.mlx_array_free(gvq);
+        const gvs = try takeContig(s, kv_view.v_triple_scales, idx_u32, 2);
+        defer _ = mlx.mlx_array_free(gvs);
+        const gvb = try takeContig(s, kv_view.v_triple_biases, idx_u32, 2);
+        defer _ = mlx.mlx_array_free(gvb);
+        const gs: u32 = kv_view.group_size;
+        if (gs == 0) return null;
+        const gkd = try kv_quant.dequantizeAffine(s, gkq, gks, gkb, gs, kv_view.bits);
+        defer _ = mlx.mlx_array_free(gkd);
+        const gvd = try kv_quant.dequantizeAffine(s, gvq, gvs, gvb, gs, kv_view.bits);
+        defer _ = mlx.mlx_array_free(gvd);
+        try mlx.check(mlx.mlx_array_set(&gk, gkd));
+        try mlx.check(mlx.mlx_array_set(&gv, gvd));
+    } else {
+        if (kv_view.k.ctx == null or kv_view.v.ctx == null) return null;
+        try mlx.check(mlx.mlx_take_axis(&gk, kv_view.k, idx_u32, 2, s));
+        try mlx.check(mlx.mlx_take_axis(&gv, kv_view.v, idx_u32, 2, s));
+    }
+    if (mlx.mlx_array_dtype(gk) != mlx.mlx_array_dtype(q_rope)) return null;
+    const gks2 = mlx.getShape(gk);
+    const gvs2 = mlx.getShape(gv);
+    if (gks2.len != 4 or gvs2.len != 4 or gks2[0] != 1 or gvs2[0] != 1 or
+        gks2[1] != h_kv or gvs2[1] != h_kv or gks2[2] != gathered_len or gvs2[2] != gathered_len or
+        gks2[3] != head_dim or gvs2[3] != head_dim) return null;
+
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out, q_rope, gk, gv, attn_scale, "array", add4, .{ .ctx = null }, false, s));
+    if (!qsa_decode_gather_logged) {
+        qsa_decode_gather_logged = true;
+        log.info("[qsa-decode-gather] engaged: S=1 K'={d} (MLX_SERVE_QSA_DECODE_GATHER=0 restores the dense mask arm)\n", .{gathered_len});
     }
     return out;
 }
@@ -12125,6 +12358,7 @@ pub const Transformer = struct {
         defer self.allocator.free(kv_lens);
         var kv_max: c_int = 0;
         var any = false;
+        const ratio: c_int = @intCast(self.config.indexer_compress_ratio);
         for (slots, 0..) |sc, i| {
             const e = &sc.ssm_entries.?[layer];
             const cache_len: c_int = @intCast(sc.moe_seq_offset.*);
@@ -12133,6 +12367,16 @@ pub const Transformer = struct {
             defer _ = mlx.mlx_array_free(qk_i);
             try mlx.check(mlx.mlx_slice(&qk_i, qk, &[_]c_int{ i_c, 0, 0 }, 3, &[_]c_int{ i_c + 1, 1, w }, 3, &[_]c_int{ 1, 1, 1 }, 3, self.s));
             masks[i] = try self.qsaMaskFromQk(sc, qk_i, fa, e, cache_len, 0, 1, 1);
+            if (sc.qsa_blocks.ctx != null) {
+                // Decode-width selection is per-slot unusable in the stacked
+                // mask path — expand it to the equivalent dense mask (the same
+                // fallback the serial arm uses when its gatherer declines).
+                const m = try qsaMaskFromBlocks(self.s, sc.qsa_blocks, cache_len + 1, ratio);
+                _ = mlx.mlx_array_free(sc.qsa_blocks);
+                sc.qsa_blocks = .{ .ctx = null };
+                _ = mlx.mlx_array_free(masks[i]);
+                masks[i] = m;
+            }
             kv_lens[i] = cache_len + 1;
             if (kv_lens[i] > kv_max) kv_max = kv_lens[i];
             if (masks[i].ctx != null) any = true;
@@ -12314,9 +12558,18 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(k32);
         try mlx.check(mlx.mlx_astype(&k32, kt, .float32, self.s));
 
-        if (batch == 1 and seq_len >= FUSED256_MIN_Q_LEN and kv > qsaGatherMinKv() and qsaGatherEnabled()) {
+        // Block selection (no dense mask) for prefill widths AND decode width:
+        // at S==1 the same sorted single-row top-k feeds the decode gatherer
+        // in `gatedFullAttnWith`, so a decode step reads O(budget) rows
+        // instead of O(kv). Batched slots each take this branch against their
+        // own history; `qsaMaskBatched` expands per-slot selections back to
+        // masks because the stacked path has no per-slot gather.
+        const want_blocks = batch == 1 and kv > qsaGatherMinKv() and qsaGatherEnabled() and
+            (seq_len >= FUSED256_MIN_Q_LEN or (seq_len == 1 and qsaDecodeGatherEnabled()));
+        if (want_blocks) {
             // Prefill: sorted per-row block indices for the gather kernel;
-            // the dense [S, kv] mask is never built.
+            // the dense [S, kv] mask is never built. Decode (S==1): the same
+            // single-row selection for the decode gatherer.
             const prof = diagEnvOn("QWEN4_PROFILE_QSA");
             var clk: ProfClock = undefined;
             if (prof) {
@@ -14890,7 +15143,13 @@ pub const Transformer = struct {
             // verify widths (and a declined gather) run under the bool mask.
             const ratio: c_int = @intCast(self.config.indexer_compress_ratio);
             var gathered: ?mlx.mlx_array = null;
-            if (ctx.qsa_blocks.ctx != null and !qwen4Standin().attn_sdpa) {
+            if (seq_len == 1 and ctx.qsa_blocks.ctx != null and ctx.qsa_mask.ctx == null and !qwen4Standin().attn_sdpa) {
+                // Decode width: subset triples (or dense rows) → subset
+                // dequant → dense SDPA over K'<<kv. Declines cleanly to the
+                // mask arm below.
+                gathered = try qsaDecodeGatherAttn(self.s, q_rope, &kv_view, ctx.qsa_blocks, ratio, attn_scale);
+            }
+            if (gathered == null and ctx.qsa_blocks.ctx != null and !qwen4Standin().attn_sdpa) {
                 const prof = diagEnvOn("QWEN4_PROFILE_QSA");
                 var clk: ProfClock = undefined;
                 if (prof) {
@@ -35529,6 +35788,159 @@ test "gatherQsa256: block-gathered QSA parity vs composed 'array' SDPA over the 
     try std.testing.expect((try gatherQsa256(s, q, k, v, scale, fx.blocks, 4)) == null);
     qsa_gather_override = true;
     try std.testing.expect((try gatherQsa256(s, q, k, v, scale, ours32, 4)) == null);
+}
+
+test "qsa decode gather: take-then-dequantize equals dequantize-then-take" {
+    // The subset-dequant primitive the decode gatherer is built on: per-token
+    // groups along D make the T axis independent, so gathering rows before or
+    // after dequantization must agree bitwise. Production-like sizes (T=256,
+    // take 64 scattered rows).
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0xdec0de);
+    const rnd = prng.random();
+    const dense = try attn256RandBf16(rnd, &[_]c_int{ 1, 2, 256, 64 }, s);
+    defer _ = mlx.mlx_array_free(dense);
+    var qq = try kv_quant.quantizeAffine(s, dense, 32, 4);
+    defer qq.deinit();
+    const n_take = 64;
+    const idx_host = blk: {
+        var tmp: [n_take]i32 = undefined;
+        var i: usize = 0;
+        while (i < n_take) : (i += 1) tmp[i] = @intCast((i * 37 + 11) % 256);
+        break :blk tmp;
+    };
+    const idx_sh = [_]c_int{n_take};
+    const idx_i32 = mlx.mlx_array_new_data(&idx_host, &idx_sh, 1, .int32);
+    defer _ = mlx.mlx_array_free(idx_i32);
+    // take_axis wants unsigned indices; every id is >= 0 by construction.
+    var idx = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(idx);
+    try mlx.check(mlx.mlx_astype(&idx, idx_i32, .uint32, s));
+    // take-then-dequantize, through the same contiguous helper the decode
+    // gatherer uses (dequantize misreads strided take views).
+    const tq = try takeContig(s, qq.q, idx, 2);
+    defer _ = mlx.mlx_array_free(tq);
+    const ts = try takeContig(s, qq.scales, idx, 2);
+    defer _ = mlx.mlx_array_free(ts);
+    const tb = try takeContig(s, qq.biases, idx, 2);
+    defer _ = mlx.mlx_array_free(tb);
+    // Exact check of the taken packed words against the source rows they
+    // name (u32 — float32 cannot distinguish large packed words; raw pointer
+    // walks go through mlx_contiguous first since a take result need not lay
+    // out densely). This pins the +0-materializer footgun below: an add of a
+    // strided take view reads back wrong, so takeContig uses mlx_contiguous.
+    {
+        var takenc = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(takenc);
+        try mlx.check(mlx.mlx_contiguous(&takenc, tq, false, s));
+        const evx = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(evx);
+        _ = mlx.mlx_vector_array_append_value(evx, takenc);
+        _ = mlx.mlx_vector_array_append_value(evx, qq.q);
+        try mlx.check(mlx.mlx_eval(evx));
+        const td = mlx.mlx_array_data_uint32(takenc) orelse return error.TestUnexpectedNullData;
+        const qd = mlx.mlx_array_data_uint32(qq.q) orelse return error.TestUnexpectedNullData;
+        var bad: usize = 0;
+        for (0..2) |h| {
+            for (0..n_take) |i| {
+                const src_row: usize = @intCast(idx_host[i]);
+                for (0..8) |w| {
+                    if (td[(h * n_take + i) * 8 + w] != qd[(h * 256 + src_row) * 8 + w]) bad += 1;
+                }
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 0), bad);
+    }
+    const sub = try kv_quant.dequantizeAffine(s, tq, ts, tb, 32, 4);
+    defer _ = mlx.mlx_array_free(sub);
+    const full = try kv_quant.dequantizeAffine(s, qq.q, qq.scales, qq.biases, 32, 4);
+    defer _ = mlx.mlx_array_free(full);
+    var want = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(want);
+    try mlx.check(mlx.mlx_take_axis(&want, full, idx, 2, s));
+    // Compare through explicit contiguous copies on BOTH sides: the shared
+    // comparator's +0 materializer may itself misread the strided take view.
+    var subc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(subc);
+    try mlx.check(mlx.mlx_contiguous(&subc, sub, false, s));
+    var wantc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wantc);
+    try mlx.check(mlx.mlx_contiguous(&wantc, want, false, s));
+    const diff = try maxAbsDiffF32(subc, wantc, s);
+    std.debug.print("[qsa-take-dequant] max abs diff {d}\n", .{diff});
+    try std.testing.expectEqual(@as(f32, 0), diff);
+}
+
+test "qsa decode gather: subset SDPA matches masked full SDPA at decode width" {
+    // End-to-end parity for `qsaDecodeGatherAttn` on synthetic geometry:
+    // same selection + tail, ascending order, causal-visible by construction.
+    // Remaining deltas are kernel tiling order only.
+    const s = mlx.gpuStream();
+    qsa_decode_gather_override = true;
+    defer qsa_decode_gather_override = null;
+    var prng = std.Random.DefaultPrng.init(0x60d31);
+    const rnd = prng.random();
+    const kL: c_int = 50;
+    const kb: c_int = 3;
+    const ratio: c_int = 4;
+    const q_shape = [_]c_int{ 1, 4, 1, 64 };
+    const kv_shape = [_]c_int{ 1, 2, kL, 64 };
+    const q = try attn256RandBf16(rnd, &q_shape, s);
+    defer _ = mlx.mlx_array_free(q);
+    const k_dense = try attn256RandBf16(rnd, &kv_shape, s);
+    defer _ = mlx.mlx_array_free(k_dense);
+    const v_dense = try attn256RandBf16(rnd, &kv_shape, s);
+    defer _ = mlx.mlx_array_free(v_dense);
+    var fx = try QsaBlockFixture.build(rnd, 1, kL, kb, ratio);
+    defer fx.deinit();
+    const scale: f32 = 1.0 / 8.0;
+
+    // Quant path: the view carries affine 4-bit triples AND dense arrays.
+    var kq = try kv_quant.quantizeAffine(s, k_dense, 32, 4);
+    defer kq.deinit();
+    var vq = try kv_quant.quantizeAffine(s, v_dense, 32, 4);
+    defer vq.deinit();
+    var view = DenseKVView{
+        .k = k_dense,
+        .v = v_dense,
+        .owned = false,
+        .k_triple_q = kq.q,
+        .k_triple_scales = kq.scales,
+        .k_triple_biases = kq.biases,
+        .v_triple_q = vq.q,
+        .v_triple_scales = vq.scales,
+        .v_triple_biases = vq.biases,
+        .has_quant_triple = true,
+        .bits = 4,
+        .group_size = 32,
+    };
+    const got = (try qsaDecodeGatherAttn(s, q, &view, fx.blocks, ratio, scale)) orelse return error.GatherDeclined;
+    defer _ = mlx.mlx_array_free(got);
+    // Reference: masked SDPA over the dense dequantized full KV (what the
+    // mask arm computes, up to its own kernel tiling).
+    const dk_full = try kv_quant.dequantizeAffine(s, kq.q, kq.scales, kq.biases, 32, 4);
+    defer _ = mlx.mlx_array_free(dk_full);
+    const dv_full = try kv_quant.dequantizeAffine(s, vq.q, vq.scales, vq.biases, 32, 4);
+    defer _ = mlx.mlx_array_free(dv_full);
+    const ref = try attn256Reference(q, dk_full, dv_full, scale, "array", fx.mask, s);
+    defer _ = mlx.mlx_array_free(ref);
+    const diff = try attn256MaxDiff(got, ref, s);
+    std.debug.print("[qsa-decode-gather] quant path max diff {d:.6}\n", .{diff});
+    try std.testing.expect(diff < 0.01);
+
+    // Dense path (no triple): same answer off the dense rows.
+    var dview = DenseKVView{ .k = k_dense, .v = v_dense, .owned = false };
+    const got_dense = (try qsaDecodeGatherAttn(s, q, &dview, fx.blocks, ratio, scale)) orelse return error.GatherDeclined;
+    defer _ = mlx.mlx_array_free(got_dense);
+    const ref_dense = try attn256Reference(q, k_dense, v_dense, scale, "array", fx.mask, s);
+    defer _ = mlx.mlx_array_free(ref_dense);
+    const diff_dense = try attn256MaxDiff(got_dense, ref_dense, s);
+    std.debug.print("[qsa-decode-gather] dense path max diff {d:.6}\n", .{diff_dense});
+    try std.testing.expect(diff_dense < 0.01);
+
+    // Kill switch + wrong-dtype blocks decline to the mask arm.
+    qsa_decode_gather_override = false;
+    try std.testing.expect((try qsaDecodeGatherAttn(s, q, &view, fx.blocks, ratio, scale)) == null);
 }
 
 test "splitMaskedSdpa256: verify-width array-mask rows split through the vector kernel match one dispatch" {

@@ -4355,7 +4355,7 @@ Ours built the dense `[1,1,S,kv]` bool mask (`qsaMaskFromQk`: block expand → t
 What shipped:
 
 - `msv_attn_qsa256` (`gatherQsa256`, kill switch `MLX_SERVE_QSA_GATHER=0`): one threadgroup per (query token, kv head, batch); the token's 12 GQA heads are the tile rows (NSG = ceil(gqa/8) simdgroups), keys are gathered by the token's sorted block list (`blocks[b, s, :]`, RATIO tokens each, INT_MAX past the row's count) followed by its own incomplete tail. Same fragment math, transposed K staging and fp32 online softmax as p256. BK is a template arg; 16 and 32 measured identical (~75 ms per 4096-row chunk-layer), 32 is the default.
-- `qsaSelectBlocks`: argpartition on the visibility-masked scores → `take_along_axis` on the visibility → INT_MAX where invisible → `sort`. Row-chunked (`qsaScoreRowsPerChunk`, `QSA_SCORE_SHEET_BUDGET` 256 MB) so the `[n_idx, rows, nb]` f32 sheet is bounded. Decode/verify widths (S < 16) and batched decode keep the dense mask path; a declined gather expands the selection with `qsaMaskFromBlocks` (also the fixture trace's mask at layer 3).
+- `qsaSelectBlocks`: argpartition on the visibility-masked scores → `take_along_axis` on the visibility → INT_MAX where invisible → `sort`. Row-chunked (`qsaScoreRowsPerChunk`, `QSA_SCORE_SHEET_BUDGET` 256 MB) so the `[n_idx, rows, nb]` f32 sheet is bounded. Verify widths (S 2..15) keep the dense mask path; decode S==1 is `qsaDecodeGatherAttn` (next story); batched decode expands per-slot selections with `qsaMaskFromBlocks`. A declined gather expands the same way (also the fixture trace's mask at layer 3).
 - `server.qsaMaskBytes` bills the bounded sheet at prefill widths, the old `4 B x rows x keys` below 16 rows.
 
 Measured (M4 Max, 4-bit pack, warm, same boot type, natural 38k prompt): gather 55.1 s (692 tok/s) vs mask arm 67.0 s (568 tok/s). Same-session llmprobe ladder, 26.8.11 app binary vs the tree (prefill tok/s): 512 545/532, 4k 784/742, 8k 753/728, 16k 681/707, 32k 589/699, 64k 479/681; single-prompt 128k 395/654, 256k 267/551 (the app needed 954 s for 254k tokens). The 4-8k dip is structural (the gather reads 2051 rows per token with no sharing; the mask arm at kv ≤ 8k reads ≤ kv rows per 64-row tile), so chunks at kv ≤ 8192 keep the mask arm (`QSA_GATHER_MIN_KV_DEFAULT`, `MLX_SERVE_QSA_GATHER_MIN_KV`); a 38k prompt is unchanged by the threshold (55.3 s). The comparison chart that prompted this (mlx 1210 @ 8k) is from ANOTHER machine: no bench artifact or llmprobe card on this box ever exceeded ~800 prefill on flash-next, and our own Aug-28 26.8.11 column reads 685 @ 8k — today's app run (753) was FASTER. Cross-machine charts set the shape of the curve, never the absolute bar. With attention stood in (`QWEN4_STANDIN=attn_sdpa`) the prompt takes 46.8 s, so attention went from ~20 s to 8.9 s (`QWEN4_PROFILE_QSA=1`: gather 53 ms at kv 4k, 71 ms at 8k, 75-79 ms flat to 37k per chunk-layer; selection 1.4 s per prompt). What is left past the flat attention term is the trunk itself (GDN + MoE + PLE + MTP-head history), not QSA.
@@ -4366,6 +4366,25 @@ Two traps met on the way:
 - `QWEN4_STANDIN=attn_qsa` is not a "no indexer" meter: with the indexer stood in there is no selection, the QSA branch is skipped, and the layer runs DENSE causal attention over the whole cache (67 s at 38k, slower than with QSA). Time the selection in-process instead (`[qsa-prof] select`).
 
 Hermetic bar: `gatherQsa256: block-gathered QSA parity vs composed 'array' SDPA over the expanded mask` (gqa 12, rows straddling the every-block-fits boundary, sentinel rows, both tiles, the expansion helper equal to the host-built mask). The qwen4 text + vision fixtures run T=20/T=28 prefills through the gather path (layer-3 mask EXACT, cos > 0.9999).
+
+## qwen4 QSA decode: dense mask + full-KV SDPA, O(kv) per step (2026-09-03)
+
+Prefill gather flattened the prompt curve; decode still collapsed 47.5 → 10.7 tok/s from 16k → 384k. At S==1 `qsaMaskFromQk` built a dense bool mask and `gatedFullAttnWith` ran full-KV SDPA. The QSA branch (`qsa_mask`/`qsa_blocks` set) also skipped `qkvAttnDecodeKernel` entirely — so even `--kv-quant 8 --kv-attn-mode auto` dequantized every cache row every step.
+
+`qsaDecodeGatherAttn` (default on, `MLX_SERVE_QSA_DECODE_GATHER=0` restores the mask arm) reuses the same sorted top-k (`qsaSelectBlocks`, same `QSA_GATHER_MIN_KV` floor as prefill) and expands selection + incomplete tail to ascending token indices, gathers those rows from the affine 4/8-bit triples (dequantizing ONLY the ~2k subset) or dense rows, then dense SDPA under an additive validity mask. Prefill, verify widths, MTP verify, and below-budget dense are untouched. Batched slots still expand to masks (`qsaMaskBatched`) — the stacked path has no per-slot gather.
+
+Locked serial ladder (`--kv-quant 8 --kv-attn-mode auto --no-mtp --no-pld --no-drafter`, temp 0, 32 tokens; only the env gate differs):
+
+| ctx | ON | OFF | speedup |
+|---|---|---|---|
+| 32k | 51.3 | 40.8 | 1.26× |
+| 64k | 48.7 | 32.9 | 1.48× |
+| 128k | 46.1 | 23.5 | 1.96× |
+| 256k | 40.9 | 14.6 | 2.80× |
+
+ON is ~flat (51→41); OFF collapses (41→15). Residual ON slope is the indexer (still O(kv/ratio) over pooled blocks), not attention. Parity: unit subset-SDPA vs masked-full-SDPA max diff 0.000000 (quant and dense); take-then-dequant bit-exact. Live 32k logprobs: top-1 32/32, identical completions, max|dlogprob| 0.24 — inside the pre-existing prefill gather-vs-mask envelope (17/32, dlogprob 1.16).
+
+Two footguns: `mlx_take_axis` needs unsigned indices (int32 aborts); quantized kernels misread strided take views (`takeContig` uses `mlx_contiguous`, not `+0`).
 
 ## QSA scalar RoPE skipped YaRN mscale; partial rotary ranking can flip (2026-09-01)
 
