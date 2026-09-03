@@ -4535,3 +4535,74 @@ The coarse head builds LAZILY on the first draft: `loadQwen4Mtp` runs while the 
 Owed: `MTP_EV_G17_NAX_QWEN4_Q4_GS64_COSTS` was fitted with the full-vocab draft in the round, so its `draft` term is now stale and the surface needs a refit — see the rule about refitting EV cost tables whenever the verify forward changes; this is the same hazard on the draft side.
 
 2-bit is what the sidecar scheme was measured at and is the obvious second arm, untried here.
+
+## The round-cost table's `tok` column is a workload mixture — and planning around it lost anyway (2026-09-04, qwen4_exp, M5 Max)
+
+**The complaint.** llmprobe `spec:predictable` on the user's own serving config
+(`--ctx-size 1048576 --kv-quant 8 --mtp --prefix-cache-disk 100GB`, qwen4_exp
+mixed-4/8-bit) alternated between ~111 and ~154 tok/s on near-identical prompts,
+ratio 1.56 where a clean-table boot reads 2.0+.
+
+**The diagnosis that looked obvious.** `mtpEvPlanSrc` planned the base depth with
+`src.measuredTokens(m) orelse mtpEvExpectedTokens(a, m)`: whenever a cell was
+trusted, tokens-per-round came from the table's `tok` EMA. That EMA is a WORKLOAD
+MIXTURE — the same width serves prose, code and tool echo, and the cell holds
+whatever ran last. The user's live `<2k` bucket read w1 1.82 tok / 22.5 ms next to
+w6 6.00 / 45.6 (three samples), and the `32k+` w1 cell 1.97 over 8299 samples.
+Nothing in that column answers "what would THIS request emit", which is exactly
+what the per-request acceptance surface `a` tracks (`mtpEvObserve` updates it every
+round; the qwen4 EV seed carries it between requests).
+
+**Two things had to change together.** Tokens from `a` alone move nothing, because
+the standing-base hysteresis only ever scores `m_lo + 1`: on this cost curve the
+neighbouring widths are 3-5% apart in tok/ms, all under `SWITCH_MARGIN` (5%), while
+w1 → w5 is 21%. A hermetic climb sim from base 1 stays at 1 forever. So the
+acceptance arm also scores every width up to the cap and steps ONE width toward the
+winner (demotions stay undamped). Both were prototyped together (`MtpCostSource.plan_accept`, parked on branch
+`worktree-agent-aa9edbab88d74a850`, commit 403bd1f); nothing shipped.
+
+**The A/B: cand lost the bar.** Four boots, order cand/main/main/cand, the live
+persisted table restored byte-identical before every boot, 100 s thermal settle
+after ready and after each kill, `npx llmprobe --bench-only`:
+
+| boot | arm | decode | spec ratio | predictable | novel | tok/step |
+|---|---|---|---|---|---|---|
+| 1 | cand | 96.1 | 1.85 | 113.1 | 61.0 | 3.75 |
+| 2 | main | 91.8 | 2.02 | 137.2 | 67.8 | 5.00 |
+| 3 | main | 94.2 | 1.51 | 105.3 | 69.7 | 2.86 |
+| 4 | cand | 97.7 | 1.67 | 108.6 | 65.0 | 3.53 |
+
+Bar was "higher predictable AND ratio in BOTH pairings, novel within 2%". Cand won
+pairing 2 and lost pairing 1, and novel was 4-10% LOWER in both. Not shipped.
+
+**What the logs say, and why the premise was half wrong.** `[spec-stats]` per
+predictable probe (`user=368b`, "Repeat the following passage exactly"), with the
+`<2k` table cells beside it:
+
+- main, boot 2: `avg_per_round=4.42 attempts=12 ext_rounds=9`; boot 3:
+  `avg_per_round=1.86 attempts=22 ext_rounds=19`. In BOTH the only `<2k` cell whose
+  sample count moves is w1 — the base never leaves 1 all boot. Predictable
+  throughput on the shipped plan is produced entirely by the EXTENSION horizon
+  (two-chunk rounds never feed the table), and the 111-vs-154 alternation is that
+  horizon flapping: same binary, same restored table, 4.42 vs 1.86 accepted per
+  round.
+- cand: `avg_per_round=2.82 attempts=17 ext_rounds=4`, w4's sample count climbing
+  every request. The acceptance arm does what it was asked to do — it lifts the
+  BASE to 4 — and a higher `best_r` then closes the horizon sooner (`cond <=
+  best_r * mc`). Trading a bimodal 105/137 for a tight 109/113 is a real change in
+  variance and a small loss in level.
+
+**Rules that came out of it.**
+
+- The base depth was never the lever on this arch: `m_lo` sat at 1 in every shipped
+  boot, and what moves predictable tok/s is `tau` and the regime gate. A planner
+  fix aimed at `m_lo` cannot address a horizon bug, and the acceptance model makes
+  the horizon SHORTER by raising the ratio it is compared against.
+- Novel prose is where a per-request token model costs: the acceptance EMA enters a
+  request at the seed/prior and takes rounds to fall, while the table's w1 mixture
+  cell was already prose-shaped (most of the mixture IS prose). Cand's novel rounds
+  cost 25.4 ms against 23.2 for the same ~0.6 accepted.
+- An engine-level A/B on a bistable path needs pairings, not a single boot: main's
+  own two boots differ by 30% on predictable, which is larger than any effect
+  measured here. The persisted table must be restored before EVERY boot (not
+  disabled — the live table IS the subject) or the arms teach each other.
