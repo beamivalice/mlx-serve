@@ -6176,8 +6176,10 @@ pub const ForwardCtx = struct {
     /// that is still a lazy sample. With `ple_defer` set, `pleEmbedding` hands
     /// the graph an unfilled leaf and records it here; the caller fills it via
     /// `Transformer.flushDeferredPle` (syncing on the token THEN) right before
-    /// the graph is evaluated. Set only by `generate.lazyForward`; a forward
-    /// evaluated with `ple_pending` still set reads zero rows.
+    /// the graph is evaluated. Set by `generate.lazyForward` (decode) and by
+    /// the MTP verify build in `Generator.nextMtp` (whose `[1, 1+m]` input is
+    /// the still-lazy draft chain); a forward evaluated with `ple_pending`
+    /// still set reads zero rows.
     ple_defer: bool = false,
     ple_pending: ?PlePending = null,
 };
@@ -6188,6 +6190,12 @@ pub const PlePending = struct {
     entry: *SSMCacheEntry,
     layer: usize,
     seq_len: c_int,
+    /// Whether the gather owes `entry.spec_ple_tokens` the verify history.
+    /// Decided (and `spec_ple_len` claimed) at BUILD time: the PLE layer's own
+    /// conv capture, later in the same forward, keys on `spec_ple_len` while
+    /// this gather has not run yet, and `spec_capture_ssm` is already back to
+    /// false by the time the flush happens.
+    capture: bool,
 };
 
 // ── Decode quantized-KV attention kernel (docs/kv-quant-perf.md) ──
@@ -12159,6 +12167,8 @@ pub const Transformer = struct {
         // mid-graph eval, no GPU sync inside the layer loop.
         const pk = try self.allocator.alloc(u16, n * emb_dim);
         defer self.allocator.free(pk);
+        // The batched arm keeps its history per SLOT and never captures.
+        const capture = ctx.batch_slots == null and self.pleClaimSpecCapture(entry, n);
         if (ctx.ple_defer and ctx.batch_slots == null) {
             std.debug.assert(ctx.ple_pending == null);
             @memset(pk, 0);
@@ -12167,11 +12177,27 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_array_set(&emb_ref, emb));
             var ids_ref = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_array_set(&ids_ref, token_ids));
-            ctx.ple_pending = .{ .emb = emb_ref, .token_ids = ids_ref, .entry = entry, .layer = layer, .seq_len = seq_len };
+            ctx.ple_pending = .{ .emb = emb_ref, .token_ids = ids_ref, .entry = entry, .layer = layer, .seq_len = seq_len, .capture = capture };
             return emb;
         }
-        try self.pleGatherBf16(ctx, token_ids, entry, layer, seq_len, pk);
+        try self.pleGatherBf16(ctx, token_ids, entry, layer, seq_len, pk, capture);
         return mlx.mlx_array_new_data(pk.ptr, &shape, 3, .bfloat16);
+    }
+
+    /// Claim (or clear) `entry`'s fixed spec-PLE token slot for a gather of
+    /// `n` ids, reporting whether the verify history fits it. ONE predicate
+    /// for the eager and the deferred arm: with `ple_defer` the gather that
+    /// would set `spec_ple_len` runs AFTER the PLE layer's conv capture, which
+    /// keys on it — so the length is claimed here, at build time, and the
+    /// gather only fills the tokens.
+    fn pleClaimSpecCapture(self: *Transformer, entry: *SSMCacheEntry, n: usize) bool {
+        const ctx_len: usize = self.qwen4.?.hash.ngram_size - 1;
+        if (self.spec_capture_ssm and ctx_len + n <= entry.spec_ple_tokens.len) {
+            entry.spec_ple_len = @intCast(ctx_len + n);
+            return true;
+        }
+        entry.spec_ple_len = 0;
+        return false;
     }
 
     /// Fill the leaf a `ple_defer` forward was built on: the token ids are
@@ -12187,22 +12213,26 @@ pub const Transformer = struct {
         }
         const dst = mlx.mlx_array_data_bfloat16(p.emb) orelse return error.PleLeafUnreadable;
         const out: [*]u16 = @constCast(dst);
-        try self.pleGatherBf16(ctx, p.token_ids, p.entry, p.layer, p.seq_len, out[0..mlx.mlx_array_size(p.emb)]);
+        try self.pleGatherBf16(ctx, p.token_ids, p.entry, p.layer, p.seq_len, out[0..mlx.mlx_array_size(p.emb)], p.capture);
     }
 
     /// Drop a pending leaf without filling it (the forward that built on it
-    /// is being abandoned).
+    /// is being abandoned). The spec-PLE slot the build claimed is released
+    /// too — no gather ever filled its tokens.
     pub fn discardDeferredPle(_: *Transformer, ctx: *ForwardCtx) void {
         const p = ctx.ple_pending orelse return;
         ctx.ple_pending = null;
+        p.entry.spec_ple_len = 0;
         _ = mlx.mlx_array_free(p.emb);
         _ = mlx.mlx_array_free(p.token_ids);
     }
 
     /// The host side of the n-gram PLE embedding: token ids → hashed rows →
     /// gathered + bf16-packed into `pk` (`[n][emb_dim]`), advancing the
-    /// entry's n-gram history.
-    fn pleGatherBf16(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array, entry: *SSMCacheEntry, layer: usize, seq_len: c_int, pk: []u16) !void {
+    /// entry's n-gram history. `capture` comes from `pleClaimSpecCapture` at
+    /// BUILD time (never re-read off `spec_capture_ssm`, which a deferred
+    /// flush sees already cleared).
+    fn pleGatherBf16(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array, entry: *SSMCacheEntry, layer: usize, seq_len: c_int, pk: []u16, capture: bool) !void {
         const st = self.qwen4.?;
         const ctx_len: usize = st.hash.ngram_size - 1;
         // Draft ids arrive as lazy graphs of whatever dtype the sampler
@@ -12234,7 +12264,8 @@ pub const Transformer = struct {
         } else {
             var prev: [8]u32 = @splat(st.hash.eos);
             if (entry.ple_prev_valid) prev = entry.ple_prev;
-            if (self.spec_capture_ssm and ctx_len + n <= entry.spec_ple_tokens.len) {
+            if (capture) {
+                std.debug.assert(ctx_len + n <= entry.spec_ple_tokens.len);
                 for (0..ctx_len) |i| entry.spec_ple_tokens[i] = prev[i];
                 for (0..n) |i| entry.spec_ple_tokens[ctx_len + i] = ids[i];
                 entry.spec_ple_len = @intCast(ctx_len + n);
@@ -39660,7 +39691,7 @@ test "qwen4 batched decode: one forwardMoeBatchedDecode tick == two serial ticks
     try testing.expect(pooled);
 }
 
-test "qwen4 deferred PLE: a pipelined decode step matches the direct forward (QWEN4_TEST_MODEL)" {
+test "qwen4 deferred PLE: pipelined decode AND MTP verify widths match the direct forward (QWEN4_TEST_MODEL)" {
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const allocator = testing.allocator;
@@ -39744,6 +39775,62 @@ test "qwen4 deferred PLE: a pipelined decode step matches the direct forward (QW
         const b = try qwen4ReadF32(allocator, ll, s);
         defer allocator.free(b);
         try testing.expectEqualSlices(f32, a, b);
+    }
+
+    // Verify-width arm: an MTP round builds `[1, 1+m]` over a chain of LAZY
+    // drafts with per-position SSM capture on. Deferred must match eager in
+    // logits AND in the rollback state the capture leaves behind — the PLE
+    // layer's own conv capture runs later in the same forward and keys on
+    // `spec_ple_len`, which the deferred gather has not written yet.
+    {
+        const rows = [_]i32{ 13, 6, 27, 3, 19, 40, 12 };
+        for ([_]usize{ 4, 7 }) |w| {
+            const vshape = [_]c_int{ 1, @intCast(w) };
+            const vids = mlx.mlx_array_new_data(&rows, &vshape, 2, .int32);
+            defer _ = mlx.mlx_array_free(vids);
+
+            dctx.capture_ssm_seq = true;
+            const dl = try xfm.forwardWith(&dctx, vids);
+            defer _ = mlx.mlx_array_free(dl);
+            dctx.capture_ssm_seq = false;
+
+            lctx.capture_ssm_seq = true;
+            lctx.ple_defer = true;
+            const ll = try xfm.forwardWith(&lctx, vids);
+            defer _ = mlx.mlx_array_free(ll);
+            lctx.ple_defer = false;
+            lctx.capture_ssm_seq = false;
+            try testing.expect(lctx.ple_pending != null);
+            try xfm.flushDeferredPle(&lctx);
+            try testing.expect(lctx.ple_pending == null);
+
+            const a = try qwen4ReadF32(allocator, dl, s);
+            defer allocator.free(a);
+            const b = try qwen4ReadF32(allocator, ll, s);
+            defer allocator.free(b);
+            try testing.expectEqualSlices(f32, a, b);
+
+            var saw_ple = false;
+            for (direct.entries, deferred.entries) |*de, *le| {
+                try testing.expectEqual(de.spec_ple_len, le.spec_ple_len);
+                try testing.expectEqual(de.ple_prev_valid, le.ple_prev_valid);
+                try testing.expectEqualSlices(u32, &de.ple_prev, &le.ple_prev);
+                // A deferred gather that never claimed the slot leaves this
+                // null while eager holds a capture: `ssmRollbackFromCapture`
+                // would then silently take the non-PLE branch.
+                try testing.expectEqual(de.spec_ple_input.ctx == null, le.spec_ple_input.ctx == null);
+                if (de.spec_ple_len > 0) {
+                    saw_ple = true;
+                    try testing.expect(de.spec_ple_len >= @as(u32, @intCast(w)));
+                    const n: usize = de.spec_ple_len;
+                    try testing.expectEqualSlices(u32, de.spec_ple_tokens[0..n], le.spec_ple_tokens[0..n]);
+                    try testing.expect(de.spec_ple_input.ctx != null);
+                }
+            }
+            try testing.expect(saw_ple);
+            for (direct.entries) |*e| ssmFreeSpecCapture(e);
+            for (deferred.entries) |*e| ssmFreeSpecCapture(e);
+        }
     }
 
     // Load-bearing arm: an unflushed leaf is NOT the direct forward.

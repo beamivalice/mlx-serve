@@ -5115,7 +5115,21 @@ pub const Generator = struct {
         }
         // Captures the post-final-norm hidden at the LAST position (next
         // round's h_prev) AND all 1+m positions (history re-append).
-        const verify_logits = try xfm.forwardWithCaptureAll(&self.ctx, verify_input, &new_hidden, &verify_hidden_all);
+        //
+        // qwen4_exp: the n-gram PLE at trunk layer 1 is a HOST gather keyed on
+        // these ids, and every id past t1 is still a lazy draft — gathering
+        // eagerly parks the build of layers 2..N behind the whole draft chain
+        // finishing on the GPU. Defer the leaf so the graph builds while the
+        // chain runs, then sync ONCE (`flushDeferredPle`, below) before Phase
+        // 4 evaluates anything. Other arches never set `ple_pending`.
+        self.ctx.ple_defer = true;
+        const verify_logits = xfm.forwardWithCaptureAll(&self.ctx, verify_input, &new_hidden, &verify_hidden_all) catch |e| {
+            self.ctx.ple_defer = false;
+            self.ctx.capture_ssm_seq = false;
+            xfm.discardDeferredPle(&self.ctx);
+            return e;
+        };
+        self.ctx.ple_defer = false;
         self.ctx.capture_ssm_seq = false;
         // Always free the transient capture buffers before returning, however
         // we exit this round (full accept, partial accept, or error).
@@ -5128,6 +5142,11 @@ pub const Generator = struct {
             self.mtp_trace.add(.verify, ph.read());
             ph.reset();
         }
+        // Fill the deferred PLE leaf: the one host read of the verify ids, and
+        // the point at which the entry's n-gram history + `spec_ple_tokens`
+        // advance. Must precede BOTH the first eval of anything downstream of
+        // the leaf (Phase 4) and `ssmRollbackFromCapture` (Phase 5).
+        try xfm.flushDeferredPle(&self.ctx);
 
         // ── Phase 4: decide longest accepted prefix ──
         // Stochastic path is fully BATCHED: accept probabilities for every
@@ -12673,6 +12692,35 @@ test "vision prefill chunks by default and the splice offset feeds every prefill
     const first = std.mem.indexOf(u8, src, set_off) orelse return error.ChunkOffsetMissing;
     try testing.expect(std.mem.indexOfPos(u8, src, first + 1, set_off) != null); // final-span site too
     try testing.expect(std.mem.indexOf(u8, src, "vision_rows_consumed += countSplice" ++ "Rows(") != null);
+}
+
+test "MTP verify forward defers the PLE gather" {
+    // Source scan: on qwen4_exp the n-gram PLE at trunk layer 1 is a HOST
+    // gather keyed on the verify ids, and every id past t1 is still a lazy
+    // draft — an eager gather parks the build of layers 2..N behind the whole
+    // draft chain finishing on the GPU. The verify build must therefore run
+    // with `ple_defer` armed, hand the leaf back on the error path, and flush
+    // it (the round's one host sync) before Phase 4 evaluates anything or
+    // Phase 5 rolls the n-gram history back.
+    const src = @embedFile("generate.zig");
+    const build = "xfm.forwardWithCaptureAll(&self.ctx, verify" ++ "_input, &new_hidden, &verify_hidden_all)";
+    const at = std.mem.indexOf(u8, src, build) orelse return error.VerifyBuildMissing;
+
+    // Armed immediately before the build, disarmed right after it.
+    const arm = "self.ctx.ple" ++ "_defer = true;";
+    const arm_at = std.mem.lastIndexOf(u8, src[0..at], arm) orelse return error.PleDeferNotArmed;
+    try testing.expect(at - arm_at < 600); // the comment block, nothing else
+    const disarm = "self.ctx.ple" ++ "_defer = false;";
+    try testing.expect(std.mem.indexOfPos(u8, src, at, disarm) != null);
+    // The build's error path hands the unfilled leaf back.
+    const discard = "xfm.discardDeferred" ++ "Ple(&self.ctx);";
+    const discard_at = std.mem.indexOfPos(u8, src, at, discard) orelse return error.PleDiscardMissing;
+    try testing.expect(discard_at - at < 400);
+    // The flush follows the build and precedes Phase 4 (the first eval).
+    const flush = "try xfm.flushDeferred" ++ "Ple(&self.ctx);";
+    const flush_at = std.mem.indexOfPos(u8, src, at, flush) orelse return error.PleFlushMissing;
+    const phase4 = std.mem.indexOfPos(u8, src, at, "// ── Phase 4:") orelse return error.Phase4Missing;
+    try testing.expect(flush_at < phase4);
 }
 
 test "MtpTrace per-index acceptance: index i counts only rounds that drafted it" {
