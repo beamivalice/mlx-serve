@@ -1,6 +1,11 @@
 const std = @import("std");
 const dsv4_mod = @import("deepseek_v4.zig");
 const qwen4_mod = @import("qwen4_exp.zig");
+// The qwen4_exp MTP head shares the sidecar head's draft-rerank scheme
+// (`mtp.rerankSelect` + `QLinear`), which reads only the TARGET's lm_head and
+// so has no head-shaped state of its own. mtp.zig imports this file back for
+// `Transformer`; neither type closes a comptime loop.
+const mtp_mod = @import("mtp.zig");
 const mlx = @import("mlx.zig");
 const mrope = @import("mrope.zig");
 const kv_quant = @import("kv_quant.zig");
@@ -5459,6 +5464,16 @@ pub const Qwen4Mtp = struct {
     /// reset starts a new REQUEST, which is precisely who should inherit it.
     ev_seed_accept: ?[MTP_EV_SEED_DEPTH]f32 = null,
     ev_seed_m_lo: u32 = 1,
+    /// Draft rerank (`mtp.rerankSelect`): a low-bit copy of the TRUNK lm_head
+    /// that shortlists 32 candidates, which the real head then re-scores. Built
+    /// LAZILY on the first draft — `loadQwen4Mtp` runs while the Transformer is
+    /// still under construction and `lm_head_w` is not assigned yet. `tried`
+    /// makes the refusal one-shot; a null `rerank` after it means the full
+    /// readout is this head's draft path.
+    rerank: ?mtp_mod.QLinear = null,
+    rerank_rows: c_int = 0,
+    rerank_logged: bool = false,
+    rerank_tried: bool = false,
 };
 
 const LinearAttnWeights = struct {
@@ -8748,6 +8763,7 @@ pub const Transformer = struct {
             _ = mlx.mlx_array_free(m.entry.ssm_state);
             if (m.entry.aux_state.ctx != null) _ = mlx.mlx_array_free(m.entry.aux_state);
             if (m.entry.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(m.entry.qsa_pooled);
+            if (m.rerank) |*rc| rc.deinit();
             self.qwen4_mtp = null;
         }
         if (self.qwen4) |st| {
@@ -13088,7 +13104,17 @@ pub const Transformer = struct {
     /// stream at positions p.., `token_ids` `[B,S]` the tokens at p+1.., and
     /// `pos_offset` = p+1 of the first row (the draft query's own position).
     /// Returns `[B,S,V]` logits for positions p+2... Caller frees.
-    pub const Qwen4MtpOut = struct { logits: mlx.mlx_array, stream: mlx.mlx_array };
+    /// `logits` is the last-row projection (null unless `.all_rows`/`.last_row`),
+    /// `stream` the pre-mixer hyper-connection stream the next chain step reads,
+    /// and `mixed` the MIXER output — the vector the lm_head consumes — which
+    /// only `.mixed_last_row` fills. The three are distinct spaces: `stream` is
+    /// `[B,S,hc*H]`, `mixed` is `[B,1,H]`, and handing the wrong one to the
+    /// lm_head is a silent shape error, not a wrong answer.
+    pub const Qwen4MtpOut = struct {
+        logits: mlx.mlx_array,
+        stream: mlx.mlx_array,
+        mixed: mlx.mlx_array = .{ .ctx = null },
+    };
 
     /// What `qwen4MtpForward` owes its caller past the head's own layer. The
     /// mixer read + the 248320-wide lm_head run over whatever rows `stream`
@@ -13105,6 +13131,11 @@ pub const Transformer = struct {
         /// No logits at all (history append): mixer + lm_head are skipped and
         /// `logits` comes back null; `stream` is the full `[B,S,hc*H]`.
         none,
+        /// The LAST row's mixer output in `mixed`, and NO lm_head: the draft
+        /// rerank path shortlists through its own coarse head, so the 248320-
+        /// wide projection — 675 MB, the single biggest read in a draft step —
+        /// never runs. `logits` comes back null; `stream` is the last row.
+        mixed_last_row,
     };
 
     /// Truncate the head's committed history to `len` rows.
@@ -13212,7 +13243,7 @@ pub const Transformer = struct {
         // Last-row-only: cut `h` HERE, so the mixer + lm_head see one row
         // instead of S. Same values as slicing the outputs afterwards.
         var out_seq: c_int = seq_len;
-        if (project == .last_row and seq_len > 1) {
+        if ((project == .last_row or project == .mixed_last_row) and seq_len > 1) {
             const hs = mlx.getShape(h);
             var h_last = mlx.mlx_array_new();
             errdefer _ = mlx.mlx_array_free(h_last);
@@ -13234,9 +13265,48 @@ pub const Transformer = struct {
 
         const mix = try self.hcRead(h, &m.mixer, batch, out_seq);
         if (mix.inj.ctx != null) _ = mlx.mlx_array_free(mix.inj);
+        // Rerank draft: the mixer output IS the answer. Skipping
+        // `lmHeadProject` here is the whole point — the 248320-wide 8-bit
+        // projection is 675 MB, more than every other read in a draft step put
+        // together, and a greedy draft only ever needed its argmax.
+        if (project == .mixed_last_row) {
+            return .{ .logits = .{ .ctx = null }, .stream = h, .mixed = mix.mixed };
+        }
         defer _ = mlx.mlx_array_free(mix.mixed);
         const logits = try self.lmHeadProject(mix.mixed, false);
         return .{ .logits = logits, .stream = h };
+    }
+
+    /// Is the qwen4_exp head's draft rerank available? Builds the coarse head
+    /// on first ask (the load path runs before `lm_head_w` is assigned), and
+    /// caches the refusal so an ineligible head probes once. False keeps the
+    /// full-vocab draft projection — today's behaviour, and what
+    /// MLX_SERVE_MTP_DRAFT_RERANK=0 restores.
+    pub fn qwen4DraftRerankReady(self: *Transformer) bool {
+        const m = &(self.qwen4_mtp orelse return false);
+        if (m.rerank_tried) return m.rerank != null;
+        m.rerank_tried = true;
+        if (mtp_mod.MtpModel.draftRerankMode() == .off) return false;
+        const bits = mtp_mod.rerankCoarseBits();
+        m.rerank = mtp_mod.buildRerankCoarse(self.s, self, bits) orelse return false;
+        const w_shape = mlx.getShape(self.lm_head_w);
+        m.rerank_rows = w_shape[0];
+        const mb = @divTrunc(mtp_mod.rerankCoarseBytes(w_shape[0], @intCast(self.config.hidden_size), bits), 1024 * 1024);
+        log.info(
+            "[qwen4] MTP draft rerank: coarse lm_head {d}-bit ({d} MB) + exact top-32 rescoring (MLX_SERVE_MTP_DRAFT_RERANK=0 restores full-vocab drafts)\n",
+            .{ bits, mb },
+        );
+        return true;
+    }
+
+    /// One greedy draft id from the mixer output `x` `[B,1,H]`. Shares the
+    /// sidecar head's scheme verbatim; a coarse-head absence or a shortlist
+    /// failure falls through to the full trunk-head readout, which is exactly
+    /// what this path replaced.
+    pub fn qwen4DraftSelect(self: *Transformer, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !mlx.mlx_array {
+        const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
+        if (try mtp_mod.rerankSelect(self.s, self, &m.rerank, m.rerank_rows, &m.rerank_logged, x, suppress_mask)) |tok| return tok;
+        return mtp_mod.fullReadoutArgmax(self.s, self, x, suppress_mask);
     }
 
     /// Test hook: layer-0 intermediates of the qwen4 forward (fixture bisect).

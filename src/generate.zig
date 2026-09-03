@@ -218,14 +218,23 @@ pub const MtpHeadRef = union(enum) {
     /// the merged history step after a partial accept is `1 + accepted` rows
     /// wide and a full-block mixer + 248320-wide lm_head over it is thrown
     /// away but for one row.
-    fn qwen4Step(t: *Transformer, id_arr: mlx.mlx_array, hidden: mlx.mlx_array, rope_offset: c_int, want_logits: bool, mrope_ctx: ?mtp_mod.MropeContext) !mtp_mod.StepOut {
-        const project: Transformer.Qwen4MtpProject = if (want_logits) .last_row else .none;
+    fn qwen4Step(t: *Transformer, id_arr: mlx.mlx_array, hidden: mlx.mlx_array, rope_offset: c_int, want: mtp_mod.StepWant, mrope_ctx: ?mtp_mod.MropeContext) !mtp_mod.StepOut {
+        // `.mixed` is NOT `.none`: a rerank draft still needs the mixer output,
+        // which is the vector the lm_head consumes. `hidden_next` is the
+        // PRE-mixer stream on this arm and would be a silent shape error there.
+        const project: Transformer.Qwen4MtpProject = switch (want) {
+            .logits => .last_row,
+            .mixed => .mixed_last_row,
+            .none => .none,
+        };
         const out = try t.qwen4MtpForward(hidden, id_arr, rope_offset + 1, mrope_ctx, project);
-        return .{ .logits = out.logits, .hidden_next = out.stream };
+        return .{ .logits = out.logits, .hidden_next = out.stream, .rerank_x = out.mixed };
     }
 
-    /// One head forward over L positions. `want_logits` returns the LAST row
-    /// only, on both arms.
+    /// One head forward over L positions. `.logits` returns the LAST row only,
+    /// on both arms. `.mixed` asks for the lm_head's INPUT vector instead: on
+    /// the sidecar that is `hidden_next` and nothing extra is produced, on
+    /// qwen4_exp it is the mixer output, returned in `rerank_x`.
     pub fn forward(
         self: MtpHeadRef,
         target: *Transformer,
@@ -233,12 +242,12 @@ pub const MtpHeadRef = union(enum) {
         id_arr: mlx.mlx_array,
         hidden: mlx.mlx_array,
         rope_offset: c_int,
-        want_logits: bool,
+        want: mtp_mod.StepWant,
         mrope_ctx: ?mtp_mod.MropeContext,
     ) !mtp_mod.StepOut {
         return switch (self) {
-            .qwen => |h| mtp_mod.forwardWithMrope(h, target, &cache.qwen, id_arr, hidden, rope_offset, want_logits, mrope_ctx),
-            .qwen4 => |t| qwen4Step(t, id_arr, hidden, rope_offset, want_logits, mrope_ctx),
+            .qwen => |h| mtp_mod.forwardWithMrope(h, target, &cache.qwen, id_arr, hidden, rope_offset, want == .logits, mrope_ctx),
+            .qwen4 => |t| qwen4Step(t, id_arr, hidden, rope_offset, want, mrope_ctx),
         };
     }
 
@@ -262,7 +271,7 @@ pub const MtpHeadRef = union(enum) {
                 const shape = [_]c_int{@intCast(token_ids.len)};
                 const id_arr = mlx.mlx_array_new_data(ids_i32.ptr, &shape, 1, .int32);
                 defer _ = mlx.mlx_array_free(id_arr);
-                const out = try qwen4Step(t, id_arr, hidden, rope_offset, false, mrope_ctx);
+                const out = try qwen4Step(t, id_arr, hidden, rope_offset, .none, mrope_ctx);
                 _ = mlx.mlx_array_free(out.hidden_next);
             },
         }
@@ -274,10 +283,16 @@ pub const MtpHeadRef = union(enum) {
     pub fn canRerankDrafts(self: MtpHeadRef) bool {
         return switch (self) {
             .qwen => |h| h.canRerankDrafts(),
-            .qwen4 => false,
+            // Built lazily on the first ask: `loadQwen4Mtp` runs while the
+            // Transformer is still under construction and its lm_head — the
+            // very weight the coarse head is a copy of — is not assigned yet.
+            .qwen4 => |t| t.qwen4DraftRerankReady(),
         };
     }
 
+    /// `x` is whatever the TARGET's lm_head consumes for this arm — the
+    /// sidecar's post-norm hidden, or qwen4_exp's MIXER output. Never
+    /// `hidden_next` on qwen4_exp: that is the pre-mixer `[B,S,hc*H]` stream.
     pub fn draftSelect(
         self: MtpHeadRef,
         target: *Transformer,
@@ -286,7 +301,7 @@ pub const MtpHeadRef = union(enum) {
     ) !mlx.mlx_array {
         return switch (self) {
             .qwen => |h| h.draftSelect(target, x, suppress_mask),
-            .qwen4 => error.NoDraftRerank,
+            .qwen4 => |t| t.qwen4DraftSelect(x, suppress_mask),
         };
     }
 
@@ -4649,6 +4664,10 @@ pub const Generator = struct {
             const need_logits = chain.q_probs != null or
                 (chain.conf_arrs != null and i < chain.plan.m_lo);
             const use_rerank = rerank_drafts and !need_logits;
+            // `want_logits: bool` could not tell a rerank draft from a history
+            // append: both skip the vocab projection, but the draft still needs
+            // the vector that projection would have consumed.
+            const want: mtp_mod.StepWant = if (use_rerank) .mixed else .logits;
             const step_out = if (i == 0 and self.mtp_hist_stash != null) blk: {
                 // Deferred history append (stashed at the END of the
                 // previous round, Phase 5a) merged into this chain's first
@@ -4680,10 +4699,18 @@ pub const Generator = struct {
                     _ = mlx.mlx_vector_array_append_value(hv, h_prev_arg);
                     try mlx.check(mlx.mlx_concatenate_axis(&merged_hidden, hv, 1, s));
                 }
-                break :blk try head.forward(xfm, mc, merged_ids, merged_hidden, @intCast(st.off0), !use_rerank, mtp_mrope_ctx);
-            } else try head.forward(xfm, mc, prev_tok_arr, h_prev_arg, @intCast(chain.off0 + i), !use_rerank, mtp_mrope_ctx);
+                break :blk try head.forward(xfm, mc, merged_ids, merged_hidden, @intCast(st.off0), want, mtp_mrope_ctx);
+            } else try head.forward(xfm, mc, prev_tok_arr, h_prev_arg, @intCast(chain.off0 + i), want, mtp_mrope_ctx);
+            // A `.mixed` step that publishes `rerank_x` means `hidden_next` is
+            // NOT what the lm_head consumes — on qwen4_exp it is the pre-mixer
+            // `[B,S,hc*H]` stream and the mixer output is the rerank input.
+            // Feeding the wrong one is a shape error, not a wrong answer.
+            defer if (step_out.rerank_x.ctx != null) {
+                _ = mlx.mlx_array_free(step_out.rerank_x);
+            };
             if (use_rerank) {
-                chain.draft_arrs[i] = try head.draftSelect(xfm, step_out.hidden_next, draft_sampling.suppress_mask);
+                const rerank_x = if (step_out.rerank_x.ctx != null) step_out.rerank_x else step_out.hidden_next;
+                chain.draft_arrs[i] = try head.draftSelect(xfm, rerank_x, draft_sampling.suppress_mask);
             } else if (chain.q_probs) |slots| {
                 // Sharp proposal: q = filtered softmax of the draft-head
                 // logits at the FIXED sharpened constants; the draft is
@@ -11107,6 +11134,45 @@ test "updateMtpEvRound: warmup and wider base rounds reset floor evidence" {
     g.updateMtpEvRound(4, 0);
     try testing.expectEqual(@as(u32, 0), g.mtp_window_idx);
     try testing.expect(!g.spec_disabled_runtime);
+}
+
+test "the qwen4 rerank draft feeds the MIXER output, never the pre-mixer stream" {
+    // The one way this change can be wrong without failing to compile. On the
+    // sidecar arm `hidden_next` IS the lm_head's input, so the obvious wiring
+    // (`draftSelect(xfm, step_out.hidden_next, ...)`) is correct there and
+    // silently wrong on qwen4_exp, whose `hidden_next` is the pre-mixer
+    // `[B,S,hc*H]` stream — 4x the width the head consumes. The chain must
+    // therefore prefer `rerank_x` when a step publishes one.
+    const source = @embedFile("generate.zig");
+    const build_at = std.mem.indexOf(u8, source, "fn mtpChainBuild(") orelse return error.MissingChainBuild;
+    const end = std.mem.indexOfPos(u8, source, build_at, "\n    /// Fire the chain's built graphs") orelse source.len;
+    const body = source[build_at..end];
+
+    const sel = std.mem.indexOf(u8, body, "head.draftSelect(") orelse return error.MissingDraftSelect;
+    const line_start = std.mem.lastIndexOfScalar(u8, body[0..sel], '\n') orelse 0;
+    const line_end = std.mem.indexOfScalarPos(u8, body, sel, '\n') orelse body.len;
+    const call = body[line_start..line_end];
+    // The rerank input is the resolved vector, never `hidden_next` directly.
+    try testing.expect(std.mem.indexOf(u8, call, "rerank_x") != null);
+    try testing.expect(std.mem.indexOf(u8, call, "hidden_next") == null);
+    try testing.expect(std.mem.indexOf(u8, body, "step_out.rerank_x.ctx != null") != null);
+
+    // ...and a `.mixed` step is what asks for it: a rerank draft must not
+    // collapse onto `.none` (the history-append mode), which produces no
+    // mixer output at all.
+    try testing.expect(std.mem.indexOf(u8, body, "if (use_rerank) .mixed else .logits") != null);
+
+    // The qwen4 arm maps `.mixed` onto the projection that SKIPS the lm_head
+    // but still runs the mixer. If it ever mapped to `.none`, `rerank_x` would
+    // be null and the chain would silently hand over the pre-mixer stream.
+    const step_at = std.mem.indexOf(u8, source, "fn qwen4Step(") orelse return error.MissingQwen4Step;
+    const step_end = std.mem.indexOfPos(u8, source, step_at, "\n    /// One head forward") orelse source.len;
+    const step_body = source[step_at..step_end];
+    try testing.expect(std.mem.indexOf(u8, step_body, ".mixed => .mixed_last_row") != null);
+    try testing.expect(std.mem.indexOf(u8, step_body, ".rerank_x = out.mixed") != null);
+
+    // And the owned mixer vector is freed by the chain, not leaked per step.
+    try testing.expect(std.mem.indexOf(u8, body, "mlx_array_free(step_out.rerank_x)") != null);
 }
 
 test "mtpEvExpectedTokens: 1 + sum of acceptance chain products" {
