@@ -213,22 +213,15 @@ pub const MtpHeadRef = union(enum) {
         };
     }
 
+    /// The head projects only what the caller consumes: this step wants the
+    /// LAST row (`want_logits`) or no logits at all, never the S-row block —
+    /// the merged history step after a partial accept is `1 + accepted` rows
+    /// wide and a full-block mixer + 248320-wide lm_head over it is thrown
+    /// away but for one row.
     fn qwen4Step(t: *Transformer, id_arr: mlx.mlx_array, hidden: mlx.mlx_array, rope_offset: c_int, want_logits: bool, mrope_ctx: ?mtp_mod.MropeContext) !mtp_mod.StepOut {
-        const s = t.s;
-        const out = try t.qwen4MtpForward(hidden, id_arr, rope_offset + 1, mrope_ctx);
-        defer _ = mlx.mlx_array_free(out.logits);
-        const hs = mlx.getShape(out.stream);
-        if (!want_logits) return .{ .logits = .{ .ctx = null }, .hidden_next = out.stream };
-        defer _ = mlx.mlx_array_free(out.stream);
-        const last = hs[1] - 1;
-        const strides = [_]c_int{ 1, 1, 1 };
-        var h_last = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(h_last);
-        try mlx.check(mlx.mlx_slice(&h_last, out.stream, &[_]c_int{ 0, last, 0 }, 3, &[_]c_int{ hs[0], hs[1], hs[2] }, 3, &strides, 3, s));
-        const ls = mlx.getShape(out.logits);
-        var l_last = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_slice(&l_last, out.logits, &[_]c_int{ 0, last, 0 }, 3, &[_]c_int{ ls[0], ls[1], ls[2] }, 3, &strides, 3, s));
-        return .{ .logits = l_last, .hidden_next = h_last };
+        const project: Transformer.Qwen4MtpProject = if (want_logits) .last_row else .none;
+        const out = try t.qwen4MtpForward(hidden, id_arr, rope_offset + 1, mrope_ctx, project);
+        return .{ .logits = out.logits, .hidden_next = out.stream };
     }
 
     /// One head forward over L positions. `want_logits` returns the LAST row

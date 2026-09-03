@@ -13072,6 +13072,23 @@ pub const Transformer = struct {
     /// Returns `[B,S,V]` logits for positions p+2... Caller frees.
     pub const Qwen4MtpOut = struct { logits: mlx.mlx_array, stream: mlx.mlx_array };
 
+    /// What `qwen4MtpForward` owes its caller past the head's own layer. The
+    /// mixer read + the 248320-wide lm_head run over whatever rows `stream`
+    /// carries, so a caller that consumes ONE row says so instead of paying
+    /// for `S` of them and slicing (the merged history step after a partial
+    /// accept is `1 + accepted` rows wide, of which the drafter wants the
+    /// last).
+    pub const Qwen4MtpProject = enum {
+        /// Every row's logits + the full `[B,S,hc*H]` stream (fixture oracles).
+        all_rows,
+        /// The LAST row only: `h` is sliced BEFORE the mixer, so `logits` is
+        /// `[B,1,V]` and `stream` is that one row.
+        last_row,
+        /// No logits at all (history append): mixer + lm_head are skipped and
+        /// `logits` comes back null; `stream` is the full `[B,S,hc*H]`.
+        none,
+    };
+
     /// Truncate the head's committed history to `len` rows.
     pub fn qwen4MtpTruncate(self: *Transformer, len: usize) !void {
         const m = &(self.qwen4_mtp orelse return);
@@ -13104,7 +13121,7 @@ pub const Transformer = struct {
     /// `pos_base + seq_offset ..`, so its attention + QSA indexer read the
     /// slot's 3-D table there (prompt rows spanning the image) and the
     /// scalar `offset + delta` past it — the same two arms as the trunk.
-    pub fn qwen4MtpForward(self: *Transformer, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, pos_offset: c_int, mrope_ctx: ?mrope.PositionContext) !Qwen4MtpOut {
+    pub fn qwen4MtpForward(self: *Transformer, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, pos_offset: c_int, mrope_ctx: ?mrope.PositionContext, project: Qwen4MtpProject) !Qwen4MtpOut {
         const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
         const cfg = &self.config;
         const hc: c_int = @intCast(cfg.hc_count);
@@ -13171,7 +13188,33 @@ pub const Transformer = struct {
         h = try self.hcWrite(h, mlp_out, pre2.inj, batch, seq_len);
         m.seq_offset += @intCast(seq_len);
 
-        const mix = try self.hcRead(h, &m.mixer, batch, seq_len);
+        // History append wants the stream and nothing else: the mixer read and
+        // the vocab-wide projection are pure, so skipping them is free.
+        if (project == .none) return .{ .logits = .{ .ctx = null }, .stream = h };
+        // Last-row-only: cut `h` HERE, so the mixer + lm_head see one row
+        // instead of S. Same values as slicing the outputs afterwards.
+        var out_seq: c_int = seq_len;
+        if (project == .last_row and seq_len > 1) {
+            const hs = mlx.getShape(h);
+            var h_last = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(h_last);
+            try mlx.check(mlx.mlx_slice(
+                &h_last,
+                h,
+                &[_]c_int{ 0, seq_len - 1, 0 },
+                3,
+                &[_]c_int{ hs[0], seq_len, hs[2] },
+                3,
+                &[_]c_int{ 1, 1, 1 },
+                3,
+                self.s,
+            ));
+            _ = mlx.mlx_array_free(h);
+            h = h_last;
+            out_seq = 1;
+        }
+
+        const mix = try self.hcRead(h, &m.mixer, batch, out_seq);
         errdefer _ = mlx.mlx_array_free(h);
         if (mix.inj.ctx != null) _ = mlx.mlx_array_free(mix.inj);
         defer _ = mlx.mlx_array_free(mix.mixed);
@@ -39976,7 +40019,7 @@ test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget 
             const next_ids = mlx.mlx_array_new_data(@ptrCast(ids_src + 1), &tshape, 2, .int32);
             defer _ = mlx.mlx_array_free(next_ids);
             try xfm.qwen4MtpReset();
-            const mo = try xfm.qwen4MtpForward(stream_prev, next_ids, 1, null);
+            const mo = try xfm.qwen4MtpForward(stream_prev, next_ids, 1, null, .all_rows);
             defer _ = mlx.mlx_array_free(mo.logits);
             defer _ = mlx.mlx_array_free(mo.stream);
             const ours_m = try qwen4ReadF32(allocator, mo.logits, s);
@@ -40246,7 +40289,7 @@ test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget 
             defer _ = mlx.mlx_array_free(hp);
             const tp = H.ids(ids_src[1..P]);
             defer _ = mlx.mlx_array_free(tp);
-            const o = try xfm.qwen4MtpForward(hp, tp, 1, null);
+            const o = try xfm.qwen4MtpForward(hp, tp, 1, null, .all_rows);
             _ = mlx.mlx_array_free(o.logits);
             _ = mlx.mlx_array_free(o.stream);
         }
@@ -40298,12 +40341,12 @@ test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget 
                     _ = mlx.mlx_array_free(stash_h.?);
                     stash_h = null;
                     stash_ids.clearRetainingCapacity();
-                    break :blk try xfm.qwen4MtpForward(mh, mids, @intCast(stash_off0 + 1), null);
+                    break :blk try xfm.qwen4MtpForward(mh, mids, @intCast(stash_off0 + 1), null, .all_rows);
                 } else blk: {
                     const one = [_]i32{prev_tok};
                     const tid = H.ids(&one);
                     defer _ = mlx.mlx_array_free(tid);
-                    break :blk try xfm.qwen4MtpForward(if (i == 0) last_hidden else h_chain.?, tid, @intCast(off0 + i + 1), null);
+                    break :blk try xfm.qwen4MtpForward(if (i == 0) last_hidden else h_chain.?, tid, @intCast(off0 + i + 1), null, .all_rows);
                 };
                 if (h_chain) |a| _ = mlx.mlx_array_free(a);
                 h_chain = try H.rows(s, o.stream, @intCast(mlx.getShape(o.stream)[1] - 1), @intCast(mlx.getShape(o.stream)[1]));
@@ -40361,7 +40404,7 @@ test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget 
             defer _ = mlx.mlx_array_free(mids);
             const mh = try H.cat(s, &.{ stash_h.?, last_hidden });
             defer _ = mlx.mlx_array_free(mh);
-            const o = try xfm.qwen4MtpForward(mh, mids, @intCast(stash_off0 + 1), null);
+            const o = try xfm.qwen4MtpForward(mh, mids, @intCast(stash_off0 + 1), null, .all_rows);
             _ = mlx.mlx_array_free(o.stream);
             last_logits = o.logits;
         }
@@ -40377,7 +40420,7 @@ test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget 
         const fids = H.ids(fresh_ids.items);
         defer _ = mlx.mlx_array_free(fids);
         try testing.expectEqual(@as(c_int, @intCast(fresh_ids.items.len)), mlx.getShape(fh)[1]);
-        const fo = try xfm.qwen4MtpForward(fh, fids, 1, null);
+        const fo = try xfm.qwen4MtpForward(fh, fids, 1, null, .all_rows);
         defer _ = mlx.mlx_array_free(fo.logits);
         defer _ = mlx.mlx_array_free(fo.stream);
         const fresh_x = try qwen4ReadF32(allocator, fo.logits, s);
@@ -40387,6 +40430,103 @@ test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget 
         std.debug.print("[qwen4 fixture] MTP cross-round (P={d}, rounds {d}, acc {d}/{d}, merged {d} rows of {d}): min cos {d:.5} argmax {d}/{d}\n", .{ P, accs.len, accs[0], accs[1], n_merged, n_rows, rx.min_cos, rx.argmax_agree, rx.rows });
         try testing.expect(rx.min_cos > 0.999);
         try testing.expect(rx.argmax_agree == rx.rows);
+    }
+}
+
+test "qwen4 MTP head: last-row and no-logits projections match the full block (QWEN4_TEST_MODEL)" {
+    // `MtpHeadRef.qwen4Step` consumes ONE row of logits, and the merged
+    // history step after a partial accept hands the head `1 + accepted` rows —
+    // so the mixer read + the vocab-wide lm_head used to run over the whole
+    // block for a single row. `.last_row` cuts the stream first, `.none`
+    // (appendHistory) skips both stages.
+    //
+    // Bars: the STREAM is a pure slice / a pure skip, so it is bit-identical
+    // on both. The last row's LOGITS are not asserted bit-identical past S=1 —
+    // a quantized projection at M=1 and at M=S are different kernels, and only
+    // the S=1 arm shares one — so the multi-row arm takes the fixture bar.
+    // That is the right bar here: these logits only steer which DRAFTS the
+    // head proposes, and the trunk's verify forward decides every byte that
+    // ships, so a last-ulp difference can move acceptance and never output.
+    const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
+    defer if (config.ngram_table_path) |p| allocator.free(p);
+    var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer xfm.deinit();
+    if (xfm.qwen4_mtp == null) return error.SkipZigTest;
+    xfm.compileQwen4Hc();
+    xfm.compileMoeRouting();
+
+    const hcH: usize = @as(usize, config.hc_count) * @as(usize, config.hidden_size);
+    const dt = mlx.mlx_array_dtype(xfm.qwen4_mtp.?.pre_norm_hidden);
+
+    for ([_]usize{ 1, 5 }) |S| {
+        // Distinct rows: identical rows cannot tell a last-row slice from a
+        // first-row one.
+        const host = try allocator.alloc(f32, S * hcH);
+        defer allocator.free(host);
+        var rs: u64 = 0x9E3779B97F4A7C15;
+        for (host) |*x| {
+            rs = rs *% 6364136223846793005 +% 1442695040888963407;
+            x.* = (@as(f32, @floatFromInt((rs >> 40) & 0xFFFF)) / 32768.0) - 1.0;
+        }
+        const hshape = [_]c_int{ 1, @intCast(S), @intCast(hcH) };
+        const sp_f32 = mlx.mlx_array_new_data(host.ptr, &hshape, 3, .float32);
+        defer _ = mlx.mlx_array_free(sp_f32);
+        var stream_prev = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(stream_prev);
+        try mlx.check(mlx.mlx_astype(&stream_prev, sp_f32, dt, s));
+
+        var id_buf: [5]i32 = undefined;
+        for (0..S) |i| id_buf[i] = @intCast(7 + i * 13);
+        const ishape = [_]c_int{ 1, @intCast(S) };
+        const ids = mlx.mlx_array_new_data(&id_buf, &ishape, 2, .int32);
+        defer _ = mlx.mlx_array_free(ids);
+
+        try xfm.qwen4MtpReset();
+        const full = try xfm.qwen4MtpForward(stream_prev, ids, 1, null, .all_rows);
+        defer _ = mlx.mlx_array_free(full.logits);
+        defer _ = mlx.mlx_array_free(full.stream);
+        const full_l = try qwen4ReadF32(allocator, full.logits, s);
+        defer allocator.free(full_l);
+        const full_h = try qwen4ReadF32(allocator, full.stream, s);
+        defer allocator.free(full_h);
+        try testing.expectEqual(S * hcH, full_h.len);
+        const v: usize = full_l.len / S;
+
+        try xfm.qwen4MtpReset();
+        const last = try xfm.qwen4MtpForward(stream_prev, ids, 1, null, .last_row);
+        defer _ = mlx.mlx_array_free(last.logits);
+        defer _ = mlx.mlx_array_free(last.stream);
+        const last_l = try qwen4ReadF32(allocator, last.logits, s);
+        defer allocator.free(last_l);
+        const last_h = try qwen4ReadF32(allocator, last.stream, s);
+        defer allocator.free(last_h);
+        try testing.expectEqual(v, last_l.len);
+        try testing.expectEqualSlices(f32, full_h[(S - 1) * hcH ..], last_h);
+        if (S == 1) {
+            try testing.expectEqualSlices(f32, full_l, last_l);
+        } else {
+            const c = qwen4CompareRows(last_l, full_l[(S - 1) * v ..], 1, v);
+            std.debug.print("[qwen4] MTP last-row projection S={d}: cos {d:.6} argmax {d}/1\n", .{ S, c.min_cos, c.argmax_agree });
+            try testing.expect(c.min_cos > 0.9999);
+            try testing.expect(c.argmax_agree == 1);
+        }
+
+        try xfm.qwen4MtpReset();
+        const bare = try xfm.qwen4MtpForward(stream_prev, ids, 1, null, .none);
+        defer _ = mlx.mlx_array_free(bare.stream);
+        try testing.expect(bare.logits.ctx == null);
+        const bare_h = try qwen4ReadF32(allocator, bare.stream, s);
+        defer allocator.free(bare_h);
+        try testing.expectEqualSlices(f32, full_h, bare_h);
     }
 }
 
