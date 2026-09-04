@@ -19137,6 +19137,17 @@ test "the 458k prefill's two unbilled terms are billed: retained checkpoints and
     const with_terms = prefillMemoryNeeded(seq, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.kvBytesPerToken(), cfg.head_dim, cfg.prefillScoreHeadDim(), cfg.hidden_size, prefillFfnWidth(&cfg), 8, chunk, cfg.prefillAttnKeys(seq), prefillStreamBytesPerToken(&cfg), prefillDequantWeightBytes(&cfg), terms);
     const without = prefillMemoryNeeded(seq, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.kvBytesPerToken(), cfg.head_dim, cfg.prefillScoreHeadDim(), cfg.hidden_size, prefillFfnWidth(&cfg), 8, chunk, cfg.prefillAttnKeys(seq), prefillStreamBytesPerToken(&cfg), prefillDequantWeightBytes(&cfg), .{});
     try t.expect(with_terms > without + 3_000_000_000);
+    // The SENTINEL runs through the same path: an omitted max_tokens must not
+    // move the bill past the context, or the guard refuses every prompt past
+    // the reservation threshold (the defect this pairing exists to catch).
+    const sentinel: u64 = omittedMaxTokensDefault(@intCast(@min(getEffectiveContextLength(&cfg), 1_048_576)));
+    const with_sentinel = prefillRequestTerms(&cfg, seq, sentinel, 8, chunk);
+    const with_explicit = prefillRequestTerms(&cfg, seq, 2048, 8, chunk);
+    try t.expect(with_sentinel.reserved_kv_bytes < 8 * 1024 * 1024 * 1024);
+    try t.expect(with_sentinel.state_bytes < 4 * with_explicit.state_bytes);
+    // and the checkpoints term does not depend on max_tokens at all.
+    try t.expectEqual(with_explicit.checkpoint_bytes, with_sentinel.checkpoint_bytes);
+
     // A short prompt is untouched: no reservation below the threshold, and
     // the state term is what the caller used to add after the margin.
     const short = prefillRequestTerms(&cfg, 4096, 2048, 8, chunk);

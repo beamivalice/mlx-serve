@@ -24,7 +24,10 @@ bad()  { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
 [ -x ./zig-out/bin/mlx-serve ] || { echo "FAIL: build with -Doptimize=ReleaseFast first"; exit 1; }
 
 LOG=$(mktemp -t mlxerr).log
-MLX_SERVE_MLX_FAULT_CHUNK=1 ./zig-out/bin/mlx-serve serve --model "$MODEL" \
+# Chunk 2, not 1: at chunk 1 the checkpoint runs before the prefill has done
+# any MLX work at all, so the arm would pass against an engine that never
+# reaches a forward. The prompt below is long enough to take a second chunk.
+MLX_SERVE_MLX_FAULT_CHUNK=2 ./zig-out/bin/mlx-serve serve --model "$MODEL" \
   --host 127.0.0.1 --port "$PORT" --log-level info > "$LOG" 2>&1 &
 SRV=$!
 trap 'kill $SRV 2>/dev/null' EXIT
@@ -38,13 +41,19 @@ req() { # $1 = prompt
 }
 
 echo "[1] the request that hits the injected MLX error is refused, by name"
-CODE=$(req "Count to three.")
+# Long enough to prefill in more than one chunk (the default chunk is 512 at
+# its narrowest), so the fault lands after real forward work.
+FAULT_PROMPT=$(python3 -c "print('Explain the following list. ' + ' '.join(str(i) for i in range(4000)))")
+CODE=$(req "$FAULT_PROMPT")
 # 503 is the memory class; the shape that must NEVER appear is an empty reply
 # from a dead socket, so a body is as load-bearing as the code.
+# 503 ONLY: the injected message is the Metal working-set abort, so the memory
+# CLASSIFICATION is part of what is under test. Accepting 500 as well made the
+# arm unable to fail on a misclassification, which is the interesting bug.
 case "$CODE" in
   503) ok "injected MLX OOM answered 503 ($(head -c 120 /tmp/mlxerr_body.json))" ;;
-  500) ok "injected MLX error answered 500 (non-memory class)" ;;
   000|"") bad "no HTTP response — the server died (the #353 symptom)" ;;
+  500) bad "answered 500: the memory class was lost between the latch and the surface" ;;
   *)   bad "unexpected status $CODE: $(head -c 200 /tmp/mlxerr_body.json)" ;;
 esac
 grep -q "FAULT INJECTION armed" "$LOG" || bad "injector never armed — the env hook moved"

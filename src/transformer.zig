@@ -44325,7 +44325,9 @@ test "a reserved KV cache grows ONCE: no old+new buffer coexists during a long p
     try t.expect(grows > 20);
 
     // Reserved: one allocation, sized to the reservation, and the walk never
-    // grows again.
+    // grows again. Driven through the REAL write path (`cache.update`), not
+    // the capacity arithmetic — the arithmetic is what the policy promises,
+    // `bufferCapacity` after a write is what the allocator did.
     // ctx 0 = "no context named" — this test is about the growth ladder,
     // and the context clamp has its own test in server.zig.
     const reserved: usize = @intCast(KVCache.reservedTokens(seq, 2048, chunk, 0));
@@ -44346,6 +44348,42 @@ test "a reserved KV cache grows ONCE: no old+new buffer coexists during a long p
     }
     try t.expectEqual(@as(usize, 1), rgrows);
     try t.expect(rcap >= reserved);
+
+    // The real thing: a reserved cache written token-by-chunk through
+    // `update` allocates ONCE. Anything else means a grow ran mid-prefill,
+    // and a grow allocates the new capacity beside the old one.
+    const s_gpu = mlx.gpuStream();
+    const walk: usize = 33_000; // past RESERVE_MIN_TOKENS
+    const step: usize = 4096;
+    const live_reserve: usize = @intCast(KVCache.reservedTokens(walk, 512, step, 0));
+    var live = try KVCache.init(t.allocator, 1);
+    defer live.deinit();
+    live.reserve(live_reserve);
+    var written: usize = 0;
+    var caps: usize = 0;
+    var last_cap: usize = 0;
+    while (written < walk) {
+        const n: c_int = @intCast(@min(step, walk - written));
+        var flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(flat);
+        const count: f64 = @floatFromInt(n * 8);
+        try mlx.check(mlx.mlx_arange(&flat, 0.0, count, 1.0, .float32, s_gpu));
+        var k = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(k);
+        const shape = [_]c_int{ 1, 1, n, 8 };
+        try mlx.check(mlx.mlx_reshape(&k, flat, &shape, 4, s_gpu));
+        var view = try live.update(0, k, k, s_gpu, 0);
+        view.deinit();
+        const cap_now: usize = KVCache.bufferCapacity(live.entries[0].keys);
+        if (cap_now != last_cap) {
+            caps += 1;
+            last_cap = cap_now;
+        }
+        written += @intCast(n);
+    }
+    try t.expectEqual(@as(usize, 1), caps);
+    try t.expect(last_cap >= live_reserve);
+    try t.expectEqual(walk, live.entries[0].offset);
     // The generation the request is allowed fits too — the reservation is
     // what the admission guard billed, so decode must not grow either.
     try t.expect(rcap >= seq + 2048);
