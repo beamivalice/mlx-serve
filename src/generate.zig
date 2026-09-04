@@ -7551,6 +7551,25 @@ pub const Generator = struct {
     /// reach `round_cost.MIN_SAMPLES` or the probe teaches nothing.
     pub const MTP_ADAPTIVE_PROBE_TOKENS: u32 = 8;
     pub const MTP_ADAPTIVE_PROBE_WARM: u32 = 2;
+    /// KV below which the switch does not exist: no vote, no probe, no cost.
+    /// The symmetric knob to `--max-mtp-ctx` — that one is a ceiling past
+    /// which speculation stays off, this is a FLOOR below which it stays on.
+    ///
+    /// Measured, not guessed: in the 2026-09-04 A/B, 11 of the 14 switches
+    /// the controller made were in the `<2k` bucket, all of them llmprobe's
+    /// short requests, and short context is where a wrong switch is most
+    /// expensive — llmprobe's predictable cell runs 151 tok/s on speculation
+    /// against roughly 95 serial, so a bad switch there costs ~2x, against
+    /// ~10% at 62.7k. Long context is the only place the feature was ever
+    /// argued for, and the whole ladder it was built from starts past 32k.
+    pub const MTP_ADAPTIVE_MIN_KV: u32 = 8192;
+
+    /// May the adaptive switch run at this context at all? Pure, and read
+    /// BEFORE the vote and the probe alike: a probe below the floor would
+    /// spend 8 serial tokens teaching a bucket that can never decide.
+    pub fn mtpAdaptiveKvEligible(kv_len: u32, min_kv: u32) bool {
+        return kv_len >= min_kv;
+    }
 
     /// Rounds in the realized price window. Full-window-only is the point:
     /// the b1-long2 misfire in the A/B voted at round ~3 on rounds that were
@@ -7778,6 +7797,15 @@ pub const Generator = struct {
         return v;
     }
 
+    var mtp_adaptive_min_kv_cache: ?u32 = null;
+    fn mtpAdaptiveMinKv() u32 {
+        if (mtp_adaptive_min_kv_cache) |v| return v;
+        const n = readEnvUsize("MLX_SERVE_MTP_ADAPTIVE_MIN_KV", MTP_ADAPTIVE_MIN_KV);
+        const v: u32 = @intCast(@min(n, @as(usize, std.math.maxInt(u32))));
+        mtp_adaptive_min_kv_cache = v;
+        return v;
+    }
+
     var mtp_adaptive_confirm_cache: ?u32 = null;
     fn mtpAdaptiveConfirm() u32 {
         if (mtp_adaptive_confirm_cache) |v| return v;
@@ -7860,7 +7888,9 @@ pub const Generator = struct {
         // "is a round worth running at all". Read AFTER the plan (m_lo is
         // the width it prices) and BEFORE the width trial — a trial measures
         // a width for a request that is about to leave speculation.
-        if (mtpAdaptiveSerialEnabled() and mtpCostTableEnabled()) {
+        if (mtpAdaptiveSerialEnabled() and mtpCostTableEnabled() and
+            mtpAdaptiveKvEligible(kv_len, mtpAdaptiveMinKv()))
+        {
             const t = &self.xfm.round_cost;
             const b = t.bucketToRead(kv_len) orelse round_cost.bucketFor(kv_len);
             // Both prices are MEASURED, and both come from rounds that
@@ -13799,6 +13829,37 @@ test "mtpAdaptiveVoteFor: the four real switch events of the 2026-09-04 qwen4 A/
     );
 }
 
+test "mtpAdaptiveKvEligible: short context is below the floor, and the floor is the default" {
+    const G = Generator;
+    const floor = G.MTP_ADAPTIVE_MIN_KV;
+    try testing.expectEqual(@as(u32, 8192), floor);
+
+    // llmprobe-shaped traffic: in the 2026-09-04 A/B, 11 of 14 switches were
+    // in the `<2k` bucket and every one of them was a short llmprobe request.
+    // Thirty of those in a boot must not reach the vote even once.
+    var reached: u32 = 0;
+    var i: u32 = 0;
+    while (i < 30) : (i += 1) {
+        // 60-token prompt, 200 tokens of reply: the whole request lives far
+        // below the floor even at its longest.
+        const kv: u32 = 60 + i * 7 + 200;
+        if (G.mtpAdaptiveKvEligible(kv, floor)) reached += 1;
+    }
+    try testing.expectEqual(@as(u32, 0), reached);
+
+    // The boundary is inclusive on the eligible side, and the contexts the
+    // feature was actually argued for are all above it.
+    try testing.expect(!G.mtpAdaptiveKvEligible(0, floor));
+    try testing.expect(!G.mtpAdaptiveKvEligible(floor - 1, floor));
+    try testing.expect(G.mtpAdaptiveKvEligible(floor, floor));
+    try testing.expect(G.mtpAdaptiveKvEligible(62_755, floor)); // the A/B prose prompt
+    try testing.expect(G.mtpAdaptiveKvEligible(374_000, floor)); // the ladder's top rung
+
+    // The knob can be moved either way, including all the way open.
+    try testing.expect(G.mtpAdaptiveKvEligible(1, 0));
+    try testing.expect(!G.mtpAdaptiveKvEligible(62_755, 131_072));
+}
+
 test "MtpPriceWindow: reads nothing until FULL, skips width trials, prices per TOKEN" {
     const G = Generator;
     const N = G.MTP_PRICE_WINDOW;
@@ -14007,6 +14068,16 @@ test "the adaptive decision is read after the EV plan, before the width trial, a
     // The window is fed from the round-end observer, on the same wall clock
     // and under the same solo gate as the table fold, with trials skipped.
     try testing.expect(std.mem.indexOf(u8, src, "self.mtp_price.observe(wall, tok, width_trial)") != null);
+
+    // The short-context FLOOR gates the whole block, so it covers the probe
+    // as well as the vote: a probe below the floor would spend 8 serial
+    // tokens teaching a bucket that is never allowed to decide.
+    const gate_at = std.mem.lastIndexOf(u8, src[0..decide_at], "mtpAdaptiveKv" ++ "Eligible(kv_len") orelse
+        return error.MissingKvFloor;
+    const probe_at = std.mem.indexOfPos(u8, src, decide_at, "mtpSerialProbe" ++ "Arm(t, kv_len") orelse
+        return error.MissingProbeArm;
+    try testing.expect(gate_at < decide_at);
+    try testing.expect(gate_at < probe_at);
 
     // In `nextMtp`: `--max-mtp-ctx` is checked FIRST and is not overridable —
     // the re-entry keys on `.adaptive`, so a ceiling crossing stays off.

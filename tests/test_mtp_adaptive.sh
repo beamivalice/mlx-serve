@@ -19,9 +19,15 @@
 #       One or the other — a zero cell with no line means nothing measured.
 #   [2] Speculation still ENGAGES on the long request (`[spec-stats] mode=mtp`
 #       with attempts > 0). The switch must not read as "MTP never ran".
-#   [3] The SHORT code request never switches: a `-> serial` decision on a
-#       2k-token prompt is a false positive, and short context is where the
-#       whole feature must cost nothing.
+#   [3] SHORT context never switches — and one request cannot prove that. In
+#       the 2026-09-04 A/B, 11 of the 14 switches the controller made were in
+#       the `<2k` bucket, every one of them an llmprobe request, and a single
+#       fresh-state fixture never matured the bucket enough to see it. So the
+#       assertion sends a BURST of short requests (llmprobe-shaped traffic)
+#       and requires zero `-> serial` across all of them. Below
+#       `MLX_SERVE_MTP_ADAPTIVE_MIN_KV` (default 8192) the vote and the probe
+#       are both switched off, so this holds by construction; the burst is
+#       what would catch the floor being removed or raised past the fixture.
 #   [4] The kill switch HOLDS: with MLX_SERVE_MTP_ADAPTIVE_SERIAL=0 no
 #       `[mtp] adaptive:` line appears anywhere in the boot, and the arm on
 #       every `[spec-stats]` line stays `adaptive=undecided`.
@@ -238,6 +244,21 @@ A_SHORT=$(req "$WORK/short_mtp.json" "$LOG_A" "$WORK/a_short.slice") ||
     { echo "FAIL: boot A short request failed"; stop_server; exit 1; }
 echo "  short mtp:   prompt_tokens=$(echo "$A_SHORT" | awk '{print $1}') completion=$(echo "$A_SHORT" | awk '{print $2}')"
 
+# llmprobe-shaped burst: one short request proves nothing, because the `<2k`
+# bucket only matures over many of them — which is exactly how the A/B's 11
+# short-context switches were missed by a single-fixture check.
+SHORT_BURST="${SHORT_BURST:-12}"
+echo "  short burst: $SHORT_BURST requests (llmprobe-shaped)"
+burst_start=$(wc -c < "$LOG_A" | tr -d ' ')
+bi=1
+while [ "$bi" -le "$SHORT_BURST" ]; do
+    req "$WORK/short_mtp.json" "$LOG_A" "$WORK/a_burst_$bi.slice" >/dev/null ||
+        { echo "FAIL: boot A short burst request $bi failed"; stop_server; exit 1; }
+    bi=$((bi + 1))
+done
+burst_end=$(wc -c < "$LOG_A" | tr -d ' ')
+tail -c "+$((burst_start + 1))" "$LOG_A" | head -c "$((burst_end - burst_start))" > "$WORK/a_burst.slice"
+
 stop_server
 
 # [2] Engagement: the long request ran speculative rounds. Without this, [1]
@@ -264,12 +285,19 @@ else
     bad "mechanism" "no '[mtp] adaptive:' line and serial_cell=$A_CELL — nothing was measured or decided"
 fi
 
-# [3] Short context never switches.
+# [3] Short context never switches — the single fixture AND the burst.
 if grep -q -- "-> serial" "$WORK/a_short.slice"; then
     bad "short context" "the short code request left speculation (false positive)"
     grep -- "\[mtp\] adaptive:" "$WORK/a_short.slice" | sed 's/^/      /'
 else
     ok "short code request stayed on speculation"
+fi
+BURST_SWITCHES=$(grep -c -- "-> serial" "$WORK/a_burst.slice" 2>/dev/null || true)
+if [ "${BURST_SWITCHES:-0}" -gt 0 ]; then
+    bad "short burst" "$BURST_SWITCHES of $SHORT_BURST short requests left speculation (the <2k regression)"
+    grep -- "\[mtp\] adaptive:" "$WORK/a_burst.slice" | head -5 | sed 's/^/      /'
+else
+    ok "$SHORT_BURST-request short burst: zero switches (kv floor holds)"
 fi
 
 # ── Boot B: the kill switch ───────────────────────────────────────────────
