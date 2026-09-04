@@ -7772,9 +7772,17 @@ pub const Generator = struct {
         }
     };
 
-    /// Whole-mechanism kill switch (`MLX_SERVE_MTP_ADAPTIVE_SERIAL=0`): the
-    /// serial cell keeps being MEASURED so `[spec-stats]` stays comparable
-    /// across an A/B, but no request switches and no probe runs.
+    /// Whole-mechanism kill switch (`MLX_SERVE_MTP_ADAPTIVE_SERIAL=0`): no
+    /// vote, no probe, no cost.
+    ///
+    /// This comment used to claim the serial cell "keeps being MEASURED so
+    /// `[spec-stats]` stays comparable across an A/B". It does not, and the
+    /// 2026-09-04 A/B proved it: `serial_cell` read 0.00 for both off-arm
+    /// boots. `observeSerialTick` still runs, but with the switch off nothing
+    /// ever votes, so no probe arms and no request decodes serially in the
+    /// bucket it is speculating in — there is nothing for the cell to fold.
+    /// That is the right trade: an off switch that costs literally nothing
+    /// beats one that keeps a meter warm for the convenience of an A/B.
     var mtp_adaptive_serial_cache: ?bool = null;
     pub fn mtpAdaptiveSerialEnabledFromEnv(raw: ?[]const u8) bool {
         const value = raw orelse return true;
