@@ -27,9 +27,18 @@ const std = @import("std");
 
 /// Drafts per round the table covers (MTP depth <= 8, a DFlash block up to 16); index 0 is serial.
 pub const MAX_WIDTH: u32 = 16;
-pub const N_BUCKETS: usize = 6;
-const BUCKET_EDGES = [_]u32{ 2048, 4096, 8192, 16384, 32768 };
-pub const BUCKET_NAMES = [N_BUCKETS][]const u8{ "<2k", "2-4k", "4-8k", "8-16k", "16-32k", "32k+" };
+/// KV buckets. The top bucket used to be an unbounded `32k+`, which put 62.7k
+/// and 374k in ONE cell: serial ms/token roughly doubles across that span, the
+/// EMA blended two regimes, and the adaptive switch's "one re-decision per
+/// bucket crossing" could never fire inside it — a request that left
+/// speculation at 40k stayed serial to 1M. The long-context rungs get their
+/// own edges; below 32k the layout is unchanged.
+pub const N_BUCKETS: usize = 9;
+const BUCKET_EDGES = [_]u32{ 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144 };
+pub const BUCKET_NAMES = [N_BUCKETS][]const u8{
+    "<2k",     "2-4k",    "4-8k",     "8-16k", "16-32k",
+    "32-64k",  "64-128k", "128-256k", "256k+",
+};
 
 /// EMA weight. MIN is wrong here (thermal soak makes the early rounds the
 /// fast ones); an EMA tracks the live machine.
@@ -595,12 +604,18 @@ pub const WidthChooser = struct {
 // Stale version or unreadable content is a QUIET miss (the kv_disk_cache
 // discipline). `MLX_SERVE_ROUND_COST_PERSIST=0` disables both directions.
 
-/// v2 added the `serial` row. The bump is not decoration: v1 files were
+/// v2 added the `serial` row. The bump was not decoration: v1 files were
 /// written by a build in which the only "no speculation" evidence was a
 /// width-0 CELL measured on a block decoder's round clock, and a v1 reader
-/// handed a v2 file would silently take the `s` lines for width `s`. A
-/// stale version is a QUIET miss, so the cost of the bump is one re-explore.
-pub const STORE_VERSION: u32 = 2;
+/// handed a v2 file would silently take the `s` lines for width `s`.
+///
+/// v3 split the top bucket (edges 64k/128k/256k). Bucket INDICES are the
+/// file's only spelling of "which context", so a v2 file read as v3 would
+/// map its `32k+` cell — an EMA of everything from 32k to 1M — onto the new
+/// `32-64k`, and the three long-context buckets would inherit numbers
+/// measured at a different context. A stale version is a QUIET miss, so the
+/// cost of the bump is one re-explore per (chip, model, quant, OS build).
+pub const STORE_VERSION: u32 = 3;
 
 pub fn persistEnabled() bool {
     const raw = std.c.getenv("MLX_SERVE_ROUND_COST_PERSIST") orelse return true;
@@ -618,7 +633,7 @@ pub fn cacheKey(buf: []u8, chip: []const u8, model_dir: []const u8, quant: []con
     return std.fmt.bufPrint(buf, "rc{d}-{x:0>16}", .{ STORE_VERSION, h.final() }) catch buf[0..0];
 }
 
-/// `rc2\n`, then one `width bucket ms tok n` line per folded width cell and
+/// `rc3\n`, then one `width bucket ms tok n` line per folded width cell and
 /// one `s bucket ms tok n` line per folded serial cell.
 pub fn serialize(buf: []u8, t: *const Table) ![]const u8 {
     var w = std.Io.Writer.fixed(buf);
@@ -725,7 +740,20 @@ test "round_cost: kv buckets" {
     try testing.expectEqual(@as(usize, 3), bucketFor(8192));
     try testing.expectEqual(@as(usize, 4), bucketFor(16384));
     try testing.expectEqual(@as(usize, 5), bucketFor(32768));
-    try testing.expectEqual(@as(usize, 5), bucketFor(1_000_000));
+    // Long context is no longer one cell: every new edge is exact, and the
+    // last bucket is the only unbounded one.
+    try testing.expectEqual(@as(usize, 5), bucketFor(65535));
+    try testing.expectEqual(@as(usize, 6), bucketFor(65536));
+    try testing.expectEqual(@as(usize, 6), bucketFor(131071));
+    try testing.expectEqual(@as(usize, 7), bucketFor(131072));
+    try testing.expectEqual(@as(usize, 7), bucketFor(262143));
+    try testing.expectEqual(@as(usize, 8), bucketFor(262144));
+    try testing.expectEqual(@as(usize, 8), bucketFor(1_000_000));
+    // The two contexts the A/B actually ran are now DIFFERENT buckets — the
+    // whole point of the split (62.7k prose vs a 374k ladder rung).
+    try testing.expect(bucketFor(62_755) != bucketFor(374_000));
+    try testing.expectEqual(N_BUCKETS, BUCKET_NAMES.len);
+    try testing.expectEqual(N_BUCKETS - 1, BUCKET_EDGES.len);
 }
 
 test "round_cost: EMA folds, first sample seeds, a cell counts at MIN_SAMPLES, a long gap reseeds" {
@@ -900,10 +928,15 @@ test "round_cost: persistence round-trips folded cells, marks them stale, reject
     try testing.expectApproxEqAbs(60.0, live.measuredMs(4, 0).?, 1e-3);
     try testing.expect(parse("rc0\n4 0 50 4 3\n") == null);
     try testing.expect(parse("rc1\n4 0 50 4 3\n") == null); // the pre-serial format is a quiet miss
-    try testing.expect(parse("rc2\n99 0 50 4 3\n") == null);
+    // v2 is a quiet miss too: its bucket INDICES mean other contexts now, so
+    // reading one would hand the new 32-64k cell an EMA measured up to 1M.
+    try testing.expect(parse("rc2\n4 5 50 4 3\n") == null);
+    try testing.expect(parse("rc3\n99 0 50 4 3\n") == null);
     try testing.expect(parse("") == null);
     var kb: [64]u8 = undefined;
-    try testing.expect(std.mem.startsWith(u8, cacheKey(&kb, "M4", "/m", "q4g64", "26.4"), "rc2-"));
+    // The version rides the KEY as well as the body, so a v3 build does not
+    // even open the v2 file — the persisted-table key semantics are unchanged.
+    try testing.expect(std.mem.startsWith(u8, cacheKey(&kb, "M4", "/m", "q4g64", "26.4"), "rc3-"));
 }
 
 test "round_cost: the serial row folds, trusts at MIN_SAMPLES and round-trips beside the widths" {
