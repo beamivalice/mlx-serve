@@ -440,8 +440,7 @@ pub const MtpModel = struct {
     /// re-score them through the trunk head's own rows (`draftSelect`). When
     /// built, the 3-bit draft head is dropped — non-greedy draft paths fall
     /// back to the trunk head.
-    rerank_coarse: ?QLinear = null,
-    rerank_rows: c_int = 0,
+    rerank_coarse: ?RerankCoarse = null,
     rerank_logged: bool = false,
 
     /// Cross-request EV controller seed (inference thread only, like every
@@ -706,6 +705,7 @@ pub const MtpModel = struct {
         const head_qp = headQuantParams(&target.config, target.lm_head_w, target.lm_head_s);
         if (head_qp.bits <= 2) return; // nothing coarser to gain
 
+        // The ONE env read: the built head carries its width from here on.
         const rc = buildRerankCoarse(self.s, target, rerankCoarseBits()) orelse return;
 
         if (self.draft_head) |*dh| {
@@ -715,8 +715,7 @@ pub const MtpModel = struct {
             self.draft_head_group = 0;
         }
         self.rerank_coarse = rc;
-        self.rerank_rows = w_shape[0];
-        log.info("[mtp] draft rerank: coarse {d}-bit/gs64 head built ({d} rows); greedy drafts re-rank through the trunk head\n", .{ rerankCoarseBits(), w_shape[0] });
+        log.info("[mtp] draft rerank: coarse {d}-bit/gs{d} head built ({d} rows); greedy drafts re-rank through the trunk head\n", .{ rc.bits, rc.group_size, rc.rows });
     }
 
     pub fn canRerankDrafts(self: *const MtpModel) bool {
@@ -742,7 +741,7 @@ pub const MtpModel = struct {
         // head is gone (never built, or a shortlist failure just dropped it):
         // this arm's own full readout answers, and it can still use the
         // low-bit draft head when one is resident.
-        if (try rerankSelect(self.s, target, &self.rerank_coarse, self.rerank_rows, &self.rerank_logged, x, suppress_mask)) |tok| return tok;
+        if (try rerankSelect(self.s, target, &self.rerank_coarse, &self.rerank_logged, x, suppress_mask)) |tok| return tok;
         return self.draftFallbackArgmax(target, x, suppress_mask);
     }
 
@@ -774,19 +773,41 @@ pub const MtpModel = struct {
 // the MIXER output, NOT the pre-mixer stream the head hands back as
 // `hidden_next`.
 
-/// Coarse-head width. The default is `draftHeadBitsFromEnv` (3), so
-/// MLX_SERVE_MTP_DRAFT_HEAD_BITS retunes it and "0"/"off" disables the build
+/// Coarse-head width AT BUILD TIME. The default is `draftHeadBitsFromEnv` (3),
+/// so MLX_SERVE_MTP_DRAFT_HEAD_BITS retunes it and "0"/"off" disables the build
 /// entirely. 2 is what the sidecar scheme was measured at and is the obvious
 /// second A/B arm; a coarser head is fewer bytes and a longer tail of
 /// shortlist misses, and a miss costs acceptance, never output.
+///
+/// Read exactly ONCE, where a head is built. The width a head is READ at is a
+/// property of its packed weights (`RerankCoarse.bits`), never of the
+/// environment at draft time — packed geometry implies K, so a re-read that
+/// disagrees with the build reads a different vocab entirely.
 pub fn rerankCoarseBits() u32 {
     return MtpModel.draftHeadBitsFromEnv();
 }
 
+/// Group size every coarse head is packed at.
+pub const RERANK_COARSE_GROUP: u32 = 64;
+
+/// A BUILT coarse readout head: the packed weights plus the geometry they
+/// were packed with. Both live together because `mlx_quantized_matmul` needs
+/// all three and only the build knows them.
+pub const RerankCoarse = struct {
+    q: QLinear,
+    bits: u32,
+    group_size: u32,
+    rows: c_int,
+
+    pub fn deinit(self: *RerankCoarse) void {
+        self.q.deinit();
+    }
+};
+
 /// The coarse readout head: a low-bit/gs64 requantized copy of the target's
 /// lm_head, materialized so the first draft does not pay for it. Infallible —
 /// every refusal returns null and the caller keeps its full-readout path.
-pub fn buildRerankCoarse(s: mlx.mlx_stream, target: *Transformer, bits: u32) ?QLinear {
+pub fn buildRerankCoarse(s: mlx.mlx_stream, target: *Transformer, bits: u32) ?RerankCoarse {
     if (bits == 0) return null;
     if (target.lm_head_s.ctx == null) return null; // dense bf16 - row-gather rerank unbuilt/unmeasured
     const w_shape = mlx.getShape(target.lm_head_w);
@@ -802,7 +823,7 @@ pub fn buildRerankCoarse(s: mlx.mlx_stream, target: *Transformer, bits: u32) ?QL
         head_qp.group_size,
         head_qp.bits,
         head_qp.mode.cstr(),
-        64,
+        RERANK_COARSE_GROUP,
         bits,
         32768,
     ) catch |err| {
@@ -819,7 +840,7 @@ pub fn buildRerankCoarse(s: mlx.mlx_stream, target: *Transformer, bits: u32) ?QL
         log.warn("[mtp] draft rerank coarse eval failed - keeping the full-readout path\n", .{});
         return null;
     };
-    return rc;
+    return .{ .q = rc, .bits = bits, .group_size = RERANK_COARSE_GROUP, .rows = w_shape[0] };
 }
 
 /// Resident bytes of a coarse head over `rows` x `hidden` at `bits`/gs64:
@@ -901,25 +922,28 @@ pub fn fullReadoutArgmax(
 pub fn rerankSelect(
     s: mlx.mlx_stream,
     target: *Transformer,
-    coarse: *?QLinear,
-    rows: c_int,
+    coarse: *?RerankCoarse,
     logged: *bool,
     x: mlx.mlx_array,
     suppress_mask: ?mlx.mlx_array,
 ) !?mlx.mlx_array {
     const rc = if (coarse.*) |*p| p else return null;
-    const coarse_bits = rerankCoarseBits();
+    // The BUILT width and group, never `rerankCoarseBits()`: the packed
+    // geometry implies K, so a per-step env re-read that disagrees with the
+    // build does not read a coarser vocab — it reads a different one.
+    const coarse_bits = rc.bits;
+    const rows = rc.rows;
 
     var coarse_logits = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(coarse_logits);
     try mlx.check(mlx.mlx_quantized_matmul(
         &coarse_logits,
         x,
-        rc.w,
-        rc.s,
-        rc.b,
+        rc.q.w,
+        rc.q.s,
+        rc.q.b,
         true,
-        mlx.mlx_optional_int.some(64),
+        mlx.mlx_optional_int.some(@intCast(rc.group_size)),
         mlx.mlx_optional_int.some(@intCast(coarse_bits)),
         "affine",
         s,
@@ -4694,7 +4718,7 @@ test "mtp: draft rerank returns the exact argmax whenever it is inside the coars
     defer fx.deinit();
 
     const coarse = buildRerankCoarse(s, &fx.xfm, 3) orelse return error.CoarseBuildDeclined;
-    var slot: ?QLinear = coarse;
+    var slot: ?RerankCoarse = coarse;
     defer if (slot) |*q| q.deinit();
     var logged = false;
 
@@ -4718,7 +4742,7 @@ test "mtp: draft rerank returns the exact argmax whenever it is inside the coars
             want = @intCast(i);
         };
 
-        const picked_arr = (try rerankSelect(s, &fx.xfm, &slot, fx.vocab, &logged, x, null)) orelse
+        const picked_arr = (try rerankSelect(s, &fx.xfm, &slot, &logged, x, null)) orelse
             return error.RerankDeclined;
         defer _ = mlx.mlx_array_free(picked_arr);
         const picked = try readIdScalar(picked_arr);
@@ -4731,9 +4755,9 @@ test "mtp: draft rerank returns the exact argmax whenever it is inside the coars
         try mlx.check(mlx.mlx_quantized_matmul(
             &coarse_logits,
             x,
-            slot.?.w,
-            slot.?.s,
-            slot.?.b,
+            slot.?.q.w,
+            slot.?.q.s,
+            slot.?.q.b,
             true,
             mlx.mlx_optional_int.some(64),
             mlx.mlx_optional_int.some(3),
@@ -4794,6 +4818,106 @@ test "mtp: draft rerank returns the exact argmax whenever it is inside the coars
     try testing.expect(decisive > 0);
 }
 
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+test "mtp: the coarse rerank head drafts at its BUILT width, not the env's current one" {
+    // The width a coarse head is READ at is a property of the BUILT weights.
+    // `rerankCoarseBits()` is the env-backed BUILD default; re-reading it per
+    // draft step means a head packed at one width gets dispatched at another
+    // the moment the variable moves — a retune between build and draft, or any
+    // caller passing `buildRerankCoarse` an explicit width, which both the
+    // sidecar and the qwen4 arm do. Packed geometry implies K, so a mismatched
+    // width does not degrade gracefully: it reads a different vocab entirely.
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+
+    var fx = try RerankFixture.init(s, TOP32_MIN_ROWS + 96, 256, 8, 64, 0x5EED);
+    defer fx.deinit();
+
+    // Built at 3 bits...
+    const coarse = buildRerankCoarse(s, &fx.xfm, 3) orelse return error.CoarseBuildDeclined;
+    var slot: ?RerankCoarse = coarse;
+    defer if (slot) |*q| q.deinit();
+    // ...and the head SAYS so, without asking the environment.
+    try testing.expectEqual(@as(u32, 3), slot.?.bits);
+    try testing.expectEqual(@as(u32, 64), slot.?.group_size);
+    try testing.expectEqual(fx.vocab, slot.?.rows);
+
+    // ...while the environment now says 2. Every draft below must still be
+    // dispatched at 3.
+    _ = setenv("MLX_SERVE_MTP_DRAFT_HEAD_BITS", "2", 1);
+    defer _ = unsetenv("MLX_SERVE_MTP_DRAFT_HEAD_BITS");
+    try testing.expectEqual(@as(u32, 2), rerankCoarseBits());
+
+    var logged = false;
+    const eps: f32 = 1e-3;
+    var kept: u32 = 0;
+    var draws: u32 = 0;
+    var seed: u64 = 1;
+    while (seed <= 8) : (seed += 1) {
+        const x = try fx.randomX(s, seed);
+        defer _ = mlx.mlx_array_free(x);
+
+        const exact = try fx.exactLogits(s, x);
+        defer _ = mlx.mlx_array_free(exact);
+        const ex = try readRow(allocator, s, exact, @intCast(fx.vocab));
+        defer allocator.free(ex);
+        var want: u32 = 0;
+        for (ex, 0..) |v, i| if (v > ex[want]) {
+            want = @intCast(i);
+        };
+
+        const picked_arr = (try rerankSelect(s, &fx.xfm, &slot, &logged, x, null)) orelse
+            return error.RerankDeclined;
+        defer _ = mlx.mlx_array_free(picked_arr);
+        const picked = try readIdScalar(picked_arr);
+        draws += 1;
+
+        // The shortlist the 3-bit head actually produces — read at 3 bits,
+        // which is the whole point.
+        var coarse_logits = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(coarse_logits);
+        try mlx.check(mlx.mlx_quantized_matmul(
+            &coarse_logits,
+            x,
+            slot.?.q.w,
+            slot.?.q.s,
+            slot.?.q.b,
+            true,
+            mlx.mlx_optional_int.some(64),
+            mlx.mlx_optional_int.some(3),
+            "affine",
+            s,
+        ));
+        var flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(flat);
+        const flat_shape = [_]c_int{fx.vocab};
+        try mlx.check(mlx.mlx_reshape(&flat, coarse_logits, &flat_shape, 1, s));
+        const cands = try draftTop32(s, flat, fx.vocab);
+        defer _ = mlx.mlx_array_free(cands);
+        try mlx.check(mlx.mlx_array_eval(cands));
+        const cand_ptr = mlx.mlx_array_data_uint32(cands) orelse return error.NoData;
+
+        var picked_in_list = false;
+        var best_in_list: u32 = cand_ptr[0];
+        for (cand_ptr[0..32]) |c| {
+            if (c == picked) picked_in_list = true;
+            if (ex[c] > ex[best_in_list]) best_in_list = c;
+        }
+        // The draft came from the BUILT head's shortlist and carries its best
+        // exact logit. Dispatched at any other width it comes from somewhere
+        // else entirely.
+        try testing.expect(picked_in_list);
+        try testing.expectApproxEqAbs(ex[best_in_list], ex[picked], eps);
+        if (@abs(ex[best_in_list] - ex[want]) <= eps) kept += 1;
+    }
+    // And the 3-bit head is still a USEFUL shortlister — a mis-dispatched read
+    // that happened to stay in range would not be.
+    try testing.expect(kept * 2 >= draws);
+}
+
 test "mtp: rerankSelect declines without a coarse head, and the full readout is the exact argmax" {
     // The fallback is not decoration: `canRerankDrafts` false, a build refusal
     // and a mid-chain shortlist failure all land here, and the answer must
@@ -4806,11 +4930,11 @@ test "mtp: rerankSelect declines without a coarse head, and the full readout is 
     var fx = try RerankFixture.init(s, TOP32_MIN_ROWS + 96, 256, 8, 64, 0xA11CE);
     defer fx.deinit();
 
-    var none: ?QLinear = null;
+    var none: ?RerankCoarse = null;
     var logged = false;
     const x = try fx.randomX(s, 7);
     defer _ = mlx.mlx_array_free(x);
-    try testing.expect((try rerankSelect(s, &fx.xfm, &none, fx.vocab, &logged, x, null)) == null);
+    try testing.expect((try rerankSelect(s, &fx.xfm, &none, &logged, x, null)) == null);
     try testing.expect(!logged);
 
     const exact = try fx.exactLogits(s, x);
@@ -4860,10 +4984,10 @@ test "mtp: a suppressed id is never drafted, through the coarse shortlist or the
     defer _ = mlx.mlx_array_free(mask);
 
     const coarse = buildRerankCoarse(s, &fx.xfm, 3) orelse return error.CoarseBuildDeclined;
-    var slot: ?QLinear = coarse;
+    var slot: ?RerankCoarse = coarse;
     defer if (slot) |*q| q.deinit();
     var logged = false;
-    const picked_arr = (try rerankSelect(s, &fx.xfm, &slot, fx.vocab, &logged, x, mask)) orelse
+    const picked_arr = (try rerankSelect(s, &fx.xfm, &slot, &logged, x, mask)) orelse
         return error.RerankDeclined;
     defer _ = mlx.mlx_array_free(picked_arr);
     try testing.expect((try readIdScalar(picked_arr)) != want);

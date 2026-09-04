@@ -5470,8 +5470,7 @@ pub const Qwen4Mtp = struct {
     /// still under construction and `lm_head_w` is not assigned yet. `tried`
     /// makes the refusal one-shot; a null `rerank` after it means the full
     /// readout is this head's draft path.
-    rerank: ?mtp_mod.QLinear = null,
-    rerank_rows: c_int = 0,
+    rerank: ?mtp_mod.RerankCoarse = null,
     rerank_logged: bool = false,
     rerank_tried: bool = false,
 };
@@ -13287,14 +13286,13 @@ pub const Transformer = struct {
         if (m.rerank_tried) return m.rerank != null;
         m.rerank_tried = true;
         if (mtp_mod.MtpModel.draftRerankMode() == .off) return false;
-        const bits = mtp_mod.rerankCoarseBits();
-        m.rerank = mtp_mod.buildRerankCoarse(self.s, self, bits) orelse return false;
-        const w_shape = mlx.getShape(self.lm_head_w);
-        m.rerank_rows = w_shape[0];
-        const mb = @divTrunc(mtp_mod.rerankCoarseBytes(w_shape[0], @intCast(self.config.hidden_size), bits), 1024 * 1024);
+        // The ONE env read: the built head carries its width from here on.
+        const rc = mtp_mod.buildRerankCoarse(self.s, self, mtp_mod.rerankCoarseBits()) orelse return false;
+        m.rerank = rc;
+        const mb = @divTrunc(mtp_mod.rerankCoarseBytes(rc.rows, @intCast(self.config.hidden_size), rc.bits), 1024 * 1024);
         log.info(
             "[qwen4] MTP draft rerank: coarse lm_head {d}-bit ({d} MB) + exact top-32 rescoring (MLX_SERVE_MTP_DRAFT_RERANK=0 restores full-vocab drafts)\n",
-            .{ bits, mb },
+            .{ rc.bits, mb },
         );
         return true;
     }
@@ -13305,7 +13303,7 @@ pub const Transformer = struct {
     /// what this path replaced.
     pub fn qwen4DraftSelect(self: *Transformer, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !mlx.mlx_array {
         const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
-        if (try mtp_mod.rerankSelect(self.s, self, &m.rerank, m.rerank_rows, &m.rerank_logged, x, suppress_mask)) |tok| return tok;
+        if (try mtp_mod.rerankSelect(self.s, self, &m.rerank, &m.rerank_logged, x, suppress_mask)) |tok| return tok;
         return mtp_mod.fullReadoutArgmax(self.s, self, x, suppress_mask);
     }
 
