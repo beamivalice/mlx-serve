@@ -43388,29 +43388,6 @@ test "qsa pooled rope: one cos/sin build per forward, not one per full-attention
 
 // ── The QSA all-visible identity skip at the engagement boundary ──
 
-/// The visibility sheet `qsaBlockVisibility` builds, without a Transformer:
-/// vis[r, b] = (b*ratio + ratio - 1) <= offset + r.
-fn qsaVisSheetForTest(s: mlx.mlx_stream, offset: c_int, seq_len: c_int, nb: c_int, ratio: c_int) !mlx.mlx_array {
-    var blk_end = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(blk_end);
-    try mlx.check(mlx.mlx_arange(&blk_end, @floatFromInt(ratio - 1), @floatFromInt(nb * ratio), @floatFromInt(ratio), .int32, s));
-    var blk_end2 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(blk_end2);
-    try mlx.check(mlx.mlx_reshape(&blk_end2, blk_end, &[_]c_int{ 1, nb }, 2, s));
-    var pos = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(pos);
-    try mlx.check(mlx.mlx_arange(&pos, @floatFromInt(offset), @floatFromInt(offset + seq_len), 1.0, .int32, s));
-    var pos2 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(pos2);
-    try mlx.check(mlx.mlx_reshape(&pos2, pos, &[_]c_int{ seq_len, 1 }, 2, s));
-    var vis = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(vis);
-    try mlx.check(mlx.mlx_less_equal(&vis, blk_end2, pos2, s));
-    var vis3 = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_expand_dims(&vis3, vis, 0, s));
-    return vis3;
-}
-
 /// Random f32 score sheet. The QSA indexer scores are f32 (the reference's own
 /// dtype), so the fixture is f32 and not the bf16 the attention helpers make.
 fn qsaRandScoresF32(rnd: std.Random, shape: []const c_int) !mlx.mlx_array {
@@ -43424,18 +43401,6 @@ fn qsaRandScoresF32(rnd: std.Random, shape: []const c_int) !mlx.mlx_array {
         x.* = if (v > 0) v else 0.0;
     }
     return mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .float32);
-}
-
-/// `b * 1e-7`, the index-descending tie bias `QsaBlockConsts` caches.
-fn qsaTieBiasForTest(s: mlx.mlx_stream, nb: c_int) !mlx.mlx_array {
-    var idx = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(idx);
-    try mlx.check(mlx.mlx_arange(&idx, 0.0, @floatFromInt(nb), 1.0, .float32, s));
-    const scale = mlx.mlx_array_new_float(1.0e-7);
-    defer _ = mlx.mlx_array_free(scale);
-    var bias = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_multiply(&bias, idx, scale, s));
-    return bias;
 }
 
 fn qsaArraysAllEqual(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !bool {
@@ -43461,11 +43426,12 @@ test "qsa mask: the all-visible skip must not hand a NULL sheet to an mlx op (kv
     // and killed the process mid-request.
     //
     // Why it hid: the skip needs BOTH `offset >= nb*ratio - 1` (all blocks
-    // complete) AND `nb > block_topk` (a selection actually happens). The
-    // second needs kv > budget = 2048; the first, at decode width, is exactly
-    // `kv % ratio == 0`. So nothing below 2048 can reach it and, above 2048,
-    // it fires on every 4th generated token — which is why a 2068-token
-    // prompt died a few tokens into generation while every short rung passed.
+    // complete) AND `nb > block_topk` (a selection actually happens). At
+    // DECODE width the first is ALWAYS true — offset is kv-1 and nb*ratio is
+    // kv minus the ragged tail — so the whole condition collapses to
+    // `nb > block_topk`, i.e. kv >= (block_topk + 1) * ratio = 2052. Past that
+    // every generated token crashes, which is why a 2068-token prompt died on
+    // its FIRST generated token while every rung under 2052 passed.
     //
     // Bar: wherever the predicate claims all-visible, (a) the real sheet must
     // in fact be all-true, and (b) the null-sheet arm must produce the SAME
@@ -43479,21 +43445,27 @@ test "qsa mask: the all-visible skip must not hand a NULL sheet to an mlx op (kv
     const rnd = prng.random();
 
     var checked_skip: usize = 0;
-    for ([_]c_int{ 2049, 2068, 2100, 4100 }) |kv| {
-        const nb = @divTrunc(kv + ratio - 1, ratio);
+    // kv 2049..2051 sit just BELOW the selection boundary (nb == 512, no
+    // selection); 2052 is the FIRST kv that can crash; 2068 is the ladder's
+    // actual prompt; 4100 is a rung that was assumed safe and is not.
+    for ([_]c_int{ 2049, 2052, 2068, 2100, 4100 }) |kv| {
+        // `nb` is the COMPLETE-block count, floor(kv/ratio) — the remainder is
+        // the ragged tail, which `qsaMaskFromBlockSel` zero-pads. Deriving it
+        // with ceil builds a mask ratio-1 columns too wide and the failure is
+        // a broadcast error, not this bug.
+        const nb = @divTrunc(kv, ratio);
         for ([_]c_int{ 1, 31, 1024 }) |seq_len| {
             if (seq_len > kv) continue;
             const offset = kv - seq_len;
-            // nb <= block_topk (no selection), and nb just ABOVE the budget by
-            // 1..8 — the window the shipped budget/4 = 512 lands in at these kv.
-            var topks = std.ArrayList(c_int){};
-            defer topks.deinit(std.testing.allocator);
-            try topks.append(std.testing.allocator, nb);
-            try topks.append(std.testing.allocator, nb + 4);
-            for (1..9) |d| try topks.append(std.testing.allocator, nb - @as(c_int, @intCast(d)));
-            try topks.append(std.testing.allocator, 512); // the production value
+            // nb <= block_topk (no selection), nb just ABOVE the budget by
+            // 1..8, and the production 512 — the window these kv land in.
+            var topk_buf: [11]c_int = undefined;
+            topk_buf[0] = nb;
+            topk_buf[1] = nb + 4;
+            for (1..9) |d| topk_buf[1 + d] = nb - @as(c_int, @intCast(d));
+            topk_buf[10] = 512;
 
-            for (topks.items) |block_topk| {
+            for (topk_buf) |block_topk| {
                 if (block_topk <= 0) continue;
                 const scores = try qsaRandScoresF32(rnd, &[_]c_int{ batch, seq_len, nb });
                 defer _ = mlx.mlx_array_free(scores);
@@ -43527,32 +43499,33 @@ test "qsa mask: the all-visible skip must not hand a NULL sheet to an mlx op (kv
     try std.testing.expect(checked_skip >= 8);
 }
 
-test "qsa boundary: the all-visible skip is reachable only past the budget, and then every ratio-th token" {
-    // Pure arithmetic, no GPU — this is the reachability argument the test
-    // above depends on, written down so it cannot rot silently.
+test "qsa boundary: past (block_topk+1)*ratio EVERY decode step reaches the all-visible skip" {
+    // Pure arithmetic, no GPU — the reachability argument the GPU test above
+    // depends on, written down so it cannot rot silently.
+    //
+    // At decode width offset = kv-1 and nb = floor(kv/ratio), so
+    // nb*ratio - 1 = kv - (kv % ratio) - 1 <= kv - 1: the all-visible claim
+    // holds for EVERY decode step, at every kv. The skip is therefore gated
+    // by `nb > block_topk` alone.
     const ratio: c_int = 4;
     const block_topk: c_int = 512; // budget 2048 / ratio
-    // Decode width: offset = kv - 1, nb = ceil(kv / ratio).
-    var hits: usize = 0;
-    var kv: c_int = 2040;
-    while (kv <= 2080) : (kv += 1) {
-        const nb = @divTrunc(kv + ratio - 1, ratio);
-        const vis = qsaAllBlocksVisible(kv - 1, nb, ratio);
-        const selects = nb > block_topk;
-        if (vis and selects) {
-            hits += 1;
-            try std.testing.expectEqual(@as(c_int, 0), @rem(kv, ratio));
-            try std.testing.expect(kv > block_topk * ratio);
-        }
+    const first: c_int = (block_topk + 1) * ratio; // 2052
+    var kv: c_int = 1;
+    while (kv <= 6000) : (kv += 1) {
+        const nb = @divTrunc(kv, ratio);
+        // Decode width is ALWAYS all-visible — no exceptions, at any kv.
+        try std.testing.expect(qsaAllBlocksVisible(kv - 1, nb, ratio));
+        // ...so reaching the skip is exactly "a selection happens".
+        try std.testing.expectEqual(kv >= first, nb > block_topk);
     }
-    // 2052, 2056, ... 2080 — every ratio-th token once past 2048.
-    try std.testing.expect(hits >= 7);
-    // Nothing at or below the budget can reach it, at ANY width.
+    // Nothing at or below the budget can select, at ANY width.
     var kv2: c_int = 1;
-    while (kv2 <= block_topk * ratio) : (kv2 += 1) {
-        const nb = @divTrunc(kv2 + ratio - 1, ratio);
-        try std.testing.expect(!(nb > block_topk));
+    while (kv2 < first) : (kv2 += 1) {
+        try std.testing.expect(!(@divTrunc(kv2, ratio) > block_topk));
     }
+    // A PREFILL chunk is different: its first row can sit far below the last
+    // complete block, which is why the bug needed a decode step to surface.
+    try std.testing.expect(!qsaAllBlocksVisible(1028, @divTrunc(@as(c_int, 2052), ratio), ratio));
 }
 
 test "qsa visibility: decode width is ALWAYS all-visible; a prefill chunk's FIRST row decides" {
