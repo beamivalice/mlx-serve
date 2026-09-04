@@ -4872,3 +4872,63 @@ so every later width sample would blend at `RESEED_WEIGHT` 0.5 instead of `BETA`
 0.1 — the width planner permanently reseeding, from a change that was supposed to
 be additive. Pinned both directions by "the serial row and the width grid keep
 SEPARATE reseed clocks".
+
+### Detail moved out of CLAUDE.md (2026-09-04 compression)
+
+The root file sits under a hard 100,000-byte cap, and the adaptive-serial rule
+plus its guard needed room. Nothing below was dropped as a RULE — every bullet
+still names its mechanism, its lever and its guard in CLAUDE.md; what came out
+were measurements and second-order notes, which belong here anyway.
+
+- **QSA verify union**: row 0's tail is read alongside the rows' block union
+  because the per-row starts RISE across a verify block, so row 0's tail covers
+  every later row's. `qsa_history_required` is the name of the miss when a
+  restored entry carries no indexer history.
+- **Round cost**: planning the base from per-request acceptance instead of the
+  table's `tok` column measured −4..10% on novel prompts; on qwen4 `m_lo` never
+  leaves w1, so the extension HORIZON — not the base — is the lever there.
+  `clearlyWorse` (≥20%) floors the interpolated plan.
+- **Per-silicon caps**: the M1 Pro row is 0.04 parity slack / depth cap 4.
+- **PLE defer**: +10% decode, verify lap 6.0 → 2.0 ms.
+- **f32 scalar promotion** (qwen4 residual widened to f32): 22.0 → 18.4
+  ms/forward, prefill 560 → 750 tok/s once fixed.
+- **hc/GDN multi-row kernels**: S=2 −8%, batched 2/4 streams +12%/+8%.
+- **Fused-vs-null MoE decode experiments**: shared expert as an 11th gather slot
+  −3%; gated shared tail in the down+reduce epilogue, in_proj fold — null;
+  multi-row gather kernels at verify widths +38% WORSE.
+- **DFlash2 selector** pays only at block 8. **`DEFAULT_DRAFT_HEAD_BITS` = 0**
+  (draft-head re-encode is off by default).
+- **Auto-mode MTP non-reproducibility**: the CONTROL differed from itself in
+  4 of 9 cells across boots.
+- **A/B hygiene**: `dsv4_dec_chain` measured +8.6%; a cost-profile A/B's boots
+  drifted 5-12% the same evening; per-prompt spec cells want sampling ACROSS
+  prompts, not just reps.
+- **qwen4 acceptance table**: code 0.91/0.80/0.68 is Table 4 of the checkpoint's
+  own report; the qwen4 G17 profile's `draft` term was fitted with a FULL-vocab
+  draft step and is stale since the rerank landed — it owes a refit.
+- **The qwen4 EV seed**: a code-trained seed costs the first prose request about
+  7 tok/s while it re-adapts.
+
+### The `restored` count is two numbers
+
+`Table.foldedCells()` counted width cells until the serial row arrived, and the
+serial row briefly slipped into the same total. There is exactly ONE consumer —
+the boot line `[spec-cost] round-cost table restored (...)` — so nothing planned
+from the inflated number, but the line itself became unreadable: "2 cells" could
+mean two widths or one width and one serial, and those are different states (the
+second cannot plan at all). `foldedCells()` is width-only again,
+`foldedSerialCells()` is its twin, `restored`/`restored_serial` are separate
+fields, and the boot line names both.
+
+### The capture step's entry invariant is checked, not asserted
+
+`mtpSerialCaptureTick` opened with `std.debug.assert(!has_pending_logits and
+!has_pending_token)`. That assert is a no-op in ReleaseFast — the only optimize
+mode that ever serves — so the guard existed exactly where it was not needed. A
+capture forward on a still-pipelined generator does not crash: it forwards the
+wrong position and publishes `last_hidden` for a row that was never committed,
+which the next MTP round then drafts from. It is now a real branch through
+`mtpSerialCaptureReady`, taking the same recovery the drain path's
+`.stay_disabled` arm takes (`mtpSerialGiveUp`: finish this request serial, log
+once). The rule generalizes: an invariant that protects a SERVING path is a
+runtime check; `std.debug.assert` is for invariants a test can violate.
