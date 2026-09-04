@@ -4692,17 +4692,26 @@ block-selection AND did not — it handed the null straight to mlx-c.
 The interesting part is not the missing branch, it is why nothing caught it.
 The skip needs BOTH halves of a conjunction:
 
-  * `nb > block_topk` — a selection actually happens, which needs kv > budget
-    (2048 tokens with the shipped budget/ratio = 512/4);
-  * `offset >= nb*ratio - 1` — all blocks complete, which at decode width
-    reduces to `kv % ratio == 0`.
+  * `offset >= nb*ratio - 1` — every block complete for the chunk's first row;
+  * `nb > block_topk` — a selection actually happens.
 
-So nothing at or below 2048 tokens can reach it at ANY width, and past 2048 it
-fires on every 4th generated token. Every short test rung sat under the budget.
-Every long rung was thousands of tokens past the boundary before anyone looked,
-and its first engagement had already happened at a kv that satisfied neither
-half at the same moment. The bug lived exactly in the band the test matrix
-stepped over: kv barely past the budget, nb barely above 512.
+The first looks like the restrictive one and is not. `nb` counts COMPLETE
+blocks, `floor(kv/ratio)`, with the remainder left as the ragged tail. So at
+decode width `offset = kv - 1` and `nb*ratio = kv - (kv % ratio)`, and
+`offset >= nb*ratio - 1` holds for EVERY decode step at EVERY kv — which the
+shipped test "qsa visibility: decode width is ALWAYS all-visible" already
+said out loud. The conjunction therefore collapses to `nb > block_topk` alone:
+kv >= (block_topk + 1) * ratio, or 2052 tokens with the shipped 512/4.
+
+Past 2052 every generated token crashes. A 2068-token prompt dies on its
+FIRST generated token. Nothing under 2052 can reach it at any width, which is
+why every short rung passed — and the long rungs never sat in the band at all.
+
+(The first analysis of this bug said the trigger was `kv % ratio == 0`, i.e.
+every 4th token. That came from deriving `nb` with ceil instead of floor, and
+it survived exactly as long as it took to RUN the test: with ceil the mask is
+ratio-1 columns too wide and dies in a broadcast, not in the null handle. An
+arithmetic claim about a boundary is worth what it is executed against.)
 
 Three things generalise.
 
@@ -4717,8 +4726,9 @@ each new consumer has to remember.
 2048" and "kv % 4 == 0" each looked individually harmless. The regression test
 walks kv in {2049, 2068, 2100, 4100} against block_topk in {nb, nb+4,
 nb-1..nb-8, 512} precisely because the failure needs the two to coincide, and it
-asserts it actually REACHED the skip (>= 8 cases) — a boundary test that never
-reaches the boundary is worse than no test, because it reports green.
+asserts it actually REACHED the skip (>= 8 cases; it reaches 55) — a boundary
+test that never reaches the boundary is worse than no test, because it reports
+green.
 
 **mlx-c's default error handler aborts.** mlx-serve installs no
 `mlx_set_error_handler`, so a recoverable argument error did not become a 500 on
