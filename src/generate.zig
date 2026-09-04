@@ -1219,6 +1219,10 @@ pub const Generator = struct {
     /// Adaptive serial controller (`MtpAdaptive`): which arm this request is
     /// on, the confirm streak behind it and the KV bucket it was decided in.
     mtp_adaptive: MtpAdaptive = .{},
+    /// This request's realized MTP price (ms per emitted token) over a
+    /// trailing window — the second of the two measured prices the switch
+    /// requires. Zeroed for every new request, hence empty after a restore.
+    mtp_price: MtpPriceWindow = .{},
     /// Ticks left in a BOUNDED serial block (the serial probe). Deliberately
     /// not `spec_disabled_runtime`: the probe is internal to `nextMtp`, so
     /// the scheduler keeps dispatching the slot as an MTP slot and the
@@ -6151,8 +6155,11 @@ pub const Generator = struct {
         if (next_depth < self.mtp_depth_current) self.mtp_promote_cooldown = MTP_PROMOTE_COOLDOWN;
         self.mtp_depth_current = next_depth;
         self.mtp_rounds_since_switch = 0;
-        // Reset the window so the new depth is judged on its own rounds.
+        // Reset the window so the new depth is judged on its own rounds. The
+        // price window goes with it for the same reason: its rounds priced a
+        // depth this request has just abandoned.
         self.mtp_window_idx = 0;
+        self.mtp_price.reset();
     }
 
     // ── MTP EV (expected-value) adaptive controller ──
@@ -6459,6 +6466,12 @@ pub const Generator = struct {
         const shape_changed = self.spec_round_prev_two_chunk != two_chunk or self.spec_round_prev_two_chunk2 != two_chunk;
         self.spec_round_prev_two_chunk2 = self.spec_round_prev_two_chunk;
         self.spec_round_prev_two_chunk = two_chunk;
+        // The realized price of speculation for THIS request, on the same
+        // wall clock the table folds and under the same solo gate (contention
+        // only ever ADDS time). Unlike the table's cells this is not per
+        // width: the vote it feeds asks whether the whole speculation is
+        // worth running, so every non-trial round counts, extension included.
+        if (post_warmup and self.spec_cost_solo) self.mtp_price.observe(wall, tok, width_trial);
         self.specObserveRound(m, wall, tok, ev_planned and !two_chunk, shape_changed);
     }
 
@@ -7539,6 +7552,65 @@ pub const Generator = struct {
     pub const MTP_ADAPTIVE_PROBE_TOKENS: u32 = 8;
     pub const MTP_ADAPTIVE_PROBE_WARM: u32 = 2;
 
+    /// Rounds in the realized price window. Full-window-only is the point:
+    /// the b1-long2 misfire in the A/B voted at round ~3 on rounds that were
+    /// all prefix-cache-restore warmup (the head's committed history is a
+    /// stub after a restore, so acceptance is unrepresentative for a while).
+    /// An EMA cannot express "full", which is why this is a ring and not the
+    /// `mtp_ev_round_ms` EMA beside it.
+    pub const MTP_PRICE_WINDOW: u32 = 16;
+
+    /// This request's realized ms per EMITTED token over a trailing window of
+    /// speculative rounds. Pure; no clock of its own — `mtpRoundEndObserve`
+    /// hands it the same inter-round wall the round-cost table folds.
+    ///
+    /// Width TRIALS are skipped: a trial deliberately runs a width the plan
+    /// rejected, and up to 3 of 16 rounds at a rejected width would price a
+    /// round the request never intends to run. Two-chunk (extension) rounds
+    /// are KEPT — the vote asks whether the whole speculation is worth
+    /// running, and an extension is part of it.
+    ///
+    /// A new request gets a zeroed window, so a prefix-cache restore starts
+    /// empty by construction: there is no restore hook to forget.
+    pub const MtpPriceWindow = struct {
+        ms: [MTP_PRICE_WINDOW]f32 = @splat(0),
+        tok: [MTP_PRICE_WINDOW]f32 = @splat(0),
+        idx: u32 = 0,
+        filled: u32 = 0,
+
+        pub fn reset(self: *MtpPriceWindow) void {
+            self.idx = 0;
+            self.filled = 0;
+        }
+
+        pub fn observe(self: *MtpPriceWindow, round_ms: f32, emitted: f32, width_trial: bool) void {
+            if (width_trial) return;
+            if (!std.math.isFinite(round_ms) or !(round_ms > 0)) return;
+            if (!std.math.isFinite(emitted) or !(emitted > 0)) return;
+            const i = self.idx % MTP_PRICE_WINDOW;
+            self.ms[i] = round_ms;
+            self.tok[i] = emitted;
+            self.idx +%= 1;
+            if (self.filled < MTP_PRICE_WINDOW) self.filled += 1;
+        }
+
+        /// Realized ms per emitted token, or null until the window is FULL.
+        /// Summed, not averaged per round: a round is not a unit of work, a
+        /// token is.
+        pub fn msPerTok(self: *const MtpPriceWindow) ?f32 {
+            if (self.filled < MTP_PRICE_WINDOW) return null;
+            var ms: f32 = 0;
+            var tok: f32 = 0;
+            for (self.ms, self.tok) |m, t| {
+                ms += m;
+                tok += t;
+            }
+            if (!(ms > 0) or !(tok > 0)) return null;
+            const v = ms / tok;
+            return if (std.math.isFinite(v)) v else null;
+        }
+    };
+
     pub const MtpAdaptiveVote = enum { undecided, mtp, serial };
     pub const MtpAdaptiveArm = enum { undecided, mtp, serial };
     pub const MtpAdaptiveAction = enum { none, to_serial, to_mtp };
@@ -7547,19 +7619,46 @@ pub const Generator = struct {
     /// one capture step.
     pub const MtpSerialExit = enum { none, drain, capture };
 
-    /// One round's vote. Pure. `round_ms` is the table's MEASURED ms at the
-    /// planned width (never interpolated — an interpolated cost cannot
-    /// justify leaving speculation), `exp_tokens` the request's own expected
-    /// committed tokens at that width, `serial_ms_tok` the bucket's measured
-    /// serial token. Any of them missing or degenerate = `.undecided`.
-    pub fn mtpAdaptiveVoteFor(round_ms: ?f32, exp_tokens: f32, serial_ms_tok: ?f32, margin: f32) MtpAdaptiveVote {
-        const r = round_ms orelse return .undecided;
+    /// One round's vote. Pure, and BOTH prices must be measured.
+    ///
+    /// v1 priced MTP as `measuredMs(m_lo) / mtpEvExpectedTokens(...)`: a
+    /// MEASURED numerator over a MODELED denominator. The model is a product
+    /// of per-index marginal acceptance EMAs, which under-predicts committed
+    /// tokens for two reasons — acceptance is positively correlated within a
+    /// round (a predictable stretch takes every draft, a hard one takes none),
+    /// so `E[prod] > prod E[]`; and the chain models a round with NO
+    /// extension while the cell's ms includes whatever the extension did.
+    /// Measured on the qwen4 A/B, the modeled token count ran 12-31% under
+    /// the same cell's own `tok` column, and the switch fired on prompts
+    /// where MTP was in fact ~10% faster than serial.
+    ///
+    /// So the vote now reads two MEASURED ms/token and requires both:
+    ///   `table_ms_tok`  — `Table.msPerTok(m_lo, bucket)`: ms and tokens
+    ///     folded from the SAME rounds of the same cell that used to supply
+    ///     only the numerator. Cross-request, but its `tok` column is a
+    ///     workload MIXTURE, so a code-fed cell reads optimistic on prose.
+    ///   `window_ms_tok` — this REQUEST's realized trailing window
+    ///     (`MtpPriceWindow`): immune to the mixture, but per-request and
+    ///     empty until it is full.
+    /// Their failure modes are disjoint, and a wrong switch costs ~10% while
+    /// a missed one costs nothing today, so `serial` needs BOTH to say serial.
+    /// Any input missing or degenerate = `.undecided`; a switch is never made
+    /// from a guess.
+    pub fn mtpAdaptiveVoteFor(
+        table_ms_tok: ?f32,
+        window_ms_tok: ?f32,
+        serial_ms_tok: ?f32,
+        margin: f32,
+    ) MtpAdaptiveVote {
+        const tbl = table_ms_tok orelse return .undecided;
+        const win = window_ms_tok orelse return .undecided;
         const ser = serial_ms_tok orelse return .undecided;
-        if (!std.math.isFinite(r) or !(r > 0)) return .undecided;
+        if (!std.math.isFinite(tbl) or !(tbl > 0)) return .undecided;
+        if (!std.math.isFinite(win) or !(win > 0)) return .undecided;
         if (!std.math.isFinite(ser) or !(ser > 0)) return .undecided;
-        if (!std.math.isFinite(exp_tokens) or !(exp_tokens > 0)) return .undecided;
         if (!std.math.isFinite(margin) or margin < 0) return .undecided;
-        return if (r / exp_tokens > ser * (1.0 + margin)) .serial else .mtp;
+        const bar = ser * (1.0 + margin);
+        return if (tbl > bar and win > bar) .serial else .mtp;
     }
 
     /// Arm a bounded serial probe, returning the bucket it will measure.
@@ -7764,14 +7863,19 @@ pub const Generator = struct {
         if (mtpAdaptiveSerialEnabled() and mtpCostTableEnabled()) {
             const t = &self.xfm.round_cost;
             const b = t.bucketToRead(kv_len) orelse round_cost.bucketFor(kv_len);
-            const exp_tok = mtpEvExpectedTokens(&self.mtp_ev_accept, plan.m_lo);
-            const round_ms = t.measuredMs(plan.m_lo, b);
+            // Both prices are MEASURED, and both come from rounds that
+            // actually ran. `msPerTok` takes ms AND tokens from one cell —
+            // the modeled `mtpEvExpectedTokens` denominator that used to sit
+            // under this numerator stays behind in `mtpEvPlanSrc`, where it
+            // only has to RANK widths and a common bias cancels.
+            const table_ms_tok = t.msPerTok(plan.m_lo, b);
+            const window_ms_tok = self.mtp_price.msPerTok();
             const serial_ms = t.serialMsPerTok(b);
-            const vote = mtpAdaptiveVoteFor(round_ms, exp_tok, serial_ms, mtpAdaptiveMargin());
+            const vote = mtpAdaptiveVoteFor(table_ms_tok, window_ms_tok, serial_ms, mtpAdaptiveMargin());
             if (self.mtp_adaptive.round(self.mtp_ev_rounds, b, vote, mtpAdaptiveConfirm()) == .to_serial) {
                 log.info(
-                    "  [mtp] adaptive: bucket {s} mtp {d:.2} ms/tok (w{d}, exp {d:.2}/round) vs serial {d:.2} ms/tok -> serial\n",
-                    .{ round_cost.BUCKET_NAMES[b], round_ms.? / exp_tok, plan.m_lo, exp_tok, serial_ms.? },
+                    "  [mtp] adaptive: bucket {s} mtp table {d:.2} / window {d:.2} ms/tok (w{d}) vs serial {d:.2} ms/tok -> serial\n",
+                    .{ round_cost.BUCKET_NAMES[b], table_ms_tok.?, window_ms_tok.?, plan.m_lo, serial_ms.? },
                 );
                 self.spec_disabled_runtime = true;
                 self.spec_disable_reason = .adaptive;
@@ -13602,30 +13706,146 @@ test "nextMtp consults the --max-mtp-ctx ceiling at round entry, before drafting
     }
 }
 
-test "mtpAdaptiveVoteFor: a switch needs both numbers, and the margin is a band" {
+test "mtpAdaptiveVoteFor: a switch needs BOTH measured prices past the margin" {
     const G = Generator;
     const margin = G.MTP_ADAPTIVE_MARGIN;
-    // Both present: 24 ms round emitting 2.0 tokens = 12.0 ms/tok.
-    try testing.expectEqual(G.MtpAdaptiveVote.mtp, G.mtpAdaptiveVoteFor(24.0, 2.0, 15.0, margin));
-    try testing.expectEqual(G.MtpAdaptiveVote.serial, G.mtpAdaptiveVoteFor(24.0, 2.0, 10.0, margin));
-    // The band: serial 11.5 puts break-even at 12.075, so 12.0 is a TIE and
-    // stays on MTP; serial 11.4 (break-even 11.97) is a loss.
-    try testing.expectEqual(G.MtpAdaptiveVote.mtp, G.mtpAdaptiveVoteFor(24.0, 2.0, 11.5, margin));
-    try testing.expectEqual(G.MtpAdaptiveVote.serial, G.mtpAdaptiveVoteFor(24.0, 2.0, 11.4, margin));
+    // Both prices past the bar (serial 10 -> bar 10.5): serial wins.
+    try testing.expectEqual(G.MtpAdaptiveVote.serial, G.mtpAdaptiveVoteFor(12.0, 12.0, 10.0, margin));
+    // Either price inside the bar keeps speculation. This is the whole point
+    // of requiring two: the table's `tok` column is a workload MIXTURE and
+    // the window is per-request, so each can be wrong alone.
+    try testing.expectEqual(G.MtpAdaptiveVote.mtp, G.mtpAdaptiveVoteFor(12.0, 9.0, 10.0, margin));
+    try testing.expectEqual(G.MtpAdaptiveVote.mtp, G.mtpAdaptiveVoteFor(9.0, 12.0, 10.0, margin));
+    try testing.expectEqual(G.MtpAdaptiveVote.mtp, G.mtpAdaptiveVoteFor(9.0, 9.0, 10.0, margin));
+    // The band: serial 11.5 puts the bar at 12.075, so 12.0 is a TIE on both
+    // and stays on MTP; serial 11.4 (bar 11.97) is a loss on both.
+    try testing.expectEqual(G.MtpAdaptiveVote.mtp, G.mtpAdaptiveVoteFor(12.0, 12.0, 11.5, margin));
+    try testing.expectEqual(G.MtpAdaptiveVote.serial, G.mtpAdaptiveVoteFor(12.0, 12.0, 11.4, margin));
     // A zero margin still declines an exact tie (strictly worse only).
-    try testing.expectEqual(G.MtpAdaptiveVote.mtp, G.mtpAdaptiveVoteFor(24.0, 2.0, 12.0, 0.0));
+    try testing.expectEqual(G.MtpAdaptiveVote.mtp, G.mtpAdaptiveVoteFor(12.0, 12.0, 12.0, 0.0));
 
-    // Any missing or degenerate input is UNDECIDED — never a switch.
-    try testing.expectEqual(G.MtpAdaptiveVote.undecided, G.mtpAdaptiveVoteFor(null, 2.0, 10.0, margin));
-    try testing.expectEqual(G.MtpAdaptiveVote.undecided, G.mtpAdaptiveVoteFor(24.0, 2.0, null, margin));
-    try testing.expectEqual(G.MtpAdaptiveVote.undecided, G.mtpAdaptiveVoteFor(0.0, 2.0, 10.0, margin));
-    try testing.expectEqual(G.MtpAdaptiveVote.undecided, G.mtpAdaptiveVoteFor(24.0, 0.0, 10.0, margin));
-    try testing.expectEqual(G.MtpAdaptiveVote.undecided, G.mtpAdaptiveVoteFor(24.0, 2.0, 0.0, margin));
+    // Any missing or degenerate input is UNDECIDED — never a switch. An
+    // unfilled window is a null, so a request cannot switch before it has
+    // priced itself.
     const nan = std.math.nan(f32);
-    try testing.expectEqual(G.MtpAdaptiveVote.undecided, G.mtpAdaptiveVoteFor(nan, 2.0, 10.0, margin));
-    try testing.expectEqual(G.MtpAdaptiveVote.undecided, G.mtpAdaptiveVoteFor(24.0, nan, 10.0, margin));
-    try testing.expectEqual(G.MtpAdaptiveVote.undecided, G.mtpAdaptiveVoteFor(24.0, 2.0, nan, margin));
-    try testing.expectEqual(G.MtpAdaptiveVote.undecided, G.mtpAdaptiveVoteFor(24.0, 2.0, 10.0, nan));
+    try testing.expectEqual(G.MtpAdaptiveVote.undecided, G.mtpAdaptiveVoteFor(null, 12.0, 10.0, margin));
+    try testing.expectEqual(G.MtpAdaptiveVote.undecided, G.mtpAdaptiveVoteFor(12.0, null, 10.0, margin));
+    try testing.expectEqual(G.MtpAdaptiveVote.undecided, G.mtpAdaptiveVoteFor(12.0, 12.0, null, margin));
+    try testing.expectEqual(G.MtpAdaptiveVote.undecided, G.mtpAdaptiveVoteFor(0.0, 12.0, 10.0, margin));
+    try testing.expectEqual(G.MtpAdaptiveVote.undecided, G.mtpAdaptiveVoteFor(12.0, 0.0, 10.0, margin));
+    try testing.expectEqual(G.MtpAdaptiveVote.undecided, G.mtpAdaptiveVoteFor(12.0, 12.0, 0.0, margin));
+    try testing.expectEqual(G.MtpAdaptiveVote.undecided, G.mtpAdaptiveVoteFor(nan, 12.0, 10.0, margin));
+    try testing.expectEqual(G.MtpAdaptiveVote.undecided, G.mtpAdaptiveVoteFor(12.0, nan, 10.0, margin));
+    try testing.expectEqual(G.MtpAdaptiveVote.undecided, G.mtpAdaptiveVoteFor(12.0, 12.0, nan, margin));
+    try testing.expectEqual(G.MtpAdaptiveVote.undecided, G.mtpAdaptiveVoteFor(12.0, 12.0, 10.0, nan));
+}
+
+test "mtpAdaptiveVoteFor: the four real switch events of the 2026-09-04 qwen4 A/B" {
+    // Every row is a switch this controller ACTUALLY made on the 62.7k prose
+    // prompt (root_adapt, 4 boots), read out of the server logs. On all four
+    // MTP was the faster arm (56.8 tok/s against serial's 51.6), so the
+    // correct vote is `mtp` every time.
+    //
+    // v1 priced MTP as measuredMs(m_lo) / mtpEvExpectedTokens(...) and voted
+    // `serial` on all four. The modeled token count ran 12-31% under the
+    // SAME cell's measured `tok`:
+    //
+    //   event     w   modeled exp   cell tok   error
+    //   b1 long1  2      1.81         2.28      -21%
+    //   b1 long2  2      1.81         2.32      -22%
+    //   b4 long1  4      1.84         2.67      -31%
+    //   b4 long2  1      1.46         1.66      -12%
+    const G = Generator;
+    const margin = G.MTP_ADAPTIVE_MARGIN;
+    const Event = struct {
+        name: []const u8,
+        table_ms_tok: f32, // Table.msPerTok(m_lo, bucket), from `table=` in [spec-stats]
+        serial_ms_tok: f32, // serial_cell= at the moment of the switch
+        window_ms_tok: f32, // round_ms EMA / (avg_per_round + 1)
+        window_full: bool, // rounds run before the vote >= MTP_PRICE_WINDOW
+    };
+    const events = [_]Event{
+        // round_ms 38.97 / (1.53 + 1) = 15.40
+        .{ .name = "b1 long1", .table_ms_tok = 16.12, .serial_ms_tok = 19.20, .window_ms_tok = 15.40, .window_full = true },
+        // The one v1 rule B would ALSO have got wrong: it voted at round ~3,
+        // and all 9 of its rounds were prefix-cache-restore warmup
+        // (avg_per_round 0.89, round_ms 45.69 -> 24.17 ms/tok). The
+        // full-window gate is what saves it — the window is not readable yet.
+        .{ .name = "b1 long2", .table_ms_tok = 15.85, .serial_ms_tok = 18.16, .window_ms_tok = 24.17, .window_full = false },
+        // round_ms 41.74 / (1.51 + 1) = 16.63
+        .{ .name = "b4 long1", .table_ms_tok = 17.28, .serial_ms_tok = 19.53, .window_ms_tok = 16.63, .window_full = true },
+        // round_ms 34.49 / (1.16 + 1) = 15.97
+        .{ .name = "b4 long2", .table_ms_tok = 17.91, .serial_ms_tok = 17.08, .window_ms_tok = 15.97, .window_full = true },
+    };
+    for (events) |e| {
+        // Rule A alone is right on all four: the measured cell says MTP.
+        try testing.expectEqual(
+            G.MtpAdaptiveVote.mtp,
+            G.mtpAdaptiveVoteFor(e.table_ms_tok, e.table_ms_tok, e.serial_ms_tok, margin),
+        );
+        // The shipped rule, with the window gated on being full.
+        const win: ?f32 = if (e.window_full) e.window_ms_tok else null;
+        try testing.expectEqual(
+            G.MtpAdaptiveVote.mtp,
+            G.mtpAdaptiveVoteFor(e.table_ms_tok, win, e.serial_ms_tok, margin),
+        );
+    }
+    // And the guard against over-fitting: rule B UNGATED reproduces v1's
+    // b1-long2 mistake, which is exactly why the full-window gate exists.
+    const b1l2 = events[1];
+    try testing.expectEqual(
+        G.MtpAdaptiveVote.serial,
+        G.mtpAdaptiveVoteFor(30.0, b1l2.window_ms_tok, b1l2.serial_ms_tok, margin),
+    );
+}
+
+test "MtpPriceWindow: reads nothing until FULL, skips width trials, prices per TOKEN" {
+    const G = Generator;
+    const N = G.MTP_PRICE_WINDOW;
+    var w = G.MtpPriceWindow{};
+    // A fresh window — every new request, and therefore every prefix-cache
+    // restore — has no price at all.
+    try testing.expect(w.msPerTok() == null);
+
+    var i: u32 = 0;
+    while (i < N - 1) : (i += 1) {
+        w.observe(20.0, 2.0, false);
+        try testing.expect(w.msPerTok() == null); // still not full
+    }
+    w.observe(20.0, 2.0, false);
+    try testing.expectApproxEqAbs(@as(f32, 10.0), w.msPerTok().?, 1e-4);
+
+    // Width trials never enter: a trial prices a width the plan rejected.
+    var t = G.MtpPriceWindow{};
+    i = 0;
+    while (i < N * 2) : (i += 1) t.observe(999.0, 1.0, true);
+    try testing.expect(t.msPerTok() == null);
+    try testing.expectEqual(@as(u32, 0), t.filled);
+
+    // Degenerate samples are dropped, not folded as zeros.
+    var d = G.MtpPriceWindow{};
+    d.observe(std.math.nan(f32), 2.0, false);
+    d.observe(20.0, 0.0, false);
+    d.observe(-1.0, 2.0, false);
+    try testing.expectEqual(@as(u32, 0), d.filled);
+
+    // Summed over the window, not averaged per round: a round is not a unit
+    // of work. Eight rounds emitting 1 token in 30 ms and eight emitting 4 in
+    // 60 ms cost (8*30 + 8*60) / (8*1 + 8*4) = 720/40 = 18.0 ms/tok — the
+    // mean of the per-round ratios (30 and 15) would have said 22.5.
+    var m = G.MtpPriceWindow{};
+    i = 0;
+    while (i < N / 2) : (i += 1) m.observe(30.0, 1.0, false);
+    while (i < N) : (i += 1) m.observe(60.0, 4.0, false);
+    try testing.expectApproxEqAbs(@as(f32, 18.0), m.msPerTok().?, 1e-4);
+
+    // The ring keeps only the last N: a reset, or N newer rounds, retires the
+    // old regime entirely.
+    i = 0;
+    while (i < N) : (i += 1) m.observe(10.0, 2.0, false);
+    try testing.expectApproxEqAbs(@as(f32, 5.0), m.msPerTok().?, 1e-4);
+    m.reset();
+    try testing.expect(m.msPerTok() == null);
 }
 
 test "MtpAdaptive: the switch needs CONFIRM consecutive rounds, counted once per round" {
@@ -13774,6 +13994,19 @@ test "the adaptive decision is read after the EV plan, before the width trial, a
     try testing.expect(std.mem.indexOf(u8, window, "spec_disabled" ++ "_runtime = true") != null);
     try testing.expect(std.mem.indexOf(u8, window, "spec_disable" ++ "_reason = .adaptive") != null);
     try testing.expect(std.mem.indexOf(u8, src, "reason={s} adaptive={s} serial_cell={d:.2}") != null);
+
+    // BOTH of the vote's MTP prices are MEASURED, and the modeled chain is
+    // not one of them. A measured numerator over a modeled denominator is
+    // how v1 came to switch on prompts where MTP was 10% faster: the product
+    // of per-index marginals ran 12-31% under the same cell's own `tok`.
+    // The model keeps its job one level up, ranking widths in `mtpEvPlanSrc`.
+    const decide_win = src[ev_at..decide_at];
+    try testing.expect(std.mem.indexOf(u8, decide_win, "t.msPer" ++ "Tok(plan.m_lo, b)") != null);
+    try testing.expect(std.mem.indexOf(u8, decide_win, "self.mtp_price.msPer" ++ "Tok()") != null);
+    try testing.expect(std.mem.indexOf(u8, decide_win, "mtpEvExpected" ++ "Tokens(&self.mtp_ev_accept") == null);
+    // The window is fed from the round-end observer, on the same wall clock
+    // and under the same solo gate as the table fold, with trials skipped.
+    try testing.expect(std.mem.indexOf(u8, src, "self.mtp_price.observe(wall, tok, width_trial)") != null);
 
     // In `nextMtp`: `--max-mtp-ctx` is checked FIRST and is not overridable —
     // the re-entry keys on `.adaptive`, so a ceiling crossing stays off.
