@@ -831,11 +831,45 @@ pub fn takeError(buf: []u8) ?[]const u8 {
     return buf[0..n];
 }
 
+/// One-shot fault injection AT the engine's checkpoint, for builds that are
+/// not test builds — `fault.arm` above is `builtin.is_test`-only and the
+/// invariant this proves ("an MLX error costs one REQUEST, not the server")
+/// can only be observed end to end, with a real model behind a real socket.
+///
+/// `MLX_SERVE_MLX_FAULT_CHUNK=<n>` latches a synthetic Metal working-set OOM
+/// at the n-th `checkError` of the process and then disarms itself, so the
+/// NEXT request runs clean and the test can assert both halves. Absent or `0`
+/// = off (`diagEnvOn` discipline: an env read with `getenv != null` is armed
+/// by `=0`). Resolved once; the armed path costs one relaxed load per prefill
+/// chunk.
+const FAULT_CHUNK_MSG = "[METAL] Command buffer execution failed: Insufficient Memory (injected by MLX_SERVE_MLX_FAULT_CHUNK). at transforms.cpp:15";
+var fault_chunk_at: ?u64 = null;
+var fault_chunk_seen: u64 = 0;
+
+fn faultChunkTarget() u64 {
+    if (fault_chunk_at) |v| return v;
+    var v: u64 = 0;
+    if (std.c.getenv("MLX_SERVE_MLX_FAULT_CHUNK")) |pz| {
+        v = std.fmt.parseInt(u64, std.mem.span(pz), 10) catch 0;
+    }
+    fault_chunk_at = v;
+    if (v > 0) log.warn("[mlx] FAULT INJECTION armed: an MLX error will be latched at checkError #{d}\n", .{v});
+    return v;
+}
+
 /// The one checkpoint the engine calls: turns a latched MLX failure into a
 /// Zig error. `error.OutOfMemory` for the memory class (named memory 503),
 /// `error.MlxFailure` for everything else. Zero cost when nothing is latched
 /// — one relaxed-ordered atomic load.
 pub fn checkError() !void {
+    const target = faultChunkTarget();
+    if (target > 0) {
+        fault_chunk_seen += 1;
+        if (fault_chunk_seen == target) {
+            fault_chunk_at = 0; // one-shot: the next request must run clean
+            latchErrorForTest(FAULT_CHUNK_MSG);
+        }
+    }
     if (!mlx_error_latched.load(.acquire)) return;
     var buf: [512]u8 = undefined;
     const msg = takeError(&buf) orelse return;
@@ -843,9 +877,18 @@ pub fn checkError() !void {
     return error.MlxFailure;
 }
 
-/// TEST ONLY: latch a message as if mlx-c had raised it.
+/// Latch a message as if mlx-c had raised it. Tests call it directly; the
+/// `MLX_SERVE_MLX_FAULT_CHUNK` injector above calls it once.
 pub fn latchErrorForTest(msg: [:0]const u8) void {
     latchMlxError(msg.ptr, null);
+}
+
+/// TEST-ONLY reset so one test's injector state cannot leak into another.
+pub fn resetFaultChunkForTest() void {
+    fault_chunk_at = null;
+    fault_chunk_seen = 0;
+    var buf: [512]u8 = undefined;
+    _ = takeError(&buf);
 }
 
 test "an MLX memory failure is classified as a memory error, an argument error is not" {
@@ -881,4 +924,44 @@ test "the latch turns an mlx-c error into a Zig error instead of exiting, once" 
     latchErrorForTest("[matmul] Last dimension of first input must match.");
     try t.expectError(error.MlxFailure, checkError());
     try t.expect(!errorPending());
+}
+
+test "the injected MLX error costs ONE checkError and the engine keeps working after it" {
+    const t = std.testing;
+    // The invariant behind issue #353, at the level a hermetic test can reach:
+    // an MLX failure is consumed EXACTLY once, and everything after it runs.
+    // The end-to-end half of it — a 503 for the failing request and a 200 for
+    // the next one on the same server — needs a real model behind a real
+    // socket, which is why the injector below is also reachable in a release
+    // build through `MLX_SERVE_MLX_FAULT_CHUNK` and pinned by
+    // `tests/test_mlx_error_recovery.sh`.
+    resetFaultChunkForTest();
+    defer resetFaultChunkForTest();
+
+    // Chunk 1 and 2 of a prefill: clean.
+    try checkError();
+    try checkError();
+
+    // Chunk 3 fails, the way the Metal working-set abort does.
+    latchErrorForTest("[METAL] Command buffer execution failed: Insufficient Memory. at transforms.cpp:15");
+    try t.expectError(error.OutOfMemory, checkError());
+
+    // And the process is still an engine: the latch is clear, the next
+    // prefill's chunks pass, and MLX itself still evaluates. (Before the
+    // handler was installed there was no "after" — mlx-c called exit(-1).)
+    try t.expect(!errorPending());
+    try checkError();
+    const s = gpuStream();
+    const shape = [_]c_int{2};
+    const data = [_]f32{ 1.5, 2.5 };
+    var a = mlx_array_new_data(@ptrCast(&data), &shape, 1, .float32);
+    defer _ = mlx_array_free(a);
+    var sum = mlx_array_new();
+    defer _ = mlx_array_free(sum);
+    try t.expectEqual(@as(c_int, 0), mlx_sum(&sum, a, false, s));
+    _ = mlx_array_eval(sum);
+    var out: f32 = 0;
+    _ = mlx_array_item_float32(&out, sum);
+    try t.expectApproxEqAbs(@as(f32, 4.0), out, 1e-6);
+    try checkError();
 }
