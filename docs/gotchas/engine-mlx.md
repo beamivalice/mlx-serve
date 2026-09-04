@@ -1418,7 +1418,6 @@ longest raw prefix. A real Qwen3.8 four-turn reproduction changed cached-token c
 `0, 2048, 0, 2048` to `0, 2048, 2048, 2048`; turn three fell from 4.79 s to 2.17 s. The
 hermetic regression uses the same shape: a 7-token raw match with its first checkpoint at 8
 must lose to a 5-token raw match that can restore at 4.
->>>>>>> main
 
 ### A synthetic-dtype reference probe nearly shipped a 2x-bandwidth Inkling forward (2026-07-30)
 Porting Inkling Small, the dtype question was "does the residual stream run bf16 or f32?" — the reference multiplies every dense-MLP output by a `[1]` `global_scale` tensor, and an early python probe (reference modules, MY casts: global_scale → f32 like the "keep_hi" converter comment implied) showed bf16 × f32-array promoting the whole stream to f32 from layer 0. Plan accordingly: f32 KV, f32 experts, 2x bandwidth. WRONG: the REAP25 checkpoint STORES the dense `mlp.global_scale` tensors as BF16 (the base model's were bf16, so the converter's f32-keep condition never fired); only the ROUTER's `gate.bias`/`gate.global_scale` are f32. The real stream is bf16 end-to-end. The probe proved the reference's promotion SEMANTICS while saying nothing about the checkpoint — same family as "read the CHECKPOINT, not the reference source" (Kokoro AdaIN, laguna YaRN), one level up: read the checkpoint's DTYPES, not the converter's intent.
@@ -4631,7 +4630,6 @@ predictable probe (`user=368b`, "Repeat the following passage exactly"), with th
   measured here. The persisted table must be restored before EVERY boot (not
   disabled — the live table IS the subject) or the arms teach each other.
 
-<<<<<<< HEAD
 ## The QSA tie bias was a MAGNITUDE contract, and the profiler that priced the fix could not see it (2026-09-04)
 
 `qsaSelectBlocks` picks each query row's top-512 indexer blocks. relu leaves many EXACT zeros in the score row, so which of several tied blocks gets picked is a real decision, and the reference (`torch.topk`) makes it by taking the LOWER index. Ours reproduced that by subtracting an index-ascending bias before `argpartition`: `biased = score - idx * 1e-7`, so on a tie the lower index is strictly larger and wins.
@@ -4737,7 +4735,6 @@ already learned this for weights ("a missing tensor is a load ERROR, never
 subsystem, and it is why this bug read as "the server crashed" rather than "one
 request failed".
 
-=======
 ## Speculation never compared itself with the serial token it replaces (`MtpAdaptive`)
 
 The EV controller answers "which draft width", and it answers it well: measured
