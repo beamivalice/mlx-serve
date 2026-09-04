@@ -5363,7 +5363,11 @@ pub const Generator = struct {
         {
             // The SAME resolution the decision used — see mtpAdaptiveBucketOf.
             const b = self.mtpAdaptiveBucket(self.mtpKvLen());
-            if (self.mtp_adaptive.serialTick(b) == .to_mtp) {
+            const prev_bucket = self.mtp_adaptive.bucket;
+            const prev_arm = self.mtp_adaptive.arm;
+            const action = self.mtp_adaptive.serialTick(b);
+            self.mtpAdaptiveSyncWindow(prev_bucket, prev_arm);
+            if (action == .to_mtp) {
                 log.info(
                     "  [mtp] adaptive: kv {d} crossed into bucket {s} -> mtp\n",
                     .{ self.mtpKvLen(), round_cost.BUCKET_NAMES[b] },
@@ -7633,6 +7637,34 @@ pub const Generator = struct {
         return mtpAdaptiveBucketOf(self.xfm.round_cost.bucketToRead(kv_len), kv_len);
     }
 
+    /// Must the realized price window be dropped? It prices ONE arm in ONE
+    /// bucket: the moment either moves, its rounds describe a regime the
+    /// request has left. `MtpPriceWindow.reset` used to be reachable only
+    /// from the legacy depth controller, so after a switch, a re-entry or a
+    /// crossing the window still held up to 15 rounds of the old regime and
+    /// the 3-round confirm re-decided mostly from them.
+    pub fn mtpAdaptiveRegimeMoved(
+        prev_bucket: ?usize,
+        prev_arm: MtpAdaptiveArm,
+        bucket: ?usize,
+        arm: MtpAdaptiveArm,
+    ) bool {
+        if (prev_arm != arm) return true;
+        if (prev_bucket == null and bucket == null) return false;
+        if (prev_bucket == null or bucket == null) return true;
+        return prev_bucket.? != bucket.?;
+    }
+
+    /// Apply the rule above around a `MtpAdaptive` transition. Both call
+    /// sites (the vote and the re-entry) go through it, so neither can
+    /// forget: a switch in EITHER direction, and a crossing, start pricing
+    /// from scratch.
+    fn mtpAdaptiveSyncWindow(self: *Generator, prev_bucket: ?usize, prev_arm: MtpAdaptiveArm) void {
+        if (mtpAdaptiveRegimeMoved(prev_bucket, prev_arm, self.mtp_adaptive.bucket, self.mtp_adaptive.arm)) {
+            self.mtp_price.reset();
+        }
+    }
+
     /// Rounds in the realized price window. Full-window-only is the point:
     /// the b1-long2 misfire in the A/B voted at round ~3 on rounds that were
     /// all prefix-cache-restore warmup (the head's committed history is a
@@ -7972,7 +8004,11 @@ pub const Generator = struct {
             const window_ms_tok = self.mtp_price.msPerTok();
             const serial_ms = t.serialMsPerTok(b);
             const vote = mtpAdaptiveVoteFor(table_ms_tok, window_ms_tok, serial_ms, mtpAdaptiveMargin());
-            if (self.mtp_adaptive.round(self.mtp_ev_rounds, b, vote, mtpAdaptiveConfirm()) == .to_serial) {
+            const prev_bucket = self.mtp_adaptive.bucket;
+            const prev_arm = self.mtp_adaptive.arm;
+            const action = self.mtp_adaptive.round(self.mtp_ev_rounds, b, vote, mtpAdaptiveConfirm());
+            self.mtpAdaptiveSyncWindow(prev_bucket, prev_arm);
+            if (action == .to_serial) {
                 log.info(
                     "  [mtp] adaptive: bucket {s} mtp table {d:.2} / window {d:.2} ms/tok (w{d}) vs serial {d:.2} ms/tok -> serial\n",
                     .{ round_cost.BUCKET_NAMES[b], table_ms_tok.?, window_ms_tok.?, plan.m_lo, serial_ms.? },
@@ -13937,6 +13973,39 @@ test "mtpAdaptiveBucketOf: the decision and the re-entry resolve ONE bucket (H6 
     try testing.expectEqual(G.MtpAdaptiveArm.serial, ok.arm);
 }
 
+test "mtpAdaptiveRegimeMoved: a switch either way, or a crossing, drops the price window (H7)" {
+    const G = Generator;
+    const A = G.MtpAdaptiveArm;
+    // Nothing moved.
+    try testing.expect(!G.mtpAdaptiveRegimeMoved(null, .undecided, null, .undecided));
+    try testing.expect(!G.mtpAdaptiveRegimeMoved(3, .mtp, 3, .mtp));
+    // Arm moved — BOTH directions. The window priced the arm the request has
+    // just left, so 3 fresh rounds must not re-decide from 13 stale ones.
+    try testing.expect(G.mtpAdaptiveRegimeMoved(3, A.mtp, 3, A.serial));
+    try testing.expect(G.mtpAdaptiveRegimeMoved(3, A.serial, 3, A.undecided));
+    try testing.expect(G.mtpAdaptiveRegimeMoved(3, A.undecided, 3, A.mtp));
+    // Bucket moved, including in and out of "not yet decided anywhere".
+    try testing.expect(G.mtpAdaptiveRegimeMoved(3, A.mtp, 4, A.mtp));
+    try testing.expect(G.mtpAdaptiveRegimeMoved(null, A.mtp, 4, A.mtp));
+    try testing.expect(G.mtpAdaptiveRegimeMoved(3, A.mtp, null, A.mtp));
+
+    // The transitions the two call sites actually produce.
+    var a = G.MtpAdaptive{};
+    var pb = a.bucket;
+    var pa = a.arm;
+    _ = a.round(0, 5, .serial, 1); // first vote: bucket null -> 5, arm -> serial
+    try testing.expect(G.mtpAdaptiveRegimeMoved(pb, pa, a.bucket, a.arm));
+    pb = a.bucket;
+    pa = a.arm;
+    _ = a.serialTick(6); // crossing: re-opens the decision
+    try testing.expect(G.mtpAdaptiveRegimeMoved(pb, pa, a.bucket, a.arm));
+    // A tick that changes nothing must NOT drop the window, or it can never fill.
+    pb = a.bucket;
+    pa = a.arm;
+    _ = a.serialTick(6);
+    try testing.expect(!G.mtpAdaptiveRegimeMoved(pb, pa, a.bucket, a.arm));
+}
+
 test "mtpAdaptiveKvEligible: short context is below the floor, and the floor is the default" {
     const G = Generator;
     const floor = G.MTP_ADAPTIVE_MIN_KV;
@@ -14176,6 +14245,11 @@ test "the adaptive decision is read after the EV plan, before the width trial, a
     // ONE bucket resolver: the decision and the re-entry must not disagree,
     // or a switch undoes itself on the next tick and oscillates.
     try testing.expect(std.mem.indexOf(u8, decide_win, "self.mtpAdaptive" ++ "Bucket(kv_len)") != null);
+    // Both transition sites drop the price window when the regime moves (H7).
+    try testing.expectEqual(
+        @as(usize, 2),
+        std.mem.count(u8, src, "self.mtpAdaptiveSync" ++ "Window(prev_bucket, prev_arm)"),
+    );
     // The window is fed from the round-end observer, on the same wall clock
     // and under the same solo gate as the table fold, with trials skipped.
     try testing.expect(std.mem.indexOf(u8, src, "self.mtp_price.observe(wall, tok, width_trial)") != null);
