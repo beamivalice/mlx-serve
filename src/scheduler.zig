@@ -303,7 +303,7 @@ pub const SubmitParams = struct {
 /// the same shape as `prefix_cache_mem_resolver`. Null in unit tests and on
 /// hosts that never route through the HTTP server, which disables the
 /// evict-to-admit path entirely (behaviour identical to before #353).
-pub var prefill_admission_fits: ?*const fn (*const model_mod.ModelConfig, usize, u32) bool = null;
+pub var prefill_admission_fits: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool) bool = null;
 
 pub const SlotState = enum { pending_prefill, decoding, finished, errored };
 
@@ -5380,20 +5380,31 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // IS the estimator (#126).
     if (prefill_admission_fits) |fits_fn| {
         if (slot.model.config) |cfg| {
+            // The probe bills what the connection thread's guard admitted
+            // with — the request's OWN kv-quant scheme and vision chunking,
+            // not the process defaults. A `kv_quant: 4` request otherwise
+            // priced its cache at fp16 here, evicted the whole hot cache and
+            // could then be refused by name AFTER being admitted.
             const Probe = struct {
                 cfg: *const model_mod.ModelConfig,
                 seq: usize,
                 max_tokens: u32,
-                fits: *const fn (*const model_mod.ModelConfig, usize, u32) bool,
+                kv_cfg: transformer_mod.KVQuantConfig,
+                unchunked: bool,
+                fits: *const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool) bool,
                 fn call(ctx: ?*anyopaque) bool {
                     const self: *@This() = @ptrCast(@alignCast(ctx.?));
-                    return self.fits(self.cfg, self.seq, self.max_tokens);
+                    return self.fits(self.cfg, self.seq, self.max_tokens, self.kv_cfg, self.unchunked);
                 }
             };
             var probe = Probe{
                 .cfg = cfg,
                 .seq = slot.full_prompt.len,
+                // Already clamped to the context by the surface that admitted
+                // it — an unclamped `max_tokens` is the omitted sentinel.
                 .max_tokens = slot.max_tokens,
+                .kv_cfg = slot.cache.config,
+                .unchunked = generate_mod.visionPrefillUnchunked(slot.vision_embeddings != null),
                 .fits = fits_fn,
             };
             if (!Probe.call(&probe)) {

@@ -3436,8 +3436,15 @@ pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: us
 /// request fit RIGHT NOW, with live memory re-read? Re-asked after every
 /// hot-cache eviction, so the estimator — not a precomputed shortfall —
 /// decides when to stop evicting.
-pub fn prefillFitsNow(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32) bool {
-    return prefillAdmissionBill(config, prompt_len, max_tokens, null, false).fits();
+///
+/// Every input is FORWARDED, none defaulted: this and `checkAttentionMemory`
+/// must bill the same number for the same request, and hardcoding
+/// `kv_override = null` here made a `kv_quant: 4` request price its cache at
+/// fp16 on the inference thread — over-billing by ~2.4x, evicting a hot cache
+/// that did not need to go and refusing by name a request the connection
+/// thread had already admitted. One estimator means one set of INPUTS too.
+pub fn prefillFitsNow(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, unchunked_prefill: bool) bool {
+    return prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill).fits();
 }
 
 fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_len: usize, max_tokens: u32, config: *const model_mod.ModelConfig, is_anthropic: bool, kv_override: ?transformer_mod.KVQuantConfig, lm: *const LoadedModel, unchunked_prefill: bool) !bool {
