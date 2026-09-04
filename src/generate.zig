@@ -12986,3 +12986,32 @@ test "qwen4: the coarse rerank head is READY before any draft has run" {
     try testing.expect(fx.xfm.qwen4BuildDraftRerank());
     try testing.expectEqual(head_ctx, fx.xfm.qwen4_mtp.?.rerank.?.q.w.ctx);
 }
+
+test "every request-finalize seam that logs [spec-stats] also logs [qsa-arms]" {
+    // Class guard for a wiring bug this test was written after: `logQsaArms`
+    // was added beside the three `gen.logSpecStats()` calls in THIS file, which
+    // are the legacy/CLI path only. The SERVER finalizes requests in
+    // `scheduler.finishSlot` ("scheduler-driven slots finalize here instead"),
+    // so `[qsa-arms]` was dead on every served request while looking wired.
+    // A per-request meter is worth nothing if it misses the path that actually
+    // serves requests, so the SEAM — not the symbol — is what gets pinned:
+    // every call site of the request summary must carry both. Needles are
+    // assembled at comptime so this test's own source cannot satisfy the scan.
+    const spec_call = "logSpec" ++ "Stats();";
+    const qsa_call = "logQsa" ++ "Arms();";
+    inline for (.{ @embedFile("generate.zig"), @embedFile("scheduler.zig") }) |src| {
+        var i: usize = 0;
+        var seams: usize = 0;
+        while (std.mem.indexOfPos(u8, src, i, spec_call)) |at| {
+            seams += 1;
+            // The paired call must sit in the same short block, not merely
+            // somewhere else in the file.
+            const win_end = @min(src.len, at + 400);
+            if (std.mem.indexOfPos(u8, src, at, qsa_call)) |q| {
+                if (q >= win_end) return error.SpecStatsSeamMissesQsaArms;
+            } else return error.SpecStatsSeamMissesQsaArms;
+            i = at + spec_call.len;
+        }
+        try std.testing.expect(seams > 0);
+    }
+}

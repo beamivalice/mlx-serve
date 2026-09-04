@@ -4677,6 +4677,10 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // finalize here instead.
     if (slot.legacy_gen) |*g| {
         g.logSpecStats();
+        // `[qsa-arms]` rides the same seam: the SERVE path finalizes here, so
+        // wiring it only beside generate.zig's own logSpecStats() calls (the
+        // legacy/CLI path) makes it dead on every served request.
+        g.logQsaArms();
         g.persistRoundCost();
     }
     commitSlotIfApplicable(sch, slot);
