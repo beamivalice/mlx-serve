@@ -8022,8 +8022,18 @@ pub const Generator = struct {
             const action = self.mtp_adaptive.round(self.mtp_ev_rounds, b, vote, mtpAdaptiveConfirm());
             self.mtpAdaptiveSyncWindow(prev_bucket, prev_arm);
             if (action == .to_serial) {
+                // "from the next round", not "now": this vote is read while
+                // the round is being PLANNED, and `nextMtp` tested
+                // `spec_disabled_runtime` before it got here, so the round now
+                // under construction still runs speculatively and the switch
+                // takes effect on the following tick. Aborting a half-built
+                // round instead would have to unwind the pre-draft and the
+                // head state mid-flight to land back on `nextMtp`'s entry
+                // invariant — the exit ramp exists precisely because that is
+                // delicate — and it would buy exactly one round. So the round
+                // stands and the LOG is honest about when the switch bites.
                 log.info(
-                    "  [mtp] adaptive: bucket {s} mtp table {d:.2} / window {d:.2} ms/tok (w{d}) vs serial {d:.2} ms/tok -> serial\n",
+                    "  [mtp] adaptive: bucket {s} mtp table {d:.2} / window {d:.2} ms/tok (w{d}) vs serial {d:.2} ms/tok -> serial (from the next round)\n",
                     .{ round_cost.BUCKET_NAMES[b], table_ms_tok.?, window_ms_tok.?, m_lo, serial_ms.? },
                 );
                 self.spec_disabled_runtime = true;
@@ -14351,6 +14361,11 @@ test "the adaptive decision is read after the EV plan, before the width trial, a
     try testing.expect(std.mem.indexOf(u8, disable_win, "spec_disabled" ++ "_runtime = true") != null);
     try testing.expect(std.mem.indexOf(u8, disable_win, "spec_disable" ++ "_reason = .adaptive") != null);
     try testing.expect(std.mem.indexOf(u8, src, "reason={s} adaptive={s} serial_cell={d:.2}") != null);
+    // M14: the vote is read while the round is being planned and `nextMtp`
+    // already tested `spec_disabled_runtime`, so the round under construction
+    // still runs speculatively. The line must say so — and must keep the
+    // "-> serial" substring every guard and analyzer greps for.
+    try testing.expect(std.mem.indexOf(u8, src, "-> serial (from the next round)") != null);
 
     // ── In `nextMtp`: `--max-mtp-ctx` is checked FIRST and is not
     // overridable — the re-entry keys on `.adaptive`, so a ceiling crossing
