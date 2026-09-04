@@ -3476,7 +3476,10 @@ const QSA_ATTN_Q_SOURCE =
     \\
     \\const int s = int(threadgroup_position_in_grid.x);
     \\const int hk = int(threadgroup_position_in_grid.y);
-    \\const int bb = int(threadgroup_position_in_grid.z);
+    \\// The caller pins batch to 1 (qs[0] != 1 declines), so the grid's z is
+    \\// free to carry the split index instead of the batch index.
+    \\const int bb = 0;
+    \\const int jsp = int(threadgroup_position_in_grid.z);
     \\const ushort lane = ushort(thread_index_in_simdgroup);
     \\const ushort warp = ushort(simdgroup_index_in_threadgroup);
     \\const int tix = int(thread_index_in_threadgroup);
@@ -3490,6 +3493,17 @@ const QSA_ATTN_Q_SOURCE =
     \\const int sel_len = count * RATIO;
     \\const int tail_start = complete * RATIO;
     \\const int L = sel_len + (p + 1 - tail_start);
+    \\// Split-K. This threadgroup owns virtual keys [t_lo, t_hi) of the row's
+    \\// own range [0, L). The virtual index already concatenates the row's
+    \\// selected blocks and THEN its ragged tail, so a contiguous virtual
+    \\// range is exactly a contiguous block range — plus, for the last
+    \\// non-empty split, the tail. Boundaries are BK-aligned so every tile
+    \\// but a split's last is full. A split starting past L is EMPTY and
+    \\// writes the merge's identity.
+    \\const int tiles = (L + BK - 1) / BK;
+    \\const int tiles_per = (tiles + NSPLIT - 1) / NSPLIT;
+    \\const int t_lo = jsp * tiles_per * BK;
+    \\const int t_hi = metal::min(L, t_lo + tiles_per * BK);
     \\
     \\const device int* blk = blocks + (long)bb * blocks_strides[0] + (long)s * blocks_strides[1];
     \\const long kq_base  = (long)bb * kq_strides[0]  + (long)hk * kq_strides[1];
@@ -3527,8 +3541,8 @@ const QSA_ATTN_Q_SOURCE =
     \\float max_score = -3.0e38f;
     \\float sum_score = 0.0f;
     \\
-    \\for (int t0 = 0; t0 < L; t0 += BK) {
-    \\  const int rows_k = metal::min(BK, L - t0);
+    \\for (int t0 = t_lo; t0 < t_hi; t0 += BK) {
+    \\  const int rows_k = metal::min(BK, t_hi - t0);
     \\
     \\  // K tile: dequantize into the SAME transposed staging the dense
     \\  // kernel fills, so the fragment math below is untouched. The 8 dims of
@@ -3620,15 +3634,168 @@ const QSA_ATTN_Q_SOURCE =
     \\  }
     \\}
     \\
+    \\// Partials for the merge pass, UNNORMALIZED: the running max and the
+    \\// running sum belong to this split alone, and only the merge knows the
+    \\// row's global max. `msv_row_max`/`msv_row_sum` reduce across the four
+    \\// lanes holding a row, so every lane of the row carries the same m/l
+    \\// and exactly one of them (sn == 0) writes the pair.
+    \\//
+    \\// An empty split writes l = 0, which is the merge's skip flag: a
+    \\// NON-empty split always has l >= 1, because its own maximum element
+    \\// contributes exp2(max - max) = 1. So l == 0 identifies emptiness
+    \\// exactly, and the merge never evaluates (-inf) - (-inf).
     \\if (row_ok) {
-    \\  const float inv = 1.0f / sum_score;
-    \\  device T* Optr = out + (((long)bb * Hq + (hk * gqa + row)) * (long)qL + (long)s) * BD + sn;
+    \\  const int hq = hk * gqa + row;
+    \\  const long pidx = ((long)hq * (long)qL + (long)s) * NSPLIT + jsp;
+    \\  device float* Aptr = pacc + pidx * BD + sn;
     \\  for (int id = 0; id < BD / 8; ++id) {
-    \\    Optr[id * 8] = T(Ofrag[id].x * inv);
-    \\    Optr[id * 8 + 1] = T(Ofrag[id].y * inv);
+    \\    Aptr[id * 8] = Ofrag[id].x;
+    \\    Aptr[id * 8 + 1] = Ofrag[id].y;
+    \\  }
+    \\  if (sn == 0) {
+    \\    const bool empty = (t_lo >= t_hi);
+    \\    pml[pidx * 2] = empty ? -INFINITY : max_score;
+    \\    pml[pidx * 2 + 1] = empty ? 0.0f : sum_score;
     \\  }
     \\}
 ;
+
+/// msv_attn_qsa256_qmerge: the split-K reduction. One threadgroup per
+/// (q head, query row), 256 threads, one output dim each.
+///
+/// Each split wrote its own online-softmax state (m_j, l_j) and an
+/// UNNORMALIZED accumulator. Combining them is the standard flash-decoding
+/// merge in the same log2 domain the split kernel accumulates in:
+///
+///   M = max_j m_j        (over non-empty splits only)
+///   o = sum_j exp2(m_j - M) * acc_j  /  sum_j exp2(m_j - M) * l_j
+///
+/// `l_j == 0` marks an empty split and is skipped, so M is never taken over
+/// an empty set and (-inf) - (-inf) never happens.
+///
+/// NSPLIT and qL are read from `pacc_shape`, not templated: the merge's only
+/// specialization is the output dtype, so its config depends on nothing that
+/// moves per token.
+const QSA_ATTN_MERGE_SOURCE =
+    \\constexpr int BD = 256;
+    \\const int d = int(thread_index_in_threadgroup);
+    \\const int s = int(threadgroup_position_in_grid.y);
+    \\const int hq = int(threadgroup_position_in_grid.z);
+    \\const int qL = pacc_shape[1];
+    \\const int NS = pacc_shape[2];
+    \\const long pbase = ((long)hq * (long)qL + (long)s) * NS;
+    \\
+    \\// Every thread reads all NS (m, l) pairs. NS <= 64 and the pairs land in
+    \\// cache after the first thread of the threadgroup touches them, which is
+    \\// cheaper than a barrier plus threadgroup storage for two floats.
+    \\float M = -INFINITY;
+    \\for (int j = 0; j < NS; ++j) {
+    \\  if (pml[(pbase + j) * 2 + 1] > 0.0f) M = metal::max(M, pml[(pbase + j) * 2]);
+    \\}
+    \\float Z = 0.0f;
+    \\float acc = 0.0f;
+    \\for (int j = 0; j < NS; ++j) {
+    \\  const float lj = pml[(pbase + j) * 2 + 1];
+    \\  if (lj <= 0.0f) continue;
+    \\  const float w = metal::exp2(pml[(pbase + j) * 2] - M);
+    \\  Z += w * lj;
+    \\  acc += w * pacc[(pbase + j) * BD + d];
+    \\}
+    \\out[((long)hq * (long)qL + (long)s) * BD + d] = T(acc / Z);
+;
+
+/// Split-K occupancy target, in threadgroups.
+///
+/// The un-split kernel's natural grid is one threadgroup per (query row, kv
+/// head): on a 24q/2kv pack that is 12 threadgroups at S=6 and 2 at S=1, each
+/// walking ~2k keys serially, on a GPU with 40 cores. Measured on this box
+/// (in-situ forward ubench, S=6, kv 62k, 4 boots counterbalanced): the fused
+/// kernel was 52.50 ms/forward against the union gather's 45.41 — +15.6%,
+/// about five times the 3.0% within-arm boot spread — while issuing 735 FEWER
+/// ops and reading the same bytes for a sixth of the MACs. Work was never the
+/// problem; the machine was idle. 8 resident threadgroups per core is the
+/// target, so 320.
+pub const QSA_ATTN_TARGET_TGS: c_int = 320;
+
+/// Ceiling on the split count. 64 lets S=1..2 still reach >= 128 threadgroups
+/// at Hk=2; past it the f32 partial buffer starts costing more traffic than
+/// the union slab it replaces.
+pub const QSA_ATTN_MAX_NSPLIT: c_int = 64;
+
+/// Default lower width bound for the fused kernel. Kept at 2 — the S=1 decode
+/// case is a real question now that split-K gives it a grid (1 x Hk x 64 =
+/// 128 threadgroups against the decode gather's ~21 dependent dispatches per
+/// layer), but the default does not move without a measurement.
+/// `MLX_SERVE_QSA_ATTN_MIN_S=1` is that measurement's lever.
+pub const QSA_ATTN_MIN_S_DEFAULT: c_int = 2;
+
+var qsa_attn_nsplit_env: ?c_int = null;
+pub var qsa_attn_nsplit_override: ?c_int = null;
+var qsa_attn_min_s_env: ?c_int = null;
+pub var qsa_attn_min_s_override: ?c_int = null;
+
+fn qsaAttnEnvInt(cache: *?c_int, name: [*:0]const u8, dflt: c_int) c_int {
+    if (cache.*) |v| return v;
+    const v = blk: {
+        const raw = std.c.getenv(name) orelse break :blk dflt;
+        const parsed = std.fmt.parseInt(c_int, std.mem.sliceTo(raw, 0), 10) catch break :blk dflt;
+        // Absent OR 0 means "auto" — a diagnostic read with `getenv != null`
+        // is armed by `=0`, which is how a harness silently turns a probe on.
+        break :blk if (parsed <= 0) dflt else parsed;
+    };
+    cache.* = v;
+    return v;
+}
+
+/// Splits per (row, kv head). Derived from S and Hk ALONE, never from kv or
+/// from the row's key count: NSPLIT is a template, so anything kv-dependent
+/// here would rebuild the config every round as the cache grows — which is
+/// exactly the bug removed from `QsaAttnCfgKey`.
+/// `MLX_SERVE_QSA_ATTN_NSPLIT=<n>` overrides (absent or 0 = auto).
+pub fn qsaAttnNSplit(seq_len: c_int, h_kv: c_int) c_int {
+    const natural = seq_len * h_kv;
+    if (natural <= 0) return 1;
+    const forced = qsa_attn_nsplit_override orelse qsaAttnEnvInt(&qsa_attn_nsplit_env, "MLX_SERVE_QSA_ATTN_NSPLIT", 0);
+    if (forced > 0) {
+        var f: c_int = 1;
+        while (f < forced and f < QSA_ATTN_MAX_NSPLIT) f *= 2;
+        return f;
+    }
+    const want = @divTrunc(QSA_ATTN_TARGET_TGS + natural - 1, natural);
+    var n: c_int = 1;
+    while (n < want and n < QSA_ATTN_MAX_NSPLIT) n *= 2;
+    return n;
+}
+
+/// Lowest query width the fused kernel serves. `MLX_SERVE_QSA_ATTN_MIN_S`.
+pub fn qsaAttnMinS() c_int {
+    const v = qsa_attn_min_s_override orelse qsaAttnEnvInt(&qsa_attn_min_s_env, "MLX_SERVE_QSA_ATTN_MIN_S", QSA_ATTN_MIN_S_DEFAULT);
+    return @max(1, @min(v, FUSED256_MIN_Q_LEN - 1));
+}
+
+var qsa_attn_merge_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
+
+fn getQsaAttnMergeKernel() !mlx.mlx_fast_metal_kernel {
+    if (qsa_attn_merge_kernel_cached) |kk| return kk;
+    const input_names = [_][*:0]const u8{ "pacc", "pml" };
+    const output_names = [_][*:0]const u8{"out"};
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new(
+        "msv_attn_qsa256_qmerge",
+        in_vec,
+        out_vec,
+        QSA_ATTN_MERGE_SOURCE,
+        ATTN_QSA256_KERNEL_HEADER,
+        false,
+        false,
+    );
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    qsa_attn_merge_kernel_cached = kernel;
+    return kernel;
+}
 
 /// Threadgroup tile depth for the packed sparse-attention kernel. 16 keys per
 /// tile stages `BD * LDK` = 256 * 24 T = 12 KiB (the dense prefill kernel's
@@ -3641,13 +3808,13 @@ var qsa_attn_q_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
 fn getQsaAttnQKernel() !mlx.mlx_fast_metal_kernel {
     if (qsa_attn_q_kernel_cached) |kk| return kk;
     const input_names = [_][*:0]const u8{ "q", "scl", "blocks", "kq", "ksc", "kbi", "vq", "vsc", "vbi" };
-    const output_names = [_][*:0]const u8{"out"};
+    const output_names = [_][*:0]const u8{ "pacc", "pml" };
     const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
     defer _ = mlx.mlx_vector_string_free(in_vec);
     const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
     defer _ = mlx.mlx_vector_string_free(out_vec);
     const kernel = mlx.mlx_fast_metal_kernel_new(
-        "msv_attn_qsa256_q",
+        "msv_attn_qsa256_qsplit",
         in_vec,
         out_vec,
         QSA_ATTN_Q_SOURCE,
@@ -3681,22 +3848,24 @@ pub fn qsaAttnKernelEnabled() bool {
 /// q shape plus every value that changes the launch or the specialization.
 /// Keyed on everything the CONFIG depends on, and nothing else.
 ///
-/// `kv` and `kb` are deliberately NOT here. Nothing in the config reads them:
-/// the output shape is (B, Hq, S, 256), the grid is (S, Hk, B), and the
-/// templates are T/NSG/BK/RATIO/BITS/GS — the kernel already takes `kL` from
-/// `kq_shape[2]` and `KB` from `blocks_shape[2]` at RUNTIME, as its own
-/// conventions scan requires. Because `kv` grows by one every decode round,
-/// carrying it here made this single-slot cache MISS on every round of a
-/// served request and rebuild a byte-identical config.
+/// `kv` and `kb` left this key in the previous commit and stay out: the kernel
+/// reads `kL` from `kq_shape[2]` and `KB` from `blocks_shape[2]` at runtime,
+/// so neither ever reaches the config. `NSPLIT` is the opposite case and IS a
+/// key field — it changes the grid and both output shapes. That is also why
+/// `qsaAttnNSplit` derives it from S and Hk alone: a kv-derived split count
+/// would put kv back in the key through the side door and restore the
+/// per-round rebuild.
 const QsaAttnCfgKey = struct {
     q_shape: ShapeKey,
     bits: u8,
     gs: u32,
     nsg: c_int,
+    nsplit: c_int,
     ratio: c_int,
     dtype: mlx.mlx_dtype,
 };
 var qsa_attn_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
+var qsa_attn_merge_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
 var qsa_attn_cfg_key: QsaAttnCfgKey = std.mem.zeroes(QsaAttnCfgKey);
 /// Rebuild counter — the only externally visible difference between a config
 /// cache hit and a rebuild.
@@ -3726,14 +3895,18 @@ pub fn qsaSparseAttn(
     // Decode width keeps `qsaDecodeGatherAttn`: one threadgroup per (row, kv
     // head) is 12 threadgroups at S == 1, which starves the GPU the way the
     // select kernel did. Prefill keeps `gatherQsa256`.
-    if (seq_len < 2 or seq_len >= FUSED256_MIN_Q_LEN) return null;
+    // Decode width is EXCLUDED by default (`qsaAttnMinS`), not by a literal:
+    // with split-K, S == 1 has a real grid, so whether the fused kernel beats
+    // `qsaDecodeGatherAttn` there is a measurement, and the lever is how it
+    // gets made. Prefill keeps `gatherQsa256`.
+    if (seq_len < qsaAttnMinS() or seq_len >= FUSED256_MIN_Q_LEN) return null;
     if (qs[0] != 1 or qs[3] != 256) return null;
     if (mlx.mlx_array_dtype(q_rope) != .bfloat16) return null;
     if (mlx.mlx_array_dtype(blocks) != .int32) return null;
     const bs = mlx.getShape(blocks);
     if (bs[0] != 1 or bs[1] != seq_len or bs[2] <= 0) return null;
-    // `kb` rides `blocks_shape[2]` into the kernel; nothing on the host needs
-    // it now that the config key is kv/kb-independent.
+    // `kb` rides `blocks_shape[2]` into the kernel; nothing on the host
+    // needs it now that the config key is kv/kb-independent.
     _ = bs[2];
     if (ratio <= 0) return null;
 
@@ -3779,7 +3952,9 @@ pub fn qsaSparseAttn(
     if (ksc_sh[2] != kv or vsc_sh[2] != kv) return null;
 
     const kernel = getQsaAttnQKernel() catch return null;
+    const merge_kernel = getQsaAttnMergeKernel() catch return null;
     const nsg: c_int = @divTrunc(gqa + 7, 8);
+    const nsplit = qsaAttnNSplit(seq_len, h_kv);
     const scl_data = [_]f32{attn_scale};
     const one = [_]c_int{1};
     const scl = mlx.mlx_array_new_data(&scl_data, &one, 1, .float32);
@@ -3790,17 +3965,25 @@ pub fn qsaSparseAttn(
         .bits = kv_view.bits,
         .gs = kv_view.group_size,
         .nsg = nsg,
+        .nsplit = nsplit,
         .ratio = ratio,
         .dtype = .bfloat16,
     };
-    if (qsa_attn_cfg == null or !std.meta.eql(qsa_attn_cfg_key, key)) {
+    if (qsa_attn_cfg == null or qsa_attn_merge_cfg == null or !std.meta.eql(qsa_attn_cfg_key, key)) {
         if (qsa_attn_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        if (qsa_attn_merge_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         qsa_attn_cfg = null;
+        qsa_attn_merge_cfg = null;
+
+        // Split pass: one threadgroup per (row, kv head, split), each writing
+        // its own unnormalized accumulator and (m, l) pair.
         const config = mlx.mlx_fast_metal_kernel_config_new();
         errdefer _ = mlx.mlx_fast_metal_kernel_config_free(config);
-        const o_shape = [_]c_int{ qs[0], qs[1], seq_len, 256 };
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &o_shape, 4, .bfloat16));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, seq_len * 32, h_kv * nsg, qs[0]));
+        const acc_shape = [_]c_int{ qs[1], seq_len, nsplit, 256 };
+        const ml_shape = [_]c_int{ qs[1], seq_len, nsplit, 2 };
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &acc_shape, 4, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &ml_shape, 4, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, seq_len * 32, h_kv * nsg, nsplit));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, nsg, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", .bfloat16));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "NSG", nsg));
@@ -3808,7 +3991,20 @@ pub fn qsaSparseAttn(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "RATIO", ratio));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", @intCast(kv_view.bits)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GS", @intCast(kv_view.group_size)));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "NSPLIT", nsplit));
+
+        // Merge pass: one threadgroup per (q head, row), 256 threads. Its only
+        // specialization is the output dtype — NSPLIT and qL ride pacc's shape.
+        const mconfig = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(mconfig);
+        const o_shape = [_]c_int{ qs[0], qs[1], seq_len, 256 };
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(mconfig, &o_shape, 4, .bfloat16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(mconfig, 256, seq_len, qs[1]));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(mconfig, 256, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(mconfig, "T", .bfloat16));
+
         qsa_attn_cfg = config;
+        qsa_attn_merge_cfg = mconfig;
         qsa_attn_cfg_key = key;
         qsa_attn_cfg_builds += 1;
     }
@@ -3826,16 +4022,30 @@ pub fn qsaSparseAttn(
     };
     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
+    var parts_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(parts_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&parts_vec, kernel, inputs_vec, qsa_attn_cfg.?, s));
+    if (mlx.mlx_vector_array_size(parts_vec) != 2) return error.MetalKernelBadOutputCount;
+    var pacc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(pacc);
+    var pml = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(pml);
+    try mlx.check(mlx.mlx_vector_array_get(&pacc, parts_vec, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&pml, parts_vec, 1));
+
+    const merge_in = [_]mlx.mlx_array{ pacc, pml };
+    const merge_vec = mlx.mlx_vector_array_new_data(&merge_in, merge_in.len);
+    defer _ = mlx.mlx_vector_array_free(merge_vec);
     var outputs_vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outputs_vec);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, qsa_attn_cfg.?, s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, merge_kernel, merge_vec, qsa_attn_merge_cfg.?, s));
     if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
     if (qsa_attn_engaged_bits.take(qsaWidthBucket(seq_len))) {
         log.info(
-            "[qsa-attn] engaged (S={d} kv={d} quant={d}/gs{d} gqa={d} bk={d}) — MLX_SERVE_QSA_ATTN_KERNEL=0 restores the union gather\n",
-            .{ seq_len, kv, kv_view.bits, kv_view.group_size, gqa, QSA_ATTN_BK },
+            "[qsa-attn] engaged (S={d} kv={d} quant={d}/gs{d} gqa={d} bk={d} nsplit={d} tgs={d}) — MLX_SERVE_QSA_ATTN_KERNEL=0 restores the union gather\n",
+            .{ seq_len, kv, kv_view.bits, kv_view.group_size, gqa, QSA_ATTN_BK, nsplit, seq_len * h_kv * nsplit },
         );
     }
     return out;
@@ -39149,7 +39359,24 @@ test "qsa sparse attn: one fused dispatch equals the union gather at verify widt
     var prng = std.Random.DefaultPrng.init(0x5A17_C0DE);
     const rnd = prng.random();
 
+    // Split-K reaches S == 1 only through the lever; the parity of the decode
+    // width is a property of the kernel either way, so it is covered here
+    // whether or not the default ever moves.
+    qsa_attn_min_s_override = 1;
+    defer qsa_attn_min_s_override = null;
+
     const cases = [_]struct { s: c_int, kv: c_int, kb: c_int, hq: c_int, hkv: c_int }{
+        // Decode width: NSPLIT hits the 64 ceiling, so most splits are empty
+        // and the merge's `l == 0` skip is doing the work.
+        .{ .s = 1, .kv = 4096, .kb = 64, .hq = 24, .hkv = 2 },
+        .{ .s = 1, .kv = 70000, .kb = 512, .hq = 24, .hkv = 2 },
+        // The deployed verify width on prose.
+        .{ .s = 3, .kv = 62000, .kb = 512, .hq = 24, .hkv = 2 },
+        // Tile count far BELOW NSPLIT: L is ~17 tiles against 64 splits, so
+        // 47 splits are empty and one carries the ragged remainder.
+        .{ .s = 2, .kv = 1024, .kb = 512, .hq = 24, .hkv = 2 },
+        // Widest verify row at long kv: NSPLIT 16, tiles not divisible by it.
+        .{ .s = 15, .kv = 70000, .kb = 512, .hq = 24, .hkv = 2 },
         // kb far below the visible block count: ragged tails and real sparsity.
         .{ .s = 2, .kv = 4096, .kb = 64, .hq = 24, .hkv = 2 },
         .{ .s = 6, .kv = 4096, .kb = 64, .hq = 24, .hkv = 2 },
@@ -39228,6 +39455,103 @@ test "qsa sparse attn: one fused dispatch equals the union gather at verify widt
             try std.testing.expect(ac > 0.99999);
         }
     }
+}
+
+test "qsa sparse attn: the split-K merge is invariant in the split count (1, 8, 64)" {
+    // The whole redesign rests on one claim: splitting a row's key range and
+    // recombining the per-split online-softmax states is exact. If the merge
+    // were wrong — a missing rescale, a max taken over empty splits, a stale
+    // accumulator — the answer would MOVE with NSPLIT while every other input
+    // stayed fixed. NSPLIT = 1 is the un-split kernel, so it is also the
+    // control: it must agree with the reference on its own.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const ta = std.testing.allocator;
+    const ratio: c_int = 4;
+    var prng = std.Random.DefaultPrng.init(0x5B17_C0DE);
+    const rnd = prng.random();
+
+    const seq: c_int = 6;
+    const kv: c_int = 20000;
+    const kb: c_int = 128;
+    const q = try attn256RandBf16(rnd, &[_]c_int{ 1, 24, seq, 256 }, s);
+    defer _ = mlx.mlx_array_free(q);
+    const k_dense = try attn256RandBf16(rnd, &[_]c_int{ 1, 2, kv, 256 }, s);
+    defer _ = mlx.mlx_array_free(k_dense);
+    const v_dense = try attn256RandBf16(rnd, &[_]c_int{ 1, 2, kv, 256 }, s);
+    defer _ = mlx.mlx_array_free(v_dense);
+    const blocks_host = try qsaVerifyBlocksHost(ta, rnd, seq, kv, kb, ratio);
+    defer ta.free(blocks_host);
+    const blocks = mlx.mlx_array_new_data(blocks_host.ptr, &[_]c_int{ 1, seq, kb }, 3, .int32);
+    defer _ = mlx.mlx_array_free(blocks);
+    const mask = try qsaMaskFromBlocks(s, blocks, kv, ratio);
+    defer _ = mlx.mlx_array_free(mask);
+    const scale: f32 = 1.0 / 16.0;
+
+    var cache = try KVCache.initWithConfig(ta, 1, kv_quant.KVQuantConfig.affine(8));
+    defer cache.deinit();
+    var view = try qsaAttnCacheFixture(ta, s, k_dense, v_dense, kv, @divTrunc(kv, 2), kv_quant.KVQuantConfig.affine(8), &cache);
+    defer view.deinit();
+    const ref = try attn256Reference(q, view.k, view.v, scale, "array", mask, s);
+    defer _ = mlx.mlx_array_free(ref);
+    const bar = try attn256UlpBar(ref, s);
+
+    defer qsa_attn_nsplit_override = null;
+    var base: ?mlx.mlx_array = null;
+    defer if (base) |b| {
+        _ = mlx.mlx_array_free(b);
+    };
+    for ([_]c_int{ 1, 8, 64 }) |ns| {
+        qsa_attn_nsplit_override = ns;
+        try std.testing.expectEqual(ns, qsaAttnNSplit(seq, 2));
+        const got = (try qsaSparseAttn(s, q, &view, blocks, ratio, scale)) orelse return error.SparseAttnDeclined;
+        defer _ = mlx.mlx_array_free(got);
+        const d = try attn256MaxDiff(got, ref, s);
+        const c = try attn256Cosine(got, ref, s);
+        std.debug.print("[qsa-attn] nsplit={d}: max diff {d:.6} cos {d:.7} (bar {d:.6})\n", .{ ns, d, c, bar });
+        try std.testing.expect(c > 0.99999);
+        try std.testing.expect(d <= bar);
+        // And against each other, not merely against the reference.
+        if (base) |b| {
+            const cc = try attn256Cosine(got, b, s);
+            try std.testing.expect(cc > 0.99999);
+        } else {
+            var keep = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_array_set(&keep, got));
+            base = keep;
+        }
+    }
+}
+
+test "qsa sparse attn: NSPLIT targets ~8 threadgroups per core from S and Hk alone" {
+    // NSPLIT must not depend on kv: it is a TEMPLATE, so a kv-derived split
+    // count would rebuild the config on every decode round — the exact tax
+    // this commit removes from the config key.
+    defer qsa_attn_nsplit_override = null;
+    qsa_attn_nsplit_override = null;
+    // The shipping pack: Hq 24 / Hk 2.
+    try std.testing.expectEqual(@as(c_int, 64), qsaAttnNSplit(1, 2));
+    try std.testing.expectEqual(@as(c_int, 64), qsaAttnNSplit(2, 2));
+    try std.testing.expectEqual(@as(c_int, 64), qsaAttnNSplit(3, 2));
+    try std.testing.expectEqual(@as(c_int, 32), qsaAttnNSplit(6, 2));
+    try std.testing.expectEqual(@as(c_int, 16), qsaAttnNSplit(15, 2));
+    // Every width clears 128 threadgroups; the un-split grid cleared 30.
+    for ([_]c_int{ 1, 2, 3, 6, 15 }) |seq| {
+        try std.testing.expect(seq * 2 * qsaAttnNSplit(seq, 2) >= 128);
+    }
+    // Always a power of two, always within the ceiling.
+    for ([_]c_int{ 1, 2, 3, 4, 6, 8, 15 }) |seq| {
+        for ([_]c_int{ 1, 2, 4, 8 }) |hk| {
+            const n = qsaAttnNSplit(seq, hk);
+            try std.testing.expect(n >= 1 and n <= QSA_ATTN_MAX_NSPLIT);
+            try std.testing.expect(n & (n - 1) == 0);
+        }
+    }
+    // The override is honoured and rounded up to a power of two.
+    qsa_attn_nsplit_override = 8;
+    try std.testing.expectEqual(@as(c_int, 8), qsaAttnNSplit(6, 2));
+    qsa_attn_nsplit_override = 5;
+    try std.testing.expectEqual(@as(c_int, 8), qsaAttnNSplit(6, 2));
 }
 
 test "qsa sparse attn: gqa tile reuse is invariant — one kv head serving 12 q heads equals 12 serving one each" {
@@ -39400,10 +39724,10 @@ test "qsa sparse attn: the config key is kv- and kb-INDEPENDENT (one build per w
     // REVERSES the assertion this test shipped with. It previously required a
     // rebuild when kv or kb changed, on the reasoning that a value invisible
     // in the q shape must be in the key. That reasoning is right in general
-    // and wrong here: nothing in the config READS kv or kb. The output shape
-    // is (B, Hq, S, 256), the grid is (S, Hk, B), and the templates are
-    // T/NSG/BK/RATIO/BITS/GS — the kernel takes `kL` from `kq_shape[2]` and
-    // `KB` from `blocks_shape[2]` at runtime.
+    // and wrong here: nothing in the config reads kv or kb. The output shapes
+    // are (Hq, S, NSPLIT, ...), the grid is (S, Hk, NSPLIT), and the templates
+    // are T/NSG/BK/RATIO/BITS/GS/NSPLIT — the kernel takes `kL` from
+    // `kq_shape[2]` and `KB` from `blocks_shape[2]` at RUNTIME.
     //
     // kv grows by one every decode round, so the old key made this
     // single-slot cache miss on every round of a served request and rebuild a
@@ -39439,29 +39763,32 @@ test "qsa sparse attn: the config key is kv- and kb-INDEPENDENT (one build per w
     };
     _ = ratio;
 
-    const base = qsa_attn_cfg_builds;
+    // Normalize first. This is ONE global slot shared with every other test in
+    // the file, and the parity test above ends on a key identical to ours — so
+    // measuring from a "cold" slot is an order dependency, not a property.
+    // This call leaves the slot keyed on our width however it started.
     try Run.once(s, ta, rnd, 6, 4096, 64);
-    try std.testing.expectEqual(base + 1, qsa_attn_cfg_builds);
+    const base = qsa_attn_cfg_builds;
     // Same shape three more times: the cached config serves all of them.
     for (0..3) |_| try Run.once(s, ta, rnd, 6, 4096, 64);
-    try std.testing.expectEqual(base + 1, qsa_attn_cfg_builds);
-    // A GROWING kv at a fixed width IS the served decode round. This is the
+    try std.testing.expectEqual(base, qsa_attn_cfg_builds);
+    // A GROWING kv at a fixed width is the served decode round. This is the
     // regression: every one of these used to be a rebuild.
     try Run.once(s, ta, rnd, 6, 8192, 64);
     try Run.once(s, ta, rnd, 6, 12288, 64);
     try Run.once(s, ta, rnd, 6, 20000, 64);
-    try std.testing.expectEqual(base + 1, qsa_attn_cfg_builds);
+    try std.testing.expectEqual(base, qsa_attn_cfg_builds);
     // A new kb is likewise a runtime shape, not a config input.
     try Run.once(s, ta, rnd, 6, 20000, 128);
-    try std.testing.expectEqual(base + 1, qsa_attn_cfg_builds);
-    // A new width IS a new grid and a new output shape.
+    try std.testing.expectEqual(base, qsa_attn_cfg_builds);
+    // A new width IS a new grid, new output shapes and a new NSPLIT.
     try Run.once(s, ta, rnd, 7, 4096, 64);
-    try std.testing.expectEqual(base + 2, qsa_attn_cfg_builds);
-    // ...and returning to a width already built is still one more build,
-    // because this is a single slot, not a map. Deliberate: a served request
-    // holds one width for a whole round.
+    try std.testing.expectEqual(base + 1, qsa_attn_cfg_builds);
+    // ...and going back to a width already built is still one more build,
+    // because this is a single slot, not a map. That is deliberate: a served
+    // request holds one width for a whole round.
     try Run.once(s, ta, rnd, 6, 4096, 64);
-    try std.testing.expectEqual(base + 3, qsa_attn_cfg_builds);
+    try std.testing.expectEqual(base + 2, qsa_attn_cfg_builds);
 }
 
 test "the fused QSA sparse attention ships a kill switch, a GPU-stream guard, a one-shot engaged log and no per-token template" {
@@ -39471,6 +39798,14 @@ test "the fused QSA sparse attention ships a kill switch, a GPU-stream guard, a 
     const lever = "MLX_SERVE_QSA_ATTN" ++ "_KERNEL";
     try std.testing.expect(std.mem.indexOf(u8, src, lever) != null);
     try std.testing.expect(std.mem.indexOf(u8, src, "[qsa-" ++ "attn] engaged") != null);
+    // The two measurement levers the split-K redesign owes: the split count
+    // and the width floor. Neither changes a default on its own.
+    try std.testing.expect(std.mem.indexOf(u8, src, "MLX_SERVE_QSA_ATTN" ++ "_NSPLIT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "MLX_SERVE_QSA_ATTN" ++ "_MIN_S") != null);
+    // The width floor is a named constant read through a function, not a
+    // literal in the gate.
+    try std.testing.expectEqual(@as(c_int, 2), QSA_ATTN_MIN_S_DEFAULT);
+    try std.testing.expectEqual(@as(c_int, 64), QSA_ATTN_MAX_NSPLIT);
 
     // Every metal_kernel helper owes its OWN stream guard.
     const fn_start = std.mem.indexOf(u8, src, "pub fn qsaSparse" ++ "Attn(").?;
@@ -39490,6 +39825,8 @@ test "the fused QSA sparse attention ships a kill switch, a GPU-stream guard, a 
     try std.testing.expect(@TypeOf(@as(QsaAttnCfgKey, undefined).q_shape) == ShapeKey);
     try std.testing.expect(!@hasField(QsaAttnCfgKey, "kv"));
     try std.testing.expect(!@hasField(QsaAttnCfgKey, "kb"));
+    // NSPLIT changes the grid and both output shapes, so it IS a key field.
+    try std.testing.expect(@hasField(QsaAttnCfgKey, "nsplit"));
 
     // Staged tile stays at the agreed depth: BD * (BK+8) T = 12 KiB at BK 16.
     try std.testing.expectEqual(@as(c_int, 16), QSA_ATTN_BK);
