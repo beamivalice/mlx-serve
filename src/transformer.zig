@@ -40640,11 +40640,292 @@ test "qwen4MtpForward owns its stream once: exactly one errdefer frees `h`" {
     var i: usize = 0;
     while (std.mem.indexOfPos(u8, body, i, needle)) |p| : (i = p + needle.len) count += 1;
     try testing.expectEqual(@as(usize, 1), count);
-    // ...and it is the one guarding the freshly reshaped stream, before the
-    // first hcWrite can reassign it.
+    // ...and it is the LINE right after the reshape that creates `h`: an
+    // errdefer declared any later leaves the ops in between unguarded, and a
+    // line bound pins the "created and guarded in one breath" shape that a
+    // byte-distance bound lets a refactor quietly stretch.
     const born = std.mem.indexOf(u8, body, "try mlx.check(mlx.mlx_reshape(&h, x4,") orelse return error.StreamInitMissing;
-    const guard = std.mem.indexOf(u8, body, needle).?;
-    try testing.expect(guard > born and guard - born < 200);
+    const born_end = std.mem.indexOfScalarPos(u8, body, born, '\n') orelse return error.StreamInitMissing;
+    const next_end = std.mem.indexOfScalarPos(u8, body, born_end + 1, '\n') orelse body.len;
+    try testing.expectEqualStrings(needle, std.mem.trim(u8, body[born_end + 1 .. next_end], " \t"));
+
+    // Every rebind of `h` inside the body either hands the OLD handle to
+    // `hcWrite` (which consumes it on success and leaves it untouched on
+    // error, so the one errdefer still covers it) or frees the predecessor on
+    // one of the two lines above it (the `.last_row` slice). A third spelling
+    // is a leak or a double free, and neither is visible from the outside.
+    const write_form = "h = try self.hc" ++ "Write(h,";
+    const free_h = "_ = mlx.mlx_array" ++ "_free(h);";
+    var seen_write: usize = 0;
+    var seen_slice: usize = 0;
+    var prev1: []const u8 = "";
+    var prev2: []const u8 = "";
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t");
+        if (std.mem.startsWith(u8, line, "h = ")) {
+            if (std.mem.startsWith(u8, line, write_form)) {
+                seen_write += 1;
+            } else {
+                // prev1 is the line above, prev2 the one above that.
+                try testing.expect(std.mem.eql(u8, prev1, free_h) or std.mem.eql(u8, prev2, free_h));
+                seen_slice += 1;
+            }
+        }
+        prev2 = prev1;
+        prev1 = line;
+    }
+    // Both shapes are actually present — an empty scan proves nothing.
+    try testing.expect(seen_write >= 2);
+    try testing.expect(seen_slice >= 1);
+
+    // And the consuming half of the contract: `hcWrite` frees the stream it
+    // was handed only PAST its last fallible call, so a failing hcWrite never
+    // takes the caller's handle with it and the caller's errdefer stays right.
+    const wsig = "fn hc" ++ "Write(self: *Transformer, stream:";
+    const wat = std.mem.indexOf(u8, src, wsig) orelse return error.HcWriteMissing;
+    const wrest = src[wat + wsig.len ..];
+    // Struct-member indentation closes the function.
+    const wbody = wrest[0 .. std.mem.indexOf(u8, wrest, "\n    }") orelse return error.HcWriteMissing];
+    const free_stream = "mlx.mlx_array" ++ "_free(stream)";
+    const freed_at = std.mem.indexOf(u8, wbody, free_stream) orelse return error.HcWriteFreeMissing;
+    const try_needle = "tr" ++ "y ";
+    var last_try: ?usize = null;
+    var ti: usize = 0;
+    while (std.mem.indexOfPos(u8, wbody, ti, try_needle)) |tp| : (ti = tp + try_needle.len) last_try = tp;
+    try testing.expect(last_try != null);
+    try testing.expect(freed_at > last_try.?);
+}
+
+/// Metal bytes held by LIVE arrays, with the allocator's free list flushed so
+/// the number is a function of ownership alone.
+fn mlxSettledActiveBytes(s: mlx.mlx_stream) usize {
+    _ = mlx.mlx_synchronize(s);
+    _ = mlx.mlx_clear_cache();
+    var active: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active);
+    return active;
+}
+
+test "mlx check fault injection: the ownership shape releases its array on every faulted op" {
+    // The machinery behind the fixture-gated sweep below, exercised on a shape
+    // that holds nothing but the ownership pattern of `qwen4MtpForward`'s `h`:
+    // an array born from an op, guarded by ONE function-scope errdefer,
+    // rebound through a BLOCK-scoped slice that frees its predecessor itself,
+    // then handed to a further fallible op. Every array here is eval'd, so a
+    // leaked handle holds real Metal bytes and the active-memory oracle can
+    // see it. The `leaky` arm is the NEGATIVE CONTROL: the same shape minus
+    // the one errdefer must trip the oracle, or a green sweep means nothing.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+
+    const H = struct {
+        fn guarded(st: mlx.mlx_stream, seed: mlx.mlx_array) !mlx.mlx_array {
+            var h = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_multiply(&h, seed, seed, st));
+            errdefer _ = mlx.mlx_array_free(h);
+            try mlx.check(mlx.mlx_array_eval(h));
+            {
+                var h_last = mlx.mlx_array_new();
+                errdefer _ = mlx.mlx_array_free(h_last);
+                try mlx.check(mlx.mlx_add(&h_last, h, seed, st));
+                try mlx.check(mlx.mlx_array_eval(h_last));
+                _ = mlx.mlx_array_free(h);
+                h = h_last;
+            }
+            var out = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(out);
+            try mlx.check(mlx.mlx_multiply(&out, h, seed, st));
+            try mlx.check(mlx.mlx_array_eval(out));
+            _ = mlx.mlx_array_free(h);
+            return out;
+        }
+        /// Same shape, ONE errdefer short. `h` lives in the CALLER's frame, so
+        /// the test can free whatever this function drops after measuring it —
+        /// an mlx op OVERWRITES its destination handle, so a copy taken before
+        /// the op is a stale pointer, not a rescue line.
+        fn leaky(st: mlx.mlx_stream, seed: mlx.mlx_array, h: *mlx.mlx_array) !mlx.mlx_array {
+            try mlx.check(mlx.mlx_multiply(h, seed, seed, st));
+            try mlx.check(mlx.mlx_array_eval(h.*));
+            {
+                var h_last = mlx.mlx_array_new();
+                errdefer _ = mlx.mlx_array_free(h_last);
+                try mlx.check(mlx.mlx_add(&h_last, h.*, seed, st));
+                try mlx.check(mlx.mlx_array_eval(h_last));
+                _ = mlx.mlx_array_free(h.*);
+                h.* = h_last;
+            }
+            var out = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(out);
+            try mlx.check(mlx.mlx_multiply(&out, h.*, seed, st));
+            try mlx.check(mlx.mlx_array_eval(out));
+            _ = mlx.mlx_array_free(h.*);
+            h.* = .{ .ctx = null };
+            return out;
+        }
+    };
+
+    const n_elem: usize = 1 << 20; // 4 MB per array: far above measurement noise
+    const host = try allocator.alloc(f32, n_elem);
+    defer allocator.free(host);
+    @memset(host, 1.5);
+    const shape = [_]c_int{@intCast(n_elem)};
+    const seed = mlx.mlx_array_new_data(host.ptr, &shape, 1, .float32);
+    defer _ = mlx.mlx_array_free(seed);
+    try mlx.check(mlx.mlx_array_eval(seed));
+
+    // One un-faulted run: warms the allocator and counts the checked ops the
+    // shape issues, which is the sweep's upper bound. Its output is freed here.
+    const c0 = mlx.op_count.load(.monotonic);
+    const warm = try H.guarded(s, seed);
+    const n_ops = mlx.op_count.load(.monotonic) - c0;
+    _ = mlx.mlx_array_free(warm);
+    try testing.expect(n_ops >= 6);
+
+    var fired: usize = 0;
+    var k: u64 = 1;
+    while (k <= n_ops) : (k += 1) {
+        const base = mlxSettledActiveBytes(s);
+        mlx.fault.arm(k);
+        const r = H.guarded(s, seed);
+        const did = mlx.fault.didFire();
+        mlx.fault.disarm();
+        if (r) |ok| {
+            _ = mlx.mlx_array_free(ok);
+        } else |err| {
+            try testing.expectEqual(error.MlxError, err);
+            try testing.expect(did);
+            fired += 1;
+        }
+        // A DOUBLE free would abort this binary here rather than fail an
+        // assertion — that abort is the other half of the proof.
+        const after = mlxSettledActiveBytes(s);
+        if (after != base) std.debug.print("[fault] guarded k={d}: base {d} after {d}\n", .{ k, base, after });
+        try testing.expectEqual(base, after);
+    }
+    try testing.expectEqual(n_ops, fired);
+
+    // Negative control: the same sweep without the errdefer must be CAUGHT.
+    var caught: usize = 0;
+    k = 1;
+    while (k <= n_ops) : (k += 1) {
+        var probe = mlx.mlx_array_new();
+        const base = mlxSettledActiveBytes(s);
+        mlx.fault.arm(k);
+        const r = H.leaky(s, seed, &probe);
+        mlx.fault.disarm();
+        if (r) |ok| {
+            _ = mlx.mlx_array_free(ok);
+        } else |_| {}
+        if (mlxSettledActiveBytes(s) > base + (n_elem * @sizeOf(f32)) / 2) caught += 1;
+        if (probe.ctx != null) _ = mlx.mlx_array_free(probe);
+        const after_ctl = mlxSettledActiveBytes(s);
+        if (after_ctl != base) std.debug.print("[fault] leaky k={d}: base {d} after {d}\n", .{ k, base, after_ctl });
+        try testing.expectEqual(base, after_ctl);
+    }
+    std.debug.print("[fault] ownership shape: {d} checked ops, {d} faulted cleanly, leak oracle caught {d}\n", .{ n_ops, fired, caught });
+    try testing.expect(caught >= 1);
+}
+
+test "qwen4MtpForward: every error path of the MTP head forward releases its stream (fault-injected, QWEN4_TEST_MODEL)" {
+    // The claim under proof: `h` is born with ONE function-scope errdefer, and
+    // every later rebind either consumes the old handle (`hcWrite`, which
+    // frees its input only past its last `try`) or frees it itself (the
+    // `.last_row` slice) — so no error path leaks it and none frees it twice.
+    // Argument cannot settle that; a sweep can.
+    //
+    // Method: fault the k-th checked mlx-c call for every k the forward
+    // issues, on every projection, at S > 1 so the slice path is live, and
+    // require live Metal bytes back at the pre-call baseline each time. The
+    // head's own state (KV, aux, seq_offset) is reset on BOTH sides of the
+    // measurement, so only ownership can move the number.
+    //
+    // What the oracle can and cannot see: MLX is lazy, so a handle leaked
+    // before anything downstream of it has been evaluated holds no buffer and
+    // is invisible here — the equality is a NECESSARY condition, sharp for
+    // every k at or past the first evaluation inside the head (the QSA host
+    // reads, the eval cadence, the projection) and weak before it. The static
+    // scan above covers the whole function unconditionally, and the DOUBLE
+    // free half is unconditional at every k: it aborts this binary rather
+    // than failing an assertion.
+    const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
+    defer if (config.ngram_table_path) |p| allocator.free(p);
+    var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer xfm.deinit();
+    if (xfm.qwen4_mtp == null) return error.SkipZigTest;
+    xfm.compileQwen4Hc();
+    xfm.compileMoeRouting();
+
+    const S: usize = 5; // > 1: keeps the `.last_row` / `.mixed_last_row` slice live
+    const hcH: usize = @as(usize, config.hc_count) * @as(usize, config.hidden_size);
+    const dt = mlx.mlx_array_dtype(xfm.qwen4_mtp.?.pre_norm_hidden);
+    const host = try allocator.alloc(f32, S * hcH);
+    defer allocator.free(host);
+    var rs: u64 = 0x243F6A8885A308D3;
+    for (host) |*x| {
+        rs = rs *% 6364136223846793005 +% 1442695040888963407;
+        x.* = (@as(f32, @floatFromInt((rs >> 40) & 0xFFFF)) / 32768.0) - 1.0;
+    }
+    const hshape = [_]c_int{ 1, @intCast(S), @intCast(hcH) };
+    const sp_f32 = mlx.mlx_array_new_data(host.ptr, &hshape, 3, .float32);
+    defer _ = mlx.mlx_array_free(sp_f32);
+    var stream_prev = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(stream_prev);
+    try mlx.check(mlx.mlx_astype(&stream_prev, sp_f32, dt, s));
+    var id_buf: [S]i32 = undefined;
+    for (0..S) |i| id_buf[i] = @intCast(7 + i * 13);
+    const ishape = [_]c_int{ 1, @intCast(S) };
+    const ids = mlx.mlx_array_new_data(&id_buf, &ishape, 2, .int32);
+    defer _ = mlx.mlx_array_free(ids);
+
+    inline for ([_]Transformer.Qwen4MtpProject{ .all_rows, .last_row, .mixed_last_row, .none }) |proj| {
+        // Un-faulted warm-up: builds every lazy artefact the forward touches
+        // and counts the checked ops it issues. Its outputs are freed HERE, or
+        // every later baseline would carry them and the equality would be a
+        // statement about nothing.
+        try xfm.qwen4MtpReset();
+        const c0 = mlx.op_count.load(.monotonic);
+        const warm = try xfm.qwen4MtpForward(stream_prev, ids, 1, null, proj);
+        const n_ops = mlx.op_count.load(.monotonic) - c0;
+        try testing.expect(warm.stream.ctx != null);
+        if (warm.logits.ctx != null) _ = mlx.mlx_array_free(warm.logits);
+        if (warm.mixed.ctx != null) _ = mlx.mlx_array_free(warm.mixed);
+        _ = mlx.mlx_array_free(warm.stream);
+
+        var errs: usize = 0;
+        var k: u64 = 1;
+        while (k <= n_ops) : (k += 1) {
+            try xfm.qwen4MtpReset();
+            const base = mlxSettledActiveBytes(s);
+            mlx.fault.arm(k);
+            const r = xfm.qwen4MtpForward(stream_prev, ids, 1, null, proj);
+            mlx.fault.disarm();
+            if (r) |o| {
+                // Reachable only where a fallback arm below the head swallowed
+                // the injected error; the outputs are still ours to free.
+                if (o.logits.ctx != null) _ = mlx.mlx_array_free(o.logits);
+                if (o.mixed.ctx != null) _ = mlx.mlx_array_free(o.mixed);
+                if (o.stream.ctx != null) _ = mlx.mlx_array_free(o.stream);
+            } else |_| {
+                errs += 1;
+            }
+            try xfm.qwen4MtpReset();
+            try testing.expectEqual(base, mlxSettledActiveBytes(s));
+        }
+        std.debug.print("[qwen4] MTP fault sweep {s}: {d} checked ops, {d} error paths, live bytes back at baseline on all\n", .{ @tagName(proj), n_ops, errs });
+        try testing.expect(errs >= 1);
+    }
+    try xfm.qwen4MtpReset();
 }
 
 test "gdn gate: compiled closure vs graph chain vs prework kernel (bit-identity probe)" {
