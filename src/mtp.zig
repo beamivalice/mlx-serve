@@ -4583,13 +4583,16 @@ test "mtp: dense bf16 head trunk is requantized at load (4b/g64); indivisible wi
 /// A bare Transformer carrying nothing but a quantized lm_head + the config
 /// fields `headQuantParams` reads. Every function under test touches exactly
 /// those, which is the property that let the qwen4_exp head reuse the scheme.
-const RerankFixture = struct {
+/// A minimal target for the rerank scheme: a Transformer carrying nothing
+/// but a quantized `lm_head`, which is all the scheme ever reads. `pub` so
+/// the qwen4 arm's tests in generate.zig build the same target.
+pub const RerankFixture = struct {
     xfm: Transformer,
     dense: mlx.mlx_array,
     vocab: c_int,
     hidden: c_int,
 
-    fn init(s: mlx.mlx_stream, vocab: c_int, hidden: c_int, bits: u32, gs: u32, seed: u64) !RerankFixture {
+    pub fn init(s: mlx.mlx_stream, vocab: c_int, hidden: c_int, bits: u32, gs: u32, seed: u64) !RerankFixture {
         var prng = std.Random.DefaultPrng.init(seed);
         const rand = prng.random();
         const n: usize = @intCast(vocab * hidden);
@@ -4631,7 +4634,7 @@ const RerankFixture = struct {
         return .{ .xfm = xfm, .dense = dense, .vocab = vocab, .hidden = hidden };
     }
 
-    fn deinit(self: *RerankFixture) void {
+    pub fn deinit(self: *RerankFixture) void {
         _ = mlx.mlx_array_free(self.dense);
         _ = mlx.mlx_array_free(self.xfm.lm_head_w);
         _ = mlx.mlx_array_free(self.xfm.lm_head_s);

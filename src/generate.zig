@@ -12929,3 +12929,48 @@ test "MtpTrace per-index acceptance: index i counts only rounds that drafted it"
     t.reset();
     try std.testing.expectEqualStrings("", t.accIdxStr(&buf));
 }
+
+test "qwen4: the coarse rerank head is READY before any draft has run" {
+    // The head is a full `requantizeRows` of the trunk lm_head plus a
+    // synchronous eval of its ~240 MB. Built lazily it landed inside the
+    // FIRST request's draft chain — on the inference thread, mid-round,
+    // draining the stream, and paid as first-token latency by whoever
+    // happened to be first after a load. `qwen4BuildDraftRerank` is that
+    // build as a standalone LOAD-time step: no Generator, no chain, no
+    // request. Afterwards `canRerankDrafts()` is a pure read.
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+
+    var fx = try mtp_mod.RerankFixture.init(s, mtp_mod.TOP32_MIN_ROWS + 96, 256, 8, 64, 0xC0DE);
+    defer fx.deinit();
+    // Only the rerank fields are read by the build; the rest of the head is
+    // the trunk's business.
+    var head: transformer_mod.Qwen4Mtp = undefined;
+    head.rerank = null;
+    head.rerank_logged = false;
+    head.rerank_tried = false;
+    fx.xfm.qwen4_mtp = head;
+    defer if (fx.xfm.qwen4_mtp) |*m| {
+        if (m.rerank) |*rc| rc.deinit();
+    };
+
+    // Nothing is built by construction...
+    try testing.expect(fx.xfm.qwen4_mtp.?.rerank == null);
+    // ...the eager build stands on its own...
+    try testing.expect(fx.xfm.qwen4BuildDraftRerank());
+    const built = fx.xfm.qwen4_mtp.?.rerank orelse return error.NoCoarseHead;
+    try testing.expectEqual(fx.vocab, built.rows);
+    try testing.expect(built.bits > 0 and built.bits < 8);
+
+    // ...and the draft path now only READS it. Same mlx handle => the ask
+    // did not rebuild anything (which is what the lazy path did).
+    const head_ctx = built.q.w.ctx;
+    const ref = MtpHeadRef{ .qwen4 = &fx.xfm };
+    try testing.expect(ref.canRerankDrafts());
+    try testing.expectEqual(head_ctx, fx.xfm.qwen4_mtp.?.rerank.?.q.w.ctx);
+
+    // One-shot: a second eager build (both load paths firing, a re-probe)
+    // keeps the head it already has.
+    try testing.expect(fx.xfm.qwen4BuildDraftRerank());
+    try testing.expectEqual(head_ctx, fx.xfm.qwen4_mtp.?.rerank.?.q.w.ctx);
+}

@@ -5465,11 +5465,13 @@ pub const Qwen4Mtp = struct {
     ev_seed_accept: ?[MTP_EV_SEED_DEPTH]f32 = null,
     ev_seed_m_lo: u32 = 1,
     /// Draft rerank (`mtp.rerankSelect`): a low-bit copy of the TRUNK lm_head
-    /// that shortlists 32 candidates, which the real head then re-scores. Built
-    /// LAZILY on the first draft — `loadQwen4Mtp` runs while the Transformer is
-    /// still under construction and `lm_head_w` is not assigned yet. `tried`
-    /// makes the refusal one-shot; a null `rerank` after it means the full
-    /// readout is this head's draft path.
+    /// that shortlists 32 candidates, which the real head then re-scores.
+    /// Built at LOAD by `qwen4BuildDraftRerank` — not in `loadQwen4Mtp`, which
+    /// runs while the Transformer is still under construction and `lm_head_w`
+    /// is not assigned yet, but from the scheduler's load path once it is.
+    /// `tried` makes it (and the refusal) one-shot, so the draft path's own
+    /// ask is a pure read; a null `rerank` after it means the full readout is
+    /// this head's draft path.
     rerank: ?mtp_mod.RerankCoarse = null,
     rerank_logged: bool = false,
     rerank_tried: bool = false,
@@ -13276,25 +13278,43 @@ pub const Transformer = struct {
         return .{ .logits = logits, .stream = h };
     }
 
-    /// Is the qwen4_exp head's draft rerank available? Builds the coarse head
-    /// on first ask (the load path runs before `lm_head_w` is assigned), and
-    /// caches the refusal so an ineligible head probes once. False keeps the
-    /// full-vocab draft projection — today's behaviour, and what
-    /// MLX_SERVE_MTP_DRAFT_RERANK=0 restores.
-    pub fn qwen4DraftRerankReady(self: *Transformer) bool {
+    /// Build the qwen4_exp head's coarse rerank head. ONE-SHOT (`rerank_tried`
+    /// caches the refusal too) and infallible — false keeps the full-vocab
+    /// draft projection, which is what MLX_SERVE_MTP_DRAFT_RERANK=0 restores.
+    ///
+    /// Called at LOAD (`scheduler.doLoadOnInferenceThread`, the site both the
+    /// boot load and the `/v1/load` cold load route through), the sidecar
+    /// arm's `maybeBuildDraftRerank`-at-bind twin: a full `requantizeRows` of
+    /// the trunk lm_head plus a synchronous eval of its ~240 MB is a LOAD
+    /// cost, and inside the first request's draft chain it was first-token
+    /// latency on the inference thread with the stream drained mid-round.
+    pub fn qwen4BuildDraftRerank(self: *Transformer) bool {
         const m = &(self.qwen4_mtp orelse return false);
         if (m.rerank_tried) return m.rerank != null;
         m.rerank_tried = true;
         if (mtp_mod.MtpModel.draftRerankMode() == .off) return false;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const t0 = std.Io.Timestamp.now(io, .awake);
         // The ONE env read: the built head carries its width from here on.
         const rc = mtp_mod.buildRerankCoarse(self.s, self, mtp_mod.rerankCoarseBits()) orelse return false;
         m.rerank = rc;
-        const mb = @divTrunc(mtp_mod.rerankCoarseBytes(rc.rows, @intCast(self.config.hidden_size), rc.bits), 1024 * 1024);
+        const bytes = mtp_mod.rerankCoarseBytes(rc.rows, @intCast(self.config.hidden_size), rc.bits);
+        const ms: u64 = @intCast(@divTrunc(t0.untilNow(io, .awake).nanoseconds, std.time.ns_per_ms));
         log.info(
-            "[qwen4] MTP draft rerank: coarse lm_head {d}-bit ({d} MB) + exact top-32 rescoring (MLX_SERVE_MTP_DRAFT_RERANK=0 restores full-vocab drafts)\n",
-            .{ rc.bits, mb },
+            "[qwen4] MTP draft rerank: coarse lm_head {d}-bit ({d} MB, {d} ms) + exact top-32 rescoring (MLX_SERVE_MTP_DRAFT_RERANK=0 restores full-vocab drafts)\n",
+            .{ rc.bits, bytes / (1024 * 1024), ms },
         );
         return true;
+    }
+
+    /// Is the qwen4_exp head's draft rerank available? A pure read once the
+    /// load-time build has run; the build is only reached here when it did
+    /// NOT (an offline path, a directly-constructed Transformer), and it is
+    /// one-shot either way.
+    pub fn qwen4DraftRerankReady(self: *Transformer) bool {
+        const m = &(self.qwen4_mtp orelse return false);
+        if (m.rerank_tried) return m.rerank != null;
+        return self.qwen4BuildDraftRerank();
     }
 
     /// One greedy draft id from the mixer output `x` `[B,1,H]`. Shares the
