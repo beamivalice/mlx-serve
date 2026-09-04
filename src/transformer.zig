@@ -38282,6 +38282,32 @@ fn attn256RandBf16Scaled(rnd: std.Random, shape: []const c_int, scale: f32, s: m
     return out;
 }
 
+/// Largest |element| of an array — the scale a bf16 rounding bar is relative
+/// to. A constant absolute bar is not portable across fixtures: one bf16 ulp
+/// is `2^-8 * |x|`, so the same correct kernel lands at 5e-4 when the outputs
+/// are ~0.12 and at 4e-3 when they are ~1.
+fn attn256MaxAbs(a: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
+    var a_c = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(a_c);
+    try mlx.check(mlx.mlx_contiguous(&a_c, a, false, s));
+    var a32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(a32);
+    try mlx.check(mlx.mlx_astype(&a32, a_c, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(a32));
+    const ad = mlx.mlx_array_data_float32(a32) orelse return error.InvalidDtype;
+    const n = mlx.mlx_array_size(a32);
+    var m: f32 = 0;
+    for (0..n) |i| m = @max(m, @abs(ad[i]));
+    return m;
+}
+
+/// Two bf16 ulps at the reference's own scale — the bar for "this differs from
+/// the reference only by rounding", independent of how big the outputs are.
+fn attn256UlpBar(ref: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
+    const m = try attn256MaxAbs(ref, s);
+    return 2.0 * m * 0.00390625 + 1.0e-6;
+}
+
 fn attn256MaxDiff(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
     // Raw data-pointer reads below: force row-major first. The fused sdpa
     // kernels hand back a [B,L,H,D]-strided VIEW and astype keeps the strides.
@@ -39100,13 +39126,15 @@ test "qsa sparse attn: one fused dispatch equals the union gather at verify widt
     // softmax; the gather arm materializes a padded union and runs SDPA over
     // it under a mask.
     //
-    // On the max-abs bar: the outputs are bf16, where one ulp at |o| ~ 1 is
-    // 2^-8 = 0.0039, so a 5e-4 absolute bar is BELOW the representable step
-    // and cannot be met by any correct implementation. Cosine is the bar that
-    // discriminates here (it is insensitive to per-element ulp across 3072
-    // elements but not to a wrong key set), and the absolute check is set to
-    // two ulps. Both measured values are printed so the bar can be tightened
-    // against evidence rather than guessed.
+    // On the max-abs bar: the difference is one bf16 ulp, and an ulp is
+    // RELATIVE (2^-8 * |x|), so a constant bar only works at one output scale.
+    // Attention output here is an average over ~2k softmax-weighted N(0,1)
+    // rows, so |o| ~ 0.03..0.12 and one ulp is 6e-5..5e-4 — measured diffs are
+    // exactly those powers of two. A fixture with larger outputs would
+    // legitimately land at 4e-3 with the same correct kernel, so the bar is
+    // two ulps of the REFERENCE's own scale (`attn256UlpBar`), not a constant.
+    // Cosine is the companion bar: insensitive to per-element rounding across
+    // 3072 elements, but not to a wrong key set.
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const ta = std.testing.allocator;
@@ -39158,9 +39186,10 @@ test "qsa sparse attn: one fused dispatch equals the union gather at verify widt
         defer _ = mlx.mlx_array_free(ref_d);
         const dd = try attn256MaxDiff(got_d, ref_d, s);
         const dc = try attn256Cosine(got_d, ref_d, s);
-        std.debug.print("[qsa-attn] S={d} kv={d} kb={d} gqa={d} dense: max diff {d:.6} cos {d:.7}\n", .{ c.s, c.kv, c.kb, @divExact(c.hq, c.hkv), dd, dc });
+        const d_bar = try attn256UlpBar(ref_d, s);
+        std.debug.print("[qsa-attn] S={d} kv={d} kb={d} gqa={d} dense: max diff {d:.6} cos {d:.7} (bar {d:.6})\n", .{ c.s, c.kv, c.kb, @divExact(c.hq, c.hkv), dd, dc, d_bar });
         try std.testing.expect(dc > 0.99999);
-        try std.testing.expect(dd < 0.008);
+        try std.testing.expect(dd <= d_bar);
 
         // Packed arm: a REAL affine-8 cache, filled in two appends so the
         // view is a strided slice of a larger capacity buffer.
@@ -39179,9 +39208,10 @@ test "qsa sparse attn: one fused dispatch equals the union gather at verify widt
         defer _ = mlx.mlx_array_free(ref_q);
         const qd = try attn256MaxDiff(got_q, ref_q, s);
         const qc = try attn256Cosine(got_q, ref_q, s);
-        std.debug.print("[qsa-attn] S={d} kv={d} kb={d} gqa={d} affine-8: max diff {d:.6} cos {d:.7}\n", .{ c.s, c.kv, c.kb, @divExact(c.hq, c.hkv), qd, qc });
+        const q_bar = try attn256UlpBar(ref_q, s);
+        std.debug.print("[qsa-attn] S={d} kv={d} kb={d} gqa={d} affine-8: max diff {d:.6} cos {d:.7} (bar {d:.6})\n", .{ c.s, c.kv, c.kb, @divExact(c.hq, c.hkv), qd, qc, q_bar });
         try std.testing.expect(qc > 0.99999);
-        try std.testing.expect(qd < 0.008);
+        try std.testing.expect(qd <= q_bar);
 
         // The union gather agrees with the fused kernel, not merely with the
         // reference: the two shipping arms must not disagree with each other.
