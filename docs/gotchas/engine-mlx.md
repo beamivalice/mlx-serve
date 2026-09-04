@@ -5152,3 +5152,55 @@ persisted history of the wrong length is worse than none.
 
 `MLX_SERVE_MTP_HEAD_PERSIST=0` restores the old reset-every-request
 behaviour, for the A/B and for a fast retreat.
+## Split-K rescued the QSA sparse-attn kernel, and the S=1 lever that was going to test it was inert (2026-09-05, qwen4_exp, M5 Max)
+
+The fused sparse-attention kernel shipped as one threadgroup per (query row,
+kv head). On a 24q/2kv pack that is 12 threadgroups at S=6 and 6 at S=3, of 64
+threads each, on a 40-core GPU. It was 15.6% SLOWER than the union gather it
+replaced at S=6 and 36.0% slower at S=3 — while issuing 735 FEWER ops, reading
+the same bytes, and doing a sixth of the MACs. S=3 is the tell: halving the
+grid roughly doubled the penalty while halving the work. Nothing about bytes or
+dispatch count does that; a starved grid does.
+
+Splitting each row's key range across NSPLIT threadgroups and merging the
+per-split online-softmax states turned it around completely (in-situ forward
+ubench, 12 counterbalanced boots, 100 s thermal idle, one binary, env-only
+arms):
+
+    S=6  off 44.814 ms | nsplit  8: 40.227   16: 39.043   32: 40.226   64: 39.330
+    S=3  off 31.536 ms | nsplit  8: 29.976   16: 29.162   32: 28.934   64: 29.182
+
+Noise floors from the repeated off boots: 1.2% at S=6, 3.2% at S=3. Every split
+count from 8 to 64 wins by 5-13%, at both widths.
+
+**The win is split-K, not the tuning.** Only ONE difference between split counts
+clears its own floor (S=6, 16 over 32, 2.9% against 1.2%); at S=3 the spread
+over 16/32/64 is 0.8% against a 3.2% floor. So the default is a single flat
+constant, not a per-width table fitted to two points one of which is noise.
+Both best cells do land on S*Hk*NSPLIT = 192 threadgroups, which would make the
+original occupancy formula right with its target retuned 320 -> 192 — recorded
+as a hypothesis, not adopted, because it rests on one resolved point.
+
+The second lesson cost a GPU slot. The plan was to test whether split-K could
+also serve SERIAL decode (S=1), where it would replace ~21 dependent dispatches
+per layer — the user's headline at long context. `MLX_SERVE_QSA_ATTN_MIN_S=1`
+existed for exactly that. The A/B came back 20.273 vs 20.200 ms, 0.4% apart,
+with IDENTICAL op counts (4859) and ZERO `[qsa-attn] engaged` lines in both
+arms. The lever had done nothing: `qsaAttnMinS()` was read inside
+`qsaSparseAttn`, but the DISPATCH carried its own `seq_len >= 2` literal, so at
+S=1 the callee was never reached and both arms ran the decode gather. The
+measurement was of the shipped path against itself.
+
+This repo already has the rule — "a guard that shapes INIT options does not
+bind DISPATCH" — written for spec tick dispatch. It generalises: a lever is a
+property of the CALL SITE, and a floor named in two places is a floor in
+neither. The fix routes both arms of the dispatch through the one predicate
+(the decode-gather arm steps aside exactly when the fused kernel claims S=1),
+and the class guard is a source scan asserting the dispatch contains no width
+literal.
+
+The cheap tell was in the data the whole time and is worth reaching for first:
+an A/B whose two arms report the SAME op count is not measuring two arms. The
+engaged-line census caught it on the first boot; without those two columns it
+would have read as "split-K is a wash at S=1" and been believed.
+
