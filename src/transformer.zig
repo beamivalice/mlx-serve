@@ -3505,9 +3505,27 @@ const QSA_ATTN_Q_SOURCE =
     \\// but a split's last is full. A split starting past L is EMPTY and
     \\// writes the merge's identity.
     \\const int tiles = (L + BK - 1) / BK;
-    \\const int tiles_per = (tiles + NSPLIT - 1) / NSPLIT;
-    \\const int t_lo = jsp * tiles_per * BK;
-    \\const int t_hi = metal::min(L, t_lo + tiles_per * BK);
+    \\// BALANCED=0 (default, MEASURED): ceil(tiles/NSPLIT) per split, so the
+    \\// last splits can be short or empty — at the swept shape 129 tiles over
+    \\// 16 splits is 14 full, 1 partial, 1 empty. BALANCED=1 spreads the
+    \\// remainder one tile per split instead. Strictly better load balance on
+    \\// paper; NOT the default because the sweep that chose NSPLIT=16 ran on
+    \\// the ceil distribution, and changing how work is divided invalidates
+    \\// it. Same outputs either way — the split boundaries move, the merge is
+    \\// exact over whatever they are.
+    \\int t_lo, t_hi;
+    \\if (BALANCED) {
+    \\  const int base_t = tiles / NSPLIT;
+    \\  const int rem_t = tiles % NSPLIT;
+    \\  const int start_t = jsp * base_t + metal::min(jsp, rem_t);
+    \\  const int cnt_t = base_t + ((jsp < rem_t) ? 1 : 0);
+    \\  t_lo = start_t * BK;
+    \\  t_hi = metal::min(L, (start_t + cnt_t) * BK);
+    \\} else {
+    \\  const int tiles_per = (tiles + NSPLIT - 1) / NSPLIT;
+    \\  t_lo = jsp * tiles_per * BK;
+    \\  t_hi = metal::min(L, t_lo + tiles_per * BK);
+    \\}
     \\
     \\const device int* blk = blocks + (long)bb * blocks_strides[0] + (long)s * blocks_strides[1];
     \\const long kq_base  = (long)bb * kq_strides[0]  + (long)hk * kq_strides[1];
@@ -3815,6 +3833,8 @@ pub fn warmQsaEnvCaches() void {
     _ = qsaAttnKernelEnabled();
     _ = qsaAttnNSplit();
     _ = qsaAttnMinS();
+    _ = qsaAttnBk();
+    _ = qsaAttnBalanced();
 }
 
 /// `qsaSelectKernelEnabled` consults an override first, so warming it through
@@ -3868,6 +3888,41 @@ fn getQsaAttnMergeKernel() !mlx.mlx_fast_metal_kernel {
 /// default 32 is 20 KiB) — half the footprint, twice the occupancy, at a
 /// width where each threadgroup already walks ~2k keys.
 pub const QSA_ATTN_BK: c_int = 16;
+
+var qsa_attn_bk_env: ?c_int = null;
+var qsa_attn_balanced_env: ?bool = null;
+pub var qsa_attn_bk_override: ?c_int = null;
+pub var qsa_attn_balanced_override: ?bool = null;
+
+/// Threadgroup tile depth, `MLX_SERVE_QSA_ATTN_BK` (default `QSA_ATTN_BK`).
+///
+/// Must be a MULTIPLE OF 8: `KT = BK / 8` indexes 8-wide fragments, so the
+/// audit's suggested 12 would silently truncate the tile rather than shrink
+/// it. The rung that actually clears the ~10 KiB occupancy bar is BK=8
+/// (BD*(BK+8)*2 = 8 KiB against 16's 12 KiB); 24 and 32 go the other way.
+///
+/// Default UNCHANGED at 16: the NSPLIT sweep ran at BK=16, and BK changes the
+/// staging, the tile count and the occupancy together, so adopting a new value
+/// means re-running that sweep, not reasoning about threadgroup bytes.
+pub fn qsaAttnBk() c_int {
+    const v = qsa_attn_bk_override orelse qsaAttnEnvInt(&qsa_attn_bk_env, "MLX_SERVE_QSA_ATTN_BK", QSA_ATTN_BK);
+    if (v <= 0 or @rem(v, 8) != 0 or v > 32) return QSA_ATTN_BK;
+    return v;
+}
+
+/// `MLX_SERVE_QSA_ATTN_BALANCED=1` spreads the tile remainder one per split
+/// instead of ceil-per-split. Default OFF for the same reason: it changes how
+/// the work is divided, so it invalidates the NSPLIT sweep and owes a re-run.
+pub fn qsaAttnBalanced() bool {
+    if (qsa_attn_balanced_override) |v| return v;
+    if (qsa_attn_balanced_env) |v| return v;
+    const v = blk: {
+        const raw = std.c.getenv("MLX_SERVE_QSA_ATTN_BALANCED") orelse break :blk false;
+        break :blk std.mem.eql(u8, std.mem.sliceTo(raw, 0), "1");
+    };
+    qsa_attn_balanced_env = v;
+    return v;
+}
 
 var qsa_attn_q_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
 
@@ -4004,6 +4059,8 @@ const QsaAttnCfgKey = struct {
     gs: u32,
     nsg: c_int,
     nsplit: c_int,
+    bk: c_int,
+    balanced: bool,
     ratio: c_int,
     dtype: mlx.mlx_dtype,
 };
@@ -4097,6 +4154,8 @@ pub fn qsaSparseAttn(
     const merge_kernel = getQsaAttnMergeKernel() catch return null;
     const nsg: c_int = @divTrunc(gqa + 7, 8);
     const nsplit = qsaAttnNSplit();
+    const bk = qsaAttnBk();
+    const balanced = qsaAttnBalanced();
     const scl_data = [_]f32{attn_scale};
     const one = [_]c_int{1};
     const scl = mlx.mlx_array_new_data(&scl_data, &one, 1, .float32);
@@ -4109,6 +4168,8 @@ pub fn qsaSparseAttn(
         .gs = kv_view.group_size,
         .nsg = nsg,
         .nsplit = nsplit,
+        .bk = bk,
+        .balanced = balanced,
         .ratio = ratio,
         .dtype = .bfloat16,
     };
@@ -4126,11 +4187,12 @@ pub fn qsaSparseAttn(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, nsg, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", .bfloat16));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "NSG", nsg));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BK", QSA_ATTN_BK));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BK", bk));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "RATIO", ratio));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", @intCast(kv_view.bits)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GS", @intCast(kv_view.group_size)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "NSPLIT", nsplit));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BALANCED", if (balanced) 1 else 0));
 
         // Merge pass: one threadgroup per (q head, row), 256 threads. Its only
         // specialization is the output dtype — NSPLIT and qL ride pacc's shape.
@@ -4182,7 +4244,7 @@ pub fn qsaSparseAttn(
     if (qsa_attn_engaged_bits.take(qsaWidthBucket(seq_len))) {
         log.info(
             "[qsa-attn] engaged (S={d} kv={d} quant={d}/gs{d} gqa={d} bk={d} nsplit={d} tgs={d}) — MLX_SERVE_QSA_ATTN_KERNEL=0 restores the union gather\n",
-            .{ seq_len, kv, kv_view.bits, kv_view.group_size, gqa, QSA_ATTN_BK, nsplit, seq_len * h_kv * nsplit },
+            .{ seq_len, kv, kv_view.bits, kv_view.group_size, gqa, bk, nsplit, seq_len * h_kv * nsplit },
         );
     }
     return out;
@@ -39773,6 +39835,30 @@ test "qsa sparse attn: NSPLIT is one MEASURED constant, and the width floor bind
     qsa_attn_nsplit_override = 1000;
     try std.testing.expectEqual(QSA_ATTN_MAX_NSPLIT, qsaAttnNSplit());
     qsa_attn_nsplit_override = null;
+
+    // L21 levers exist, default to the MEASURED configuration, and validate.
+    defer qsa_attn_bk_override = null;
+    defer qsa_attn_balanced_override = null;
+    try std.testing.expectEqual(QSA_ATTN_BK, qsaAttnBk());
+    try std.testing.expectEqual(false, qsaAttnBalanced());
+    // BK must be a multiple of 8: KT = BK/8 indexes 8-wide fragments, so 12
+    // (the value that would hit the ~10 KiB occupancy bar by arithmetic alone)
+    // truncates the tile instead of shrinking it. Rejected back to the default.
+    qsa_attn_bk_override = 12;
+    try std.testing.expectEqual(QSA_ATTN_BK, qsaAttnBk());
+    qsa_attn_bk_override = 0;
+    try std.testing.expectEqual(QSA_ATTN_BK, qsaAttnBk());
+    qsa_attn_bk_override = 64;
+    try std.testing.expectEqual(QSA_ATTN_BK, qsaAttnBk());
+    // 8 is the rung that clears the bar and is accepted — for a sweep, not a
+    // default: BD*(8+8)*2 = 8 KiB against 16's 12 KiB.
+    qsa_attn_bk_override = 8;
+    try std.testing.expectEqual(@as(c_int, 8), qsaAttnBk());
+    try std.testing.expect(256 * (8 + 8) * 2 <= 10 * 1024);
+    qsa_attn_bk_override = null;
+    qsa_attn_balanced_override = true;
+    try std.testing.expectEqual(true, qsaAttnBalanced());
+    qsa_attn_balanced_override = null;
 
     // The width floor: default excludes decode, the lever includes it.
     defer qsa_attn_min_s_override = null;
