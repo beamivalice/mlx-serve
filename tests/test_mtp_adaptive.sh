@@ -31,6 +31,14 @@
 #   [4] The kill switch HOLDS: with MLX_SERVE_MTP_ADAPTIVE_SERIAL=0 no
 #       `[mtp] adaptive:` line appears anywhere in the boot, and the arm on
 #       every `[spec-stats]` line stays `adaptive=undecided`.
+#   [6] A model that never speculates writes NOTHING. `observeSerialTick` sits
+#       on the scheduler's regular decode path, which every model takes, so it
+#       used to fold a serial cell on every token of every model and rewrite
+#       ~/.mlx-serve/round-cost/<key>.txt at the end of every request, for a
+#       table with no reader. Boot C runs `--no-mtp` with persistence ENABLED
+#       under an isolated HOME and requires the round-cost directory to stay
+#       empty.
+#
 #   [5] The kill switch costs NOTHING: with `=0` the off boot shows no probe
 #       line and no switch, and `serial_cell=` may legitimately read 0.00.
 #       An earlier version of this script asserted the opposite — that the
@@ -156,6 +164,12 @@ PY
 [ -f "$WORK/long_mtp.json" ] || { echo "FAIL: could not generate prompts"; exit 1; }
 
 # ── Server lifecycle ──────────────────────────────────────────────────────
+# Boot C's isolated HOME: the ONLY place this script lets the server persist a
+# round-cost table, so [6] can assert on its contents. The user's real
+# ~/.mlx-serve is never a write target.
+ISO_HOME="$WORK/home"
+RC_DIR="$ISO_HOME/.mlx-serve/round-cost"
+
 start_server() { # $1 = log path, $2 = value for MLX_SERVE_MTP_ADAPTIVE_SERIAL ("" = unset)
     local log="$1" adapt="$2"
     pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
@@ -360,6 +374,58 @@ else
     ok "kill switch: no probe ran (serial_cell=$B_CELL, informational)"
 fi
 
+# ── Boot C: a model that never speculates must not write a round-cost table ──
+# Persistence is ON here (no MLX_SERVE_ROUND_COST_PERSIST=0) but HOME is the
+# isolated one, so the only table this server could write is the one we check.
+echo "== boot C: --no-mtp, persistence ON, isolated HOME =="
+LOG_C=/tmp/mtp_adaptive_nomtp.log
+mkdir -p "$ISO_HOME"
+rm -rf "$RC_DIR"
+pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
+for _ in $(seq 1 30); do
+    lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1 || break
+    sleep 1
+done
+: > "$LOG_C"
+HOME="$ISO_HOME" MLX_SERVE_MTP_TRACE=1 \
+"$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" \
+    --no-mtp --kv-quant 8 --ctx-size "$CTX_SIZE" --no-pld \
+    --prefix-cache-entries 2 --log-level info >"$LOG_C" 2>&1 &
+SERVER_PID=$!
+c_model_mb=$(du -sm "$MODEL" 2>/dev/null | awk '{print $1}')
+c_ready=$(( 600 + ${c_model_mb:-0} / 50 ))
+c_up=0
+for _ in $(seq 1 $((c_ready / 3)) ); do
+    grep -q "Model ready (loaded on inference thread)" "$LOG_C" && { c_up=1; break; }
+    kill -0 "$SERVER_PID" 2>/dev/null || break
+    sleep 3
+done
+if [ "$c_up" -ne 1 ]; then
+    bad "no-mtp boot" "server did not become ready"
+else
+    # A long request (many decode ticks) plus an explicit enable_mtp:false one:
+    # both take the regular decode path, which is where the unconditional fold
+    # used to live.
+    req "$WORK/long_mtp.json" "$LOG_C" "$WORK/c_long.slice" >/dev/null ||
+        bad "no-mtp boot" "long request failed"
+    req "$WORK/long_serial.json" "$LOG_C" "$WORK/c_serial.slice" >/dev/null ||
+        bad "no-mtp boot" "enable_mtp:false request failed"
+    stop_server
+    RC_FILES=$(ls -1 "$RC_DIR" 2>/dev/null | wc -l | tr -d ' ')
+    if [ "${RC_FILES:-0}" -eq 0 ]; then
+        ok "--no-mtp boot wrote no round-cost table ($RC_DIR empty)"
+    else
+        bad "no-mtp boot" "$RC_FILES round-cost file(s) written by a model that never speculates"
+        ls -la "$RC_DIR" | sed 's/^/      /'
+    fi
+    # And it certainly must not have decided anything.
+    if grep -q "\[mtp\] adaptive:" "$LOG_C"; then
+        bad "no-mtp boot" "an adaptive line appeared with --no-mtp"
+    else
+        ok "--no-mtp boot made no adaptive decision"
+    fi
+fi
+
 echo
-echo "── $PASS passed, $FAIL failed ── (logs: $LOG_A, $LOG_B)"
+echo "── $PASS passed, $FAIL failed ── (logs: $LOG_A, $LOG_B, $LOG_C)"
 [ "$FAIL" -eq 0 ] || exit 1
