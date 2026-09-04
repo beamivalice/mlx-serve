@@ -18986,7 +18986,10 @@ test "every request surface runs the --max-mtp-ctx admission gate" {
     // any context while every other layer looked correct. Needles split so
     // this test's own text cannot satisfy the count.
     const src = @embedFile("server.zig");
-    const call = "admitMtpFor" ++ "Ctx(enable_mtp";
+    // Leading "= " so the FUNCTION DEFINITION does not count as a call site:
+    // `fn admitMtpForCtx(enable_mtp: bool, ...)` matches the bare needle too,
+    // which is why the old bound had to be `>= 4` and could not be exact.
+    const call = "= admitMtpFor" ++ "Ctx(enable_mtp";
     var sites: usize = 0;
     var idx: usize = 0;
     while (std.mem.indexOfPos(u8, src, idx, call)) |at| {
@@ -18994,9 +18997,11 @@ test "every request surface runs the --max-mtp-ctx admission gate" {
         idx = at + call.len;
     }
     // chat/completions, completions, messages, responses (`enable_mtp_resp`
-    // shares the prefix) — plus nothing else, since the helper takes the
-    // RESOLVED value and each surface resolves it once.
-    try std.testing.expect(sites >= 4);
+    // shares the prefix) — and EXACTLY those four. `>= 4` passed while a
+    // surface was missing as long as another had two calls, which is the
+    // shape this scan exists to catch; the helper takes the RESOLVED value
+    // and each surface resolves it once, so the count is exact.
+    try std.testing.expectEqual(@as(usize, 4), sites);
 
     // The gate reads the ONE value the CLI sets; a second source of truth for
     // the ceiling is the bug this pins.
@@ -19122,12 +19127,14 @@ test "the 458k prefill's two unbilled terms are billed: retained checkpoints and
     const kv_per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8);
     try t.expectEqual((2048 + chunk) * kv_per_tok, terms.reserved_kv_bytes);
     try t.expect(terms.reserved_kv_bytes * 4 < seq * kv_per_tok); // headroom, not a copy
-    // The indexer history is billed at ONE copy: `qsaAppendKeys` appends into
-    // a capacity buffer, so no old+new pair is live in the chunk's graph. The
-    // sizer bills it at the same width, so advertised and admitted contexts
-    // cannot diverge.
+    // The indexer history is billed at TWO copies even here, where the growth
+    // transient is gone (`qsaAppendKeys` appends into a capacity buffer, so no
+    // old+new pair is live in the chunk's graph): the end-of-prefill
+    // checkpoint attach materializes the second one regardless. The sizer
+    // bills the same width, so advertised and admitted contexts cannot
+    // diverge. Full contract in "billed at BOTH copies" below.
     try t.expect(QSA_HISTORY_GROWS_IN_PLACE);
-    try t.expectEqual(cfg.qsaHistoryBytesPerToken(), statePerTokenBilled(&cfg));
+    try t.expectEqual(cfg.qsaHistoryBytesPerToken() * 2, statePerTokenBilled(&cfg));
     try t.expectEqual((seq + 2048 + chunk) * statePerTokenBilled(&cfg), terms.state_bytes);
     try t.expectEqual(held, terms.checkpoint_bytes);
 

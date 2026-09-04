@@ -2109,12 +2109,19 @@ pub const Generator = struct {
             // us already clamped by the server, but a reservation is a number
             // two subsystems must agree on and neither may trust its caller
             // for it (the omitted-max_tokens sentinel, #353 follow-up).
-            ctx.cache.reserve(@intCast(transformer_mod.KVCache.reservedTokens(
+            const reserved_tokens = transformer_mod.KVCache.reservedTokens(
                 prompt_ids.len,
                 max_tokens,
                 default_chunk,
                 xfm.config.max_position_embeddings,
-            )));
+            );
+            ctx.cache.reserve(@intCast(reserved_tokens));
+            // The arch's OWN per-request buffers reserve at the SAME length.
+            // The KV cache was sized in one shot while the QSA raw-key history
+            // and the pooled bank still walked the +25% ladder underneath it —
+            // the transient the guard already bills (`statePerTokenBilled`),
+            // paid per layer per rung (#353 follow-up).
+            transformer_mod.reserveQsaHistory(ctx.ssm_entries, @intCast(reserved_tokens));
 
             var pos: usize = 0;
             while (pos < loop_end) {

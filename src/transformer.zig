@@ -5848,6 +5848,14 @@ pub const SSMCacheEntry = struct {
     qsa_pooled_blocks: c_int = 0,
     qsa_score_bank: mlx.mlx_array = .{ .ctx = null },
     qsa_score_blocks: c_int = 0,
+    /// Rows this entry's QSA history is asked to hold UP FRONT, the exact
+    /// counterpart of `KVCache.reserve_tokens` (#353 follow-up). Without it a
+    /// reserved prefill still walked the +25% proportional ladder on these
+    /// buffers — a `mlx_zeros` plus a `slice_update` of everything so far, per
+    /// grow, per layer, beside a KV cache that had already been sized once.
+    /// The pooled bank derives its own reservation from this by `ratio`.
+    /// Set through `reserveQsaHistory`; 0 = no reservation.
+    qsa_reserve_rows: usize = 0,
 };
 
 /// Free and null a LIVE entry's whole QSA state: the raw-key history, the
@@ -5875,13 +5883,32 @@ pub fn ssmFreeQsaState(e: *SSMCacheEntry) void {
 /// Growth is the KV cache's proportional policy — a linear +S would
 /// reallocate on every decode step, which is the copy this replaces.
 const QsaKeyAppendPlan = struct { new_cap: usize, write_at: usize, new_rows: usize };
-fn qsaKeyAppendPlan(rows: usize, cap: usize, add: usize) QsaKeyAppendPlan {
+fn qsaKeyAppendPlan(rows: usize, cap: usize, add: usize, reserve: usize) QsaKeyAppendPlan {
     const need = rows + add;
+    // A reservation raises the FIRST grow to the whole request, exactly as
+    // `KVCache.nextCapacityReserved` does: past it the proportional policy
+    // takes over, and a reservation never shrinks a buffer already larger.
+    const grown = if (need <= cap) cap else @max(KVCache.nextCapacityPolicy(cap, need, false), reserve);
     return .{
-        .new_cap = if (need <= cap) cap else KVCache.nextCapacityPolicy(cap, need, false),
+        .new_cap = grown,
         .write_at = rows,
         .new_rows = need,
     };
+}
+
+/// How many times a capacity buffer actually allocated. A reserved prefill
+/// must move this exactly ONCE per buffer, which is the whole point.
+pub var qsa_cap_buf_allocs: usize = 0;
+
+/// Ask every live entry's QSA history to hold `tokens` rows up front.
+/// Monotone and idempotent like `KVCache.reserve`, and off under the same
+/// kill switch — one reservation decision, one lever (`MLX_SERVE_KV_RESERVE=0`).
+pub fn reserveQsaHistory(entries: ?[]SSMCacheEntry, tokens: usize) void {
+    if (!KVCache.kvReserveEnabled()) return;
+    const es = entries orelse return;
+    for (es) |*e| {
+        if (tokens > e.qsa_reserve_rows) e.qsa_reserve_rows = tokens;
+    }
 }
 
 /// Append `chunk` into a pre-grown capacity buffer along `axis` and republish
@@ -5892,7 +5919,7 @@ fn qsaKeyAppendPlan(rows: usize, cap: usize, add: usize) QsaKeyAppendPlan {
 /// The published view is dropped FIRST: while it lives it holds a reference
 /// to the buffer's memory, and mlx would then copy the whole buffer instead
 /// of donating it into the update — exactly the copy this pattern removes.
-fn capBufAppend(s: mlx.mlx_stream, buf: *mlx.mlx_array, view: *mlx.mlx_array, count: *c_int, chunk: mlx.mlx_array, axis: usize) !void {
+fn capBufAppend(s: mlx.mlx_stream, buf: *mlx.mlx_array, view: *mlx.mlx_array, count: *c_int, chunk: mlx.mlx_array, axis: usize, reserve: usize) !void {
     const csh = mlx.getShape(chunk);
     const nd: usize = csh.len;
     std.debug.assert(nd <= 4 and axis < nd);
@@ -5901,13 +5928,14 @@ fn capBufAppend(s: mlx.mlx_stream, buf: *mlx.mlx_array, view: *mlx.mlx_array, co
     view.* = .{ .ctx = null };
 
     const cap: usize = if (buf.ctx != null) @intCast(mlx.getShape(buf.*)[axis]) else 0;
-    const plan = qsaKeyAppendPlan(@intCast(count.*), cap, @intCast(add));
+    const plan = qsaKeyAppendPlan(@intCast(count.*), cap, @intCast(add), reserve);
     var start = [_]c_int{ 0, 0, 0, 0 };
     var stop = [_]c_int{ 0, 0, 0, 0 };
     const strides = [_]c_int{ 1, 1, 1, 1 };
     for (csh, 0..) |d, i| stop[i] = d;
 
     if (plan.new_cap != cap) {
+        qsa_cap_buf_allocs += 1;
         var shape = [_]c_int{ 0, 0, 0, 0 };
         for (csh, 0..) |d, i| shape[i] = d;
         shape[axis] = @intCast(plan.new_cap);
@@ -14100,7 +14128,7 @@ pub const Transformer = struct {
                 entry.qsa_key_rows = held;
             }
         }
-        try capBufAppend(s, &entry.qsa_key_buf, &entry.aux_state, &entry.qsa_key_rows, k_raw, 1);
+        try capBufAppend(s, &entry.qsa_key_buf, &entry.aux_state, &entry.qsa_key_rows, k_raw, 1, entry.qsa_reserve_rows);
     }
 
     /// Extend the pooled block-key bank by `new3` `[B, n_new, hd]` bf16 and
@@ -14119,7 +14147,10 @@ pub const Transformer = struct {
                 entry.qsa_pooled_blocks = nb_cached;
             }
         }
-        try capBufAppend(s, &entry.qsa_pooled_buf, &entry.qsa_pooled, &entry.qsa_pooled_blocks, new3, 1);
+        // The bank holds one row per COMPLETED block, so its reservation is
+        // the row reservation divided by the pooling ratio.
+        const ratio: usize = @max(@as(usize, @intCast(entry.qsa_ratio)), 1);
+        try capBufAppend(s, &entry.qsa_pooled_buf, &entry.qsa_pooled, &entry.qsa_pooled_blocks, new3, 1, entry.qsa_reserve_rows / ratio);
     }
 
     /// The block-score matmul's key operand: `[B, 1, hd, nb]` f32, the pooled
@@ -43213,32 +43244,87 @@ test "scan: a live QSA entry's aux_state is only freed through ssmFreeQsaState" 
 
 test "qsa key append plan: rows advance by S, capacity grows only when it must" {
     // Pure arithmetic, no MLX. `cap == 0` is "no buffer yet".
-    const p0 = qsaKeyAppendPlan(0, 0, 4);
+    const p0 = qsaKeyAppendPlan(0, 0, 4, 0);
     try testing.expectEqual(@as(usize, 0), p0.write_at);
     try testing.expectEqual(@as(usize, 4), p0.new_rows);
     try testing.expect(p0.new_cap >= 4);
 
     // Inside capacity: no growth, write at the current row count.
-    const p1 = qsaKeyAppendPlan(100, 512, 1);
+    const p1 = qsaKeyAppendPlan(100, 512, 1, 0);
     try testing.expectEqual(@as(usize, 512), p1.new_cap);
     try testing.expectEqual(@as(usize, 100), p1.write_at);
     try testing.expectEqual(@as(usize, 101), p1.new_rows);
 
     // Exactly full is still inside.
-    const p2 = qsaKeyAppendPlan(511, 512, 1);
+    const p2 = qsaKeyAppendPlan(511, 512, 1, 0);
     try testing.expectEqual(@as(usize, 512), p2.new_cap);
     try testing.expectEqual(@as(usize, 512), p2.new_rows);
 
     // One past: grow, and never below what the append needs.
-    const p3 = qsaKeyAppendPlan(512, 512, 1);
+    const p3 = qsaKeyAppendPlan(512, 512, 1, 0);
     try testing.expect(p3.new_cap >= 513);
     try testing.expectEqual(@as(usize, 512), p3.write_at);
     try testing.expectEqual(@as(usize, 513), p3.new_rows);
 
     // A prefill chunk far past the capacity is covered in ONE growth.
-    const p4 = qsaKeyAppendPlan(500, 512, 4096);
+    const p4 = qsaKeyAppendPlan(500, 512, 4096, 0);
     try testing.expect(p4.new_cap >= 4596);
     try testing.expectEqual(@as(usize, 4596), p4.new_rows);
+}
+
+test "qsa history reservation: a reserved prefill allocates its buffers ONCE (#353 follow-up)" {
+    // The KV cache learned to reserve; these buffers had not. A 400k-style
+    // prefill therefore walked the +25% ladder on the raw-key history AND the
+    // pooled bank — every rung a `mlx_zeros` of the new capacity plus a
+    // `slice_update` of everything written so far, per layer — beside a KV
+    // cache that had already been sized in one shot. RED before
+    // `qsa_reserve_rows`: the loop below allocated ~30 times, not once.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const ta = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x5E5E_4E5E);
+    const rnd = prng.random();
+    const hd: c_int = 128;
+    const chunk_rows: c_int = 4096;
+    const total: usize = 409_600;
+
+    var t = Transformer{ .s = s, .allocator = ta };
+    var entries = [_]SSMCacheEntry{.{ .ssm_state = mlx.mlx_array_new(), .conv_state = mlx.mlx_array_new() }};
+    const entry = &entries[0];
+    defer {
+        ssmFreeQsaState(entry);
+        _ = mlx.mlx_array_free(entry.ssm_state);
+        _ = mlx.mlx_array_free(entry.conv_state);
+    }
+
+    // Reserved exactly the way a prefill does it: through the slice the
+    // forward context hands over, not by poking the field.
+    reserveQsaHistory(entries[0..], total);
+    try testing.expectEqual(total, entry.qsa_reserve_rows);
+
+    const before = qsa_cap_buf_allocs;
+    var rows: c_int = 0;
+    while (@as(usize, @intCast(rows)) < total) {
+        const chunk = try attn256RandBf16(rnd, &[_]c_int{ 1, chunk_rows, hd }, s);
+        defer _ = mlx.mlx_array_free(chunk);
+        try t.qsaAppendKeys(entry, chunk, rows);
+        rows += chunk_rows;
+    }
+    // ONE allocation for the whole prefill, and it is the reservation's size.
+    try testing.expectEqual(@as(usize, 1), qsa_cap_buf_allocs - before);
+    try testing.expectEqual(@as(c_int, @intCast(total)), mlx.getShape(entry.qsa_key_buf)[1]);
+    try testing.expectEqual(rows, mlx.getShape(entry.aux_state)[1]);
+}
+
+test "qsa key append plan: a reservation raises the FIRST grow and nothing else" {
+    // Pure arithmetic. Inside capacity a reservation changes nothing...
+    try testing.expectEqual(@as(usize, 512), qsaKeyAppendPlan(100, 512, 1, 400_000).new_cap);
+    // ...on a grow it wins over the proportional policy...
+    try testing.expectEqual(@as(usize, 400_000), qsaKeyAppendPlan(0, 0, 4096, 400_000).new_cap);
+    // ...but never shrinks what the append actually needs.
+    try testing.expect(qsaKeyAppendPlan(0, 0, 500_000, 400_000).new_cap >= 500_000);
+    // Past the reservation the policy takes over again.
+    try testing.expect(qsaKeyAppendPlan(400_000, 400_000, 1, 400_000).new_cap > 400_000);
 }
 
 test "qsa key history: capacity-buffer append equals the concatenated reference, across a growth boundary" {
