@@ -44203,13 +44203,8 @@ test "a reserved KV cache grows ONCE: no old+new buffer coexists during a long p
     // grows again.
     const reserved: usize = @intCast(KVCache.reservedTokens(seq, 2048, chunk));
     try t.expectEqual(seq + 2048 + chunk, reserved);
-    var rcache = KVCache{
-        .entries = &.{},
-        .step = 0,
-        .allocator = t.allocator,
-        .config = KVQuantConfig.dense,
-        .quant_state = null,
-    };
+    var rcache = try KVCache.init(t.allocator, 1);
+    defer rcache.deinit();
     rcache.reserve(reserved);
     var rcap: usize = 0;
     var rpos: usize = 0;
@@ -44231,13 +44226,8 @@ test "a reserved KV cache grows ONCE: no old+new buffer coexists during a long p
     // A request under the threshold reserves nothing: byte-identical
     // behaviour for every prompt the flat runtime floor was measured on.
     try t.expectEqual(@as(u64, 0), KVCache.reservedTokens(4096, 2048, chunk));
-    var small = KVCache{
-        .entries = &.{},
-        .step = 0,
-        .allocator = t.allocator,
-        .config = KVQuantConfig.dense,
-        .quant_state = null,
-    };
+    var small = try KVCache.init(t.allocator, 1);
+    defer small.deinit();
     small.reserve(@intCast(KVCache.reservedTokens(4096, 2048, chunk)));
     try t.expectEqual(
         KVCache.nextCapacityPolicy(1024, 2048, KVCache.kvGrowLinear()),
