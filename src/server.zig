@@ -3256,9 +3256,9 @@ fn mlxMemoryGuardApplies(uses_ds4: bool, uses_llama: bool) bool {
 /// every current and future call site is covered without per-site gating.
 /// Per-token bytes of the arch's own out-of-cache request state AS BILLED.
 /// One helper because the auto-context sizer and the admission guard must
-/// agree on it: while the QSA history still re-concatenates, its peak holds
-/// two copies, and a sizer that bills one advertises a context the guard then
-/// refuses (issue #353).
+/// agree on it: a sizer that bills a different width than the guard advertises
+/// a context the guard then refuses (issue #353). The history appends into a
+/// capacity buffer now, so ONE copy is the whole bill.
 pub fn statePerTokenBilled(config: *const model_mod.ModelConfig) u64 {
     const per_tok = config.qsaHistoryBytesPerToken();
     return if (QSA_HISTORY_GROWS_IN_PLACE) per_tok else per_tok * 2;
@@ -3319,19 +3319,20 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
     return .{
         .reserved_kv_bytes = (reserved -| seq) * kv_per_tok,
         // The indexer history is reserved at the same length, at the width
-        // `statePerTokenBilled` decides — doubled while the history is still
-        // rebuilt per chunk by `mlx_concatenate_axis` (old and new coexist).
+        // `statePerTokenBilled` decides — ONE copy, since `qsaAppendKeys`
+        // appends into a capacity buffer instead of re-concatenating.
         .state_bytes = reserved * statePerTokenBilled(config),
         .checkpoint_bytes = retainedSsmCheckpointBytes(config, seq, chunk),
     };
 }
 
-/// False while `qsaAppendKeys` still rebuilds the history with
-/// `mlx_concatenate_axis(old, new)` — the old buffer stays live in the
-/// chunk's lazy graph, so the peak holds two copies. Flip to true in the same
-/// commit that gives the history a capacity buffer, and the doubling above
-/// disappears with it.
-pub const QSA_HISTORY_GROWS_IN_PLACE: bool = false;
+/// True since `qsaAppendKeys` appends into the capacity buffer behind
+/// `entry.qsa_key_buf` (`capBufAppend`) instead of rebuilding the history with
+/// `mlx_concatenate_axis(old, new)`. While it re-concatenated, the old buffer
+/// stayed live in the chunk's lazy graph and the peak held TWO copies, so the
+/// bill above was doubled; one copy is now the truth. Flip back with the
+/// append, never on its own — the sizer and the guard both read it.
+pub const QSA_HISTORY_GROWS_IN_PLACE: bool = true;
 
 /// A slot that errored reports WHY. The MLX error latch turns a Metal
 /// working-set abort into `error.OutOfMemory` on the inference thread instead
@@ -19065,10 +19066,12 @@ test "the 458k prefill's two unbilled terms are billed: retained checkpoints and
     const kv_per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8);
     try t.expectEqual((2048 + chunk) * kv_per_tok, terms.reserved_kv_bytes);
     try t.expect(terms.reserved_kv_bytes * 4 < seq * kv_per_tok); // headroom, not a copy
-    // The indexer history IS still doubled — it re-concatenates per chunk —
-    // and the sizer bills it at the same width, so advertised and admitted
-    // contexts cannot diverge.
-    try t.expectEqual(cfg.qsaHistoryBytesPerToken() * 2, statePerTokenBilled(&cfg));
+    // The indexer history is billed at ONE copy: `qsaAppendKeys` appends into
+    // a capacity buffer, so no old+new pair is live in the chunk's graph. The
+    // sizer bills it at the same width, so advertised and admitted contexts
+    // cannot diverge.
+    try t.expect(QSA_HISTORY_GROWS_IN_PLACE);
+    try t.expectEqual(cfg.qsaHistoryBytesPerToken(), statePerTokenBilled(&cfg));
     try t.expectEqual((seq + 2048 + chunk) * statePerTokenBilled(&cfg), terms.state_bytes);
     try t.expectEqual(held, terms.checkpoint_bytes);
 

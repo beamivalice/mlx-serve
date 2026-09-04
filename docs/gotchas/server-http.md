@@ -1755,10 +1755,14 @@ accumulated. Pricing a transient you can delete is the wrong trade.
   `MLX_SERVE_KV_RESERVE=0` restores it everywhere.
 * `retainedSsmCheckpointBytes` and `statePerTokenBilled` join the estimator,
   the latter read by the auto-context sizer AND the guard so advertised and
-  admitted contexts cannot diverge. The QSA history is still billed at two
-  copies because it still re-concatenates; `QSA_HISTORY_GROWS_IN_PLACE` is the
-  one flag to flip when the capacity-buffer append lands (longctx-bundle
-  `8ebad7c` does exactly that).
+  admitted contexts cannot diverge. The QSA history was billed at TWO copies
+  while it re-concatenated per chunk; with the capacity-buffer append in the
+  same tree (`qsaAppendKeys` -> `capBufAppend`), `QSA_HISTORY_GROWS_IN_PLACE`
+  is true and the bill is ONE copy. That halving is not cosmetic: at
+  `--ctx-size 1048576` on qwen4_exp the doubled bill clamped a requested
+  24,576 MB hot cache to 5,703 MB, and the single copy gives most of it back.
+  The flag exists so the two move together — flip it back only if the append
+  ever returns to `mlx_concatenate_axis(old, new)`.
 * `HotPrefixCache.evictLruToAdmit` gives memory back rather than refusing: a
   cached prefix is an optimization, the request is the work. It runs on the
   inference thread (sole mlx caller, even for frees) after the prefix restore
