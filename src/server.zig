@@ -3254,14 +3254,30 @@ fn mlxMemoryGuardApplies(uses_ds4: bool, uses_llama: bool) bool {
 /// `lm` is the resolved model: an embedded-engine model skips this guard
 /// entirely (see `mlxMemoryGuardApplies`) — this is the single chokepoint, so
 /// every current and future call site is covered without per-site gating.
-/// Per-token bytes of the arch's own out-of-cache request state AS BILLED.
+/// Per-token bytes of the arch's own out-of-cache request state AS BILLED:
+/// TWO copies of the QSA indexer history, always.
+///
+/// The second copy is not the growth transient — it is
+/// `transformer.attachQsaHistoryToLatest`, which every prefill calls at its
+/// end and which MATERIALIZES the history onto the newest SSM checkpoint
+/// (`copyQsaHistorySliced(… materialize = true)`; a checkpoint must outlive
+/// the live entry, and the sliced arm cannot share a view of a slice
+/// anyway). 1.76 GB at 458,832 tokens on qwen4_exp, and both
+/// `qsaHistoryBytesPerToken` and `ssmCheckpointBytes` used to document the
+/// opposite ("checkpoints stopped cloning it").
+///
+/// The growth transient — old + new across the per-chunk
+/// `mlx_concatenate_axis` — peaks at the same two copies and never coexists
+/// with the attach (one is inside the chunk loop, the other after it), so
+/// this ONE bound covers both and does not change when the history gains a
+/// capacity buffer. `QSA_HISTORY_GROWS_IN_PLACE` therefore documents the
+/// growth arm without changing the bill.
+///
 /// One helper because the auto-context sizer and the admission guard must
-/// agree on it: a sizer that bills a different width than the guard advertises
-/// a context the guard then refuses (issue #353). The history appends into a
-/// capacity buffer now, so ONE copy is the whole bill.
+/// agree on it: a sizer that bills one copy advertises a context the guard
+/// then refuses (issue #353).
 pub fn statePerTokenBilled(config: *const model_mod.ModelConfig) u64 {
-    const per_tok = config.qsaHistoryBytesPerToken();
-    return if (QSA_HISTORY_GROWS_IN_PLACE) per_tok else per_tok * 2;
+    return config.qsaHistoryBytesPerToken() * 2;
 }
 
 /// Tokens of cache capacity a request RESERVES at admission: the prompt, the
@@ -3319,20 +3335,22 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
     const kv_per_tok = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);
     return .{
         .reserved_kv_bytes = (reserved -| seq) * kv_per_tok,
-        // The indexer history is reserved at the same length, at the width
-        // `statePerTokenBilled` decides — ONE copy, since `qsaAppendKeys`
-        // appends into a capacity buffer instead of re-concatenating.
+        // The indexer history at the width `statePerTokenBilled` decides:
+        // the live copy plus the one the end-of-prefill checkpoint attach
+        // materializes.
         .state_bytes = reserved * statePerTokenBilled(config),
         .checkpoint_bytes = retainedSsmCheckpointBytes(config, seq, chunk),
     };
 }
 
 /// True since `qsaAppendKeys` appends into the capacity buffer behind
-/// `entry.qsa_key_buf` (`capBufAppend`) instead of rebuilding the history with
-/// `mlx_concatenate_axis(old, new)`. While it re-concatenated, the old buffer
-/// stayed live in the chunk's lazy graph and the peak held TWO copies, so the
-/// bill above was doubled; one copy is now the truth. Flip back with the
-/// append, never on its own — the sizer and the guard both read it.
+/// `entry.qsa_key_buf` (`capBufAppend`) instead of rebuilding the history
+/// with `mlx_concatenate_axis(old, new)`, so the growth transient is gone on
+/// this tree. DOCUMENTATION ONLY: it does not enter the bill. The bill above
+/// is two copies either way, because the end-of-prefill checkpoint attach
+/// materializes a second one regardless of how the history grew — removing
+/// the growth transient does not remove that, which is exactly why this flag
+/// stopped being read.
 pub const QSA_HISTORY_GROWS_IN_PLACE: bool = true;
 
 /// A slot that errored reports WHY. The MLX error latch turns a Metal
@@ -19216,4 +19234,39 @@ test "the admission probe bills the request's OWN kv-quant and chunking, not the
     const sched = @embedFile("scheduler.zig");
     try t.expect(std.mem.indexOf(u8, sched, ".kv_cfg = slot.cache.config,") != null);
     try t.expect(std.mem.indexOf(u8, sched, ".unchunked = generate_mod.visionPrefillUnchunked(slot.vision_embeddings != null),") != null);
+}
+
+test "the QSA history is billed at BOTH copies: the live one and the checkpoint attach" {
+    const t = std.testing;
+    // `attachQsaHistoryToLatest` runs at the end of EVERY prefill and
+    // materializes the history onto the newest SSM checkpoint
+    // (`copyQsaHistorySliced(… materialize = true)`) — 1.76 GB at 458,832
+    // tokens on qwen4_exp, and the two doc comments that mention it claimed
+    // checkpoints had stopped cloning it.
+    const cfg = qwen4ExpOomConfig();
+    const one = cfg.qsaHistoryBytesPerToken();
+    try t.expect(one > 0);
+    try t.expectEqual(one * 2, statePerTokenBilled(&cfg));
+
+    // The bill does NOT depend on how the history grows: the growth transient
+    // (old + new across a concatenate, inside the chunk loop) and the attach
+    // (after it) never coexist, so two copies bounds both — which is what
+    // makes a capacity buffer safe to adopt without re-deriving this term.
+    const src = @embedFile("server.zig");
+    try t.expect(std.mem.indexOf(u8, src, "QSA_HISTORY_GROWS_IN_PLACE) per_tok") == null);
+
+    // At the live 458,832-token length the second copy is real money.
+    const seq: u64 = 458_832;
+    try t.expect(seq * one > 1_700_000_000);
+    const terms = prefillRequestTerms(&cfg, seq, 2048, 8, 4096);
+    try t.expect(terms.state_bytes >= 2 * seq * one);
+
+    // Both sizer sites read the BILLED width, never the one-copy helper.
+    try t.expect(std.mem.indexOf(u8, src, "+| config.qsaHistoryBytesPerToken()) *|") == null);
+    try t.expect(std.mem.indexOf(u8, src, "kv_bits) + config.qsaHistoryBytesPerToken();") == null);
+    // An arch with no indexer is billed nothing, either way.
+    var dense = model_mod.ModelConfig{};
+    dense.num_hidden_layers = 32;
+    dense.num_attention_heads = 32;
+    try t.expectEqual(@as(u64, 0), statePerTokenBilled(&dense));
 }
