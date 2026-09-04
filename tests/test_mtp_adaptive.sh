@@ -85,7 +85,12 @@ fi
 # the decision to be made where the feature exists at all.
 PROMPT_TOKENS_MIN="${PROMPT_TOKENS_MIN:-30000}"
 LONG_CHARS="${LONG_CHARS:-165000}"
-MAX_TOKENS=120
+# Long enough that the long cells run tens of speculative rounds: the price
+# window is 16 rounds and the serial cell needs MIN_SAMPLES ticks.
+MAX_TOKENS=200
+# Below this the long request cannot have exercised the mechanism, whatever the
+# mechanism did — a fixture failure, reported as one.
+MIN_LONG_COMPLETION="${MIN_LONG_COMPLETION:-60}"
 CTX_SIZE="${CTX_SIZE:-131072}"
 
 PASS=0
@@ -131,8 +136,15 @@ def body(content, mtp):
             "enable_mtp": mtp,
             "messages": [{"role": "user", "content": content}]}
 
-long_q = (long_text + "\n\nUsing only the sections above, name the very first "
-          "word of Section 1 and then stop.")
+# The ANSWER length is part of the fixture, not a detail. The price window is
+# 16 rounds and a serial cell needs MIN_SAMPLES ticks, so a question the model
+# can satisfy in two tokens measures nothing at all — the first version of this
+# script asked for "the first word of Section 1 and then stop", got a 2-token
+# reply, and reported "nothing was measured" against a mechanism that was fine.
+long_q = (long_text + "\n\nDescribe the material above in detail: its overall "
+          "structure, how the sections are numbered, the kind of vocabulary it "
+          "uses, and how one section differs from another. Keep writing until "
+          "you have covered all four points thoroughly.")
 short_q = ("Write a Python function that reverses a linked list in place. "
            "Return only the code.")
 
@@ -240,9 +252,17 @@ fi
 
 A_LONG=$(req "$WORK/long_mtp.json" "$LOG_A" "$WORK/a_long.slice") ||
     { echo "FAIL: boot A long MTP request failed"; stop_server; exit 1; }
-echo "  long mtp:    prompt_tokens=$(echo "$A_LONG" | awk '{print $1}') completion=$(echo "$A_LONG" | awk '{print $2}')"
+A_LONG_N=$(echo "$A_LONG" | awk '{print $2}')
+echo "  long mtp:    prompt_tokens=$(echo "$A_LONG" | awk '{print $1}') completion=$A_LONG_N"
 [ "$(echo "$A_LONG" | awk '{print $3}')" -gt 0 ] ||
     bad "content" "boot A long MTP request returned empty content"
+# A short reply cannot exercise a 16-round window or fill a serial cell, so
+# without this the next assertion blames the mechanism for the prompt.
+if [ "${A_LONG_N:-0}" -lt "$MIN_LONG_COMPLETION" ]; then
+    bad "fixture" "long reply was only $A_LONG_N tokens (< $MIN_LONG_COMPLETION): too few rounds to measure anything — fix the PROMPT, not the controller"
+else
+    ok "long reply is long enough to price ($A_LONG_N tokens)"
+fi
 
 A_SHORT=$(req "$WORK/short_mtp.json" "$LOG_A" "$WORK/a_short.slice") ||
     { echo "FAIL: boot A short request failed"; stop_server; exit 1; }
