@@ -2123,6 +2123,15 @@ pub const Generator = struct {
                         return error.Cancelled;
                     }
                 }
+                // An MLX failure inside a PREVIOUS chunk — the Metal
+                // working-set OOM of issue #353 is the one this exists for —
+                // latched a message instead of killing the process (see
+                // `mlx.installErrorHandler`). Everything that chunk produced
+                // is garbage, but MLX has cleared its own error state, so the
+                // honest move is to abandon THIS request and keep the server.
+                // No checkpoint salvage: unlike a client disconnect, the
+                // state we would be saving is the state that failed.
+                try mlx.checkError();
                 // Pick this chunk's end. Normal path: hit the configured chunk
                 // size. Phase 1 path: if a checkpoint stride boundary lands
                 // inside the would-be chunk, shrink the chunk so it ends
@@ -2301,6 +2310,8 @@ pub const Generator = struct {
                     if (options.interleave_hook) |hk| hk.call(hk.ctx);
                 }
             }
+            // The last chunk's failure has no next iteration to catch it.
+            try mlx.checkError();
 
             // Phase 1: always-on snapshot at the post-prefill position
             // (= prefix_len, i.e., prompt_ids.len - 1). The stride loop

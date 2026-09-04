@@ -371,6 +371,13 @@ pub fn main(init: std.process.Init) !void {
     // (~121 GB on a 128 GB Mac) is no defense.
     server_mod.applyMlxCacheLimit();
 
+    // And make an MLX failure an ERROR rather than the end of the process.
+    // mlx-c's default handler prints and calls exit(-1), so a Metal
+    // working-set OOM mid-prefill killed the server with no 503 and no
+    // connection close (issue #353). Same reasoning as the line above for
+    // living here: ONCE, above every subcommand branch.
+    mlx.installErrorHandler();
+
     // Materialize CLI args from the iterator API into a flat slice
     var args_iter = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
     defer args_iter.deinit();

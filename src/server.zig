@@ -3224,6 +3224,21 @@ fn mlxMemoryGuardApplies(uses_ds4: bool, uses_llama: bool) bool {
 /// `lm` is the resolved model: an embedded-engine model skips this guard
 /// entirely (see `mlxMemoryGuardApplies`) — this is the single chokepoint, so
 /// every current and future call site is covered without per-site gating.
+/// A slot that errored reports WHY. The MLX error latch turns a Metal
+/// working-set abort into `error.OutOfMemory` on the inference thread instead
+/// of `exit(-1)` (issue #353); a request that dies that way is a MEMORY
+/// failure the operator can act on, not a generic engine fault. ONE helper so
+/// the three slot-drain sites cannot answer differently.
+fn slotFailure(slot: *scheduler_mod.Slot) anyerror {
+    if (slot.errorIsMemory()) return error.GenerationOutOfMemory;
+    return error.GenerationFailed;
+}
+
+/// The message every `error.GenerationOutOfMemory` arm sends. Names the
+/// condition and the levers; the byte counts live in the server log's `[mlx]`
+/// line, the only place that knows which allocation failed.
+const GEN_OOM_MSG = "The engine ran out of GPU memory during this request and it was abandoned. The server is still running. Reduce the prompt length, lower --ctx-size, or free memory on the machine.";
+
 fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_len: usize, config: *const model_mod.ModelConfig, is_anthropic: bool, kv_override: ?transformer_mod.KVQuantConfig, lm: *const LoadedModel, unchunked_prefill: bool) !bool {
     if (!mlxMemoryGuardApplies(lm.ds4_engine != null, lm.llama_engine != null)) return true;
     const heads = config.num_attention_heads;
@@ -5978,6 +5993,7 @@ fn handleNonStreamingCompletion(
     const use_pld = !use_mtp and !use_drafter and enable_pld and logprobs_n == 0 and sampling.constraint == null;
 
     var result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_pld, use_drafter, use_mtp, getTimeoutNs(), null, 0, .{}, logprobs_n, null, null, stream) catch |err| switch (err) {
+        error.GenerationOutOfMemory => return sendErrorResponse(allocator, stream, "503 Service Unavailable", "server_error", GEN_OOM_MSG, 503),
         error.GenerationFailed => return sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null),
         else => return err,
     };
@@ -6353,7 +6369,7 @@ fn nonStreamingViaScheduler(
         switch (nr) {
             .token => |t| try output_ids.append(allocator, t),
             .done => break :wait,
-            .err => return error.GenerationFailed,
+            .err => return slotFailure(slot),
         }
     }
 
@@ -6459,6 +6475,10 @@ fn handleNonStreamingGeneration(
         break :blk v;
     };
     const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, vision_key, mrope, logprobs_n, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
+        error.GenerationOutOfMemory => {
+            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "server_error", GEN_OOM_MSG, 503);
+            return;
+        },
         error.GenerationFailed => {
             try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null);
             return;
@@ -6808,7 +6828,7 @@ const StreamingTokenStream = struct {
                     self.finished = true;
                     return .done;
                 },
-                .err => return error.GenerationFailed,
+                .err => return slotFailure(s),
             }
         }
         if (try self.next(allocator)) |t| return .{ .token = t };
@@ -6829,7 +6849,7 @@ const StreamingTokenStream = struct {
                     self.finished = true;
                     return null;
                 },
-                .err => return error.GenerationFailed,
+                .err => return slotFailure(s),
             }
         }
         // Drain any pending tokens from a previous speculative step FIRST,
@@ -12146,6 +12166,7 @@ fn handleAnthropicNonStreaming(
     // wired for /v1/chat/completions; see computeQwenMrope). Qwen image requests
     // still decode correctly — M-RoPE refines spatial grounding only.
     const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, vision_key, .{}, 0, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
+        error.GenerationOutOfMemory => return sendAnthropicError(allocator, stream, "api_error", GEN_OOM_MSG, 503),
         error.GenerationFailed => return sendAnthropicError(allocator, stream, "api_error", "generation failed", 500),
         else => return err,
     };
@@ -14141,6 +14162,7 @@ fn handleResponses(
             break :blk v;
         };
         result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve_ns, vis_key, .{}, 0, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
+            error.GenerationOutOfMemory => return sendErrorResponse(allocator, stream, "503 Service Unavailable", "server_error", GEN_OOM_MSG, 503),
             error.GenerationFailed => return sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null),
             else => return err,
         };
@@ -18742,4 +18764,37 @@ test "every request surface runs the --max-mtp-ctx admission gate" {
     try std.testing.expect(std.mem.indexOf(u8, main_src, "\"--max-mtp" ++ "-ctx\"") != null);
     // ... and in --help, which is the flag list users read.
     try std.testing.expect(std.mem.indexOf(u8, main_src, "--max-mtp" ++ "-ctx <n>") != null);
+test "an MLX failure is a named memory 503, and main installs the latch that makes one possible" {
+    const t = std.testing;
+    // Class guard for issue #353: mlx-c's DEFAULT error handler calls
+    // exit(-1), so before this the FIRST Metal working-set abort took the
+    // whole server with it — no status line, no connection close, every other
+    // in-flight request gone. The handler must be installed ONCE from main(),
+    // beside the cache limit, or a subcommand keeps the fatal default.
+    const main_src = @embedFile("main.zig");
+    try t.expect(std.mem.indexOf(u8, main_src, "mlx.installErrorHandler();") != null);
+
+    // The prefill chunk loop is the checkpoint that turns a latched failure
+    // into an abandoned REQUEST rather than an abandoned process: once per
+    // chunk (the cancel check's cadence) and once after the last chunk, which
+    // has no next iteration to catch it.
+    const gen_src = @embedFile("generate.zig");
+    var seen: usize = 0;
+    var at: usize = 0;
+    while (std.mem.indexOfPos(u8, gen_src, at, "try mlx.checkError();")) |hit| {
+        seen += 1;
+        at = hit + 1;
+    }
+    try t.expect(seen >= 2);
+
+    // And the client sees the CLASS, not "generation failed": every slot
+    // drain site answers through `slotFailure`, never a bare
+    // `error.GenerationFailed`.
+    const src = @embedFile("server.zig");
+    try t.expect(std.mem.indexOf(u8, src, ".err => return error.GenerationFailed,") == null);
+    // Both spellings of a memory failure are the memory class, exactly as
+    // `loadErrorFromName` treats them on the load path.
+    try t.expect(scheduler_mod.Slot.errorNameIsMemory("OutOfMemory"));
+    try t.expect(scheduler_mod.Slot.errorNameIsMemory("InsufficientMemory"));
+    try t.expect(!scheduler_mod.Slot.errorNameIsMemory("MissingWeight"));
 }

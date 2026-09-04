@@ -777,6 +777,25 @@ pub const Slot = struct {
 
     /// Inference thread: signal error. `name` is borrowed; we dupe so the
     /// connection thread can read it after the inference loop drops the slot.
+    /// Whether a slot error name names a MEMORY failure. The MLX error latch
+    /// raises `error.OutOfMemory` for a Metal working-set abort and Zig's own
+    /// allocator raises the same name, and the registry's `loadErrorFromName`
+    /// already keeps both spellings in the memory class — this is the decode
+    /// path's copy of that one decision, so a client gets a 503 it can act on
+    /// instead of "generation failed" (issue #353).
+    pub fn errorNameIsMemory(name: []const u8) bool {
+        return std.mem.eql(u8, name, "OutOfMemory") or
+            std.mem.eql(u8, name, "InsufficientMemory");
+    }
+
+    /// Live form of the above: reads the slot's latched error name.
+    pub fn errorIsMemory(self: *Slot) bool {
+        self.out_mu.lockUncancelable(self.io);
+        defer self.out_mu.unlock(self.io);
+        const name = self.error_code orelse return false;
+        return errorNameIsMemory(name);
+    }
+
     fn markError(self: *Slot, name: []const u8) void {
         self.out_mu.lockUncancelable(self.io);
         defer self.out_mu.unlock(self.io);

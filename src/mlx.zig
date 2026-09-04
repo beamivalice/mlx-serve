@@ -715,3 +715,170 @@ test "wired fit target: zero headroom, clamped, declines empty" {
     try t.expectEqual(@as(?usize, null), wiredFitTarget(0, 64 << 20, 115 * gb));
     try t.expectEqual(@as(?usize, null), wiredFitTarget(10 * gb, 64 << 20, 0));
 }
+
+// ── mlx-c error latch: an MLX failure is an ERROR, never `exit(-1)` ──
+//
+// mlx-c's DEFAULT error handler is
+//
+//     static void mlx_error_handler_default_(const char* msg, void* data) {
+//       printf("MLX error: %s\n", msg);
+//       exit(-1);
+//     }
+//
+// (`lib/mlxc-src/mlx/c/error.cpp`), installed unless someone calls
+// `mlx_set_error_handler`. Every mlx-c entry point is
+// `try { ... } catch (std::exception& e) { mlx_error(e.what()); return 1; }`,
+// so an MLX exception is CAUGHT at the C boundary and then the process is
+// killed by the handler before the `return 1` ever reaches us.
+//
+// That is what a Metal working-set OOM looks like from the outside: mlx
+// 0.32.2 stores a failed command buffer's status in `CommandEncoder::error_`
+// and re-throws it from `synchronize()`/`get_command_encoder()`
+// (`lib/mlx-src/mlx/backend/metal/device.cpp:564-579`), a stream thread's
+// exception is captured into `StreamThread::error` and re-thrown on the main
+// thread at the next enqueue (`lib/mlx-src/mlx/scheduler.cpp:77-79,99-112`),
+// and mlx-c catches it — the live 458,832-token report's
+// "…Insufficient Memory… at transforms.cpp:15" is `_mlx_error`'s own
+// " at %s:%d" suffix naming `mlx/c/transforms.cpp`, i.e. `mlx_eval`. The
+// death was ours to prevent, not Metal's to inflict (issue #353).
+//
+// So: install a handler that LATCHES the message and returns. The mlx-c call
+// then returns 1 as designed, and the engine turns the latch into a named
+// error at its next checkpoint. mlx clears its own error state when it
+// throws (`Error::check` exchanges the message out), so the process stays
+// serviceable for the next request.
+var mlx_error_latched = std.atomic.Value(bool).init(false);
+var mlx_error_buf: [512]u8 = undefined;
+var mlx_error_len: usize = 0;
+var mlx_error_mtx: std.Thread.Mutex = .{};
+
+/// Classification of a latched mlx-c message. Memory failures must reach the
+/// client as a memory 503 (`ModelRegistry.loadErrorFromName` keeps BOTH
+/// `error.OutOfMemory` and `error.InsufficientMemory` in that class), so the
+/// spelling of the failure decides the error we raise. Every MLX allocation
+/// failure and every Metal command-buffer OOM lands in one of these:
+///
+///   * "[METAL] Command buffer execution failed: Insufficient Memory …"
+///     — the working-set abort this latch exists for;
+///   * "[malloc] Unable to allocate N bytes." / "[metal::malloc] …" —
+///     `MetalAllocator::malloc`'s own throws;
+///   * "[metal::malloc] Resource limit (N) exceeded." — buffer-count wall,
+///     which is a memory condition from the operator's side too.
+pub fn mlxErrorIsMemory(msg: []const u8) bool {
+    const needles = [_][]const u8{
+        "Insufficient Memory",
+        "insufficient memory",
+        "Unable to allocate",
+        "Resource limit",
+        "out of memory",
+        "Out of memory",
+        "maximum allowed buffer size",
+    };
+    for (needles) |n| {
+        if (std.mem.indexOf(u8, msg, n) != null) return true;
+    }
+    return false;
+}
+
+fn latchMlxError(msg: [*:0]const u8, data: ?*anyopaque) callconv(.c) void {
+    _ = data;
+    const span = std.mem.span(msg);
+    mlx_error_mtx.lock();
+    defer mlx_error_mtx.unlock();
+    // FIRST error wins: mlx preserves the earliest error for the same reason
+    // (a poisoned stream produces follow-on noise that hides the cause).
+    if (!mlx_error_latched.load(.acquire)) {
+        const n = @min(span.len, mlx_error_buf.len);
+        @memcpy(mlx_error_buf[0..n], span[0..n]);
+        mlx_error_len = n;
+        mlx_error_latched.store(true, .release);
+    }
+    log.err("[mlx] {s}\n", .{span});
+}
+
+/// Install the latching handler. Called ONCE from `main()`, next to
+/// `server.applyMlxCacheLimit`, for the same reason: a per-path install is how
+/// a mode ends up silently keeping the old behaviour.
+///
+/// `MLX_SERVE_MLX_ERROR_LATCH=0` restores mlx-c's `exit(-1)` handler for
+/// same-boot A/Bs and for anyone who would rather have a core than a 503.
+pub fn installErrorHandler() void {
+    if (std.c.getenv("MLX_SERVE_MLX_ERROR_LATCH")) |p| {
+        if (std.mem.eql(u8, std.mem.span(p), "0")) {
+            log.info("[mlx] error latch disabled — an MLX error will exit the process\n", .{});
+            return;
+        }
+    }
+    mlx_set_error_handler(latchMlxError, null, null);
+}
+
+/// True when an MLX call has failed since the last `takeError`.
+pub fn errorPending() bool {
+    return mlx_error_latched.load(.acquire);
+}
+
+/// Consume the latched message into `buf`, clearing the latch. Returns null
+/// when nothing is latched. The message is COPIED so the caller can format it
+/// after another MLX call has run.
+pub fn takeError(buf: []u8) ?[]const u8 {
+    if (!mlx_error_latched.load(.acquire)) return null;
+    mlx_error_mtx.lock();
+    defer mlx_error_mtx.unlock();
+    const n = @min(mlx_error_len, buf.len);
+    @memcpy(buf[0..n], mlx_error_buf[0..n]);
+    mlx_error_len = 0;
+    mlx_error_latched.store(false, .release);
+    return buf[0..n];
+}
+
+/// The one checkpoint the engine calls: turns a latched MLX failure into a
+/// Zig error. `error.OutOfMemory` for the memory class (named memory 503),
+/// `error.MlxFailure` for everything else. Zero cost when nothing is latched
+/// — one relaxed-ordered atomic load.
+pub fn checkError() !void {
+    if (!mlx_error_latched.load(.acquire)) return;
+    var buf: [512]u8 = undefined;
+    const msg = takeError(&buf) orelse return;
+    if (mlxErrorIsMemory(msg)) return error.OutOfMemory;
+    return error.MlxFailure;
+}
+
+/// TEST ONLY: latch a message as if mlx-c had raised it.
+pub fn latchErrorForTest(msg: [:0]const u8) void {
+    latchMlxError(msg.ptr, null);
+}
+
+test "an MLX memory failure is classified as a memory error, an argument error is not" {
+    const t = std.testing;
+    // The exact strings mlx produces for the two OOM shapes issue #353 hit.
+    try t.expect(mlxErrorIsMemory("[METAL] Command buffer execution failed: Insufficient Memory (kIOGPUCommandBufferCallbackErrorOutOfMemory). at transforms.cpp:15"));
+    try t.expect(mlxErrorIsMemory("[malloc] Unable to allocate 8589934592 bytes."));
+    try t.expect(mlxErrorIsMemory("[metal::malloc] Resource limit (128000) exceeded."));
+    try t.expect(mlxErrorIsMemory("[metal::malloc] Attempting to allocate 99 bytes which is greater than the maximum allowed buffer size of 5 bytes."));
+    // A shape/argument bug must NOT be reported to the client as "out of
+    // memory" — it is a 500-class engine fault, not something the operator
+    // fixes by shortening the prompt.
+    try t.expect(!mlxErrorIsMemory("[slice_update] Invalid slice sizes."));
+    try t.expect(!mlxErrorIsMemory("[matmul] Last dimension of first input must match."));
+}
+
+test "the latch turns an mlx-c error into a Zig error instead of exiting, once" {
+    const t = std.testing;
+    try t.expect(!errorPending());
+    try checkError();
+
+    latchErrorForTest("[METAL] Command buffer execution failed: Insufficient Memory. at transforms.cpp:15");
+    try t.expect(errorPending());
+    // FIRST error wins — a poisoned stream's follow-on noise must not rename
+    // the cause.
+    latchErrorForTest("[slice_update] Invalid slice sizes.");
+    try t.expectError(error.OutOfMemory, checkError());
+    // Consumed: the next request starts clean, which is the whole point of
+    // not exiting.
+    try t.expect(!errorPending());
+    try checkError();
+
+    latchErrorForTest("[matmul] Last dimension of first input must match.");
+    try t.expectError(error.MlxFailure, checkError());
+    try t.expect(!errorPending());
+}
