@@ -3704,6 +3704,32 @@ const QSA_ATTN_MERGE_SOURCE =
     \\out[((long)hq * (long)qL + (long)s) * BD + d] = T(acc / Z);
 ;
 
+/// MEASURED split count (M5 Max, 40 cores, qwen4_exp Hq 24 / Hk 2, kv 62k,
+/// 8-bit KV, in-situ forward ubench, 12 counterbalanced boots).
+///
+///   S=6  off 44.814 | ns 8: 40.227  16: 39.043  32: 40.226  64: 39.330
+///   S=3  off 31.536 | ns 8: 29.976  16: 29.162  32: 28.934  64: 29.182
+///
+/// Every split count from 8 to 64 beats the union gather by 5-13%, so the win
+/// is split-K itself and NOT the tuning. Only one difference BETWEEN split
+/// counts clears its own noise floor: at S=6, 16 beats 32 by 2.9% against a
+/// 1.2% floor. At S=3 the spread across 16/32/64 is 0.8% against a 3.2%
+/// floor, i.e. unresolved. So this is one flat constant rather than a
+/// per-width table two data points could not justify.
+///
+/// (Both best cells happen to sit at S*Hk*NSPLIT = 192 threadgroups, which
+/// would make the occupancy formula right with the target retuned 320 -> 192.
+/// Recorded as a hypothesis, not adopted: it rests on ONE resolved point, and
+/// a second sweep at other widths would be needed to tell it from coincidence.)
+pub const QSA_ATTN_NSPLIT_DEFAULT: c_int = 16;
+
+/// The occupancy target the first default was DERIVED from, kept only to
+/// explain why deriving it was wrong. Aiming at 8 resident threadgroups per
+/// core over-splits: past ~192 threadgroups the f32 partial buffer
+/// (S*Hq*NSPLIT*256*4 B, written by the split pass and read by the merge)
+/// costs more traffic than the extra parallelism buys back. Unused by policy.
+pub const QSA_ATTN_TARGET_TGS_UNUSED: c_int = 320;
+
 /// Split-K occupancy target, in threadgroups.
 ///
 /// The un-split kernel's natural grid is one threadgroup per (query row, kv
@@ -3715,7 +3741,7 @@ const QSA_ATTN_MERGE_SOURCE =
 /// ops and reading the same bytes for a sixth of the MACs. Work was never the
 /// problem; the machine was idle. 8 resident threadgroups per core is the
 /// target, so 320.
-pub const QSA_ATTN_TARGET_TGS: c_int = 320;
+
 
 /// Ceiling on the split count. 64 lets S=1..2 still reach >= 128 threadgroups
 /// at Hk=2; past it the f32 partial buffer starts costing more traffic than
@@ -3761,10 +3787,7 @@ pub fn qsaAttnNSplit(seq_len: c_int, h_kv: c_int) c_int {
         while (f < forced and f < QSA_ATTN_MAX_NSPLIT) f *= 2;
         return f;
     }
-    const want = @divTrunc(QSA_ATTN_TARGET_TGS + natural - 1, natural);
-    var n: c_int = 1;
-    while (n < want and n < QSA_ATTN_MAX_NSPLIT) n *= 2;
-    return n;
+    return QSA_ATTN_NSPLIT_DEFAULT;
 }
 
 /// Lowest query width the fused kernel serves. `MLX_SERVE_QSA_ATTN_MIN_S`.
@@ -17932,13 +17955,20 @@ pub const Transformer = struct {
             // verify widths (and a declined gather) run under the bool mask.
             const ratio: c_int = @intCast(self.config.indexer_compress_ratio);
             var gathered: ?mlx.mlx_array = null;
-            if (seq_len == 1 and ctx.qsa_blocks.ctx != null and ctx.qsa_mask.ctx == null and !qwen4Standin().attn_sdpa) {
+            // ONE predicate decides the floor. `qsaAttnMinS()` used to be read
+            // only INSIDE `qsaSparseAttn`, while this dispatch carried its own
+            // `seq_len >= 2` literal — so `MLX_SERVE_QSA_ATTN_MIN_S=1` moved
+            // the callee's gate and the caller never called it. The lever was
+            // inert and an S=1 A/B measured the decode gather against itself
+            // (identical op counts, zero engaged lines, 0.4% apart).
+            const fused_min_s = qsaAttnMinS();
+            if (seq_len == 1 and seq_len < fused_min_s and ctx.qsa_blocks.ctx != null and ctx.qsa_mask.ctx == null and !qwen4Standin().attn_sdpa) {
                 // Decode width: subset triples (or dense rows) → subset
                 // dequant → dense SDPA over K'<<kv. Declines cleanly to the
                 // mask arm below.
                 gathered = try qsaDecodeGatherAttn(self.s, q_rope, &kv_view, ctx.qsa_blocks, ratio, attn_scale);
             }
-            if (gathered == null and seq_len >= 2 and seq_len < FUSED256_MIN_Q_LEN and
+            if (gathered == null and seq_len >= fused_min_s and seq_len < FUSED256_MIN_Q_LEN and
                 ctx.qsa_blocks.ctx != null and ctx.qsa_mask.ctx == null and !qwen4Standin().attn_sdpa)
             {
                 // Verify width, first choice: ONE fused dispatch per layer.
@@ -39523,35 +39553,45 @@ test "qsa sparse attn: the split-K merge is invariant in the split count (1, 8, 
     }
 }
 
-test "qsa sparse attn: NSPLIT targets ~8 threadgroups per core from S and Hk alone" {
-    // NSPLIT must not depend on kv: it is a TEMPLATE, so a kv-derived split
-    // count would rebuild the config on every decode round — the exact tax
-    // this commit removes from the config key.
+test "qsa sparse attn: NSPLIT is one MEASURED constant, and the width floor binds the DISPATCH" {
+    // The default is flat because the sweep says so: every split count 8..64
+    // wins, and only S=6's 16-vs-32 (2.9% over a 1.2% floor) is resolved. A
+    // per-width table would be fitting two points, one of them noise.
     defer qsa_attn_nsplit_override = null;
     qsa_attn_nsplit_override = null;
-    // The shipping pack: Hq 24 / Hk 2.
-    try std.testing.expectEqual(@as(c_int, 64), qsaAttnNSplit(1, 2));
-    try std.testing.expectEqual(@as(c_int, 64), qsaAttnNSplit(2, 2));
-    try std.testing.expectEqual(@as(c_int, 64), qsaAttnNSplit(3, 2));
-    try std.testing.expectEqual(@as(c_int, 32), qsaAttnNSplit(6, 2));
-    try std.testing.expectEqual(@as(c_int, 16), qsaAttnNSplit(15, 2));
-    // Every width clears 128 threadgroups; the un-split grid cleared 30.
-    for ([_]c_int{ 1, 2, 3, 6, 15 }) |seq| {
-        try std.testing.expect(seq * 2 * qsaAttnNSplit(seq, 2) >= 128);
-    }
-    // Always a power of two, always within the ceiling.
     for ([_]c_int{ 1, 2, 3, 4, 6, 8, 15 }) |seq| {
         for ([_]c_int{ 1, 2, 4, 8 }) |hk| {
-            const n = qsaAttnNSplit(seq, hk);
-            try std.testing.expect(n >= 1 and n <= QSA_ATTN_MAX_NSPLIT);
-            try std.testing.expect(n & (n - 1) == 0);
+            try std.testing.expectEqual(QSA_ATTN_NSPLIT_DEFAULT, qsaAttnNSplit(seq, hk));
         }
     }
-    // The override is honoured and rounded up to a power of two.
+    try std.testing.expectEqual(@as(c_int, 16), QSA_ATTN_NSPLIT_DEFAULT);
+    // The override still rounds up to a power of two, within the ceiling.
     qsa_attn_nsplit_override = 8;
     try std.testing.expectEqual(@as(c_int, 8), qsaAttnNSplit(6, 2));
     qsa_attn_nsplit_override = 5;
     try std.testing.expectEqual(@as(c_int, 8), qsaAttnNSplit(6, 2));
+    qsa_attn_nsplit_override = 1000;
+    try std.testing.expectEqual(QSA_ATTN_MAX_NSPLIT, qsaAttnNSplit(6, 2));
+    qsa_attn_nsplit_override = null;
+
+    // The width floor: default excludes decode, the lever includes it.
+    defer qsa_attn_min_s_override = null;
+    qsa_attn_min_s_override = null;
+    try std.testing.expectEqual(@as(c_int, 2), QSA_ATTN_MIN_S_DEFAULT);
+    try std.testing.expectEqual(@as(c_int, 2), qsaAttnMinS());
+    qsa_attn_min_s_override = 1;
+    try std.testing.expectEqual(@as(c_int, 1), qsaAttnMinS());
+
+    // CLASS GUARD. The floor must bind the DISPATCH, not just the callee: the
+    // dispatch used to carry `seq_len >= 2` as a literal, which made the lever
+    // inert. Both arms of the dispatch now read the one predicate, and the
+    // decode-gather arm steps aside exactly when the fused kernel claims S=1.
+    const src = @embedFile("transformer.zig");
+    const disp = std.mem.indexOf(u8, src, "gathered = try qsaSparse" ++ "Attn(").?;
+    const head = src[disp -| 1400 .. disp];
+    try std.testing.expect(std.mem.indexOf(u8, head, "seq_len >= fused_" ++ "min_s") != null);
+    try std.testing.expect(std.mem.indexOf(u8, head, "seq_len < fused_" ++ "min_s") != null);
+    try std.testing.expect(std.mem.indexOf(u8, head, "seq_len >= 2 and") == null);
 }
 
 test "qsa sparse attn: gqa tile reuse is invariant — one kv head serving 12 q heads equals 12 serving one each" {
