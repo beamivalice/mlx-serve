@@ -18251,13 +18251,21 @@ test "checkAttentionMemory does not bill resident hot-cache buffers twice" {
     // resident entry to `needed` again (the 138k-token false-400 regression).
     const t = std.testing;
     const src = @embedFile("server.zig");
-    const start = std.mem.indexOf(u8, src, "fn checkAttention" ++ "Memory(") orelse return error.CallSiteMoved;
+    // The bill and the headroom moved into `prefillAdmissionBill` (#353: the
+    // inference thread's evict-or-refuse probe must compute them the same
+    // way), so the span this pins runs from THERE to the end of the guard —
+    // the same code, one function earlier.
+    const start = std.mem.indexOf(u8, src, "pub fn prefillAdmission" ++ "Bill(") orelse return error.CallSiteMoved;
     const tail = src[start..];
     const end = std.mem.indexOf(u8, tail, "\nextern \"c\" fn sysctlbyname") orelse return error.CallSiteMoved;
     const body = tail[0..end];
     try t.expect(std.mem.indexOf(u8, body, "largestEntry" ++ "Bytes") == null);
     try t.expect(std.mem.indexOf(u8, body, "hot_" ++ "restore") == null);
     try t.expect(std.mem.indexOf(u8, body, "mlx_get_active_memory(&active_mem)") != null);
+    // The hot cache appears exactly ONCE and only as `evictable` — a hint for
+    // the admit-after-eviction arm, never added to `needed`.
+    try t.expect(std.mem.indexOf(u8, body, "residentBytes()") != null);
+    try t.expect(std.mem.indexOf(u8, body, "needed = needed +") == null);
 }
 
 test "checkAttentionMemory wires the CONFIG's key bound, not a dense seq" {
@@ -18278,7 +18286,7 @@ test "checkAttentionMemory wires the CONFIG's key bound, not a dense seq" {
     const call = "prefillMemoryNeeded(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, chunk,";
     const at = std.mem.indexOf(u8, src, call) orelse return error.CallSiteMoved;
     const tail = src[at + call.len ..];
-    const end = std.mem.indexOfScalar(u8, tail, ')', .{}) orelse return error.CallSiteMoved;
+    const end = std.mem.indexOfScalar(u8, tail, ')') orelse return error.CallSiteMoved;
     try t.expectEqualStrings(" config.prefillAttnKeys(seq", tail[0..end]);
     // The arch's own prefill streams and its dequantized-weight working set
     // are the same class of parameter: derived from the CONFIG at the site, or
@@ -18972,7 +18980,17 @@ test "an MLX failure is a named memory 503, and main installs the latch that mak
     // drain site answers through `slotFailure`, never a bare
     // `error.GenerationFailed`.
     const src = @embedFile("server.zig");
-    try t.expect(std.mem.indexOf(u8, src, ".err => return error.GenerationFailed,") == null);
+    // The needle is SPLIT with `++` (the file's scan-test convention) so this
+    // test's own source cannot match it — without that, an absent-form
+    // assertion over `@embedFile("server.zig")` can only ever fail.
+    const bare = ".err => return error.Generation" ++ "Failed,";
+    var bare_seen: usize = 0;
+    var bare_at: usize = 0;
+    while (std.mem.indexOfPos(u8, src, bare_at, bare)) |hit| {
+        bare_seen += 1;
+        bare_at = hit + 1;
+    }
+    try t.expectEqual(@as(usize, 0), bare_seen);
     // Both spellings of a memory failure are the memory class, exactly as
     // `loadErrorFromName` treats them on the load path.
     try t.expect(scheduler_mod.Slot.errorNameIsMemory("OutOfMemory"));
@@ -19019,7 +19037,10 @@ test "the 458k prefill's two unbilled terms are billed: retained checkpoints and
     //    captured every stride and held up to --ssm-checkpoint-max (32) —
     //    ~1.9 GB the guard billed at zero.
     const per_cp = cfg.ssmCheckpointBytes();
-    try t.expect(per_cp > 58 * 1024 * 1024 and per_cp < 60 * 1024 * 1024);
+    // 36 linear layers x (1,572,864 B of state + 61,440 B of conv window) =
+    // 58.83 MB. Stated in BYTES: the same number is 56.1 MiB, and the two
+    // spellings are 5% apart.
+    try t.expect(per_cp > 58_000_000 and per_cp < 60_000_000);
     const held = retainedSsmCheckpointBytes(&cfg, seq, chunk);
     try t.expectEqual(@as(u64, ssm_checkpoint_max) * per_cp, held);
     try t.expect(held > 1_800_000_000);

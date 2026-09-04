@@ -3258,14 +3258,23 @@ test "evictLruToAdmit: the cache gives memory back to admit a prefill, oldest fi
     // A request that does not fit even with an empty cache reports
     // `admitted = false` — the caller refuses it by NAME rather than
     // admitting a prefill that would take the working set down.
-    var impossible = Fits{ .cache = &hc, .want_below = 0 };
-    const none = hc.evictLruToAdmit(458_832, &impossible, Fits.call, true);
+    // (`want_below = 0` would not do: an emptied cache satisfies it. The
+    // request that cannot be served is the one no amount of cache fits.)
+    const Never = struct {
+        fn call(ctx: ?*anyopaque) bool {
+            _ = ctx;
+            return false;
+        }
+    };
+    const none = hc.evictLruToAdmit(458_832, null, Never.call, true);
     try testing.expect(!none.admitted);
     // …and `protect_mru` kept the entry this request restored from: one
     // entry survives even a hopeless eviction pass.
     try testing.expectEqual(@as(usize, 1), hc.entryCount());
-    // Without the protection the same pass empties the cache.
-    const rest = hc.evictLruToAdmit(458_832, &impossible, Fits.call, false);
+    // Without the protection the same pass empties the cache — and STILL
+    // reports `admitted = false`, which is what makes the caller refuse by
+    // name instead of starting a prefill the machine cannot finish.
+    const rest = hc.evictLruToAdmit(458_832, null, Never.call, false);
     try testing.expect(!rest.admitted);
     try testing.expectEqual(@as(usize, 0), hc.entryCount());
 }
