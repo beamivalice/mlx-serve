@@ -5361,7 +5361,8 @@ pub const Generator = struct {
         if (self.spec_disabled_runtime and self.spec_disable_reason == .adaptive and
             mtpAdaptiveSerialEnabled() and self.mtpAdaptiveHeadMayResume())
         {
-            const b = round_cost.bucketFor(self.mtpKvLen());
+            // The SAME resolution the decision used — see mtpAdaptiveBucketOf.
+            const b = self.mtpAdaptiveBucket(self.mtpKvLen());
             if (self.mtp_adaptive.serialTick(b) == .to_mtp) {
                 log.info(
                     "  [mtp] adaptive: kv {d} crossed into bucket {s} -> mtp\n",
@@ -7613,6 +7614,25 @@ pub const Generator = struct {
         return kv_len >= min_kv;
     }
 
+    /// THE bucket the adaptive switch speaks in. Pure half, so the rule is
+    /// testable: `read` is `Table.bucketToRead(kv)`, which may hand back a
+    /// NEIGHBOUR bucket when the request's own one is unmeasured.
+    ///
+    /// Every site must resolve it the same way. The decision read
+    /// `bucketToRead orelse bucketFor` while the re-entry read plain
+    /// `bucketFor`: whenever the fallback fired those disagree, so the switch
+    /// stored one bucket and the very next serial tick saw a different one,
+    /// called it a crossing and re-entered — then the next round switched
+    /// again. An oscillation, and not a cheap one: every lap pays the drain
+    /// plus the capture forward of the exit ramp.
+    pub fn mtpAdaptiveBucketOf(read: ?usize, kv_len: u32) usize {
+        return read orelse round_cost.bucketFor(kv_len);
+    }
+
+    fn mtpAdaptiveBucket(self: *const Generator, kv_len: u32) usize {
+        return mtpAdaptiveBucketOf(self.xfm.round_cost.bucketToRead(kv_len), kv_len);
+    }
+
     /// Rounds in the realized price window. Full-window-only is the point:
     /// the b1-long2 misfire in the A/B voted at round ~3 on rounds that were
     /// all prefix-cache-restore warmup (the head's committed history is a
@@ -7942,7 +7962,7 @@ pub const Generator = struct {
             mtpAdaptiveKvEligible(kv_len, mtpAdaptiveMinKv()))
         {
             const t = &self.xfm.round_cost;
-            const b = t.bucketToRead(kv_len) orelse round_cost.bucketFor(kv_len);
+            const b = self.mtpAdaptiveBucket(kv_len);
             // Both prices are MEASURED, and both come from rounds that
             // actually ran. `msPerTok` takes ms AND tokens from one cell —
             // the modeled `mtpEvExpectedTokens` denominator that used to sit
@@ -13885,6 +13905,38 @@ test "mtpAdaptiveVoteFor: the four real switch events of the 2026-09-04 qwen4 A/
     );
 }
 
+test "mtpAdaptiveBucketOf: the decision and the re-entry resolve ONE bucket (H6 oscillation)" {
+    const G = Generator;
+    const kv: u32 = 40_000;
+    const own = round_cost.bucketFor(kv);
+
+    // No measured neighbour: both sites land on the request's own bucket.
+    try testing.expectEqual(own, G.mtpAdaptiveBucketOf(null, kv));
+    // A measured NEIGHBOUR is what the prices came from, so it is the bucket
+    // the switch speaks in — at BOTH sites.
+    try testing.expectEqual(@as(usize, own + 1), G.mtpAdaptiveBucketOf(own + 1, kv));
+    try testing.expect(G.mtpAdaptiveBucketOf(own + 1, kv) != round_cost.bucketFor(kv));
+
+    // The oscillation the mismatch produced: a switch decided in the read
+    // bucket, followed by a serial tick that resolved the bucket the OTHER
+    // way, reads as a crossing and re-enters immediately — then the next
+    // round switches again, each lap paying the drain + capture ramp.
+    var osc = G.MtpAdaptive{};
+    _ = osc.round(0, G.mtpAdaptiveBucketOf(own + 1, kv), .serial, 1);
+    try testing.expectEqual(G.MtpAdaptiveArm.serial, osc.arm);
+    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, osc.serialTick(round_cost.bucketFor(kv)));
+
+    // With one resolver the switch is sticky, which is the contract.
+    var ok = G.MtpAdaptive{};
+    const b = G.mtpAdaptiveBucketOf(own + 1, kv);
+    _ = ok.round(0, b, .serial, 1);
+    var i: u32 = 0;
+    while (i < 50) : (i += 1) {
+        try testing.expectEqual(G.MtpAdaptiveAction.none, ok.serialTick(G.mtpAdaptiveBucketOf(own + 1, kv)));
+    }
+    try testing.expectEqual(G.MtpAdaptiveArm.serial, ok.arm);
+}
+
 test "mtpAdaptiveKvEligible: short context is below the floor, and the floor is the default" {
     const G = Generator;
     const floor = G.MTP_ADAPTIVE_MIN_KV;
@@ -14121,6 +14173,9 @@ test "the adaptive decision is read after the EV plan, before the width trial, a
     try testing.expect(std.mem.indexOf(u8, decide_win, "t.msPer" ++ "Tok(plan.m_lo, b)") != null);
     try testing.expect(std.mem.indexOf(u8, decide_win, "self.mtp_price.msPer" ++ "Tok()") != null);
     try testing.expect(std.mem.indexOf(u8, decide_win, "mtpEvExpected" ++ "Tokens(&self.mtp_ev_accept") == null);
+    // ONE bucket resolver: the decision and the re-entry must not disagree,
+    // or a switch undoes itself on the next tick and oscillates.
+    try testing.expect(std.mem.indexOf(u8, decide_win, "self.mtpAdaptive" ++ "Bucket(kv_len)") != null);
     // The window is fed from the round-end observer, on the same wall clock
     // and under the same solo gate as the table fold, with trials skipped.
     try testing.expect(std.mem.indexOf(u8, src, "self.mtp_price.observe(wall, tok, width_trial)") != null);
@@ -14145,6 +14200,14 @@ test "the adaptive decision is read after the EV plan, before the width trial, a
         return error.MissingReentry;
     try testing.expect(ceiling_at < reentry_at);
     try testing.expect(std.mem.indexOf(u8, src[fn_at..reentry_at], "spec_disable" ++ "_reason == .adaptive") != null);
+    // ONE bucket resolver at BOTH sites (H6): the decision resolved
+    // `bucketToRead orelse bucketFor` while the re-entry resolved plain
+    // `bucketFor`, so whenever the fallback fired a switch read as a crossing
+    // on its very next tick and undid itself, paying the drain + capture ramp
+    // every lap.
+    const reentry_win = src[fn_at .. reentry_at + 64];
+    try testing.expect(std.mem.indexOf(u8, reentry_win, "self.mtpAdaptive" ++ "Bucket(self.mtpKvLen())") != null);
+    try testing.expect(std.mem.indexOf(u8, reentry_win, "round_cost.bucket" ++ "For(self.mtpKvLen())") == null);
 
     // Every serial tick the server runs folds into the table through ONE
     // helper: the block inside nextMtp, and the scheduler's regular path (a
