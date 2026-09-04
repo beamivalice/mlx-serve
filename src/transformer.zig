@@ -2978,6 +2978,449 @@ pub fn gatherQsa256(
     return out;
 }
 
+// ── Fused QSA top-k block select (msv_qsa_select) ──
+//
+// The composed arm spends ~10 dependent dispatches per attention layer
+// (subtract → where → argpartition → slice → astype → take_along_axis →
+// where → sort) to move ~8 MB, and mlx's argpartition is itself a
+// multi-block argsort. At decode width that is ~0.31 ms/layer of pure
+// dispatch latency at kv 62.7k — the largest remaining S=1 term — and at
+// prefill the same chain runs over a [rows, nb] sheet whose nb reaches 262k
+// at 1M context. This kernel is ONE dispatch: one threadgroup per query row,
+// an MSD radix select over the f32 score row's monotone ordinal, then an
+// index-ordered stream compaction that writes the ids already ascending.
+//
+// SEMANTICS. Exactly the contract `qsaChunkSelect` publishes: per row, the
+// top-`K` VISIBLE blocks (block b is visible for the row iff b < bounds[row]),
+// ties broken toward the LOWER block index, emitted ASCENDING, INT_MAX past
+// the row's count when fewer than K blocks are visible.
+//
+// The tie rule here is EXACT (score desc, index asc) — it is what torch.topk
+// does and therefore what the HF reference the `qwen4 fixture` tests pin does.
+// The composed arm APPROXIMATES that rule by subtracting an index-ascending
+// `b * 1e-7` bias before argpartition; on exact ties (the exact zeros relu
+// leaves, which is the case the bias exists for) the two agree, but the bias
+// is not free: at nb = 262144 it spans 0.026, so it flips genuinely distinct
+// near-ties the wrong way, and at large score magnitudes it rounds away
+// entirely and hands ties back to argpartition's arbitrary order. Where the
+// two arms disagree the kernel is the reference-correct one; the parity test
+// pins both halves of that claim.
+const QSA_SELECT_KERNEL_HEADER =
+    \\// Monotone f32 -> uint32: ascending order preserved, NaN above every
+    \\// number, -0.0 and +0.0 the SAME key (torch compares them equal, and a
+    \\// relu sum can produce either).
+    \\inline uint msv_qsa_ord(float v) {
+    \\  if (metal::isnan(v)) { return 0xFFFFFFFFu; }
+    \\  if (v == 0.0f) { return 0x80000000u; }
+    \\  uint u = as_type<uint>(v);
+    \\  return (u & 0x80000000u) ? (~u) : (u | 0x80000000u);
+    \\}
+    \\
+;
+
+/// One threadgroup per query row (grid y). Three phases:
+///
+///  1. MSD radix select over the 32-bit ordinal in digits of 11/11/10 bits,
+///     counting ONLY visible blocks. Each level histograms the elements that
+///     match the prefix fixed so far, scans the bins from the top to find the
+///     digit the K-th largest lives in, and narrows. It stops early the moment
+///     a bin's whole count is exactly what is still needed — for float data
+///     that is usually level 1 or 2, so the row is read 2-3 times, not 4.
+///     Result: the threshold ordinal `T` and `need_eq`, the number of
+///     ordinal-== T elements to take (lowest indices first).
+///  2. Compaction: one more ascending pass. An element is selected iff
+///     `ord > T`, or `ord == T` and its rank among the == T elements is below
+///     `need_eq`. Its output slot is the number of selected elements with a
+///     SMALLER index, which two running prefix sums (over the `>` and `==`
+///     predicates) give directly — so the output is born sorted and no
+///     bitonic pass is needed.
+///  3. Rows with `bounds[row] <= K` skip both: every visible block is a pick,
+///     so the row is `0 .. bounds-1` then INT_MAX.
+///
+/// Threadgroup memory: 2048 atomic_uint histogram (8 KiB) + 2*NSIMD simdgroup
+/// partials + 4 scalars ≈ 8.3 KiB — one threadgroup per core at TGS=1024.
+const QSA_SELECT_KERNEL_SOURCE =
+    \\constexpr uint TGN   = (uint)TGS;
+    \\constexpr uint SIMDW = 32u;
+    \\constexpr uint NSIMD = TGN / SIMDW;
+    \\constexpr uint BINS  = 2048u;
+    \\constexpr uint KTOP  = (uint)K;
+    \\constexpr int  SENTINEL = 2147483647;
+    \\
+    \\threadgroup metal::atomic_uint hist[BINS];
+    \\threadgroup uint sgs[2u * NSIMD];
+    \\threadgroup uint sh[4];
+    \\
+    \\const uint row  = threadgroup_position_in_grid.y;
+    \\const uint tid  = thread_position_in_threadgroup.x;
+    \\const uint lane = thread_index_in_simdgroup;
+    \\const uint sg   = simdgroup_index_in_threadgroup;
+    \\
+    \\// nb rides the SHAPE, never a template arg: it grows every `ratio`
+    \\// tokens of a generation, and a template value would JIT a fresh
+    \\// specialization per decode step.
+    \\const uint nb = (uint)scores_shape[2];
+    \\const int  vbi = bounds[row];
+    \\const uint vb  = (vbi > 0) ? (uint)vbi : 0u;
+    \\const device float* sc = scores + (ulong)row * (ulong)nb;
+    \\device int* outp = ids + (ulong)row * (ulong)KTOP;
+    \\
+    \\if (vb <= KTOP) {
+    \\  // Fewer visible blocks than the budget: every one of them is a pick.
+    \\  for (uint i = tid; i < KTOP; i += TGN) outp[i] = (i < vb) ? int(i) : SENTINEL;
+    \\  return;
+    \\}
+    \\
+    \\uint pref = 0u;   // ordinal bits fixed so far, right-aligned
+    \\uint fixed = 0u;  // how many bits that is
+    \\uint need = KTOP; // still to take from within the prefix bucket
+    \\uint T = 0u;
+    \\uint need_eq = 0u;
+    \\
+    \\for (uint lv = 0u; lv < 3u; ++lv) {
+    \\  const uint width = (lv == 2u) ? 10u : 11u;
+    \\  const uint nbins = 1u << width;
+    \\  const uint shift = 32u - fixed - width;
+    \\  // Clamped: at level 0 nothing is fixed and `32u - fixed` would be an
+    \\  // out-of-range shift. The `fixed != 0u` guard below is what actually
+    \\  // skips it; the clamp keeps the expression well-defined regardless.
+    \\  const uint hi    = (fixed == 0u) ? 31u : (32u - fixed);
+    \\
+    \\  for (uint b = tid; b < nbins; b += TGN) metal::atomic_store_explicit(&hist[b], 0u, metal::memory_order_relaxed);
+    \\  if (tid == 0u) { sh[0] = 0u; sh[1] = 0u; sh[2] = 0u; }
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\
+    \\  // Run-length coalescing: a relu score row is mostly exact zeros, which
+    \\  // all land in ONE bin. Folding a thread's consecutive equal digits into
+    \\  // a single atomic keeps that bin from serializing the whole pass.
+    \\  uint last_d = 0xFFFFFFFFu;
+    \\  uint run = 0u;
+    \\  for (uint i = tid; i < vb; i += TGN) {
+    \\    const uint u = msv_qsa_ord(sc[i]);
+    \\    if (fixed != 0u && (u >> hi) != pref) continue;
+    \\    const uint d = (u >> shift) & (nbins - 1u);
+    \\    if (d == last_d) { run += 1u; continue; }
+    \\    if (run != 0u) metal::atomic_fetch_add_explicit(&hist[last_d], run, metal::memory_order_relaxed);
+    \\    last_d = d;
+    \\    run = 1u;
+    \\  }
+    \\  if (run != 0u) metal::atomic_fetch_add_explicit(&hist[last_d], run, metal::memory_order_relaxed);
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\
+    \\  // One simdgroup scans the bins from the TOP down: lane 0 owns the
+    \\  // highest chunk, so the exclusive prefix over lanes IS the count of
+    \\  // elements above that lane's chunk.
+    \\  if (sg == 0u) {
+    \\    const uint chunk = nbins / SIMDW;
+    \\    const uint base  = nbins - (lane + 1u) * chunk;
+    \\    uint tot = 0u;
+    \\    for (uint j = 0u; j < chunk; ++j) tot += metal::atomic_load_explicit(&hist[base + j], metal::memory_order_relaxed);
+    \\    const uint pre = metal::simd_prefix_exclusive_sum(tot);
+    \\    if (pre < need && need <= pre + tot) {
+    \\      uint acc = pre;
+    \\      for (uint jj = chunk; jj > 0u; --jj) {
+    \\        const uint bidx = base + jj - 1u;
+    \\        const uint c = metal::atomic_load_explicit(&hist[bidx], metal::memory_order_relaxed);
+    \\        if (acc + c >= need) { sh[0] = bidx; sh[1] = acc; sh[2] = c; break; }
+    \\        acc += c;
+    \\      }
+    \\    }
+    \\  }
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  const uint d_sel   = sh[0];
+    \\  const uint above_w = sh[1];
+    \\  const uint cnt_d   = sh[2];
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\
+    \\  need = need - above_w;
+    \\  pref = (pref << width) | d_sel;
+    \\  fixed += width;
+    \\  // `cnt_d == need` means the whole bucket is taken: the threshold can be
+    \\  // the bucket's FLOOR (low bits zero) and `need_eq` covers however many
+    \\  // sit exactly on it — gt + eq is still exactly K either way.
+    \\  if (cnt_d == need || fixed >= 32u) {
+    \\    T = (fixed >= 32u) ? pref : (pref << (32u - fixed));
+    \\    need_eq = need;
+    \\    break;
+    \\  }
+    \\}
+    \\
+    \\// Pre-fill with the sentinel: the compaction is proven to write exactly
+    \\// KTOP slots, and a slot left unwritten must read as "no block" rather
+    \\// than as whatever the allocator handed us.
+    \\for (uint i = tid; i < KTOP; i += TGN) outp[i] = SENTINEL;
+    \\threadgroup_barrier(metal::mem_flags::mem_device);
+    \\
+    \\uint run_gt = 0u;
+    \\uint run_eq = 0u;
+    \\for (uint base = 0u; base < vb; base += TGN) {
+    \\  const uint i = base + tid;
+    \\  uint g = 0u;
+    \\  uint e = 0u;
+    \\  if (i < vb) {
+    \\    const uint u = msv_qsa_ord(sc[i]);
+    \\    g = (u > T) ? 1u : 0u;
+    \\    e = (u == T) ? 1u : 0u;
+    \\  }
+    \\  const uint pg = metal::simd_prefix_exclusive_sum(g);
+    \\  const uint pe = metal::simd_prefix_exclusive_sum(e);
+    \\  const uint sg_g = metal::simd_sum(g);
+    \\  const uint sg_e = metal::simd_sum(e);
+    \\  if (lane == 0u) { sgs[sg] = sg_g; sgs[NSIMD + sg] = sg_e; }
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  uint off_g = 0u, off_e = 0u, tot_g = 0u, tot_e = 0u;
+    \\  for (uint j = 0u; j < NSIMD; ++j) {
+    \\    const uint a = sgs[j];
+    \\    const uint b = sgs[NSIMD + j];
+    \\    if (j < sg) { off_g += a; off_e += b; }
+    \\    tot_g += a;
+    \\    tot_e += b;
+    \\  }
+    \\  const uint gb = run_gt + off_g + pg;
+    \\  const uint eb = run_eq + off_e + pe;
+    \\  if (i < vb) {
+    \\    // Slot = the number of SELECTED elements with a smaller index, so
+    \\    // the row is written already ascending. `gt + min(eq, need_eq)` is
+    \\    // exactly KTOP by construction; the bound is belt-and-braces so a
+    \\    // miscount can never scribble into the next row.
+    \\    if (g != 0u) {
+    \\      const uint pos = gb + metal::min(eb, need_eq);
+    \\      if (pos < KTOP) outp[pos] = int(i);
+    \\    } else if (e != 0u && eb < need_eq) {
+    \\      const uint pos = gb + eb;
+    \\      if (pos < KTOP) outp[pos] = int(i);
+    \\    }
+    \\  }
+    \\  run_gt += tot_g;
+    \\  run_eq += tot_e;
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  if (run_gt + metal::min(run_eq, need_eq) >= KTOP) break;
+    \\}
+;
+
+/// Threads per row-threadgroup. One threadgroup owns a whole score row, so
+/// this IS the memory parallelism over a row that is 1 MB at 1M context —
+/// 1024 is the Apple ceiling for a kernel this register-light.
+/// `MLX_SERVE_QSA_SELECT_TG=256|512|1024` is the A/B (and the escape hatch if
+/// a machine's `maxTotalThreadsPerThreadgroup` refuses 1024). Read once: a
+/// per-token-varying template value would JIT per value.
+const QSA_SELECT_TG_DEFAULT: c_int = 1024;
+pub var qsa_select_tg_override: ?c_int = null;
+var qsa_select_tg_cached: ?c_int = null;
+
+fn qsaSelectTg() c_int {
+    if (qsa_select_tg_override) |v| return v;
+    if (qsa_select_tg_cached) |v| return v;
+    var v: c_int = QSA_SELECT_TG_DEFAULT;
+    if (std.c.getenv("MLX_SERVE_QSA_SELECT_TG")) |raw| {
+        const parsed = std.fmt.parseInt(c_int, std.mem.sliceTo(raw, 0), 10) catch v;
+        if (parsed == 256 or parsed == 512 or parsed == 1024) v = parsed;
+    }
+    qsa_select_tg_cached = v;
+    return v;
+}
+
+var qsa_select_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
+
+fn getQsaSelectKernel() !mlx.mlx_fast_metal_kernel {
+    if (qsa_select_kernel_cached) |kk| return kk;
+    const input_names = [_][*:0]const u8{ "scores", "bounds" };
+    const output_names = [_][*:0]const u8{"ids"};
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new(
+        "msv_qsa_select",
+        in_vec,
+        out_vec,
+        QSA_SELECT_KERNEL_SOURCE,
+        QSA_SELECT_KERNEL_HEADER,
+        true, // the row walk indexes linearly; let mlx materialize a view
+        false,
+    );
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    qsa_select_kernel_cached = kernel;
+    return kernel;
+}
+
+/// The config bakes the OUTPUT shape and the grid, so it is keyed on the FULL
+/// input shape (rows AND nb) plus K — never on a product (the ShapeKey rule).
+const QsaSelectCfgKey = struct { shape: ShapeKey, k: c_int, tg: c_int };
+var qsa_select_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
+var qsa_select_cfg_key: QsaSelectCfgKey = std.mem.zeroes(QsaSelectCfgKey);
+/// Rebuild counter — the only externally visible difference between a config
+/// cache hit and a rebuild (the dispatch is identical either way).
+pub var qsa_select_cfg_builds: usize = 0;
+var qsa_select_engaged_bits: OneShotBits = .{};
+
+pub var qsa_select_kernel_override: ?bool = null;
+var qsa_select_kernel_env: ?bool = null;
+
+/// Fused QSA block select (default ON). `MLX_SERVE_QSA_SELECT_KERNEL=0`
+/// restores the bias + argpartition + take + sort chain.
+pub fn qsaSelectKernelEnabled() bool {
+    if (qsa_select_kernel_override) |v| return v;
+    if (qsa_select_kernel_env) |v| return v;
+    const v = blk: {
+        const raw = std.c.getenv("MLX_SERVE_QSA_SELECT_KERNEL") orelse break :blk true;
+        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
+    };
+    qsa_select_kernel_env = v;
+    return v;
+}
+
+/// Per-row first-NOT-fully-visible block index — the kernel's visibility
+/// bound. Block b is complete for the query at cache position p iff
+/// `b*ratio + ratio - 1 <= p`, i.e. `b < (p+1)/ratio`. `all_vis` is the
+/// caller's own `qsaAllBlocksVisible` claim and is honored verbatim so the
+/// fused arm and the composed arm answer the SAME question (the composed arm
+/// drops its visibility sheet under that claim).
+fn qsaVisibleBoundsHost(out: []i32, row0: c_int, rows: c_int, nb: c_int, ratio: c_int, all_vis: bool) void {
+    const n: usize = @intCast(rows);
+    var r: usize = 0;
+    while (r < n) : (r += 1) {
+        if (all_vis) {
+            out[r] = nb;
+            continue;
+        }
+        const p: c_int = row0 + @as(c_int, @intCast(r));
+        const complete: c_int = if (p < 0) 0 else @divTrunc(p + 1, ratio);
+        out[r] = @min(nb, complete);
+    }
+}
+
+/// Fused replacement for the whole composed selection tail: `scores` is the
+/// f32 `[1, rows, nb]` sheet, `bounds` the int32 `[rows]` visibility bounds
+/// (`qsaVisibleBoundsHost`), and the result the sorted int32 `[1, rows, kb]`
+/// selection with INT_MAX past each row's count. Null = declined (kill
+/// switch, stream, dtype, geometry) — the caller keeps the composed chain.
+pub fn qsaSelectTopBlocks(
+    s: mlx.mlx_stream,
+    scores: mlx.mlx_array,
+    bounds: mlx.mlx_array,
+    kb: c_int,
+) !?mlx.mlx_array {
+    if (!qsaSelectKernelEnabled()) return null;
+    if (!mlx.streamIsGpu(s)) return null;
+    if (scores.ctx == null or bounds.ctx == null) return null;
+    if (mlx.mlx_array_dtype(scores) != .float32 or mlx.mlx_array_dtype(bounds) != .int32) return null;
+    if (mlx.mlx_array_ndim(scores) != 3 or mlx.mlx_array_ndim(bounds) != 1) return null;
+    const ssh = mlx.getShape(scores);
+    const bsh = mlx.getShape(bounds);
+    if (ssh[0] != 1) return null;
+    const rows = ssh[1];
+    const nb = ssh[2];
+    if (rows <= 0 or nb <= 0 or bsh[0] != rows) return null;
+    if (kb <= 0 or kb > nb) return null;
+
+    const kernel = getQsaSelectKernel() catch return null;
+    const tg = qsaSelectTg();
+    const key = QsaSelectCfgKey{ .shape = ShapeKey.from(ssh), .k = kb, .tg = tg };
+    if (qsa_select_cfg == null or !std.meta.eql(qsa_select_cfg_key, key)) {
+        if (qsa_select_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        qsa_select_cfg = null;
+        const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(config);
+        const o_shape = [_]c_int{ 1, rows, kb };
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &o_shape, 3, .int32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, tg, rows, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, tg, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "TGS", tg));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "K", kb));
+        qsa_select_cfg = config;
+        qsa_select_cfg_key = key;
+        qsa_select_cfg_builds += 1;
+    }
+
+    const inputs_arr = [_]mlx.mlx_array{ scores, bounds };
+    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+    defer _ = mlx.mlx_vector_array_free(inputs_vec);
+    var outputs_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, qsa_select_cfg.?, s));
+    if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
+    if (qsa_select_engaged_bits.take(qsaWidthBucket(rows))) {
+        log.info(
+            "[qsa-select] engaged (S={d} nb={d} k={d} tg={d}) — MLX_SERVE_QSA_SELECT_KERNEL=0 restores the argpartition chain\n",
+            .{ rows, nb, kb, tg },
+        );
+    }
+    return out;
+}
+
+// ── The composed selection arm (the kernel's reference) ──
+//
+// Free functions, not Transformer methods, for one reason: the fused kernel's
+// parity test has to run BOTH arms on the same scores, and a test that
+// re-types the chain would drift from the chain that ships.
+
+/// argpartition of the visibility-masked scores [B,S,nb]: the last
+/// `block_topk` columns are the picks. torch.topk keeps the LOWER index among
+/// equal scores (relu leaves many exact zeros): a tiny index-ascending bias
+/// subtracted from the scores reproduces it.
+/// A null-ctx `vis3` means the caller proved every block visible
+/// (`qsaAllBlocksVisible`): `where(all-true, biased, -inf)` is `biased`, so
+/// the mask op is skipped and argpartition reads the same values.
+fn qsaTopBlocksOps(s: mlx.mlx_stream, scores: mlx.mlx_array, vis3: mlx.mlx_array, tie_bias: mlx.mlx_array, nb: c_int, block_topk: c_int) !mlx.mlx_array {
+    var biased = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(biased);
+    try mlx.check(mlx.mlx_subtract(&biased, scores, tie_bias, s));
+    if (vis3.ctx == null) {
+        var part_all = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_argpartition_axis(&part_all, biased, nb - block_topk, -1, s));
+        return part_all;
+    }
+    const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
+    defer _ = mlx.mlx_array_free(neg_inf);
+    var masked = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(masked);
+    try mlx.check(mlx.mlx_where(&masked, vis3, biased, neg_inf, s));
+    var part = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_argpartition_axis(&part, masked, nb - block_topk, -1, s));
+    return part;
+}
+
+/// Sort a `[1, rows, kb]` pick list ascending, mapping picks the visibility
+/// sheet rejects to INT_MAX first (they sort to the end of the row). Under an
+/// `all_vis` claim both the take and the where are identities and only the
+/// sort runs.
+fn qsaSortWithInvisible(s: mlx.mlx_stream, top_idx: mlx.mlx_array, vis3: mlx.mlx_array, all_vis: bool) !mlx.mlx_array {
+    var sorted = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(sorted);
+    if (all_vis) {
+        try mlx.check(mlx.mlx_sort_axis(&sorted, top_idx, -1, s));
+        return sorted;
+    }
+    const int_max = mlx.mlx_array_new_int(std.math.maxInt(i32));
+    defer _ = mlx.mlx_array_free(int_max);
+    var picked_vis = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(picked_vis);
+    try mlx.check(mlx.mlx_take_along_axis(&picked_vis, vis3, top_idx, -1, s));
+    var sel = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sel);
+    try mlx.check(mlx.mlx_where(&sel, picked_vis, top_idx, int_max, s));
+    try mlx.check(mlx.mlx_sort_axis(&sorted, sel, -1, s));
+    return sorted;
+}
+
+/// The composed arm the fused kernel replaces, end to end: bias → (visibility
+/// -inf) → argpartition → slice → astype → (invisible → INT_MAX) → sort.
+fn qsaSelectComposedOps(s: mlx.mlx_stream, scores: mlx.mlx_array, vis3: mlx.mlx_array, tie_bias: mlx.mlx_array, rows: c_int, nb: c_int, kb: c_int, block_topk: c_int, all_vis: bool) !mlx.mlx_array {
+    const strides3 = [_]c_int{ 1, 1, 1 };
+    const part = try qsaTopBlocksOps(s, scores, vis3, tie_bias, nb, block_topk);
+    defer _ = mlx.mlx_array_free(part);
+    var tail = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(tail);
+    try mlx.check(mlx.mlx_slice(&tail, part, &[_]c_int{ 0, 0, nb - kb }, 3, &[_]c_int{ 1, rows, nb }, 3, &strides3, 3, s));
+    var top_idx = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(top_idx);
+    try mlx.check(mlx.mlx_astype(&top_idx, tail, .int32, s));
+    return qsaSortWithInvisible(s, top_idx, vis3, all_vis);
+}
+
 // ── QSA arm meters ──
 //
 // A single process-global `engaged` bool is not a meter: it fires on the
@@ -13945,24 +14388,8 @@ pub const Transformer = struct {
     /// (`qsaAllBlocksVisible`): `where(all-true, biased, -inf)` is `biased`,
     /// so the mask op is skipped and argpartition reads the same values.
     fn qsaTopBlocks(self: *Transformer, scores: mlx.mlx_array, vis3: mlx.mlx_array, nb: c_int, ratio: c_int, block_topk: c_int) !mlx.mlx_array {
-        const s = self.s;
-        try self.qsa_consts.ensure(s, nb, ratio);
-        var biased = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(biased);
-        try mlx.check(mlx.mlx_subtract(&biased, scores, self.qsa_consts.tie_bias, s));
-        if (vis3.ctx == null) {
-            var part_all = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_argpartition_axis(&part_all, biased, nb - block_topk, -1, s));
-            return part_all;
-        }
-        const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
-        defer _ = mlx.mlx_array_free(neg_inf);
-        var masked = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(masked);
-        try mlx.check(mlx.mlx_where(&masked, vis3, biased, neg_inf, s));
-        var part = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_argpartition_axis(&part, masked, nb - block_topk, -1, s));
-        return part;
+        try self.qsa_consts.ensure(self.s, nb, ratio);
+        return qsaTopBlocksOps(self.s, scores, vis3, self.qsa_consts.tie_bias, nb, block_topk);
     }
 
     /// One row-chunk of the prefill/decode block selection: the top-`kb`
@@ -13973,46 +14400,36 @@ pub const Transformer = struct {
     /// invisible→INT_MAX where are all identities and are skipped; the
     /// remaining ops read exactly the values the masked arm produced. Passing
     /// `false` always builds them — the equivalence test compares the arms.
+    /// The fused arm reads the SAME claim through `qsaVisibleBoundsHost`, so
+    /// both arms answer the same question either way.
     fn qsaChunkSelect(self: *Transformer, scores: mlx.mlx_array, canonical: mlx.mlx_array, row0: c_int, rows: c_int, nb: c_int, ratio: c_int, kb: c_int, block_topk: c_int, all_vis: bool) !mlx.mlx_array {
-        const strides3 = [_]c_int{ 1, 1, 1 };
+        if (canonical.ctx == null and qsaSelectKernelEnabled() and mlx.streamIsGpu(self.s)) {
+            // The whole composed tail in ONE dispatch. Bounds are pure
+            // arithmetic over (row0, rows, nb, ratio) — a host buffer, never
+            // a graph the GPU has to build. The kill switch is read HERE too,
+            // so a disabled arm costs no allocation at all.
+            const bounds_host = try self.allocator.alloc(i32, @intCast(rows));
+            defer self.allocator.free(bounds_host);
+            qsaVisibleBoundsHost(bounds_host, row0, rows, nb, ratio, all_vis);
+            const bounds = mlx.mlx_array_new_data(bounds_host.ptr, &[_]c_int{rows}, 1, .int32);
+            defer _ = mlx.mlx_array_free(bounds);
+            if (try qsaSelectTopBlocks(self.s, scores, bounds, kb)) |fused| return fused;
+        }
         var vis3 = mlx.mlx_array{ .ctx = null };
         defer if (vis3.ctx != null) {
             _ = mlx.mlx_array_free(vis3);
         };
         if (!all_vis) vis3 = try self.qsaBlockVisibility(row0, rows, nb, ratio);
-
+        if (canonical.ctx == null) {
+            try self.qsa_consts.ensure(self.s, nb, ratio);
+            return qsaSelectComposedOps(self.s, scores, vis3, self.qsa_consts.tie_bias, rows, nb, kb, block_topk, all_vis);
+        }
+        // `nb <= block_topk`: every block is a pick, so the arange broadcast IS
+        // the selection and only visibility can remove one.
         var top_idx = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(top_idx);
-        if (canonical.ctx != null) {
-            try mlx.check(mlx.mlx_broadcast_to(&top_idx, canonical, &[_]c_int{ 1, rows, nb }, 3, self.s));
-        } else {
-            const part = try self.qsaTopBlocks(scores, vis3, nb, ratio, block_topk);
-            defer _ = mlx.mlx_array_free(part);
-            var tail = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(tail);
-            try mlx.check(mlx.mlx_slice(&tail, part, &[_]c_int{ 0, 0, nb - kb }, 3, &[_]c_int{ 1, rows, nb }, 3, &strides3, 3, self.s));
-            try mlx.check(mlx.mlx_astype(&top_idx, tail, .int32, self.s));
-        }
-        var sorted = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(sorted);
-        if (all_vis) {
-            // Every pick is visible, so take_along_axis(vis3, top_idx) is
-            // all-true and the INT_MAX `where` returns top_idx unchanged.
-            try mlx.check(mlx.mlx_sort_axis(&sorted, top_idx, -1, self.s));
-            return sorted;
-        }
-        // Invisible picks (rows with fewer visible blocks than the budget)
-        // become INT_MAX and sort to the end of the row.
-        const int_max = mlx.mlx_array_new_int(std.math.maxInt(i32));
-        defer _ = mlx.mlx_array_free(int_max);
-        var picked_vis = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(picked_vis);
-        try mlx.check(mlx.mlx_take_along_axis(&picked_vis, vis3, top_idx, -1, self.s));
-        var sel = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(sel);
-        try mlx.check(mlx.mlx_where(&sel, picked_vis, top_idx, int_max, self.s));
-        try mlx.check(mlx.mlx_sort_axis(&sorted, sel, -1, self.s));
-        return sorted;
+        try mlx.check(mlx.mlx_broadcast_to(&top_idx, canonical, &[_]c_int{ 1, rows, nb }, 3, self.s));
+        return qsaSortWithInvisible(self.s, top_idx, vis3, all_vis);
     }
 
     /// Prefill block selection for the gather kernel: per row the top-k
@@ -43051,4 +43468,307 @@ test "qsa block constants: one build per nb, not one per full-attention layer" {
     // Same nb, different ratio: also a different table.
     try qc.ensure(s, 7, 8);
     try testing.expectEqual(@as(usize, 3), qc.builds);
+}
+
+// ── Fused QSA block select (msv_qsa_select) ──
+
+/// The `[1, rows, nb]` bool visibility sheet the composed arm masks with —
+/// the ops `Transformer.qsaBlockVisibility` runs, free of a Transformer so
+/// the parity test can drive both arms itself.
+fn qsaVisSheetForTest(s: mlx.mlx_stream, row0: c_int, rows: c_int, nb: c_int, ratio: c_int) !mlx.mlx_array {
+    var blk_end = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(blk_end);
+    try mlx.check(mlx.mlx_arange(&blk_end, @floatFromInt(ratio - 1), @floatFromInt(nb * ratio), @floatFromInt(ratio), .int32, s));
+    var blk_end2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(blk_end2);
+    try mlx.check(mlx.mlx_reshape(&blk_end2, blk_end, &[_]c_int{ 1, nb }, 2, s));
+    var pos = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(pos);
+    try mlx.check(mlx.mlx_arange(&pos, @floatFromInt(row0), @floatFromInt(row0 + rows), 1.0, .int32, s));
+    var pos2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(pos2);
+    try mlx.check(mlx.mlx_reshape(&pos2, pos, &[_]c_int{ rows, 1 }, 2, s));
+    var vis = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(vis);
+    try mlx.check(mlx.mlx_less_equal(&vis, blk_end2, pos2, s));
+    var vis3 = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_expand_dims(&vis3, vis, 0, s));
+    return vis3;
+}
+
+/// `QsaBlockConsts.tie_bias` without the cache: `b * 1e-7`.
+fn qsaTieBiasForTest(s: mlx.mlx_stream, nb: c_int) !mlx.mlx_array {
+    var idx = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(idx);
+    try mlx.check(mlx.mlx_arange(&idx, 0, @floatFromInt(nb), 1.0, .float32, s));
+    const eps = mlx.mlx_array_new_float(1e-7);
+    defer _ = mlx.mlx_array_free(eps);
+    var bias = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_multiply(&bias, idx, eps, s));
+    return bias;
+}
+
+/// Bit-equality of two int32 `[1, rows, k]` selections, reported by (row, slot).
+fn qsaExpectSameIds(want: mlx.mlx_array, got: mlx.mlx_array, rows: c_int, k: c_int) !void {
+    const gs = mlx.getShape(got);
+    try testing.expectEqual(@as(usize, 3), gs.len);
+    try testing.expectEqual(@as(c_int, 1), gs[0]);
+    try testing.expectEqual(rows, gs[1]);
+    try testing.expectEqual(k, gs[2]);
+    try testing.expectEqual(mlx.mlx_dtype.int32, mlx.mlx_array_dtype(got));
+    try mlx.check(mlx.mlx_array_eval(want));
+    try mlx.check(mlx.mlx_array_eval(got));
+    const a = mlx.mlx_array_data_int32(want).?;
+    const b = mlx.mlx_array_data_int32(got).?;
+    const ku: usize = @intCast(k);
+    const n: usize = @as(usize, @intCast(rows)) * ku;
+    for (0..n) |i| {
+        if (a[i] != b[i]) {
+            std.debug.print(
+                "[qsa-select] mismatch at row {d} slot {d}: chain {d} kernel {d}\n",
+                .{ i / ku, i % ku, a[i], b[i] },
+            );
+            return error.QsaSelectMismatch;
+        }
+    }
+}
+
+test "qsaVisibleBoundsHost: the first NOT-fully-visible block per row" {
+    // Pure arithmetic, no GPU: block b is complete at cache position
+    // b*ratio + ratio - 1, so a query at p sees blocks [0, (p+1)/ratio).
+    var out: [6]i32 = undefined;
+    qsaVisibleBoundsHost(&out, 0, 6, 700, 4, false);
+    try testing.expectEqualSlices(i32, &[_]i32{ 0, 0, 0, 1, 1, 1 }, &out);
+    // Clamped by nb: past nb*ratio every block is complete.
+    qsaVisibleBoundsHost(&out, 2799, 6, 700, 4, false);
+    try testing.expectEqualSlices(i32, &[_]i32{ 700, 700, 700, 700, 700, 700 }, &out);
+    // Straddling the 512 budget is the interesting row range.
+    qsaVisibleBoundsHost(&out, 2044, 6, 700, 4, false);
+    try testing.expectEqualSlices(i32, &[_]i32{ 511, 511, 511, 512, 512, 512 }, &out);
+    // An `all_vis` claim is honored verbatim — the composed arm drops its
+    // visibility sheet under the same claim, so both arms must.
+    qsaVisibleBoundsHost(&out, 4, 6, 24, 4, true);
+    try testing.expectEqualSlices(i32, &[_]i32{ 24, 24, 24, 24, 24, 24 }, &out);
+}
+
+test "qsa select kernel: the fused radix-select emits the argpartition chain's ids bit for bit" {
+    // (a) The bar is BIT equality of the int32 selections, across the nb the
+    // arch really reaches (700 .. 262144 = 1M context at ratio 4), the query
+    // widths it really runs at (decode 1, verify 6/15, prefill chunks), and
+    // three visibility regimes: fewer than 512 visible blocks (the INT_MAX
+    // arm), a chunk straddling the budget, and all-visible.
+    //
+    // Scores sit on a COARSE integer grid on purpose. Distinct values are
+    // >= 1.0 apart — far outside the composed arm's `nb * 1e-7` tie bias,
+    // which spans 0.026 at nb = 262144 — so the only ties are EXACT ties,
+    // where the bias rule and the kernel's exact (score desc, index asc) rule
+    // agree by construction. Where they do NOT agree the kernel is the
+    // reference-correct arm; the next test pins that separately.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const ta = testing.allocator;
+    const ratio: c_int = 4;
+    const k: c_int = 512;
+
+    const cases = [_]struct { nb: c_int, rows: c_int }{
+        .{ .nb = 700, .rows = 1 },
+        .{ .nb = 700, .rows = 6 },
+        .{ .nb = 700, .rows = 15 },
+        .{ .nb = 700, .rows = 256 },
+        .{ .nb = 2048, .rows = 1 },
+        .{ .nb = 2048, .rows = 15 },
+        .{ .nb = 2048, .rows = 256 },
+        .{ .nb = 15675, .rows = 1 },
+        .{ .nb = 15675, .rows = 6 },
+        .{ .nb = 15675, .rows = 15 },
+        .{ .nb = 15675, .rows = 256 },
+        .{ .nb = 65536, .rows = 1 },
+        .{ .nb = 65536, .rows = 15 },
+        .{ .nb = 65536, .rows = 64 },
+        .{ .nb = 262144, .rows = 1 },
+        .{ .nb = 262144, .rows = 6 },
+    };
+    var prng = std.Random.DefaultPrng.init(0x9A50_C711);
+    const rnd = prng.random();
+
+    for (cases) |c| {
+        const nbu: usize = @intCast(c.nb);
+        const rowsu: usize = @intCast(c.rows);
+        const buf = try ta.alloc(f32, rowsu * nbu);
+        defer ta.free(buf);
+        // A third of the sheet is EXACT zero — what relu leaves, and the case
+        // the tie rule exists for.
+        for (buf) |*v| v.* = if (rnd.uintLessThan(u8, 3) == 0)
+            0.0
+        else
+            @floatFromInt(rnd.uintLessThan(u32, 1000));
+        const sc_shape = [_]c_int{ 1, c.rows, c.nb };
+        const scores = mlx.mlx_array_new_data(buf.ptr, &sc_shape, 3, .float32);
+        defer _ = mlx.mlx_array_free(scores);
+
+        const row0s = [_]c_int{ 0, 2044, 2000, c.nb * ratio };
+        for (row0s) |row0| {
+            const all_vis = qsaAllBlocksVisible(row0, c.nb, ratio);
+            var vis3 = mlx.mlx_array{ .ctx = null };
+            defer if (vis3.ctx != null) {
+                _ = mlx.mlx_array_free(vis3);
+            };
+            if (!all_vis) vis3 = try qsaVisSheetForTest(s, row0, c.rows, c.nb, ratio);
+            const bias = try qsaTieBiasForTest(s, c.nb);
+            defer _ = mlx.mlx_array_free(bias);
+            const want = try qsaSelectComposedOps(s, scores, vis3, bias, c.rows, c.nb, k, k, all_vis);
+            defer _ = mlx.mlx_array_free(want);
+
+            const bounds_host = try ta.alloc(i32, rowsu);
+            defer ta.free(bounds_host);
+            qsaVisibleBoundsHost(bounds_host, row0, c.rows, c.nb, ratio, all_vis);
+            const bounds = mlx.mlx_array_new_data(bounds_host.ptr, &[_]c_int{c.rows}, 1, .int32);
+            defer _ = mlx.mlx_array_free(bounds);
+            const got = (try qsaSelectTopBlocks(s, scores, bounds, k)) orelse return error.SelectKernelDeclined;
+            defer _ = mlx.mlx_array_free(got);
+
+            qsaExpectSameIds(want, got, c.rows, k) catch |e| {
+                std.debug.print("[qsa-select] case nb={d} rows={d} row0={d} all_vis={}\n", .{ c.nb, c.rows, row0, all_vis });
+                return e;
+            };
+        }
+    }
+}
+
+test "qsa select kernel: on a near-tie the exact rule and the bias trick DISAGREE, and the kernel takes the exact one" {
+    // The composed arm reproduces torch.topk's lower-index-wins by
+    // subtracting `b * 1e-7` before argpartition. That is exact only on EXACT
+    // ties: at nb = 262144 the bias spans 0.026, so a genuinely higher score
+    // 0.005 above a lower-indexed rival loses to it. torch.topk (the HF
+    // reference the `qwen4 fixture` tests pin) takes the higher SCORE, and so
+    // does the kernel — which is why the two arms are allowed to differ here
+    // and only here.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const ta = testing.allocator;
+    const nb: c_int = 262144;
+    const k: c_int = 512;
+    const ratio: c_int = 4;
+    const winner: usize = 200000;
+
+    const buf = try ta.alloc(f32, @intCast(nb));
+    defer ta.free(buf);
+    @memset(buf, 0.0);
+    // 511 uncontested winners, then two candidates for the last slot.
+    for (1..512) |i| buf[i] = 1000.0;
+    buf[0] = 10.0; //          biased: 10.000  (bias 0)
+    buf[winner] = 10.005; //   biased:  9.985  (bias 0.02) — the bias flips it
+    const sc_shape = [_]c_int{ 1, 1, nb };
+    const scores = mlx.mlx_array_new_data(buf.ptr, &sc_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(scores);
+
+    const row0: c_int = nb * ratio; // all-visible
+    try testing.expect(qsaAllBlocksVisible(row0, nb, ratio));
+    const none = mlx.mlx_array{ .ctx = null };
+    const bias = try qsaTieBiasForTest(s, nb);
+    defer _ = mlx.mlx_array_free(bias);
+    const chain = try qsaSelectComposedOps(s, scores, none, bias, 1, nb, k, k, true);
+    defer _ = mlx.mlx_array_free(chain);
+
+    var bounds_host = [_]i32{nb};
+    const bounds = mlx.mlx_array_new_data(&bounds_host, &[_]c_int{1}, 1, .int32);
+    defer _ = mlx.mlx_array_free(bounds);
+    const fused = (try qsaSelectTopBlocks(s, scores, bounds, k)) orelse return error.SelectKernelDeclined;
+    defer _ = mlx.mlx_array_free(fused);
+
+    try mlx.check(mlx.mlx_array_eval(chain));
+    try mlx.check(mlx.mlx_array_eval(fused));
+    const ch = mlx.mlx_array_data_int32(chain).?;
+    const fu = mlx.mlx_array_data_int32(fused).?;
+    const H = struct {
+        fn has(row: [*]const i32, n: usize, v: i32) bool {
+            for (0..n) |i| if (row[i] == v) return true;
+            return false;
+        }
+    };
+    const ku: usize = @intCast(k);
+    // The kernel is the reference: the higher score wins the last slot.
+    try testing.expect(H.has(fu, ku, @intCast(winner)));
+    try testing.expect(!H.has(fu, ku, 0));
+    // The chain is not: the bias hands the slot to index 0.
+    try testing.expect(H.has(ch, ku, 0));
+    try testing.expect(!H.has(ch, ku, @intCast(winner)));
+    // Both are still ascending and full.
+    for (1..ku) |i| try testing.expect(fu[i] > fu[i - 1]);
+}
+
+test "qsa select kernel: the config is cached per FULL shape and rebuilt when rows or nb change" {
+    // (b) A metal_kernel config rebuilt per call is CPU tax, and a config
+    // keyed on anything less than the full shape hands a caller an output
+    // labelled with someone else's dims (the ShapeKey rule). One slot, so a
+    // shape change costs exactly one rebuild — including coming BACK.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const ta = testing.allocator;
+    const k: c_int = 8;
+
+    const Run = struct {
+        fn once(st: mlx.mlx_stream, alloc: std.mem.Allocator, rows: c_int, nb: c_int, kk: c_int) !void {
+            const buf = try alloc.alloc(f32, @intCast(rows * nb));
+            defer alloc.free(buf);
+            for (buf, 0..) |*v, i| v.* = @floatFromInt(i % 97);
+            const sh = [_]c_int{ 1, rows, nb };
+            const sc = mlx.mlx_array_new_data(buf.ptr, &sh, 3, .float32);
+            defer _ = mlx.mlx_array_free(sc);
+            const bh = try alloc.alloc(i32, @intCast(rows));
+            defer alloc.free(bh);
+            @memset(bh, nb);
+            const bd = mlx.mlx_array_new_data(bh.ptr, &[_]c_int{rows}, 1, .int32);
+            defer _ = mlx.mlx_array_free(bd);
+            const out = (try qsaSelectTopBlocks(st, sc, bd, kk)) orelse return error.SelectKernelDeclined;
+            defer _ = mlx.mlx_array_free(out);
+            try mlx.check(mlx.mlx_array_eval(out));
+        }
+    };
+
+    const base = qsa_select_cfg_builds;
+    try Run.once(s, ta, 4, 64, k);
+    try testing.expectEqual(base + 1, qsa_select_cfg_builds);
+    // Same shape, three more calls: the cached config serves all of them.
+    for (0..3) |_| try Run.once(s, ta, 4, 64, k);
+    try testing.expectEqual(base + 1, qsa_select_cfg_builds);
+    // A new ROW count is a new output shape and a new grid.
+    try Run.once(s, ta, 9, 64, k);
+    try testing.expectEqual(base + 2, qsa_select_cfg_builds);
+    // A new nb with the SAME row count and the same element count as no
+    // previous call: keying on a product would miss this.
+    try Run.once(s, ta, 9, 128, k);
+    try testing.expectEqual(base + 3, qsa_select_cfg_builds);
+    // Back to the first shape: one slot, so this rebuilds too.
+    try Run.once(s, ta, 4, 64, k);
+    try testing.expectEqual(base + 4, qsa_select_cfg_builds);
+}
+
+test "the fused QSA select ships a kill switch, a GPU-stream guard, a one-shot engaged log and nb off the SHAPE" {
+    // (c) Class guard for the kernel conventions. Needles are assembled at
+    // comptime so this test's own source cannot satisfy the scan.
+    const src = @embedFile("transformer.zig");
+    const lever = "MLX_SERVE_QSA_SELECT" ++ "_KERNEL";
+    try testing.expect(std.mem.indexOf(u8, src, lever) != null);
+    try testing.expect(std.mem.indexOf(u8, src, "[qsa-" ++ "select] engaged") != null);
+
+    // Every metal_kernel helper owes its OWN stream guard.
+    const fn_start = std.mem.indexOf(u8, src, "pub fn qsaSelect" ++ "TopBlocks(").?;
+    const head = src[fn_start..@min(src.len, fn_start + 1500)];
+    try testing.expect(std.mem.indexOf(u8, head, "stream" ++ "IsGpu") != null);
+
+    // nb rides the SHAPE. A per-token-varying TEMPLATE value is a fresh JIT
+    // per value, and nb grows every `ratio` tokens of a generation.
+    try testing.expect(std.mem.indexOf(u8, src, "scores_" ++ "shape[2]") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "template_arg_int(config, \"" ++ "NB\"") == null);
+    // Only the model-fixed budget and the threadgroup width are templates.
+    try testing.expect(std.mem.indexOf(u8, src, "template_arg_int(config, \"" ++ "K\", kb)") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "template_arg_int(config, \"" ++ "TGS\"") != null);
+
+    // The config key carries the FULL shape, never a derived product.
+    try testing.expect(@TypeOf(@as(QsaSelectCfgKey, undefined).shape) == ShapeKey);
+
+    // Threadgroup memory is an OCCUPANCY decision: the histogram is 2048
+    // uints (8 KiB) and the whole kernel must stay under ~10 KiB.
+    try testing.expect(std.mem.indexOf(u8, QSA_SELECT_KERNEL_SOURCE, "BINS  = 2048u") != null);
 }
