@@ -6911,6 +6911,23 @@ pub const PlePending = struct {
     capture: bool,
 };
 
+/// Does every complete block visible-check pass for EVERY query row of a call
+/// that starts at cache position `offset`?
+///
+/// Block `b` is complete for a query at cache position `p` iff
+/// `b*ratio + ratio - 1 <= p`; the highest complete block ends at
+/// `nb*ratio - 1`, and the lowest row of the call sits at `offset`. So the
+/// whole `[rows, nb]` visibility sheet is all-true iff `offset >= nb*ratio-1`
+/// — the LAST row is always past the bar and proves nothing.
+///
+/// At decode width this is ALWAYS true: `offset == kv-1` and
+/// `nb == kv/ratio`, so `nb*ratio <= kv` for every ragged tail. The
+/// visibility mask, the `-inf` where inside `qsaTopBlocks` and the
+/// invisible→INT_MAX where are then all identities.
+fn qsaAllBlocksVisible(offset: c_int, nb: c_int, ratio: c_int) bool {
+    return offset >= nb * ratio - 1;
+}
+
 /// The nb-keyed constants of the QSA block selection. Both consumers
 /// (`qsaBlockVisibility`'s block-end column and `qsaTopBlocks`' tie bias)
 /// depend on nothing but the block count and the compress ratio, and every
@@ -13601,8 +13618,14 @@ pub const Transformer = struct {
                 std.debug.print("\n", .{});
             }
         }
-        const vis3 = try self.qsaBlockVisibility(offset, seq_len, nb, ratio);
-        defer _ = mlx.mlx_array_free(vis3);
+        // Past the budget an all-visible call skips the sheet entirely; the
+        // `nb <= block_topk` arm IS the sheet, so it always builds it.
+        const all_vis = qsaAllBlocksVisible(offset, nb, ratio);
+        var vis3 = mlx.mlx_array{ .ctx = null };
+        defer if (vis3.ctx != null) {
+            _ = mlx.mlx_array_free(vis3);
+        };
+        if (!all_vis or nb <= block_topk) vis3 = try self.qsaBlockVisibility(offset, seq_len, nb, ratio);
 
         var blk_sel = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(blk_sel);
@@ -13651,20 +13674,78 @@ pub const Transformer = struct {
     /// `block_topk` columns are the picks. torch.topk keeps the LOWER index
     /// among equal scores (relu leaves many exact zeros): a tiny
     /// index-descending bias reproduces it.
+    /// A null-ctx `vis3` means the caller proved every block visible
+    /// (`qsaAllBlocksVisible`): `where(all-true, biased, -inf)` is `biased`,
+    /// so the mask op is skipped and argpartition reads the same values.
     fn qsaTopBlocks(self: *Transformer, scores: mlx.mlx_array, vis3: mlx.mlx_array, nb: c_int, ratio: c_int, block_topk: c_int) !mlx.mlx_array {
         const s = self.s;
         try self.qsa_consts.ensure(s, nb, ratio);
-        const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
-        defer _ = mlx.mlx_array_free(neg_inf);
         var biased = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(biased);
         try mlx.check(mlx.mlx_subtract(&biased, scores, self.qsa_consts.tie_bias, s));
+        if (vis3.ctx == null) {
+            var part_all = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_argpartition_axis(&part_all, biased, nb - block_topk, -1, s));
+            return part_all;
+        }
+        const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
+        defer _ = mlx.mlx_array_free(neg_inf);
         var masked = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(masked);
         try mlx.check(mlx.mlx_where(&masked, vis3, biased, neg_inf, s));
         var part = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_argpartition_axis(&part, masked, nb - block_topk, -1, s));
         return part;
+    }
+
+    /// One row-chunk of the prefill/decode block selection: the top-`kb`
+    /// visible blocks per row, ascending, INT_MAX past the row's count.
+    ///
+    /// `all_vis` = `qsaAllBlocksVisible` for this chunk's FIRST row. When it
+    /// holds, the visibility sheet, `qsaTopBlocks`' `-inf` where, and the
+    /// invisible→INT_MAX where are all identities and are skipped; the
+    /// remaining ops read exactly the values the masked arm produced. Passing
+    /// `false` always builds them — the equivalence test compares the arms.
+    fn qsaChunkSelect(self: *Transformer, scores: mlx.mlx_array, canonical: mlx.mlx_array, row0: c_int, rows: c_int, nb: c_int, ratio: c_int, kb: c_int, block_topk: c_int, all_vis: bool) !mlx.mlx_array {
+        const strides3 = [_]c_int{ 1, 1, 1 };
+        var vis3 = mlx.mlx_array{ .ctx = null };
+        defer if (vis3.ctx != null) {
+            _ = mlx.mlx_array_free(vis3);
+        };
+        if (!all_vis) vis3 = try self.qsaBlockVisibility(row0, rows, nb, ratio);
+
+        var top_idx = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(top_idx);
+        if (canonical.ctx != null) {
+            try mlx.check(mlx.mlx_broadcast_to(&top_idx, canonical, &[_]c_int{ 1, rows, nb }, 3, self.s));
+        } else {
+            const part = try self.qsaTopBlocks(scores, vis3, nb, ratio, block_topk);
+            defer _ = mlx.mlx_array_free(part);
+            var tail = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(tail);
+            try mlx.check(mlx.mlx_slice(&tail, part, &[_]c_int{ 0, 0, nb - kb }, 3, &[_]c_int{ 1, rows, nb }, 3, &strides3, 3, self.s));
+            try mlx.check(mlx.mlx_astype(&top_idx, tail, .int32, self.s));
+        }
+        var sorted = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(sorted);
+        if (all_vis) {
+            // Every pick is visible, so take_along_axis(vis3, top_idx) is
+            // all-true and the INT_MAX `where` returns top_idx unchanged.
+            try mlx.check(mlx.mlx_sort_axis(&sorted, top_idx, -1, self.s));
+            return sorted;
+        }
+        // Invisible picks (rows with fewer visible blocks than the budget)
+        // become INT_MAX and sort to the end of the row.
+        const int_max = mlx.mlx_array_new_int(std.math.maxInt(i32));
+        defer _ = mlx.mlx_array_free(int_max);
+        var picked_vis = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(picked_vis);
+        try mlx.check(mlx.mlx_take_along_axis(&picked_vis, vis3, top_idx, -1, self.s));
+        var sel = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sel);
+        try mlx.check(mlx.mlx_where(&sel, picked_vis, top_idx, int_max, self.s));
+        try mlx.check(mlx.mlx_sort_axis(&sorted, sel, -1, self.s));
+        return sorted;
     }
 
     /// Prefill block selection for the gather kernel: per row the top-k
@@ -13679,11 +13760,8 @@ pub const Transformer = struct {
         const kb: c_int = @min(nb, block_topk);
         const rows_per: c_int = @intCast(qsaScoreRowsPerChunk(@intCast(n_idx), @intCast(nb), @intCast(seq_len)));
         const strides4 = [_]c_int{ 1, 1, 1, 1 };
-        const strides3 = [_]c_int{ 1, 1, 1 };
         const zero = mlx.mlx_array_new_float(0.0);
         defer _ = mlx.mlx_array_free(zero);
-        const int_max = mlx.mlx_array_new_int(std.math.maxInt(i32));
-        defer _ = mlx.mlx_array_free(int_max);
         var canonical = mlx.mlx_array{ .ctx = null };
         defer if (canonical.ctx != null) {
             _ = mlx.mlx_array_free(canonical);
@@ -13720,32 +13798,8 @@ pub const Transformer = struct {
             var scores = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(scores);
             try mlx.check(mlx.mlx_sum_axis(&scores, relu, 1, false, self.s)); // [1,rows,nb]
-            const vis3 = try self.qsaBlockVisibility(offset + r0, rows, nb, ratio);
-            defer _ = mlx.mlx_array_free(vis3);
-
-            var top_idx = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(top_idx);
-            if (canonical.ctx != null) {
-                try mlx.check(mlx.mlx_broadcast_to(&top_idx, canonical, &[_]c_int{ 1, rows, nb }, 3, self.s));
-            } else {
-                const part = try self.qsaTopBlocks(scores, vis3, nb, ratio, block_topk);
-                defer _ = mlx.mlx_array_free(part);
-                var tail = mlx.mlx_array_new();
-                defer _ = mlx.mlx_array_free(tail);
-                try mlx.check(mlx.mlx_slice(&tail, part, &[_]c_int{ 0, 0, nb - kb }, 3, &[_]c_int{ 1, rows, nb }, 3, &strides3, 3, self.s));
-                try mlx.check(mlx.mlx_astype(&top_idx, tail, .int32, self.s));
-            }
-            // Invisible picks (rows with fewer visible blocks than the
-            // budget) become INT_MAX and sort to the end of the row.
-            var picked_vis = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(picked_vis);
-            try mlx.check(mlx.mlx_take_along_axis(&picked_vis, vis3, top_idx, -1, self.s));
-            var sel = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(sel);
-            try mlx.check(mlx.mlx_where(&sel, picked_vis, top_idx, int_max, self.s));
-            var sorted = mlx.mlx_array_new();
+            const sorted = try self.qsaChunkSelect(scores, canonical, offset + r0, rows, nb, ratio, kb, block_topk, qsaAllBlocksVisible(offset + r0, nb, ratio));
             errdefer _ = mlx.mlx_array_free(sorted);
-            try mlx.check(mlx.mlx_sort_axis(&sorted, sel, -1, self.s));
             try parts.append(self.allocator, sorted);
         }
         if (parts.items.len == 1) return parts.pop().?;
@@ -42262,6 +42316,92 @@ test "the qwen4 EV seed width is mtp.MAX_DEPTH itself, not a mirrored constant" 
     const source = @embedFile("transformer.zig");
     try testing.expect(std.mem.indexOf(u8, source, "ev_seed_accept: ?[mtp_mod.MAX_DEPTH]f32") != null);
     try testing.expect(std.mem.indexOf(u8, source, "const mtp_mod = @import(\"mtp.zig\");") != null);
+}
+
+test "qsa visibility: decode width is ALWAYS all-visible; a prefill chunk's FIRST row decides" {
+    // Block b is complete at cache position b*ratio + ratio - 1, so the highest
+    // complete block ends at nb*ratio - 1. Every row of a call sees every block
+    // iff the LOWEST row (`offset`) is at or past that — the last row is always
+    // past it and proves nothing.
+    const ratio: c_int = 4;
+    // Decode (S == 1): offset == kv-1, nb == kv/ratio, so nb*ratio <= kv and
+    // nb*ratio - 1 <= offset for EVERY ragged tail kv % ratio in {0,1,2,3}.
+    var kv: c_int = 2049;
+    while (kv <= 2400) : (kv += 1) {
+        const nb = @divTrunc(kv, ratio);
+        try testing.expect(qsaAllBlocksVisible(kv - 1, nb, ratio));
+    }
+    // A prefill chunk: nb = 513 blocks end at 2051, which is exactly the bar.
+    try testing.expect(qsaAllBlocksVisible(2051, 513, ratio));
+    try testing.expect(!qsaAllBlocksVisible(2050, 513, ratio));
+    try testing.expect(!qsaAllBlocksVisible(0, 513, ratio));
+    // No complete block yet: vacuously all-visible.
+    try testing.expect(qsaAllBlocksVisible(0, 0, ratio));
+}
+
+test "qsa visibility skip: bit-identical selection where it is an identity, and a REAL difference where it is not" {
+    // `qsaChunkSelect(all_vis = true)` drops the visibility mask, its -inf
+    // `where` and the INT_MAX `where`. Where every block really is visible
+    // those three are identities and the two arms must agree BIT for BIT on
+    // random scores. Where they are not, the arms must DIFFER — otherwise the
+    // test would pass against a blanket "always skip".
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+
+    var t: Transformer = undefined;
+    t.s = s;
+    t.allocator = testing.allocator;
+    t.config = .{};
+    t.qsa_consts = .{};
+    defer t.qsa_consts.deinit();
+
+    const ratio: c_int = 4;
+    const nb: c_int = 24;
+    const block_topk: c_int = 8;
+    const rows: c_int = 6;
+    var prng = std.Random.DefaultPrng.init(0x5EED_9E11);
+    const rnd = prng.random();
+    var sc_buf: [@as(usize, @intCast(rows)) * @as(usize, @intCast(nb))]f32 = undefined;
+    // Exact zeros in the mix: relu leaves plenty, and the tie bias is what
+    // decides those — a skip that changed tie handling would show up here.
+    for (&sc_buf) |*v| v.* = if (rnd.boolean()) 0.0 else rnd.float(f32) * 4.0;
+    const sc_shape = [_]c_int{ 1, rows, nb };
+    const scores = mlx.mlx_array_new_data(&sc_buf, &sc_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(scores);
+    const none = mlx.mlx_array{ .ctx = null };
+
+    // All blocks visible: the chunk's first row is at nb*ratio - 1 = 95.
+    const row0_all: c_int = nb * ratio - 1;
+    try testing.expect(qsaAllBlocksVisible(row0_all, nb, ratio));
+    const a = try t.qsaChunkSelect(scores, none, row0_all, rows, nb, ratio, block_topk, block_topk, true);
+    defer _ = mlx.mlx_array_free(a);
+    const b = try t.qsaChunkSelect(scores, none, row0_all, rows, nb, ratio, block_topk, block_topk, false);
+    defer _ = mlx.mlx_array_free(b);
+    try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(a, b, s));
+
+    // Same chunk one row earlier is NOT all-visible; skipping there is wrong,
+    // and the two arms must disagree.
+    const row0_partial: c_int = 4;
+    try testing.expect(!qsaAllBlocksVisible(row0_partial, nb, ratio));
+    const c = try t.qsaChunkSelect(scores, none, row0_partial, rows, nb, ratio, block_topk, block_topk, true);
+    defer _ = mlx.mlx_array_free(c);
+    const d = try t.qsaChunkSelect(scores, none, row0_partial, rows, nb, ratio, block_topk, block_topk, false);
+    defer _ = mlx.mlx_array_free(d);
+    try testing.expect(try attn256MaxDiff(c, d, s) > 0.0);
+
+    // The `nb <= block_topk` arm (canonical arange broadcast) takes the same
+    // skip: every row picks every block, sorted ascending.
+    var ar = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ar);
+    try mlx.check(mlx.mlx_arange(&ar, 0, @floatFromInt(nb), 1.0, .int32, s));
+    var canonical = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(canonical);
+    try mlx.check(mlx.mlx_reshape(&canonical, ar, &[_]c_int{ 1, 1, nb }, 3, s));
+    const e = try t.qsaChunkSelect(scores, canonical, row0_all, rows, nb, ratio, nb, nb, true);
+    defer _ = mlx.mlx_array_free(e);
+    const f = try t.qsaChunkSelect(scores, canonical, row0_all, rows, nb, ratio, nb, nb, false);
+    defer _ = mlx.mlx_array_free(f);
+    try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(e, f, s));
 }
 
 test "qsa block constants: one build per nb, not one per full-attention layer" {
