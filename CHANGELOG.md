@@ -2,6 +2,11 @@
 
 ## v26.9.2 (unreleased)
 
+<!-- PERF NUMBERS PROVISIONAL: every measurement in this section is from a
+     per-branch ladder, not the final base-vs-mega judge. To be replaced by
+     the judge tables (long auto ladder + short ladder, --prefill-chunk 4096
+     pinned on both arms) before this release ships. -->
+
 ### Highlights
 
 - **Speculative decoding on Flash Next got cheaper per round.** The speculation step used to stall: the model's n-gram lookup needs its draft tokens on the CPU, so the rest of the 48-layer graph waited for the whole draft chain to finish on the GPU before it was even built. It is now built while the drafts are still running, and the draft head only projects the row it actually uses. Code prompts go 111 -> 117 tok/s and prose 56 -> 59 on an M5 Max at a fixed draft depth, with byte-identical output.
