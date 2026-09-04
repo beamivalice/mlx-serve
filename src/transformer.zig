@@ -43508,31 +43508,6 @@ fn qsaTieBiasForTest(s: mlx.mlx_stream, nb: c_int) !mlx.mlx_array {
     return bias;
 }
 
-/// Bit-equality of two int32 `[1, rows, k]` selections, reported by (row, slot).
-fn qsaExpectSameIds(want: mlx.mlx_array, got: mlx.mlx_array, rows: c_int, k: c_int) !void {
-    const gs = mlx.getShape(got);
-    try testing.expectEqual(@as(usize, 3), gs.len);
-    try testing.expectEqual(@as(c_int, 1), gs[0]);
-    try testing.expectEqual(rows, gs[1]);
-    try testing.expectEqual(k, gs[2]);
-    try testing.expectEqual(mlx.mlx_dtype.int32, mlx.mlx_array_dtype(got));
-    try mlx.check(mlx.mlx_array_eval(want));
-    try mlx.check(mlx.mlx_array_eval(got));
-    const a = mlx.mlx_array_data_int32(want).?;
-    const b = mlx.mlx_array_data_int32(got).?;
-    const ku: usize = @intCast(k);
-    const n: usize = @as(usize, @intCast(rows)) * ku;
-    for (0..n) |i| {
-        if (a[i] != b[i]) {
-            std.debug.print(
-                "[qsa-select] mismatch at row {d} slot {d}: chain {d} kernel {d}\n",
-                .{ i / ku, i % ku, a[i], b[i] },
-            );
-            return error.QsaSelectMismatch;
-        }
-    }
-}
-
 test "qsaVisibleBoundsHost: the first NOT-fully-visible block per row" {
     // Pure arithmetic, no GPU: block b is complete at cache position
     // b*ratio + ratio - 1, so a query at p sees blocks [0, (p+1)/ratio).
@@ -43551,19 +43526,80 @@ test "qsaVisibleBoundsHost: the first NOT-fully-visible block per row" {
     try testing.expectEqualSlices(i32, &[_]i32{ 24, 24, 24, 24, 24, 24 }, &out);
 }
 
-test "qsa select kernel: the fused radix-select emits the argpartition chain's ids bit for bit" {
-    // (a) The bar is BIT equality of the int32 selections, across the nb the
-    // arch really reaches (700 .. 262144 = 1M context at ratio 4), the query
-    // widths it really runs at (decode 1, verify 6/15, prefill chunks), and
-    // three visibility regimes: fewer than 512 visible blocks (the INT_MAX
-    // arm), a chunk straddling the budget, and all-visible.
+/// The reference the kernel and the chain are BOTH measured against: per row,
+/// the top-`k` VISIBLE blocks by (score descending, index ascending) — the
+/// order `torch.topk` returns and therefore what the HF reference computes —
+/// emitted ascending with INT_MAX past the row's count.
+fn qsaExactTopHost(alloc: std.mem.Allocator, scores: []const f32, rows: c_int, nb: c_int, bounds: []const i32, k: c_int) ![]i32 {
+    const nbu: usize = @intCast(nb);
+    const ku: usize = @intCast(k);
+    const out = try alloc.alloc(i32, @as(usize, @intCast(rows)) * ku);
+    errdefer alloc.free(out);
+    const Cand = struct { v: f32, i: i32 };
+    const cand = try alloc.alloc(Cand, nbu);
+    defer alloc.free(cand);
+    const pick = try alloc.alloc(i32, ku);
+    defer alloc.free(pick);
+    const Lt = struct {
+        fn lt(_: void, a: Cand, b: Cand) bool {
+            if (a.v != b.v) return a.v > b.v;
+            return a.i < b.i;
+        }
+    };
+    for (0..@intCast(rows)) |r| {
+        const vb: usize = @intCast(@max(bounds[r], 0));
+        for (0..vb) |i| cand[i] = .{ .v = scores[r * nbu + i], .i = @intCast(i) };
+        std.sort.pdq(Cand, cand[0..vb], {}, Lt.lt);
+        const take = @min(vb, ku);
+        for (0..take) |i| pick[i] = cand[i].i;
+        std.sort.pdq(i32, pick[0..take], {}, std.sort.asc(i32));
+        for (0..take) |i| out[r * ku + i] = pick[i];
+        for (take..ku) |i| out[r * ku + i] = std.math.maxInt(i32);
+    }
+    return out;
+}
+
+/// Bit-equality of an int32 `[1, rows, k]` selection against a host reference.
+fn qsaExpectMatchesHost(got: mlx.mlx_array, want: []const i32, rows: c_int, k: c_int, who: []const u8) !void {
+    const gs = mlx.getShape(got);
+    try testing.expectEqual(@as(usize, 3), gs.len);
+    try testing.expectEqual(@as(c_int, 1), gs[0]);
+    try testing.expectEqual(rows, gs[1]);
+    try testing.expectEqual(k, gs[2]);
+    try testing.expectEqual(mlx.mlx_dtype.int32, mlx.mlx_array_dtype(got));
+    try mlx.check(mlx.mlx_array_eval(got));
+    const b = mlx.mlx_array_data_int32(got).?;
+    const ku: usize = @intCast(k);
+    for (want, 0..) |w, i| {
+        if (w != b[i]) {
+            std.debug.print(
+                "[qsa-select] {s} differs from the exact reference at row {d} slot {d}: reference {d} got {d}\n",
+                .{ who, i / ku, i % ku, w, b[i] },
+            );
+            return error.QsaSelectMismatch;
+        }
+    }
+}
+
+test "qsa select kernel: the fused radix-select IS the exact top-k, and so is the chain where its bias can resolve" {
+    // (a) The bar is BIT equality against `qsaExactTopHost` — (score desc,
+    // index asc), the order torch.topk returns — across the nb the arch really
+    // reaches (700 .. 262144 = 1M context at ratio 4), the query widths it
+    // really runs at (decode 1, verify 6/15, prefill chunks) and three
+    // visibility regimes: fewer than 512 visible blocks (the INT_MAX arm), a
+    // chunk straddling the budget, and all-visible.
     //
-    // Scores sit on a COARSE integer grid on purpose. Distinct values are
-    // >= 1.0 apart — far outside the composed arm's `nb * 1e-7` tie bias,
-    // which spans 0.026 at nb = 262144 — so the only ties are EXACT ties,
-    // where the bias rule and the kernel's exact (score desc, index asc) rule
-    // agree by construction. Where they do NOT agree the kernel is the
-    // reference-correct arm; the next test pins that separately.
+    // Scores are a 9-level grid of EXACT binary fractions k/16 in [0, 0.5],
+    // plus a third forced exact zeros. Two properties make this the regime
+    // where the shipping chain is also exact, so both arms can be held to the
+    // same bar: the level step 0.0625 is far above the chain's whole tie bias
+    // (nb * 1e-7 = 0.026 at the widest nb), so the bias can never reorder
+    // DISTINCT values; and at |score| <= 0.5 the f32 ulp (5.96e-8) is below
+    // the bias step 1e-7, so the bias still separates ADJACENT indices on a
+    // tie. Nine levels over 262144 blocks means the threshold level holds tens
+    // of thousands of ties and the tie rule decides most of the row — which is
+    // the whole point. Where the chain's bias CANNOT resolve, it is not a
+    // reference at all: the next test pins that.
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const ta = testing.allocator;
@@ -43596,12 +43632,10 @@ test "qsa select kernel: the fused radix-select emits the argpartition chain's i
         const rowsu: usize = @intCast(c.rows);
         const buf = try ta.alloc(f32, rowsu * nbu);
         defer ta.free(buf);
-        // A third of the sheet is EXACT zero — what relu leaves, and the case
-        // the tie rule exists for.
         for (buf) |*v| v.* = if (rnd.uintLessThan(u8, 3) == 0)
             0.0
         else
-            @floatFromInt(rnd.uintLessThan(u32, 1000));
+            @as(f32, @floatFromInt(rnd.uintLessThan(u32, 9))) / 16.0;
         const sc_shape = [_]c_int{ 1, c.rows, c.nb };
         const scores = mlx.mlx_array_new_data(buf.ptr, &sc_shape, 3, .float32);
         defer _ = mlx.mlx_array_free(scores);
@@ -43609,6 +43643,17 @@ test "qsa select kernel: the fused radix-select emits the argpartition chain's i
         const row0s = [_]c_int{ 0, 2044, 2000, c.nb * ratio };
         for (row0s) |row0| {
             const all_vis = qsaAllBlocksVisible(row0, c.nb, ratio);
+            const bounds_host = try ta.alloc(i32, rowsu);
+            defer ta.free(bounds_host);
+            qsaVisibleBoundsHost(bounds_host, row0, c.rows, c.nb, ratio, all_vis);
+            const want = try qsaExactTopHost(ta, buf, c.rows, c.nb, bounds_host, k);
+            defer ta.free(want);
+
+            const bounds = mlx.mlx_array_new_data(bounds_host.ptr, &[_]c_int{c.rows}, 1, .int32);
+            defer _ = mlx.mlx_array_free(bounds);
+            const got = (try qsaSelectTopBlocks(s, scores, bounds, k)) orelse return error.SelectKernelDeclined;
+            defer _ = mlx.mlx_array_free(got);
+
             var vis3 = mlx.mlx_array{ .ctx = null };
             defer if (vis3.ctx != null) {
                 _ = mlx.mlx_array_free(vis3);
@@ -43616,22 +43661,133 @@ test "qsa select kernel: the fused radix-select emits the argpartition chain's i
             if (!all_vis) vis3 = try qsaVisSheetForTest(s, row0, c.rows, c.nb, ratio);
             const bias = try qsaTieBiasForTest(s, c.nb);
             defer _ = mlx.mlx_array_free(bias);
-            const want = try qsaSelectComposedOps(s, scores, vis3, bias, c.rows, c.nb, k, k, all_vis);
-            defer _ = mlx.mlx_array_free(want);
+            const chain = try qsaSelectComposedOps(s, scores, vis3, bias, c.rows, c.nb, k, k, all_vis);
+            defer _ = mlx.mlx_array_free(chain);
 
-            const bounds_host = try ta.alloc(i32, rowsu);
-            defer ta.free(bounds_host);
-            qsaVisibleBoundsHost(bounds_host, row0, c.rows, c.nb, ratio, all_vis);
-            const bounds = mlx.mlx_array_new_data(bounds_host.ptr, &[_]c_int{c.rows}, 1, .int32);
-            defer _ = mlx.mlx_array_free(bounds);
-            const got = (try qsaSelectTopBlocks(s, scores, bounds, k)) orelse return error.SelectKernelDeclined;
-            defer _ = mlx.mlx_array_free(got);
-
-            qsaExpectSameIds(want, got, c.rows, k) catch |e| {
+            qsaExpectMatchesHost(got, want, c.rows, k, "the fused kernel") catch |e| {
+                std.debug.print("[qsa-select] case nb={d} rows={d} row0={d} all_vis={}\n", .{ c.nb, c.rows, row0, all_vis });
+                return e;
+            };
+            qsaExpectMatchesHost(chain, want, c.rows, k, "the composed chain") catch |e| {
                 std.debug.print("[qsa-select] case nb={d} rows={d} row0={d} all_vis={}\n", .{ c.nb, c.rows, row0, all_vis });
                 return e;
             };
         }
+    }
+}
+
+test "qsa select kernel: past the bias's f32 resolution the chain's tie rule is UNSPECIFIED and the kernel's is not" {
+    // The shipping chain reproduces torch.topk's lower-index-wins by
+    // subtracting `b * 1e-7` before argpartition. That works only while the
+    // bias survives ROUNDING: at score v one f32 ulp is v * 2^-23, so the
+    // 1e-7 step between adjacent blocks vanishes above |v| ~= 0.84 and the tie
+    // falls back to argpartition's internal order — which is arbitrary, not
+    // reliably wrong, so this test pins the CAUSE (exact f32 arithmetic) and
+    // the kernel's answer, never a particular argpartition outcome.
+    //
+    // Live at nb = 2048, score 625: adjacent blocks 1369/1370 biased to the
+    // same f32 and the chain returned 1370 over 1369.
+    //
+    // A relu sum over four indexer heads is nowhere near 0.84, so this is the
+    // PRODUCTION regime. It is why the parity test above can hold the chain to
+    // the exact reference only on its small-magnitude grid, and why the kernel
+    // — which never rounds a tie away — is the reference-correct arm.
+    const eps: f32 = 1e-7;
+    // Count the DISTINCT biased values the chain can actually see across a
+    // 2048-block row. At production magnitude the whole tie bias collapses
+    // into 4 of them (~512 blocks share each), so the chain's "lower index
+    // wins" is a coin flip inside every one of those groups; at |v| <= 0.5
+    // every block is separated and the rule holds. Pure f32 arithmetic — no
+    // GPU, no argpartition, no seed.
+    const Distinct = struct {
+        fn count(v: f32, n: u32) usize {
+            var seen: usize = 0;
+            var prev: f32 = 0;
+            var b: u32 = 0;
+            while (b < n) : (b += 1) {
+                const cur = v - @as(f32, @floatFromInt(b)) * eps;
+                if (b == 0 or cur != prev) seen += 1;
+                prev = cur;
+            }
+            return seen;
+        }
+    };
+    try testing.expectEqual(@as(usize, 4), Distinct.count(625.0, 2048));
+    try testing.expectEqual(@as(usize, 2048), Distinct.count(0.5, 2048));
+    // The live case: adjacent blocks 1369/1370 biased to the same f32.
+    const big: f32 = 625.0;
+    try testing.expectEqual(big - 1369 * eps, big - 1370 * eps);
+
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const ta = testing.allocator;
+    const ratio: c_int = 4;
+    const nb: c_int = 2048;
+    const k: c_int = 512;
+    const rows: c_int = 16;
+
+    const nbu: usize = @intCast(nb);
+    const buf = try ta.alloc(f32, @as(usize, @intCast(rows)) * nbu);
+    defer ta.free(buf);
+    var prng = std.Random.DefaultPrng.init(0x9A50_C711);
+    const rnd = prng.random();
+    for (buf) |*v| v.* = if (rnd.uintLessThan(u8, 3) == 0)
+        0.0
+    else
+        @floatFromInt(rnd.uintLessThan(u32, 1000));
+
+    const sc_shape = [_]c_int{ 1, rows, nb };
+    const scores = mlx.mlx_array_new_data(buf.ptr, &sc_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(scores);
+    const row0: c_int = nb * ratio;
+    try testing.expect(qsaAllBlocksVisible(row0, nb, ratio));
+
+    const bounds_host = try ta.alloc(i32, @intCast(rows));
+    defer ta.free(bounds_host);
+    @memset(bounds_host, nb);
+    const want = try qsaExactTopHost(ta, buf, rows, nb, bounds_host, k);
+    defer ta.free(want);
+    const bounds = mlx.mlx_array_new_data(bounds_host.ptr, &[_]c_int{rows}, 1, .int32);
+    defer _ = mlx.mlx_array_free(bounds);
+
+    // The kernel is the reference AT PRODUCTION MAGNITUDE — the property the
+    // chain cannot offer here.
+    const got = (try qsaSelectTopBlocks(s, scores, bounds, k)) orelse return error.SelectKernelDeclined;
+    defer _ = mlx.mlx_array_free(got);
+    try qsaExpectMatchesHost(got, want, rows, k, "the fused kernel");
+
+    // Whatever the chain returns here, it may only ever be wrong ABOUT A TIE.
+    // The bar is the selected SCORE multiset per row: a selection that swaps
+    // tied blocks keeps it, one that takes a genuinely different block does
+    // not. (Comparing ids slot by slot would be nonsense — one differing pick
+    // shifts every later slot of an ascending id list.) Zero differences is a
+    // legal outcome: argpartition's tie order is unspecified, not reliably
+    // wrong.
+    const none = mlx.mlx_array{ .ctx = null };
+    const bias = try qsaTieBiasForTest(s, nb);
+    defer _ = mlx.mlx_array_free(bias);
+    const chain = try qsaSelectComposedOps(s, scores, none, bias, rows, nb, k, k, true);
+    defer _ = mlx.mlx_array_free(chain);
+    try mlx.check(mlx.mlx_array_eval(chain));
+    const ch = mlx.mlx_array_data_int32(chain).?;
+    const ku: usize = @intCast(k);
+    const sw = try ta.alloc(f32, ku);
+    defer ta.free(sw);
+    const sc = try ta.alloc(f32, ku);
+    defer ta.free(sc);
+    var diffs: usize = 0;
+    for (0..@intCast(rows)) |r| {
+        for (0..ku) |i| {
+            sw[i] = buf[r * nbu + @as(usize, @intCast(want[r * ku + i]))];
+            sc[i] = buf[r * nbu + @as(usize, @intCast(ch[r * ku + i]))];
+            if (want[r * ku + i] != ch[r * ku + i]) diffs += 1;
+        }
+        std.sort.pdq(f32, sw, {}, std.sort.asc(f32));
+        std.sort.pdq(f32, sc, {}, std.sort.asc(f32));
+        try testing.expectEqualSlices(f32, sw, sc);
+    }
+    if (diffs > 0) {
+        std.debug.print("[qsa-select] the chain differs from the exact rule in {d}/{d} slots at production magnitude (tied blocks only)\n", .{ diffs, want.len });
     }
 }
 
