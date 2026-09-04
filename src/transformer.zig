@@ -3679,10 +3679,17 @@ pub fn qsaAttnKernelEnabled() bool {
 
 /// The config bakes the output shape and the grid, so it is keyed on the FULL
 /// q shape plus every value that changes the launch or the specialization.
+/// Keyed on everything the CONFIG depends on, and nothing else.
+///
+/// `kv` and `kb` are deliberately NOT here. Nothing in the config reads them:
+/// the output shape is (B, Hq, S, 256), the grid is (S, Hk, B), and the
+/// templates are T/NSG/BK/RATIO/BITS/GS — the kernel already takes `kL` from
+/// `kq_shape[2]` and `KB` from `blocks_shape[2]` at RUNTIME, as its own
+/// conventions scan requires. Because `kv` grows by one every decode round,
+/// carrying it here made this single-slot cache MISS on every round of a
+/// served request and rebuild a byte-identical config.
 const QsaAttnCfgKey = struct {
     q_shape: ShapeKey,
-    kb: c_int,
-    kv: c_int,
     bits: u8,
     gs: u32,
     nsg: c_int,
@@ -3725,7 +3732,9 @@ pub fn qsaSparseAttn(
     if (mlx.mlx_array_dtype(blocks) != .int32) return null;
     const bs = mlx.getShape(blocks);
     if (bs[0] != 1 or bs[1] != seq_len or bs[2] <= 0) return null;
-    const kb = bs[2];
+    // `kb` rides `blocks_shape[2]` into the kernel; nothing on the host needs
+    // it now that the config key is kv/kb-independent.
+    _ = bs[2];
     if (ratio <= 0) return null;
 
     // Dense cache: the prefill kernel already IS this kernel's dense arm.
@@ -3778,8 +3787,6 @@ pub fn qsaSparseAttn(
 
     const key = QsaAttnCfgKey{
         .q_shape = ShapeKey.from(qs),
-        .kb = kb,
-        .kv = kv,
         .bits = kv_view.bits,
         .gs = kv_view.group_size,
         .nsg = nsg,
@@ -39389,10 +39396,19 @@ test "qsa sparse attn: the width gate, the kill switch and the quant preconditio
     }
 }
 
-test "qsa sparse attn: the config is cached per FULL shape and rebuilt when S, kv or kb change" {
-    // (b) One slot keyed on the full q shape plus everything that changes the
-    // launch. A key that dropped kv or kb would hand a later caller a config
-    // whose grid and output shape belong to the first (the ShapeKey rule).
+test "qsa sparse attn: the config key is kv- and kb-INDEPENDENT (one build per width)" {
+    // REVERSES the assertion this test shipped with. It previously required a
+    // rebuild when kv or kb changed, on the reasoning that a value invisible
+    // in the q shape must be in the key. That reasoning is right in general
+    // and wrong here: nothing in the config READS kv or kb. The output shape
+    // is (B, Hq, S, 256), the grid is (S, Hk, B), and the templates are
+    // T/NSG/BK/RATIO/BITS/GS — the kernel takes `kL` from `kq_shape[2]` and
+    // `KB` from `blocks_shape[2]` at runtime.
+    //
+    // kv grows by one every decode round, so the old key made this
+    // single-slot cache miss on every round of a served request and rebuild a
+    // byte-identical config. That is the behaviour under test now: same width,
+    // any kv, any kb => exactly one build.
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const ta = std.testing.allocator;
@@ -39429,16 +39445,23 @@ test "qsa sparse attn: the config is cached per FULL shape and rebuilt when S, k
     // Same shape three more times: the cached config serves all of them.
     for (0..3) |_| try Run.once(s, ta, rnd, 6, 4096, 64);
     try std.testing.expectEqual(base + 1, qsa_attn_cfg_builds);
-    // A new width is a new grid AND a new output shape.
+    // A GROWING kv at a fixed width IS the served decode round. This is the
+    // regression: every one of these used to be a rebuild.
+    try Run.once(s, ta, rnd, 6, 8192, 64);
+    try Run.once(s, ta, rnd, 6, 12288, 64);
+    try Run.once(s, ta, rnd, 6, 20000, 64);
+    try std.testing.expectEqual(base + 1, qsa_attn_cfg_builds);
+    // A new kb is likewise a runtime shape, not a config input.
+    try Run.once(s, ta, rnd, 6, 20000, 128);
+    try std.testing.expectEqual(base + 1, qsa_attn_cfg_builds);
+    // A new width IS a new grid and a new output shape.
     try Run.once(s, ta, rnd, 7, 4096, 64);
     try std.testing.expectEqual(base + 2, qsa_attn_cfg_builds);
-    // Same width, new kv: the q shape is unchanged, so a key that carried
-    // only the q shape would wrongly reuse the previous config.
-    try Run.once(s, ta, rnd, 7, 8192, 64);
+    // ...and returning to a width already built is still one more build,
+    // because this is a single slot, not a map. Deliberate: a served request
+    // holds one width for a whole round.
+    try Run.once(s, ta, rnd, 6, 4096, 64);
     try std.testing.expectEqual(base + 3, qsa_attn_cfg_builds);
-    // Same width and kv, new kb: likewise invisible in the q shape.
-    try Run.once(s, ta, rnd, 7, 8192, 128);
-    try std.testing.expectEqual(base + 4, qsa_attn_cfg_builds);
 }
 
 test "the fused QSA sparse attention ships a kill switch, a GPU-stream guard, a one-shot engaged log and no per-token template" {
@@ -39461,10 +39484,12 @@ test "the fused QSA sparse attention ships a kill switch, a GPU-stream guard, a 
     try std.testing.expect(std.mem.indexOf(u8, src, "template_arg_int(config, \"" ++ "SEQ\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, src, "template_arg_int(config, \"" ++ "KB\"") == null);
 
-    // The config key carries the FULL q shape, never a derived product.
+    // The config key carries the FULL q shape, never a derived product, and
+    // carries NOTHING the config does not read. kv and kb are runtime shapes:
+    // keeping them here rebuilt an identical config every decode round.
     try std.testing.expect(@TypeOf(@as(QsaAttnCfgKey, undefined).q_shape) == ShapeKey);
-    try std.testing.expect(@hasField(QsaAttnCfgKey, "kv"));
-    try std.testing.expect(@hasField(QsaAttnCfgKey, "kb"));
+    try std.testing.expect(!@hasField(QsaAttnCfgKey, "kv"));
+    try std.testing.expect(!@hasField(QsaAttnCfgKey, "kb"));
 
     // Staged tile stays at the agreed depth: BD * (BK+8) T = 12 KiB at BK 16.
     try std.testing.expectEqual(@as(c_int, 16), QSA_ATTN_BK);
