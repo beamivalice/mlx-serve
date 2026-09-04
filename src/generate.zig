@@ -1469,7 +1469,7 @@ pub const Generator = struct {
             else
                 0.0;
             log.info(
-                "  [spec-stats] mode=mtp attempts={d} accepts={d} avg_per_round={d:.2} per_draft_pct={d:.1}% depth={d} drafted={d} ext_rounds={d} runtime_disabled={s} reason={s} adaptive={s} serial_cell={d:.2} sync_ms={d:.2} round_ms={d:.2} two_ms_tok={d:.2} one_ms_tok={d:.2} verdict_round={d} trials={d} width_trials={d} table={s}:{s} table_drops=t{d}/c{d}/b{d}\n",
+                "  [spec-stats] mode=mtp attempts={d} accepts={d} avg_per_round={d:.2} per_draft_pct={d:.1}% depth={d} drafted={d} ext_rounds={d} runtime_disabled={s} reason={s} adaptive={s} serial_cell={d:.2} sync_ms={d:.2} round_ms={d:.2} two_ms_tok={d:.2} one_ms_tok={d:.2} verdict_round={d} trials={d} width_trials={d} table={s}:{s} table_drops=t{d}/c{d}/b{d} serial_drops=t{d}/c{d}/b{d}\n",
                 .{
                     self.mtp_attempted,
                     self.mtp_accepted_tokens,
@@ -1494,6 +1494,9 @@ pub const Generator = struct {
                     self.xfm.round_cost.dropped_transition,
                     self.xfm.round_cost.dropped_contended,
                     self.xfm.round_cost.dropped_bad,
+                    self.xfm.round_cost.serial_dropped_transition,
+                    self.xfm.round_cost.serial_dropped_contended,
+                    self.xfm.round_cost.serial_dropped_bad,
                 },
             );
             return;
@@ -5202,7 +5205,31 @@ pub const Generator = struct {
     /// — the GPU still holds the previous round's tail — and contention only
     /// ever ADDS time, so a busy server restarts the clock rather than
     /// teaching the table a lie.
+    /// Will ANYONE read a serial cell for this model? The cell exists for
+    /// exactly one consumer, the adaptive switch, so folding one anywhere
+    /// else is pure cost: `observeSerialTick` sits on the scheduler's regular
+    /// decode path, which every model takes, so gemma3, llama, a GGUF and any
+    /// `--no-mtp` boot were all folding a serial cell on every token and
+    /// rewriting `~/.mlx-serve/round-cost/<key>.txt` at the end of every
+    /// request for a table nothing would ever read.
+    ///
+    /// The gate is on the MODEL, not the request: `enable_mtp:false` against a
+    /// checkpoint that HAS a head is the cleanest source of serial data there
+    /// is, and it must keep feeding the cell. Known gap: a request that opted
+    /// out of a SIDECAR head has neither `self.mtp` nor `xfm.qwen4_mtp`, so it
+    /// does not fold — conservative, and never wrong.
+    pub fn serialCellWanted(self: *const Generator) bool {
+        if (!mtpAdaptiveSerialEnabled() or !mtpCostTableEnabled()) return false;
+        if (self.mtp == null and self.xfm.qwen4_mtp == null) return false;
+        return mtpAdaptiveKvEligible(self.mtpKvLen(), mtpAdaptiveMinKv());
+    }
+
     pub fn observeSerialTick(self: *Generator) void {
+        if (!self.serialCellWanted()) {
+            self.mtp_serial_clock = null;
+            self.mtp_serial_warm = 0;
+            return;
+        }
         if (!self.spec_cost_solo) {
             self.mtp_serial_clock = null;
             self.mtp_serial_warm = 0;
@@ -6546,9 +6573,12 @@ pub const Generator = struct {
     /// new samples (request end; inference thread, so no lock).
     pub fn persistRoundCost(self: *Generator) void {
         const t = &self.xfm.round_cost;
-        if (t.folded == t.stored_at) return;
+        // BOTH clocks: a boot that only learned serial cells still persists
+        // them, and a boot that learned nothing writes nothing.
+        const folded = round_cost.totalFolded(t);
+        if (folded == t.stored_at) return;
         round_cost.storeCached(self.timer.io, self.xfm.round_cost_key_buf[0..self.xfm.round_cost_key_len], t);
-        t.stored_at = t.folded;
+        t.stored_at = folded;
     }
 
     /// Round-cost table kill switch — MLX_SERVE_MTP_COST_TABLE=0 keeps the

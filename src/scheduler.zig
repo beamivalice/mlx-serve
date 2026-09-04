@@ -5971,10 +5971,13 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
     }
 
     // Regular path. This is also where a request that never armed MTP
-    // (`enable_mtp:false`, `--no-mtp`, a non-MTP model) teaches the round-cost
-    // table what a plain serial token costs at this context — the one number
-    // the width planner could never see. `observeSerialTick` owns every drop
-    // rule (contention, block warmup), so the call is unconditional.
+    // (`enable_mtp:false` on a checkpoint that HAS a head) teaches the
+    // round-cost table what a plain serial token costs at this context — the
+    // one number the width planner could never see. The call is unconditional
+    // here but `observeSerialTick` is NOT: it owns every drop rule (contention,
+    // block warmup) AND `serialCellWanted`, which keeps models with no MTP
+    // head from folding a cell nothing will read and rewriting the persisted
+    // table on every request.
     const tok_opt = try gen.next(slot.allocator);
     if (tok_opt == null) {
         finishSlot(sch, slot, gen.finish_reason);

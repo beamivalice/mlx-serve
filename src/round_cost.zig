@@ -128,6 +128,16 @@ pub const Table = struct {
     dropped_transition: u32 = 0,
     dropped_contended: u32 = 0,
     dropped_bad: u32 = 0,
+    /// The serial row's OWN fold/drop counters. It cannot share the width
+    /// grid's: a width sample is a ROUND and a serial sample is a TOKEN, and
+    /// a mixed workload runs thousands of the latter per hundred of the
+    /// former. Sharing made `[spec-stats] table_drops` unreadable (two clocks
+    /// summed into one number) and made the persistence trigger fire on plain
+    /// decode traffic that had taught the width grid nothing.
+    serial_folded: u32 = 0,
+    serial_dropped_transition: u32 = 0,
+    serial_dropped_contended: u32 = 0,
+    serial_dropped_bad: u32 = 0,
     /// One-shot: the first plan that read the table instead of the prior.
     first_use_logged: bool = false,
     /// `folded` at the last store (persistence writes only when it moved).
@@ -181,6 +191,7 @@ pub const Table = struct {
             self.dropped_transition += 1;
             return .transition;
         }
+        self.folded += 1;
         return self.foldInto(&self.cells[width][bucketFor(kv_len)], ms, tokens, self.seq);
     }
 
@@ -192,22 +203,22 @@ pub const Table = struct {
     pub fn observeSerial(self: *Table, kv_len: u32, ms: f32, solo: bool, transition: bool) Verdict {
         self.serial_seq +%= 1;
         if (!std.math.isFinite(ms) or ms <= 0) {
-            self.dropped_bad += 1;
+            self.serial_dropped_bad += 1;
             return .bad_sample;
         }
         if (!solo) {
-            self.dropped_contended += 1;
+            self.serial_dropped_contended += 1;
             return .contended;
         }
         if (transition) {
-            self.dropped_transition += 1;
+            self.serial_dropped_transition += 1;
             return .transition;
         }
+        self.serial_folded += 1;
         return self.foldInto(&self.serial[bucketFor(kv_len)], ms, 1.0, self.serial_seq);
     }
 
     fn foldInto(self: *Table, cell: *Cell, ms: f32, tokens: f32, clock: u32) Verdict {
-        self.folded += 1;
         defer cell.last_seen = clock;
         if (cell.n == 0) {
             cell.ms = ms;
@@ -630,6 +641,13 @@ pub const WidthChooser = struct {
 /// cost of the bump is one re-explore per (chip, model, quant, OS build).
 pub const STORE_VERSION: u32 = 3;
 
+/// Samples folded into EITHER row. The persistence trigger reads this, so a
+/// boot that only ever learned serial cells still writes them, while the two
+/// counters stay separate for reporting.
+pub fn totalFolded(t: *const Table) u32 {
+    return t.folded +% t.serial_folded;
+}
+
 pub fn persistEnabled() bool {
     const raw = std.c.getenv("MLX_SERVE_ROUND_COST_PERSIST") orelse return true;
     return !std.mem.eql(u8, std.mem.span(raw), "0");
@@ -950,6 +968,42 @@ test "round_cost: persistence round-trips folded cells, marks them stale, reject
     // The version rides the KEY as well as the body, so a v3 build does not
     // even open the v2 file — the persisted-table key semantics are unchanged.
     try testing.expect(std.mem.startsWith(u8, cacheKey(&kb, "M4", "/m", "q4g64", "26.4"), "rc3-"));
+}
+
+test "round_cost: the serial row keeps its OWN fold and drop counters (M19)" {
+    var t = Table{};
+    // A width sample is a ROUND, a serial sample is a TOKEN. Sharing the
+    // counters made `table_drops` two clocks summed into one number, and made
+    // the persistence trigger fire on plain decode traffic that had taught the
+    // width grid nothing.
+    _ = t.observe(4, 1000, 50.0, 4.0, true, false);
+    try testing.expectEqual(@as(u32, 1), t.folded);
+    try testing.expectEqual(@as(u32, 0), t.serial_folded);
+
+    _ = t.observeSerial(1000, 16.0, true, false);
+    _ = t.observeSerial(1000, 16.0, true, false);
+    try testing.expectEqual(@as(u32, 1), t.folded); // width clock did not move
+    try testing.expectEqual(@as(u32, 2), t.serial_folded);
+
+    // Drops are separate too, per row.
+    _ = t.observe(4, 1000, 50.0, 4.0, false, false); // contended round
+    _ = t.observeSerial(1000, 16.0, false, false); // contended tick
+    _ = t.observeSerial(1000, 0.0, true, false); // bad tick
+    _ = t.observeSerial(1000, 16.0, true, true); // transition tick
+    try testing.expectEqual(@as(u32, 1), t.dropped_contended);
+    try testing.expectEqual(@as(u32, 0), t.dropped_bad);
+    try testing.expectEqual(@as(u32, 0), t.dropped_transition);
+    try testing.expectEqual(@as(u32, 1), t.serial_dropped_contended);
+    try testing.expectEqual(@as(u32, 1), t.serial_dropped_bad);
+    try testing.expectEqual(@as(u32, 1), t.serial_dropped_transition);
+
+    // The persistence trigger reads BOTH, so a boot that only learned serial
+    // cells still writes them.
+    try testing.expectEqual(@as(u32, 3), totalFolded(&t));
+    var only_serial = Table{};
+    try testing.expectEqual(@as(u32, 0), totalFolded(&only_serial));
+    _ = only_serial.observeSerial(1000, 16.0, true, false);
+    try testing.expectEqual(@as(u32, 1), totalFolded(&only_serial));
 }
 
 test "round_cost: the serial row folds, trusts at MIN_SAMPLES and round-trips beside the widths" {
