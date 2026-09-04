@@ -44287,6 +44287,8 @@ test "the fused QSA select ships a kill switch, a GPU-stream guard, a one-shot e
     // Threadgroup memory is an OCCUPANCY decision: the histogram is 2048
     // uints (8 KiB) and the whole kernel must stay under ~10 KiB.
     try testing.expect(std.mem.indexOf(u8, QSA_SELECT_KERNEL_SOURCE, "BINS  = 2048u") != null);
+}
+
 test "a reserved KV cache grows ONCE: no old+new buffer coexists during a long prefill" {
     const t = std.testing;
     // Issue #353. `growQuantBuf` allocates the whole new capacity and

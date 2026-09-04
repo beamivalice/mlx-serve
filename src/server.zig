@@ -18954,6 +18954,8 @@ test "every request surface runs the --max-mtp-ctx admission gate" {
     try std.testing.expect(std.mem.indexOf(u8, main_src, "\"--max-mtp" ++ "-ctx\"") != null);
     // ... and in --help, which is the flag list users read.
     try std.testing.expect(std.mem.indexOf(u8, main_src, "--max-mtp" ++ "-ctx <n>") != null);
+}
+
 test "an MLX failure is a named memory 503, and main installs the latch that makes one possible" {
     const t = std.testing;
     // Class guard for issue #353: mlx-c's DEFAULT error handler calls
