@@ -1680,3 +1680,94 @@ contract.
 Guards: `tests/test_json_schema_thinking.sh` (all three surfaces + stream arm
 + mask-engagement count) and the server.zig source scan pairing every
 `[grammar] enforcing` site with a gate call.
+
+## A 458k prefill killed the server, and the fatal part was mlx-c's default error handler (#353, 2026-09-03)
+
+**Symptom.** Apple M5 Max 128 GB, Qwen3.8-Flash-Next `mixed-4-8bit`, main at
+`fa960f1`, `--ctx-size 1048576 --kv-quant 8 --mtp --mtp-depth 5
+--prefix-cache-entries 4 --prefix-cache-mem 24GB`. A cold prefill of 458,832
+tokens passed the memory preflight (billed ~18.1 GB against 26.6 GB
+available) and then the PROCESS died mid-prefill with
+
+    Command buffer execution failed: Insufficient Memory
+    (kIOGPUCommandBufferCallbackErrorOutOfMemory) at transforms.cpp:15
+
+No 503, no connection close, every other in-flight request gone. The rung
+before it — 393k, cold — had completed at `peak_bytes` 103.0 GB under a
+103.4 GB ceiling, and its own 6478 MB hot-cache entry was resident when the
+458k request was admitted.
+
+**It was filed as an uncatchable Metal abort. It was not.** The tell is the
+suffix: `" at %s:%d"` is appended by mlx-c's own `_mlx_error`
+(`lib/mlxc-src/mlx/c/error.cpp`), and the file it names is
+`mlx/c/transforms.cpp` — `mlx_eval`. So the exception had already been caught
+at the C boundary. Reading the pinned MLX (0.32.2) end to end:
+
+* a failed command buffer's status is stored into `CommandEncoder::error_` by
+  the completion handler and re-thrown from `synchronize()` /
+  `get_command_encoder()` — `mlx/backend/metal/device.cpp:518-579`;
+* an exception raised on a stream thread is captured into
+  `StreamThread::error` and re-thrown on the main thread at the next enqueue
+  — `mlx/scheduler.cpp:77-79, 99-112`;
+* every mlx-c entry point is
+  `try { … } catch (std::exception& e) { mlx_error(e.what()); return 1; }`.
+
+What killed the server is the handler nobody had replaced:
+
+    static void mlx_error_handler_default_(const char* msg, void* data) {
+      printf("MLX error: %s\n", msg);
+      exit(-1);
+    }
+
+`mlx.installErrorHandler` (once, from `main()`, beside `applyMlxCacheLimit`)
+latches the message and returns; `mlx.checkError()` turns the latch into
+`error.OutOfMemory` (memory class, by message) or `error.MlxFailure`, checked
+once per prefill chunk. MLX clears its own error state as it throws, so the
+next request starts clean. `MLX_SERVE_MLX_ERROR_LATCH=0` restores `exit(-1)`.
+
+**What the guard could not see.** Two terms, both proportional, both billed as
+constants or not at all:
+
+1. *Growth coexistence.* `KVCache.growQuantBuf` allocates the whole new
+   capacity with `mlx_zeros` and slice_updates the old buffer into it; the QSA
+   indexer history is a `mlx_concatenate_axis(old, new)` per chunk per
+   full-attention layer. Both leave the old buffer live in the chunk's lazy
+   graph. `PREFILL_RUNTIME_FLOOR_BYTES` claims this in its own doc comment and
+   prices it at a flat 512 MB — measured as an intercept on prompts of a few
+   thousand tokens. At 458,832 it is ~7.75 GB.
+2. *Retained SSM checkpoints.* 36 GatedDeltaNet layers x (state + conv) =
+   58.8 MB each, up to `--ssm-checkpoint-max` (32) held while the prefill
+   runs: 1.88 GB, billed at zero, and saturated at both 393k and 458k.
+
+**Why the obvious fix was parked.** `parked/admission-guard-rewrite` bills the
+growth copy at the worst chunk. It is correct and it refuses the request that
+died — and it roughly HALVES the maximum admissible context on every arch,
+because the peak is then modelled as two copies of everything the prefill has
+accumulated. Pricing a transient you can delete is the wrong trade.
+
+**What shipped instead.** Remove the transient, then let the cache pay:
+
+* `KVCache.reservedTokens` (prompt + max_tokens + one chunk, only past
+  `RESERVE_MIN_TOKENS` = 32k) is reserved before the first chunk writes, so a
+  long prefill grows its buffers exactly ONCE and nothing coexists. The guard
+  bills that reservation's headroom — tens of megabytes — instead of a second
+  copy of the cache. Short prompts keep the proportional policy untouched;
+  `MLX_SERVE_KV_RESERVE=0` restores it everywhere.
+* `retainedSsmCheckpointBytes` and `statePerTokenBilled` join the estimator,
+  the latter read by the auto-context sizer AND the guard so advertised and
+  admitted contexts cannot diverge. The QSA history is still billed at two
+  copies because it still re-concatenates; `QSA_HISTORY_GROWS_IN_PLACE` is the
+  one flag to flip when the capacity-buffer append lands (longctx-bundle
+  `8ebad7c` does exactly that).
+* `HotPrefixCache.evictLruToAdmit` gives memory back rather than refusing: a
+  cached prefix is an optimization, the request is the work. It runs on the
+  inference thread (sole mlx caller, even for frees) after the prefix restore
+  — which makes the entry in use the most-recently-used one, so LRU reaches it
+  last and `protect_mru` stops before it. The fits predicate is re-asked after
+  every eviction, never compared against a precomputed shortfall (#126).
+  Refusal happens only with an empty cache, and quotes the hot-cache bytes it
+  counted.
+
+**Bar.** The unit tests pin the terms and the single-grow invariant; the live
+bar is a 64k-step ladder 384k → 512k on a 128 GB box: every rung either
+completes or answers a 503, and the process is still serving at the end.
