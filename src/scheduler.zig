@@ -5198,6 +5198,15 @@ fn interleaveDecodeTick(sch: *Scheduler) u64 {
     }
     sch.queue_mu.unlock(sch.io);
     if (n == 0) return 0;
+    // The interval since each of these slots' previous tick contains a PREFILL
+    // CHUNK, not just decode. `spec_cost_solo` is true throughout — this
+    // stream really is the only one decoding — so the serial cell would fold
+    // a chunk's wall time as if it were a token's, and that number is
+    // persisted and then used to decide against speculation for the rest of
+    // the process. Drop the pending interval; the next tick seeds a fresh one.
+    for (buf[0..n]) |s| {
+        if (s.legacy_gen) |*g| g.invalidateSerialClock();
+    }
     var sw = io_util.Stopwatch.init(sch.io);
     runDecodeTick(sch, buf[0..n]) catch |err| {
         log.err("[interleave] decode tick failed: {s}\n", .{@errorName(err)});

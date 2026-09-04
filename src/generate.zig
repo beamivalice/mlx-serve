@@ -5224,6 +5224,20 @@ pub const Generator = struct {
         return mtpAdaptiveKvEligible(self.mtpKvLen(), mtpAdaptiveMinKv());
     }
 
+    /// Throw away the serial cell's PENDING interval: the next read seeds
+    /// instead of measuring. Called when something ran between two decode
+    /// ticks that is not decode — today, a prefill chunk under
+    /// `scheduler.interleaveDecodeTick`, which runs decode ticks from inside
+    /// another request's prefill. `spec_cost_solo` reads true throughout
+    /// (this stream really is the only one DECODING), so without this the
+    /// interval carried a whole prefill chunk into the serial cell, which is
+    /// then persisted and used to decide against MTP for the rest of the
+    /// process.
+    pub fn invalidateSerialClock(self: *Generator) void {
+        self.mtp_serial_clock = null;
+        self.mtp_serial_warm = 0;
+    }
+
     pub fn observeSerialTick(self: *Generator) void {
         if (!self.serialCellWanted()) {
             self.mtp_serial_clock = null;
@@ -14361,6 +14375,18 @@ test "the adaptive decision is read after the EV plan, before the width trial, a
     try testing.expect(std.mem.indexOf(u8, src, "if (!self.serialCell" ++ "Wanted())") != null);
     const sched = @embedFile("scheduler.zig");
     try testing.expect(std.mem.indexOf(u8, sched, "gen.observe" ++ "SerialTick();") != null);
+
+    // M13: an INTERLEAVED decode tick runs from inside another request's
+    // prefill, so the interval since the previous tick contains a prefill
+    // chunk while `spec_cost_solo` still reads true. The pending interval must
+    // be dropped BEFORE the tick runs, or the chunk is folded as a token.
+    const il_at = std.mem.indexOf(u8, sched, "fn interleaveDecode" ++ "Tick(sch: *Scheduler)") orelse
+        return error.MissingInterleave;
+    const inval_at = std.mem.indexOfPos(u8, sched, il_at, "g.invalidateSerial" ++ "Clock()") orelse
+        return error.MissingSerialClockInvalidation;
+    const tick_at = std.mem.indexOfPos(u8, sched, il_at, "runDecode" ++ "Tick(sch, buf[0..n])") orelse
+        return error.MissingRunDecodeTick;
+    try testing.expect(inval_at < tick_at);
 }
 
 test "mtpSerialCaptureReady: the capture step's entry invariant is a RUNTIME check, not an assert" {
