@@ -312,7 +312,9 @@ pub const NgramTable = struct {
         // Read path, so the output is byte-identical either way; the win (or
         // the wake-round loss at small kv) is timing only.
         // QWEN4_PLE_PREFETCH_PREFILL=0 restores the decode-only gate.
-        const wide_ok = row_ids.len <= PrefetchPool.MAX_ROWS or plePrefillPrefetchEnabled();
+        const wide = row_ids.len > PrefetchPool.MAX_ROWS;
+        const wide_ok = !wide or plePrefillPrefetchEnabled();
+        if (wide) notePrefillGatherArm(wide_ok, row_ids.len);
         if (self.pool) |p| if (self.fd >= 0 and need <= PrefetchPool.ROW_BUF and wide_ok) {
             const wl: usize = self.wcols * 4;
             const sl: usize = self.scols * 2;
@@ -447,6 +449,26 @@ fn plePrefetchEnabled() bool {
     const v = raw == null or raw.?[0] != '0';
     S.v = v;
     return v;
+}
+
+/// One-shot per arm: an A/B whose ON side silently fell back to the serial walk
+/// (no pool on this box, a row wider than ROW_BUF) would read as "the lever does
+/// nothing" rather than as a broken arm. Engagement is SAID, never inferred from
+/// timing -- and BOTH arms say something, so the off arm is positively
+/// identified too instead of being asserted by absence. Atomic because the
+/// counters are read by the pool's workers, though the PLE gather itself only
+/// ever runs on the inference thread.
+var ple_prefill_arm_said: [2]std.atomic.Value(bool) = .{ .init(false), .init(false) };
+
+fn notePrefillGatherArm(pooled: bool, rows: usize) void {
+    const slot: usize = if (pooled) 1 else 0;
+    if (ple_prefill_arm_said[slot].swap(true, .monotonic)) return;
+    if (pooled) {
+        const batches = (rows + PrefetchPool.MAX_ROWS - 1) / PrefetchPool.MAX_ROWS;
+        log.info("[qwen4] PLE prefill gather: POOLED ({d} rows, {d} batches of {d}; QWEN4_PLE_PREFETCH_PREFILL=0 restores the serial mmap walk)\n", .{ rows, batches, PrefetchPool.MAX_ROWS });
+    } else {
+        log.info("[qwen4] PLE prefill gather: SERIAL mmap walk ({d} rows; QWEN4_PLE_PREFETCH_PREFILL=0 is set)\n", .{rows});
+    }
 }
 
 /// Test seam for the prefill gate below (the env is read once per process).
