@@ -3064,9 +3064,13 @@ pub const QsaDecline = struct {
     }
 };
 
-/// Per-request tally of which arm served each full-attention call. Three
-/// increments per attention layer; read and reset where the request's
-/// `[mtp-trace]` line is emitted.
+/// Per-request tally of which arm served each full-attention call. One
+/// increment per attention layer; read and reset where the request's
+/// `[qsa-arms]` line is emitted. It lives on the REQUEST's `ForwardCtx`
+/// (the Generator's own), never on the shared Transformer: qwen4 text slots
+/// batch-decode on one Transformer and a cold prefill interleaves with other
+/// slots' decode ticks, so a Transformer-level tally prints the union of
+/// every concurrent slot and leaves the next finisher an empty one.
 pub const QsaArmCounts = struct {
     mask: u32 = 0,
     decode: u32 = 0,
@@ -3081,8 +3085,25 @@ pub const QsaArmCounts = struct {
             .prefill_gather => self.prefill +|= 1,
         }
     }
+    /// A gather served the call: which gather is the query WIDTH's business.
+    pub fn noteGather(self: *QsaArmCounts, seq_len: c_int) void {
+        self.note(switch (qsaWidthBucket(seq_len)) {
+            0 => .decode_gather,
+            1 => .verify_gather,
+            else => .prefill_gather,
+        });
+    }
     pub fn total(self: QsaArmCounts) u32 {
         return self.mask +| self.decode +| self.verify +| self.prefill;
+    }
+    /// Read and clear this request's tally. Null when nothing was counted
+    /// (not a QSA arch, or below the sparse budget) so a caller never prints
+    /// a meaningless `qsa=mask 0/0`.
+    pub fn take(self: *QsaArmCounts) ?QsaArmCounts {
+        const c = self.*;
+        self.reset();
+        if (c.total() == 0) return null;
+        return c;
     }
     /// The arm that served the most calls; null when nothing was counted.
     /// Ties break toward the CHEAPEST arm that could have run so a tie never
@@ -3109,6 +3130,13 @@ pub const QsaArmCounts = struct {
         self.* = .{};
     }
 };
+
+/// One batched call serves every slot in the group with the SAME arm (the
+/// stacked-mask SDPA), so it counts once on each participating slot's own
+/// tally — a single shared counter would report the group as one request.
+fn noteQsaArmForSlots(slots: []const *ForwardCtx, arm: QsaArm) void {
+    for (slots) |slot_ctx| slot_ctx.qsa_arms.note(arm);
+}
 
 /// Engagement meters, one-shot per (arm, width bucket): bit = arm*4 + bucket.
 var qsa_engaged_bits: OneShotBits = .{};
@@ -6757,6 +6785,17 @@ pub const ForwardCtx = struct {
     /// (prefill), `qsaVerifyGatherAttn` (S = 2..15) and `qsaDecodeGatherAttn`
     /// (S == 1); set INSTEAD of `qsa_mask`. Null-ctx = not selected.
     qsa_blocks: mlx.mlx_array = .{ .ctx = null },
+    /// Which QSA arm served each full-attention call of THIS request. The
+    /// `[qsa-arms]` line is a per-request meter, so the tally is owned by the
+    /// seam that logs it (`Generator.logQsaArms` over the Generator's own
+    /// ctx) — a Transformer-level counter merged every concurrent slot's
+    /// calls (batched decode + interleaved prefill) into whichever request
+    /// finished first. A batched forward attributes each call to every
+    /// participating slot's own ctx (`noteQsaArmForSlots`).
+    ///
+    /// Scoped to the TRUNK: the qwen4 MTP head's forward builds its own ctx
+    /// and its single QSA layer is not part of this tally.
+    qsa_arms: QsaArmCounts = .{},
     /// Phase 2 (Plan ricky): when true, attention call sites consume the
     /// cache's quantized K/V triples directly via `kv_quant.quantAttention`
     /// instead of dequantizing through `DenseKVView`. Only effective when
@@ -7824,11 +7863,6 @@ pub const Transformer = struct {
     /// the oracle test): the shipped checkpoint is bf16 end to end, the f32
     /// fixture is the tighter bar for the MATH.
     qwen4_stream_f32: bool = false,
-    /// Which QSA arm served each full-attention call of the CURRENT request.
-    /// One increment per attention layer; read + reset where the request's
-    /// `[mtp-trace]` line is emitted (`qsaArmsTake`). A one-shot "engaged"
-    /// meter fires once per session and cannot say what ran at 62k — this can.
-    qsa_arms: QsaArmCounts = .{},
     qwen4_mixer: ?HcWeights = null,
     /// qwen4_exp MTP head (one hyper-connected QSA+MoE layer over the trunk's
     /// pre-mixer stream + next-token embedding). Loaded when the pack carries
@@ -13626,16 +13660,6 @@ pub const Transformer = struct {
         return merged;
     }
 
-    /// Read and clear the request's QSA arm tally. Returns null when nothing
-    /// was counted (not a QSA arch, or below the sparse budget) so a caller
-    /// never prints a meaningless `qsa=mask 0/0`.
-    pub fn qsaArmsTake(self: *Transformer) ?QsaArmCounts {
-        const c = self.qsa_arms;
-        self.qsa_arms.reset();
-        if (c.total() == 0) return null;
-        return c;
-    }
-
     /// Full-attention layer with the QSA mask threaded through
     /// `gatedFullAttnWith` (q-gate, QK norm, partial RoPE, KV cache all shared).
     fn qwen4AttnWith(self: *Transformer, ctx: *ForwardCtx, x: mlx.mlx_array, fa: *const FullAttnWeights, entry: *SSMCacheEntry, layer: u32, cache_len: c_int, pos_base: c_int, batch: c_int, seq_len: c_int, is_prefill: bool) !mlx.mlx_array {
@@ -16081,7 +16105,10 @@ pub const Transformer = struct {
                 defer _ = mlx.mlx_array_free(stacked_mask);
                 if (ctx.qsa_mask.ctx != null) {
                     // qwen4 QSA: the per-slot block selection (bool, false-
-                    // padded to kv_max) narrows the additive pad mask.
+                    // padded to kv_max) narrows the additive pad mask. One
+                    // dense-mask call serves the whole group, so it is billed
+                    // to every slot in it — the tally is per REQUEST.
+                    noteQsaArmForSlots(slots, .mask);
                     const neg_inf = bf16Scalar(-std.math.inf(f32), self.s);
                     defer _ = mlx.mlx_array_free(neg_inf);
                     var narrowed = mlx.mlx_array_new();
@@ -16146,18 +16173,14 @@ pub const Transformer = struct {
                 };
             }
             if (gathered) |g| {
-                self.qsa_arms.note(switch (qsaWidthBucket(seq_len)) {
-                    0 => .decode_gather,
-                    1 => .verify_gather,
-                    else => .prefill_gather,
-                });
+                ctx.qsa_arms.noteGather(seq_len);
                 _ = mlx.mlx_array_free(attn_out);
                 attn_out = g;
             } else {
                 // The dense [S, kv] mask arm reads `full_k`/`full_v` — on a
                 // quantized cache that is what EVALUATES the whole-range
                 // dequant graph `updateAffine` built, per layer per forward.
-                self.qsa_arms.note(.mask);
+                ctx.qsa_arms.note(.mask);
                 if (ctx.qsa_mask.ctx == null) ctx.qsa_mask = try qsaMaskFromBlocks(self.s, ctx.qsa_blocks, mlx.getShape(full_k)[2], ratio);
                 if (qwen4Standin().attn_sdpa) {
                     _ = mlx.mlx_array_free(attn_out);
@@ -37270,6 +37293,83 @@ test "qsa arm meters: one-shot bits, width buckets, and the per-request tally" {
         // Reasons index OneShotBits directly — they must fit its 32 bits.
         try std.testing.expect(v < 32);
     }
+}
+
+test "qsa arm tally is owned by the request: two ForwardCtx owners never mix" {
+    // The `[qsa-arms]` line is a PER-REQUEST meter, so its tally belongs to
+    // the seam that logs it (the Generator's own ForwardCtx), never to the
+    // shared Transformer. qwen4 text slots batch-decode on ONE Transformer
+    // (`forwardMoeBatchedDecode`) and a cold prefill interleaves with other
+    // slots' decode ticks (`scheduler.interleaveDecodeTick`), so a
+    // Transformer-level counter printed the union of every concurrent slot
+    // since the last reset and left the next finisher a near-empty tally — a
+    // short chat claimed `qsa=verify_gather` while the 40k chat later logged
+    // `qsa=mask`. Two owners here stand in for two concurrent slots.
+    //
+    // `cache` / `moe_seq_offset` are never read on this path — the tally is
+    // pure bookkeeping on the ctx — so the ctxs are built as shells.
+    var cache_a: KVCache = undefined;
+    var cache_b: KVCache = undefined;
+    var off_a: usize = 0;
+    var off_b: usize = 0;
+    var a: ForwardCtx = .{ .cache = &cache_a, .moe_seq_offset = &off_a, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
+    var b: ForwardCtx = .{ .cache = &cache_b, .moe_seq_offset = &off_b, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
+
+    // A serves a decode-width gather and a prefill-width gather; B serves the
+    // dense mask arm in between (the interleave the shared counter merged).
+    a.qsa_arms.noteGather(1);
+    b.qsa_arms.note(.mask);
+    a.qsa_arms.noteGather(FUSED256_MIN_Q_LEN);
+    b.qsa_arms.note(.mask);
+    a.qsa_arms.noteGather(4);
+
+    try std.testing.expectEqual(@as(u32, 3), a.qsa_arms.total());
+    try std.testing.expectEqual(@as(u32, 0), a.qsa_arms.mask);
+    try std.testing.expectEqual(@as(u32, 1), a.qsa_arms.decode);
+    try std.testing.expectEqual(@as(u32, 1), a.qsa_arms.verify);
+    try std.testing.expectEqual(@as(u32, 1), a.qsa_arms.prefill);
+    try std.testing.expectEqual(@as(u32, 2), b.qsa_arms.total());
+    try std.testing.expectEqual(@as(u32, 2), b.qsa_arms.mask);
+
+    // A finishing request takes its OWN tally; B's survives untouched (the
+    // shared field reset whichever slot finished first).
+    const taken = a.qsa_arms.take().?;
+    try std.testing.expectEqual(@as(u32, 3), taken.total());
+    try std.testing.expect(a.qsa_arms.take() == null);
+    try std.testing.expectEqual(@as(u32, 2), b.qsa_arms.total());
+    try std.testing.expectEqual(QsaArm.mask, b.qsa_arms.take().?.majority().?);
+
+    // One batched call serves the whole group with the SAME arm: it counts
+    // once on every participating slot, not once on a shared counter.
+    const slots = [_]*ForwardCtx{ &a, &b };
+    noteQsaArmForSlots(&slots, .mask);
+    try std.testing.expectEqual(@as(u32, 1), a.qsa_arms.mask);
+    try std.testing.expectEqual(@as(u32, 1), b.qsa_arms.mask);
+}
+
+test "the qsa arm tally lives on the ForwardCtx and every increment goes through it" {
+    // Class guard for the ownership itself: a future edit that parks the
+    // counter back on the shared Transformer (or increments through `self`)
+    // reintroduces the union-of-slots bug with the log line looking healthy.
+    // Needles are assembled at comptime so this test's own source cannot
+    // satisfy the scan.
+    const field = "qsa_" ++ "arms";
+    try std.testing.expect(@hasField(ForwardCtx, field));
+    try std.testing.expect(!@hasField(Transformer, field));
+    try std.testing.expect(!@hasDecl(Transformer, "qsaArms" ++ "Take"));
+
+    const xfm_src = @embedFile("transformer.zig");
+    // No self-owned tally anywhere: a `self.`-qualified tally was the field
+    // on the shared Transformer this bug came from.
+    try std.testing.expect(std.mem.indexOf(u8, xfm_src, "self." ++ field) == null);
+    // ... and the attention site increments through the request's ctx.
+    try std.testing.expect(std.mem.indexOf(u8, xfm_src, "ctx." ++ field ++ ".note(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xfm_src, "ctx." ++ field ++ ".noteGather(") != null);
+
+    // The logging seam reads the Generator's own ctx, not the Transformer.
+    const gen_src = @embedFile("generate.zig");
+    try std.testing.expect(std.mem.indexOf(u8, gen_src, "self.ctx." ++ field) != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen_src, "xfm.qsaArms" ++ "Take") == null);
 }
 
 test "qsa verify gather geometry: rows, the union tail, and the no-win decline" {

@@ -1367,7 +1367,11 @@ pub const Generator = struct {
     /// (a full kv8 dequant per layer per forward) otherwise reads like a
     /// healthy run. Emitted next to `[spec-stats]`; resets the tally.
     pub fn logQsaArms(self: *Generator) void {
-        const c = self.xfm.qsaArmsTake() orelse return;
+        // The tally rides THIS request's ForwardCtx — the one every forward
+        // of this slot was handed. A Transformer-level counter printed the
+        // union of every slot that decoded or prefilled since the last
+        // finisher reset it.
+        const c = self.ctx.qsa_arms.take() orelse return;
         const arm = c.majority() orelse return;
         log.info(
             "  [qsa-arms] qsa={s} calls={d} mask={d} decode={d} verify={d} prefill={d}\n",
