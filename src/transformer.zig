@@ -14369,8 +14369,14 @@ pub const Transformer = struct {
         var blk_sel = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(blk_sel);
         if (nb <= block_topk) {
-            // This arm IS the sheet, so the caller always builds it.
-            try mlx.check(mlx.mlx_array_set(&blk_sel, vis3));
+            // This arm IS the sheet. The caller always builds it here, but the
+            // seam stays total: a null sheet under this arm means every block
+            // is both visible and selected.
+            if (vis3.ctx == null) {
+                try mlx.check(mlx.mlx_ones(&blk_sel, &[_]c_int{ batch, seq_len, nb }, 3, .bool_, s));
+            } else {
+                try mlx.check(mlx.mlx_array_set(&blk_sel, vis3));
+            }
         } else {
             const part = try qsaTopBlocksOps(s, scores, vis3, tie_bias, nb, block_topk);
             defer _ = mlx.mlx_array_free(part);
@@ -14385,7 +14391,17 @@ pub const Transformer = struct {
             var picked = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(picked);
             try mlx.check(mlx.mlx_put_along_axis(&picked, falses, top_idx, true_v, -1, s));
-            try mlx.check(mlx.mlx_logical_and(&blk_sel, picked, vis3, s));
+            if (vis3.ctx == null) {
+                // THE FIX. `picked AND all-true` is `picked`, so under the
+                // all-visible claim this op is the identity the skip promised
+                // — and passing the null handle to mlx_logical_and instead
+                // raised "expected a non-empty mlx_array" and aborted the
+                // process. Every consumer of `vis3` skips its own op; this one
+                // was the consumer that did not.
+                try mlx.check(mlx.mlx_array_set(&blk_sel, picked));
+            } else {
+                try mlx.check(mlx.mlx_logical_and(&blk_sel, picked, vis3, s));
+            }
         }
         return qsaMaskFromBlockSel(s, blk_sel, offset, seq_len, kv, nb, ratio, batch);
     }
