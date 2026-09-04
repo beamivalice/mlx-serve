@@ -5043,21 +5043,46 @@ made the whole machinery skip it: `scheduler`'s `mtp_kv` was null, so
 `qwen4MtpReset` at the top of every request. Every prefix-cache hit therefore
 drafted from an EMPTY head sitting at a 62.7k-token cursor.
 
-The measurement (root_adapt2, 62.7k prose prompt, auto MTP,
-`--prefix-cache-entries 4 --prefix-cache-mem 4GB`, two boots):
+What this cost is ACCEPTANCE, and that is the whole claim. One boot per arm of
+the same binary (`ab_head.sh`, 62.7k prose prompt, auto MTP, `--kv-quant 8
+--prefix-cache-entries 4 --prefix-cache-mem 24GB`), arm = the
+`MLX_SERVE_MTP_HEAD_PERSIST` kill switch:
 
-| turn | matched | m_avg | acc | tok/s |
-|---|---|---|---|---|
-| long1 (cold prefill) | 0 | 2.94 / 3.97 | 1.59 / 1.66 | 54.1 / 50.5 |
-| long2 (same prompt, hit) | 62724 | 1.00 | 0.59 / 0.50 | 52.2 / 54.0 |
-| serial control | 62724 | — | — | 51.1 / 50.2 |
+| turn | head | acc | per-index acceptance |
+|---|---|---|---|
+| long1 (cold prefill), both arms | none | 1.25 / 1.25 | .66/.53/.33 and .72/.44/.38 |
+| long2 (same prompt, hit) | restored / blind | 1.47 / 0.78 | .72/.47/.28/.00 vs .50/.28/.00/.00 |
+| long3 (second hit) | restored / blind | 1.19 / 1.13 | .59/.41/.25 vs .75/.38/.00 |
 
-Per-index acceptance told the same story more sharply: cold
-0.81/0.54/0.45/0.36 against restored 0.69/0.40/0.00/0.00. The planner then did
-exactly its job — it priced a round it could not win and collapsed to
-`m_lo = 1` — so the symptom presented as "auto MTP trails serial at long
+The cold cells are the control and they agree exactly (1.25 on both arms — the
+arms are the same code until a restore happens). After a restore the head that
+kept its history keeps DEPTH 3; both blind hits lose it outright (index 2 =
+0.00 twice). That is the bug and its fix, stated in the one quantity the
+change actually moves.
+
+THROUGHPUT IS UNPROVEN. In that run the hits came out +17.0%/+10.1% (persisted)
+against +10.1%/+18.1% (blind) over each boot's OWN serial cell — a wash whose
+per-cell ordering flips between arms, which is exactly the spec-cell coin flip
+at n=2 cells and one uncounterbalanced boot per arm. An earlier ladder
+observation of a harder collapse (`m_avg` pinned at 1.00, tok/s at serial) was
+taken at `--prefix-cache-mem 4GB` WITH the SSD tier and the adaptive-serial
+switch under test, and did not reproduce on the 24 GB RAM-only configuration
+above. Re-running counterbalanced (off,on,on,off) in that original regime, with
+more hit cells and a `MLX_SERVE_MTP_FORCE_DEPTH`-pinned correctness arm, is the
+open follow-up; until it lands this is a correctness fix and carries no perf
+claim.
+
+Two bars that look like evidence and are not. Auto-mode MTP output is not
+byte-reproducible, so comparing the two arms' TEXT proves nothing: in that run
+`long1` — a cold prefill with no restore on either arm, i.e. a byte-identical
+code path — diverged at character 186. And an averaged `acc` hides which depth
+died; `acc_idx` (`MLX_SERVE_MTP_TRACE=1`) is what shows the collapse.
+
+The planner, meanwhile, did exactly its job: it priced rounds it could not win
+and narrowed, so the symptom presented as "auto MTP is unimpressive at long
 context" rather than as a cache bug. Nothing in the logs said the head had no
-history, because nothing was ever asked to say so.
+history, because nothing was ever asked to say so — which is why the restore
+path now logs `[qwen4] MTP head restored/declined` on every hit.
 
 Rebuilding the head on a restore is not available: row r of its history is
 (pre-mixer stream at r, token r+1), and the pre-mixer stream comes from the
