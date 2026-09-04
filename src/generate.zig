@@ -1230,6 +1230,9 @@ pub const Generator = struct {
     /// Ticks of the current serial block already spent warming: their wall
     /// time is the previous speculative round's tail, not a serial token's.
     mtp_serial_warm: u32 = 0,
+    /// One line per request, not one per tick: `mtpSerialGiveUp` is a
+    /// should-never-happen recovery and a tick loop would flood the log.
+    mtp_serial_giveup_logged: bool = false,
     /// Inter-tick wall clock feeding the table's serial cell (the twin of
     /// `mtp_regime_clock`). Null = the next read SEEDS instead of measuring.
     mtp_serial_clock: ?io_util.Stopwatch = null,
@@ -5165,6 +5168,35 @@ pub const Generator = struct {
         _ = self.xfm.round_cost.observeSerial(self.mtpKvLen(), ms, true, warm);
     }
 
+    /// May `mtpSerialCaptureTick` run? Its whole contract is to forward the
+    /// ONE pending token with capture, so a generator still holding pipelined
+    /// logits or a pipelined token would have it forward the wrong position
+    /// and publish a hidden for a row that was never committed. Pure, so the
+    /// rule is testable without MLX — and a RUNTIME check, not an assert:
+    /// `std.debug.assert` compiles to nothing in ReleaseFast, which is the
+    /// only build that ever serves, so the guard would have been absent in
+    /// exactly the builds that need it.
+    pub fn mtpSerialCaptureReady(has_pending_logits: bool, has_pending_token: bool) bool {
+        return !has_pending_logits and !has_pending_token;
+    }
+
+    /// Abandon the ramp back to MTP and finish this request on the serial
+    /// arm. Reached from the two states the pipelined machine is not supposed
+    /// to produce; either way the safe answer is the same, so it is ONE
+    /// helper. Logged once per request — a tick loop would flood the log.
+    fn mtpSerialGiveUp(self: *Generator, allocator: std.mem.Allocator, why: []const u8) !?DrafterStepResult {
+        if (!self.mtp_serial_giveup_logged) {
+            self.mtp_serial_giveup_logged = true;
+            log.info("  [mtp] adaptive: {s} at the serial exit -> serial for the rest of the request\n", .{why});
+        }
+        self.mtp_serial_exit = .none;
+        self.mtp_serial_left = 0;
+        self.spec_disabled_runtime = true;
+        self.spec_disable_reason = .adaptive;
+        const tok = try self.next(allocator) orelse return null;
+        return try mtpSerialOneToken(allocator, tok);
+    }
+
     /// One tick of a serial block. `.none` is the REAL serial arm — a plain
     /// pipelined `next()`, the thing the serial cell measures; `.drain` and
     /// `.capture` are the exit ramp back to `nextMtp`'s entry invariant.
@@ -5173,18 +5205,10 @@ pub const Generator = struct {
         if (self.mtp_serial_exit == .drain) {
             switch (try self.drainPipelineForSpec(allocator)) {
                 .stopped => return null,
-                .stay_disabled => {
-                    // A half-state the pipelined state machine never
-                    // produces. Rather than risk nextMtp's entry invariant,
-                    // this request finishes on the serial arm.
-                    log.info("  [mtp] adaptive: unexpected pipeline state at the serial exit -> serial for the rest of the request\n", .{});
-                    self.mtp_serial_exit = .none;
-                    self.mtp_serial_left = 0;
-                    self.spec_disabled_runtime = true;
-                    self.spec_disable_reason = .adaptive;
-                    const tok = try self.next(allocator) orelse return null;
-                    return try mtpSerialOneToken(allocator, tok);
-                },
+                // A half-state the pipelined state machine never produces.
+                // Rather than risk nextMtp's entry invariant, this request
+                // finishes on the serial arm.
+                .stay_disabled => return try self.mtpSerialGiveUp(allocator, "unexpected pipeline state"),
                 .already_clean => {
                     self.mtp_serial_exit = .capture;
                     return try self.mtpSerialCaptureTick(allocator);
@@ -5210,7 +5234,13 @@ pub const Generator = struct {
     /// committed position again, and sample its successor WITHOUT forwarding
     /// it — exactly `nextMtp`'s entry invariant.
     fn mtpSerialCaptureTick(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
-        std.debug.assert(!self.has_pending_logits and !self.has_pending_token);
+        // The entry invariant is CHECKED, not asserted: an assert is a no-op
+        // in the only optimize mode that serves, and a capture forward on a
+        // still-pipelined generator corrupts `last_hidden` silently rather
+        // than crashing. The recovery is the drain arm's — finish serial.
+        if (!mtpSerialCaptureReady(self.has_pending_logits, self.has_pending_token)) {
+            return try self.mtpSerialGiveUp(allocator, "pipeline not drained");
+        }
         if (try self.checkStop()) return null;
         const token = self.next_token_id;
         const tok_i32: i32 = @intCast(token);
@@ -13762,4 +13792,33 @@ test "the adaptive decision is read after the EV plan, before the width trial, a
     try testing.expect(std.mem.indexOf(u8, src, "self.observe" ++ "SerialTick();") != null);
     const sched = @embedFile("scheduler.zig");
     try testing.expect(std.mem.indexOf(u8, sched, "gen.observe" ++ "SerialTick();") != null);
+}
+
+test "mtpSerialCaptureReady: the capture step's entry invariant is a RUNTIME check, not an assert" {
+    const G = Generator;
+    // The only state the capture forward may run in.
+    try testing.expect(G.mtpSerialCaptureReady(false, false));
+    try testing.expect(!G.mtpSerialCaptureReady(true, false));
+    try testing.expect(!G.mtpSerialCaptureReady(false, true));
+    try testing.expect(!G.mtpSerialCaptureReady(true, true));
+
+    const src = @embedFile("generate.zig");
+    const at = std.mem.indexOf(u8, src, "fn mtpSerialCapture" ++ "Tick(self: *Generator") orelse
+        return error.MissingCaptureTick;
+    const end = std.mem.indexOfPos(u8, src, at, "\n    }\n") orelse src.len;
+    const body = src[at..end];
+    // A `std.debug.assert` here compiles to nothing in ReleaseFast — the only
+    // mode that ever serves — so the invariant must be a real branch that
+    // takes the give-up arm, exactly like the drain path's `.stay_disabled`.
+    try testing.expect(std.mem.indexOf(u8, body, "std.debug." ++ "assert") == null);
+    try testing.expect(std.mem.indexOf(u8, body, "mtpSerialCapture" ++ "Ready(") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "mtpSerialGive" ++ "Up(") != null);
+    // ONE recovery, shared with the drain arm: two spellings of "finish this
+    // request serial" would drift apart.
+    try testing.expect(std.mem.indexOf(u8, src, ".stay_disabled => return try self.mtpSerialGive" ++ "Up(") != null);
+    // Logged once per request, never once per tick.
+    const give_at = std.mem.indexOf(u8, src, "fn mtpSerialGive" ++ "Up(self: *Generator") orelse
+        return error.MissingGiveUp;
+    const give_end = std.mem.indexOfPos(u8, src, give_at, "\n    }\n") orelse src.len;
+    try testing.expect(std.mem.indexOf(u8, src[give_at..give_end], "mtp_serial_giveup_" ++ "logged") != null);
 }
