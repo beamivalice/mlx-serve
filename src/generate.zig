@@ -13821,11 +13821,17 @@ test "mtpAdaptiveVoteFor: the four real switch events of the 2026-09-04 qwen4 A/
             G.MtpAdaptiveVote.mtp,
             G.mtpAdaptiveVoteFor(e.table_ms_tok, e.table_ms_tok, e.serial_ms_tok, margin),
         );
-        // The shipped rule, with the window gated on being full.
+        // The shipped rule, with the window gated on being full. What must
+        // hold on every row is that it does NOT vote serial; an unfilled
+        // window is `.undecided`, which is stronger than `.mtp` — the
+        // controller cannot even evaluate the round, and `MtpAdaptive.round`
+        // clears the confirm streak on it. Both outcomes leave speculation on.
         const win: ?f32 = if (e.window_full) e.window_ms_tok else null;
+        const got = G.mtpAdaptiveVoteFor(e.table_ms_tok, win, e.serial_ms_tok, margin);
+        try testing.expect(got != .serial);
         try testing.expectEqual(
-            G.MtpAdaptiveVote.mtp,
-            G.mtpAdaptiveVoteFor(e.table_ms_tok, win, e.serial_ms_tok, margin),
+            if (e.window_full) G.MtpAdaptiveVote.mtp else G.MtpAdaptiveVote.undecided,
+            got,
         );
     }
     // And the guard against over-fitting: rule B UNGATED reproduces v1's
