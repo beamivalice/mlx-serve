@@ -15354,7 +15354,7 @@ pub const Transformer = struct {
         if (!all_vis or nb <= block_topk) vis3 = try self.qsaBlockVisibility(offset, seq_len, nb, ratio);
 
         try self.qsa_consts.ensure(self.s, nb, ratio);
-        return qsaSelectMaskOps(self.s, scores, vis3, self.qsa_consts.tie_bias, offset, seq_len, kv, nb, ratio, block_topk, batch);
+        return qsaSelectMaskOps(self.allocator, self.s, scores, vis3, self.qsa_consts.tie_bias, offset, seq_len, kv, nb, ratio, block_topk, batch);
     }
 
     /// Block selection -> dense `[B,1,S,kv]` QSA mask, as pure ops.
@@ -15369,6 +15369,7 @@ pub const Transformer = struct {
     /// Split out of `qsaMaskFromQk` so the all-visible claim is testable
     /// without a Transformer, a cache or a checkpoint.
     fn qsaSelectMaskOps(
+        alloc: std.mem.Allocator,
         s: mlx.mlx_stream,
         scores: mlx.mlx_array,
         vis3: mlx.mlx_array,
@@ -15394,11 +15395,56 @@ pub const Transformer = struct {
                 try mlx.check(mlx.mlx_array_set(&blk_sel, vis3));
             }
         } else {
-            const part = try qsaTopBlocksOps(s, scores, vis3, tie_bias, nb, block_topk);
-            defer _ = mlx.mlx_array_free(part);
+            // ONE tie rule. The gather path selects with the exact
+            // radix-select kernel (`qsaChunkSelect` -> `qsaSelectTopBlocks`);
+            // this arm used the argpartition chain, whose 1e-7
+            // index-descending bias only APPROXIMATES `torch.topk`'s
+            // lower-index-wins and disagrees with the exact rule on near-ties
+            // past f32 resolution. Two arms with two rules means two slots in
+            // one batch can attend DIFFERENT blocks for the same scores — the
+            // mask arm serves batched slots, `MLX_SERVE_QSA_GATHER=0`, and kv
+            // below the gather floor, all of which coexist with the gather
+            // path. So prefer the same kernel here and keep the chain as its
+            // decline path.
             var top_idx = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(top_idx);
-            try mlx.check(mlx.mlx_slice(&top_idx, part, &[_]c_int{ 0, 0, nb - block_topk }, 3, &[_]c_int{ batch, seq_len, nb }, 3, &strides3, 3, s));
+            var have_exact = false;
+            if (batch == 1) {
+                const bounds_host = try alloc.alloc(i32, @intCast(seq_len));
+                defer alloc.free(bounds_host);
+                // A null sheet IS the all-visible claim, the same one
+                // `qsaChunkSelect` passes down.
+                qsaVisibleBoundsHost(bounds_host, offset, seq_len, nb, ratio, vis3.ctx == null);
+                const bounds = mlx.mlx_array_new_data(bounds_host.ptr, &[_]c_int{seq_len}, 1, .int32);
+                defer _ = mlx.mlx_array_free(bounds);
+                if (qsaSelectTopBlocks(s, scores, bounds, block_topk) catch null) |picks| {
+                    defer _ = mlx.mlx_array_free(picks);
+                    // The kernel pads a row that has FEWER than block_topk
+                    // visible blocks with INT_MAX. Clamping those to 0 is safe
+                    // rather than merely convenient: such a row selects every
+                    // block it can see, so block 0 is already true when it is
+                    // visible — and when it is not (a row with no complete
+                    // block at all), the `logical_and` with the sheet below
+                    // clears it. That AND is load-bearing for this path.
+                    const nb_v = mlx.mlx_array_new_int(nb);
+                    defer _ = mlx.mlx_array_free(nb_v);
+                    var valid = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(valid);
+                    try mlx.check(mlx.mlx_less(&valid, picks, nb_v, s));
+                    const zero_i = mlx.mlx_array_new_int(0);
+                    defer _ = mlx.mlx_array_free(zero_i);
+                    try mlx.check(mlx.mlx_where(&top_idx, valid, picks, zero_i, s));
+                    have_exact = true;
+                }
+            }
+            var part = mlx.mlx_array{ .ctx = null };
+            defer if (part.ctx != null) {
+                _ = mlx.mlx_array_free(part);
+            };
+            if (!have_exact) {
+                part = try qsaTopBlocksOps(s, scores, vis3, tie_bias, nb, block_topk);
+                try mlx.check(mlx.mlx_slice(&top_idx, part, &[_]c_int{ 0, 0, nb - block_topk }, 3, &[_]c_int{ batch, seq_len, nb }, 3, &strides3, 3, s));
+            }
             var falses = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(falses);
             try mlx.check(mlx.mlx_zeros(&falses, &[_]c_int{ batch, seq_len, nb }, 3, .bool_, s));
@@ -45280,7 +45326,7 @@ test "qsa mask: the all-visible skip must not hand a NULL sheet to an mlx op (kv
                 const sheet = try qsaVisSheetForTest(s, offset, seq_len, nb, ratio);
                 defer _ = mlx.mlx_array_free(sheet);
 
-                const ref = try Transformer.qsaSelectMaskOps(s, scores, sheet, tie, offset, seq_len, kv, nb, ratio, block_topk, batch);
+                const ref = try Transformer.qsaSelectMaskOps(std.testing.allocator, s, scores, sheet, tie, offset, seq_len, kv, nb, ratio, block_topk, batch);
                 defer _ = mlx.mlx_array_free(ref);
                 try mlx.check(mlx.mlx_array_eval(ref));
 
@@ -45293,7 +45339,7 @@ test "qsa mask: the all-visible skip must not hand a NULL sheet to an mlx op (kv
                 // (b) the skip is an identity. RED before the fix: this call
                 // raises "expected a non-empty mlx_array" for block_topk < nb.
                 const null_vis = mlx.mlx_array{ .ctx = null };
-                const got = try Transformer.qsaSelectMaskOps(s, scores, null_vis, tie, offset, seq_len, kv, nb, ratio, block_topk, batch);
+                const got = try Transformer.qsaSelectMaskOps(std.testing.allocator, s, scores, null_vis, tie, offset, seq_len, kv, nb, ratio, block_topk, batch);
                 defer _ = mlx.mlx_array_free(got);
                 try std.testing.expect(try qsaArraysAllEqual(got, ref, s));
                 checked_skip += 1;
@@ -45303,6 +45349,82 @@ test "qsa mask: the all-visible skip must not hand a NULL sheet to an mlx op (kv
     // The test is worthless if it never reached the skip: pin that it did.
     std.debug.print("[qsa-boundary] all-visible skip exercised in {d} cases\n", .{checked_skip});
     try std.testing.expect(checked_skip >= 8);
+}
+
+test "qsa selection: the mask arm and the gather path use ONE tie rule (M12)" {
+    // Two selection paths coexisted with two DIFFERENT tie rules. The gather
+    // path selects with the exact radix-select kernel (`qsaChunkSelect` ->
+    // `qsaSelectTopBlocks`); the mask arm went through `qsaTopBlocksOps`,
+    // whose 1e-7 index-descending bias only APPROXIMATES torch.topk's
+    // lower-index-wins and is unspecified past f32 resolution — the file's own
+    // "the exact rule and the bias trick DISAGREE" test pins that they differ.
+    //
+    // That is a correctness problem, not a style one: the mask arm serves
+    // batched slots, `MLX_SERVE_QSA_GATHER=0`, and kv below the gather floor,
+    // all of which coexist with the gather path in one process. Two slots with
+    // identical scores could attend different blocks depending only on which
+    // arm served them, which is what `tests/test_batched_equivalence.sh` would
+    // eventually catch as an unexplained near-tie divergence.
+    //
+    // The routing is the thing under test, and the sharp signal is that the
+    // mask arm now DISPATCHES the select kernel at all: before the fix its
+    // build counter could not move, because that arm never called it.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const ta = std.testing.allocator;
+    const ratio: c_int = 4;
+    const batch: c_int = 1;
+    // All-visible at width S needs S <= (kv % ratio) + 1: offset is kv-S and
+    // the last complete block ends at kv - (kv % ratio) - 1. So kv must NOT be
+    // a multiple of ratio for any S > 1 to see every block — 4096 never can.
+    const seq_len: c_int = 4;
+    const kv: c_int = 4099;
+    const nb = @divTrunc(kv, ratio);
+    // 511 rather than 512 so this test owns a config key no other test builds,
+    // which is what makes the build counter a sound routing signal.
+    const block_topk: c_int = 511;
+    var prng = std.Random.DefaultPrng.init(0x71E5_10FF);
+    const rnd = prng.random();
+
+    // relu output: many EXACT zeros, which is the tie the two rules break
+    // differently.
+    const scores = try qsaRandScoresF32(rnd, &[_]c_int{ batch, seq_len, nb });
+    defer _ = mlx.mlx_array_free(scores);
+    const tie = try qsaTieBiasForTest(s, nb);
+    defer _ = mlx.mlx_array_free(tie);
+    const offset = kv - seq_len;
+    // All blocks complete for this chunk's first row => the null sheet, the
+    // same all-visible claim `qsaChunkSelect` passes down.
+    try std.testing.expect(qsaAllBlocksVisible(offset, nb, ratio));
+    const null_vis = mlx.mlx_array{ .ctx = null };
+
+    const before = qsaSelectCfgBuilds();
+    const got = try Transformer.qsaSelectMaskOps(ta, s, scores, null_vis, tie, offset, seq_len, kv, nb, ratio, block_topk, batch);
+    defer _ = mlx.mlx_array_free(got);
+    try mlx.check(mlx.mlx_array_eval(got));
+    // The kernel ran: a config was built or served for THIS arm. (A build
+    // means it dispatched; a hit means it dispatched and the LRU had it.)
+    // A build, not a hit: this key is unique to this test, so the counter
+    // moving IS the mask arm dispatching the select kernel. Before the fix it
+    // could not move — that arm never called it.
+    try std.testing.expect(qsaSelectCfgBuilds() > before);
+
+    // Shape contract is unchanged by the routing.
+    try std.testing.expectEqual(@as(usize, 4), @as(usize, @intCast(mlx.mlx_array_ndim(got))));
+    const gsh = mlx.getShape(got);
+    try std.testing.expectEqual(batch, gsh[0]);
+    try std.testing.expectEqual(seq_len, gsh[2]);
+    try std.testing.expectEqual(kv, gsh[3]);
+
+    // And with the kernel OFF both arms fall to the chain — still ONE rule,
+    // just the other one. The invariant is "the two arms agree with each
+    // other", never "the two RULES agree with each other".
+    qsa_select_kernel_override = false;
+    defer qsa_select_kernel_override = null;
+    const chain = try Transformer.qsaSelectMaskOps(ta, s, scores, null_vis, tie, offset, seq_len, kv, nb, ratio, block_topk, batch);
+    defer _ = mlx.mlx_array_free(chain);
+    try mlx.check(mlx.mlx_array_eval(chain));
+    try std.testing.expectEqual(kv, mlx.getShape(chain)[3]);
 }
 
 test "qsa boundary: past (block_topk+1)*ratio EVERY decode step reaches the all-visible skip" {
