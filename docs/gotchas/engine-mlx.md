@@ -4386,6 +4386,26 @@ ON is ~flat (51→41); OFF collapses (41→15). Residual ON slope is the indexer
 
 Two footguns: `mlx_take_axis` needs unsigned indices (int32 aborts); quantized kernels misread strided take views (`takeContig` uses `mlx_contiguous`, not `+0`).
 
+## qwen4 QSA at verify widths: the union of the block's rows, not the whole cache (2026-09-04)
+
+Prefill and decode gathered; the width in between did not. At 2 ≤ S < 16 — an MTP or DFlash verify block — `qsaMaskFromQk` fell through to the dense `[S, kv]` bool mask and `gatedFullAttnWith` read the full `DenseKVView`. Under `--kv-quant 8` that view is a fresh dequant of the ENTIRE stored range, per layer, per verify forward: the arm that was supposed to make MTP cheap paid the whole cache twice a round.
+
+`qsaVerifyGatherAttn` (default on, `MLX_SERVE_QSA_VERIFY_GATHER=0` restores the mask; floor `QSA_VERIFY_GATHER_MIN_KV` = 16384, `MLX_SERVE_QSA_VERIFY_GATHER_MIN_KV`) gathers a FIXED-size superset of the block's rows and dequantizes only those rows through the decode arm's `takeContig` + `dequantizeAffine` path. Fixed-size is the whole design constraint: a real set union has a data-dependent size, and learning it means a host sync inside a lazy decode graph.
+
+Three things had to be got right, and two of them are counter-intuitive.
+
+**The union tail is row 0's, not the last row's.** Each query at cache position `p` always sees `[ratio*floor((p+1)/ratio), p]`. Tail STARTS rise with position and tails are SUFFIXES, so the largest tail belongs to the EARLIEST row. Taking the last row's start (the natural guess — "the newest rows are the tail") drops the first rows' tail tokens; the plan test names the exact `(row, token)` it loses (`S=2 kv=4096 row 0 token 4092`). The union tail is therefore `[tail_start(offset), kv)`, at most `ratio - 1 + S` tokens.
+
+**Duplicates are not free.** The obvious fixed-size union — concatenate the S rows' selections and let duplicates ride — double-counts under the softmax: membership is a property of the BLOCK, so both copies of a shared block test true for the same row and that key is summed twice. The gathered rows must be strictly ascending and distinct. So: the union is taken over the `[S, nb]` scatter as a bool `[nb_lo]`, ranked by `where(u, b, nb_lo + b)`, argsorted, the first `k_blocks = min(nb_lo, S*kb)` kept, then sorted. Padding entries are blocks NO row selected; their tokens sit below every row's tail start and outside every row's selection, so the per-row mask hides them everywhere — the real union size is never needed on the host.
+
+**The two parts must be disjoint.** Part B is only the blocks lying ENTIRELY below the union tail (`b < nb_lo`); a selected block at or above it is already covered by part A. The `[S, R]` mask is then literally the dense formula evaluated at the gathered tokens: `causal ∧ (member ∨ tail)`, with membership read by `take_axis` from an `[S, nb+2]` scatter (column `nb` is the always-false sink for tokens past the last complete block, `nb+1` the INT_MAX sentinel sink).
+
+R per S at the production budget (512 blocks of 4): S=2 → 1024·4, S=5 → 2560·4, S=7 → 14344 rows, S=15 → 30736. So the arm pays from ~16k keys at S=2..7 and only past ~31k at S=15 — at 20k/S=15 `k_blocks` saturates at `nb_lo` and `rows == kv`, which the gate declines rather than dressing a full read as a gather. hd 256 with an array mask still has no fused MLX arm, so the gathered `[R]` goes through `splitMaskedSdpa256` exactly as the dense `[kv]` mask did.
+
+Two more footguns inherited from the decode arm: `mlx_take_axis` wants unsigned indices, and quantized kernels misread strided take views (`takeContig` uses `mlx_contiguous`, never `+0`). One new one: the prefill kernel `gatherQsa256` has NO q_len floor of its own, so once verify widths carry a selection the dispatch must guard it — otherwise a declined verify gather falls into a kernel that walks the whole cache. Scan-pinned.
+
+Bars: a pure planner (`QsaVerifyGeom` + `qsaVerifyPlanHost`) checked against a brute-force dense `[S, kv]` mask over 7 geometries including a ragged tail and `ratio != 4`; MLX parity of `qsaVerifyGatherAttn` vs `qsaMaskFromBlocks` + full SDPA at S ∈ {2,5,7,15} × kv ∈ {4096, 20000}, dense and through a real affine-8 `KVCache` — max abs diff ≤ 4.9e-4, cosine ≥ 0.999994; and a wiring scan that the selection arm reaches S=2..15 and the dispatch calls the verify arm before the prefill kernel. Live timing is still owed.
+
 ## qwen4 QSA history in every SSM checkpoint OOM'd 400k prefills (2026-09-03)
 
 Prefix-cache snapshots copied `aux_state`/`qsa_pooled` (the growing indexer key history) at every stride. 32 copies of a ~273k-row buffer is ~30 GB on top of 70 GB weights — Metal OOM at 400k while auto-context advertised 700k–1M (`--kv-quant 8` made it worse: billed KV shrank, QSA bytes did not).
