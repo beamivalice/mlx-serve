@@ -1,0 +1,309 @@
+#!/bin/bash
+# Adaptive serial switch — integration guard.
+#
+# The mechanism: past some context a speculative round costs more per token
+# than the plain decode step it replaces (a verify row on a sparse-attention
+# trunk is BYTES), so the server measures a plain token per KV bucket
+# (`round_cost.Table.serial`) and stops speculating for the rest of a request
+# when the planned round loses by 5% three rounds running. `--max-mtp-ctx` is
+# the hard override; `MLX_SERVE_MTP_ADAPTIVE_SERIAL=0` is the kill switch.
+#
+# What is pinned here is the INVARIANT, never the model's choice. Whether a
+# given checkpoint on a given Mac actually switches at 40k depends on measured
+# ms — an assertion that it MUST switch would be a checkpoint expectation
+# (CLAUDE.md). What must hold on every machine:
+#
+#   [1] The mechanism runs with the switch on: the request's log slice carries
+#       the `[mtp] adaptive:` decision line, OR `[spec-stats] serial_cell=`
+#       reports a measured (> 0) plain-token cost for the request's bucket.
+#       One or the other — a zero cell with no line means nothing measured.
+#   [2] Speculation still ENGAGES on the long request (`[spec-stats] mode=mtp`
+#       with attempts > 0). The switch must not read as "MTP never ran".
+#   [3] The SHORT code request never switches: a `-> serial` decision on a
+#       2k-token prompt is a false positive, and short context is where the
+#       whole feature must cost nothing.
+#   [4] The kill switch HOLDS: with MLX_SERVE_MTP_ADAPTIVE_SERIAL=0 no
+#       `[mtp] adaptive:` line appears anywhere in the boot, and the arm on
+#       every `[spec-stats]` line stays `adaptive=undecided`.
+#   [5] The kill switch does NOT stop the MEASUREMENT: `serial_cell=` is still
+#       > 0 in the off boot. That is the documented contract that makes an
+#       on/off A/B comparable — if =0 turned the meter off too, the two arms
+#       could not be read against each other.
+#
+# The long prompt is GENERATED here, deterministically, from a fixed seed and
+# a word list written for this test (no corpus file to ship, no third-party
+# text): ~40k tokens of prose-shaped filler, distinct paragraph by paragraph
+# so it is not a degenerate repeat. Both boots see byte-identical prompts.
+#
+# The round-cost table is never read from or written to the user's home
+# (MLX_SERVE_ROUND_COST_PERSIST=0): each boot learns its serial cell from
+# scratch, which is also what makes boot B's assertions independent of boot A.
+#
+# Usage: MTP_ADAPTIVE_MODEL=<model-dir> ./tests/test_mtp_adaptive.sh [port]
+# Run from the repo root (BIN is ./zig-out/bin/mlx-serve).
+
+set -u
+PORT="${1:-11316}"
+BIN="${MLX_SERVE_BIN:-./zig-out/bin/mlx-serve}"
+LOG_A=/tmp/mtp_adaptive_on.log
+LOG_B=/tmp/mtp_adaptive_off.log
+WORK=$(mktemp -d /tmp/mtp_adaptive.XXXXXX)
+trap 'rm -rf "$WORK"' EXIT
+
+# First existing candidate wins; MTP_ADAPTIVE_MODEL overrides. The feature is
+# arch-agnostic (any checkpoint with an MTP head), but it only has anything to
+# decide on a long-context trunk, so the candidates are the Flash Next packs.
+MODEL="${MTP_ADAPTIVE_MODEL:-}"
+if [ -z "$MODEL" ]; then
+    for cand in \
+        "$HOME/llm/models/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit" \
+        "$HOME/.mlx-serve/models/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit" \
+        "$HOME/.mlx-serve/models/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit"; do
+        [ -d "$cand" ] && { MODEL="$cand"; break; }
+    done
+fi
+if [ -z "$MODEL" ] || [ ! -d "$MODEL" ]; then
+    echo "SKIP: no long-context MTP checkpoint found (set MTP_ADAPTIVE_MODEL)"
+    exit 0
+fi
+if [ ! -x "$BIN" ]; then
+    echo "SKIP: no server binary at $BIN (build first)"
+    exit 0
+fi
+
+# ~40k tokens. The context has to clear the top KV bucket's floor (32k) for
+# the decision to be made where the feature exists at all.
+PROMPT_TOKENS_MIN="${PROMPT_TOKENS_MIN:-30000}"
+LONG_CHARS="${LONG_CHARS:-165000}"
+MAX_TOKENS=120
+CTX_SIZE="${CTX_SIZE:-131072}"
+
+PASS=0
+FAIL=0
+ok()   { echo "PASS [$1]"; PASS=$((PASS+1)); }
+bad()  { echo "FAIL [$1]: $2"; FAIL=$((FAIL+1)); }
+
+# ── Deterministic prompt bodies ───────────────────────────────────────────
+# One python invocation writes both request bodies. The long text is an LCG
+# walk over a fixed word list, so it is byte-identical on every machine and
+# every run, and varied enough that it is not a repetition-loop input.
+python3 - "$WORK" "$LONG_CHARS" "$MAX_TOKENS" <<'PY'
+import json, sys, pathlib
+work, chars, max_tokens = pathlib.Path(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
+
+WORDS = ("harbour lantern quiet ledger orchard sandstone drifting compass meadow "
+         "tinker rope kettle furrow beacon willow granite shallow ember thistle "
+         "marsh cobble weather almanac hollow river bramble shutter pasture flint "
+         "lichen tallow bridge cartwright saddle furnace ripple heather quarry "
+         "spindle brine oaken hedgerow smithy trellis warren coppice fallow gale").split()
+
+state = 20260904          # fixed seed: the prompt must be a constant
+def nxt(n):
+    global state
+    state = (state * 6364136223846793005 + 1442695040888963407) % (1 << 64)
+    return (state >> 33) % n
+
+out, para = [], 0
+while sum(len(p) for p in out) < chars:
+    para += 1
+    sentences = []
+    for _ in range(4 + nxt(4)):
+        w = [WORDS[nxt(len(WORDS))] for _ in range(8 + nxt(11))]
+        w[0] = w[0].capitalize()
+        sentences.append(" ".join(w) + ".")
+    out.append(f"Section {para}. " + " ".join(sentences) + "\n\n")
+long_text = "".join(out)[:chars]
+
+def body(content, mtp):
+    return {"model": "default", "stream": False, "temperature": 0, "top_p": 1.0,
+            "max_tokens": max_tokens, "enable_thinking": False,
+            "enable_pld": False, "enable_drafter": False,
+            "enable_mtp": mtp,
+            "messages": [{"role": "user", "content": content}]}
+
+long_q = (long_text + "\n\nUsing only the sections above, name the very first "
+          "word of Section 1 and then stop.")
+short_q = ("Write a Python function that reverses a linked list in place. "
+           "Return only the code.")
+
+(work / "long_serial.json").write_text(json.dumps(body(long_q, False)))
+(work / "long_mtp.json").write_text(json.dumps(body(long_q, True)))
+(work / "short_mtp.json").write_text(json.dumps(body(short_q, True)))
+print(f"generated long prompt: {len(long_q)} chars", file=sys.stderr)
+PY
+[ -f "$WORK/long_mtp.json" ] || { echo "FAIL: could not generate prompts"; exit 1; }
+
+# ── Server lifecycle ──────────────────────────────────────────────────────
+start_server() { # $1 = log path, $2 = value for MLX_SERVE_MTP_ADAPTIVE_SERIAL ("" = unset)
+    local log="$1" adapt="$2"
+    pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
+    for _ in $(seq 1 30); do
+        lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1 || break
+        sleep 1
+    done
+    : > "$log"
+    # ROUND_COST_PERSIST=0: never read or write the user's ~/.mlx-serve
+    # round-cost table — a persisted serial cell from an earlier boot would
+    # decide this run's requests and the two boots would not be independent.
+    if [ -n "$adapt" ]; then
+        MLX_SERVE_ROUND_COST_PERSIST=0 MLX_SERVE_MTP_TRACE=1 \
+        MLX_SERVE_MTP_ADAPTIVE_SERIAL="$adapt" \
+        "$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" \
+            --mtp --kv-quant 8 --ctx-size "$CTX_SIZE" --no-pld \
+            --prefix-cache-entries 2 --log-level info >"$log" 2>&1 &
+    else
+        MLX_SERVE_ROUND_COST_PERSIST=0 MLX_SERVE_MTP_TRACE=1 \
+        "$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" \
+            --mtp --kv-quant 8 --ctx-size "$CTX_SIZE" --no-pld \
+            --prefix-cache-entries 2 --log-level info >"$log" 2>&1 &
+    fi
+    SERVER_PID=$!
+    local model_mb ready_secs
+    model_mb=$(du -sm "$MODEL" 2>/dev/null | awk '{print $1}')
+    ready_secs=$(( 600 + ${model_mb:-0} / 50 ))
+    for _ in $(seq 1 $((ready_secs / 3)) ); do
+        grep -q "Model ready (loaded on inference thread)" "$log" && return 0
+        kill -0 "$SERVER_PID" 2>/dev/null || break
+        sleep 3
+    done
+    echo "FAIL: server did not become ready"; tail -20 "$log"; exit 1
+}
+
+stop_server() {
+    kill "$SERVER_PID" 2>/dev/null
+    wait "$SERVER_PID" 2>/dev/null
+    for _ in $(seq 1 60); do
+        lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1 || break
+        sleep 1
+    done
+}
+
+# req <body-file> <log> <slice-out> -> echoes "<prompt_tokens> <completion_tokens>"
+# and leaves this request's OWN slice of the server log in <slice-out>. Every
+# assertion below is made against a slice, never the whole file: "the log
+# contains a switch line" is meaningless if the line belongs to another
+# request.
+req() {
+    local bodyf="$1" log="$2" slicef="$3"
+    local start end counts
+    start=$(wc -c < "$log" | tr -d ' ')
+    counts=$(curl -s -m 3600 "http://127.0.0.1:$PORT/v1/chat/completions" \
+        -H 'Content-Type: application/json' --data-binary "@$bodyf" |
+        python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+if d.get('error'):
+    print('ERR', d['error'], file=sys.stderr); raise SystemExit(2)
+u = d.get('usage') or {}
+c = (d.get('choices') or [{}])[0].get('message', {}).get('content') or ''
+print(u.get('prompt_tokens', 0), u.get('completion_tokens', 0), len(c))
+") || return 1
+    end=$(wc -c < "$log" | tr -d ' ')
+    tail -c "+$((start + 1))" "$log" | head -c "$((end - start))" > "$slicef"
+    echo "$counts"
+}
+
+# The largest measured serial cell reported anywhere in a log (0 if none).
+max_serial_cell() { # $1 = log
+    grep -o "serial_cell=[0-9.]*" "$1" | cut -d= -f2 |
+        sort -g | tail -1 | sed 's/^$/0/'
+}
+gt_zero() { python3 -c "import sys; sys.exit(0 if float(sys.argv[1] or 0) > 0 else 1)" "$1"; }
+
+# ── Boot A: the switch ON (default; the env var is simply not set) ────────
+echo "== boot A: adaptive serial ON (model $MODEL) =="
+start_server "$LOG_A" ""
+
+# The serial request FIRST: a bucket with no measured plain token cannot be
+# decided at all, and this is the ordinary way one gets measured (the bounded
+# probe is the fallback for workloads that never decode serially).
+A_SERIAL=$(req "$WORK/long_serial.json" "$LOG_A" "$WORK/a_serial.slice") ||
+    { echo "FAIL: boot A long serial request failed"; stop_server; exit 1; }
+A_PROMPT_N=$(echo "$A_SERIAL" | awk '{print $1}')
+echo "  long serial: prompt_tokens=$A_PROMPT_N completion=$(echo "$A_SERIAL" | awk '{print $2}')"
+
+if [ "${A_PROMPT_N:-0}" -ge "$PROMPT_TOKENS_MIN" ]; then
+    ok "prompt reaches the long-context regime ($A_PROMPT_N >= $PROMPT_TOKENS_MIN tokens)"
+else
+    bad "prompt length" "only $A_PROMPT_N prompt tokens (< $PROMPT_TOKENS_MIN); raise LONG_CHARS"
+fi
+
+A_LONG=$(req "$WORK/long_mtp.json" "$LOG_A" "$WORK/a_long.slice") ||
+    { echo "FAIL: boot A long MTP request failed"; stop_server; exit 1; }
+echo "  long mtp:    prompt_tokens=$(echo "$A_LONG" | awk '{print $1}') completion=$(echo "$A_LONG" | awk '{print $2}')"
+[ "$(echo "$A_LONG" | awk '{print $3}')" -gt 0 ] ||
+    bad "content" "boot A long MTP request returned empty content"
+
+A_SHORT=$(req "$WORK/short_mtp.json" "$LOG_A" "$WORK/a_short.slice") ||
+    { echo "FAIL: boot A short request failed"; stop_server; exit 1; }
+echo "  short mtp:   prompt_tokens=$(echo "$A_SHORT" | awk '{print $1}') completion=$(echo "$A_SHORT" | awk '{print $2}')"
+
+stop_server
+
+# [2] Engagement: the long request ran speculative rounds. Without this, [1]
+#     could be satisfied by a server that never speculated at all.
+if grep -q "\[spec-stats\] mode=mtp" "$WORK/a_long.slice"; then
+    ATTEMPTS=$(grep -o "mode=mtp attempts=[0-9]*" "$WORK/a_long.slice" | tail -1 | grep -o "[0-9]*$")
+    if [ "${ATTEMPTS:-0}" -gt 0 ]; then
+        ok "speculation engaged on the long request (attempts=$ATTEMPTS)"
+    else
+        bad "engagement" "mode=mtp logged with attempts=0 on the long request"
+    fi
+else
+    bad "engagement" "no '[spec-stats] mode=mtp' for the long request (dispatch hole)"
+fi
+
+# [1] The mechanism ran: a decision line, or a measured serial cell.
+A_CELL=$(max_serial_cell "$LOG_A")
+if grep -q "\[mtp\] adaptive:" "$WORK/a_long.slice"; then
+    ok "adaptive controller reported a decision on the long request"
+    grep "\[mtp\] adaptive:" "$WORK/a_long.slice" | sed 's/^/      /'
+elif gt_zero "$A_CELL"; then
+    ok "serial cell measured with the switch on (serial_cell=$A_CELL ms/tok)"
+else
+    bad "mechanism" "no '[mtp] adaptive:' line and serial_cell=$A_CELL — nothing was measured or decided"
+fi
+
+# [3] Short context never switches.
+if grep -q -- "-> serial" "$WORK/a_short.slice"; then
+    bad "short context" "the short code request left speculation (false positive)"
+    grep -- "\[mtp\] adaptive:" "$WORK/a_short.slice" | sed 's/^/      /'
+else
+    ok "short code request stayed on speculation"
+fi
+
+# ── Boot B: the kill switch ───────────────────────────────────────────────
+echo "== boot B: MLX_SERVE_MTP_ADAPTIVE_SERIAL=0 =="
+start_server "$LOG_B" "0"
+
+req "$WORK/long_serial.json" "$LOG_B" "$WORK/b_serial.slice" >/dev/null ||
+    { echo "FAIL: boot B long serial request failed"; stop_server; exit 1; }
+B_LONG=$(req "$WORK/long_mtp.json" "$LOG_B" "$WORK/b_long.slice") ||
+    { echo "FAIL: boot B long MTP request failed"; stop_server; exit 1; }
+echo "  long mtp:    prompt_tokens=$(echo "$B_LONG" | awk '{print $1}') completion=$(echo "$B_LONG" | awk '{print $2}')"
+stop_server
+
+# [4] Nothing switches, and nothing probes, anywhere in the boot.
+if grep -q "\[mtp\] adaptive:" "$LOG_B"; then
+    bad "kill switch" "'[mtp] adaptive:' appeared with MLX_SERVE_MTP_ADAPTIVE_SERIAL=0"
+    grep "\[mtp\] adaptive:" "$LOG_B" | head -5 | sed 's/^/      /'
+else
+    ok "kill switch: no adaptive decision or probe line in the whole boot"
+fi
+if grep -q "adaptive=serial" "$LOG_B"; then
+    bad "kill switch" "a request reported adaptive=serial with the switch off"
+else
+    ok "kill switch: every request's arm stayed off the serial arm"
+fi
+
+# [5] ...but the meter keeps running, or an on/off A/B cannot be compared.
+B_CELL=$(max_serial_cell "$LOG_B")
+if gt_zero "$B_CELL"; then
+    ok "serial cell still measured with the switch off (serial_cell=$B_CELL ms/tok)"
+else
+    bad "kill switch" "serial_cell=$B_CELL with the switch off — the meter must stay on"
+fi
+
+echo
+echo "── $PASS passed, $FAIL failed ── (logs: $LOG_A, $LOG_B)"
+[ "$FAIL" -eq 0 ] || exit 1
