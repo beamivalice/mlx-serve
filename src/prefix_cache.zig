@@ -186,7 +186,14 @@ pub const DflashTarget = struct { cache: *KVCache, base_pos: *usize };
 /// What `evictLruToAdmit` gave up, and whether it was enough.
 pub const EvictionReport = struct {
     entries: usize = 0,
+    /// Bytes the ALLOCATOR actually got back (live delta).
     bytes: u64 = 0,
+    /// Bytes the cache had BILLED for those entries. Larger than `bytes`
+    /// whenever a snapshot refcount-shares its buffers with a live cache.
+    accounted_bytes: u64 = 0,
+    /// The pass stopped because an eviction returned nothing: what is left is
+    /// shared with a live request and dropping it would cost hits for free.
+    shared_stop: bool = false,
     /// False means the cache is empty (or down to the entry this request is
     /// using) and the request STILL does not fit — refuse it by name.
     admitted: bool = false,
@@ -224,6 +231,10 @@ pub const HotPrefixCache = struct {
     disk: ?kv_disk_cache.DiskTier = null,
     /// A commit landed since the last `flushPendingDisk`.
     disk_dirty: bool = false,
+    /// `last_used` of the entry the CURRENT request restored from, or null.
+    /// Set by the restore, cleared at the start of every lookup — never a
+    /// stale request's entry. `evictLruToAdmit` refuses to evict it.
+    last_restored_used: ?u64 = null,
     /// The arch keeps a QSA indexer history beside its SSM state (qwen4_exp).
     /// A restore that leaves the live entries without it cannot prefill —
     /// `qsaMaskFromQk` errors on every turn on that prefix — so it is a MISS.
@@ -614,6 +625,9 @@ pub const HotPrefixCache = struct {
         dflash_target: ?DflashTarget,
         mtp_target: ?DflashTarget,
     ) !LookupResult {
+        // A previous request's restored-entry marker must never protect an
+        // entry from THIS request's eviction pass.
+        self.last_restored_used = null;
         var probe: MatchProbe = .{};
         const match = self.findBestRestorableMatch(
             prompt_ids,
@@ -723,6 +737,13 @@ pub const HotPrefixCache = struct {
         const m = match.?;
         const e = &self.entries.items[m.idx];
         e.last_used = self.bumpCounter();
+        // Identity of the entry THIS request is about to run on. `restore`
+        // refcount-SHARES its buffers with the slot's cache, so evicting it
+        // frees nothing and only throws away the hit — and "most recently
+        // used" is not the same claim: a concurrent commit bumps the counter
+        // past us. Read by `evictLruToAdmit`, cleared at the top of the next
+        // lookup.
+        self.last_restored_used = e.last_used;
 
         try target_cache.restore(&e.snapshot);
 
@@ -1503,14 +1524,11 @@ pub const HotPrefixCache = struct {
     }
 
     fn evictOneLru(self: *HotPrefixCache, reason: []const u8) void {
-        var lru_idx: usize = 0;
-        var lru_used: u64 = std.math.maxInt(u64);
-        for (self.entries.items, 0..) |*e, i| {
-            if (e.last_used < lru_used) {
-                lru_used = e.last_used;
-                lru_idx = i;
-            }
-        }
+        const idx = self.lruIndexExcluding(null) orelse return;
+        self.evictAt(idx, reason);
+    }
+
+    fn evictAt(self: *HotPrefixCache, lru_idx: usize, reason: []const u8) void {
         var evicted = self.entries.swapRemove(lru_idx);
         const tokens_len = evicted.tokens.len;
         const kv_mb = @as(f64, @floatFromInt(evicted.kv_bytes)) / (1024.0 * 1024.0);
@@ -1555,29 +1573,72 @@ pub const HotPrefixCache = struct {
     /// `fits` is re-asked after every eviction rather than compared against a
     /// precomputed shortfall: freeing an entry moves live MLX memory, and the
     /// one estimator that knows the bill is the one that must answer (#126).
+    /// An eviction that returns less than this to the allocator freed nothing
+    /// worth having: its buffers are refcount-SHARED with a live generator, so
+    /// dropping the entry only cost us the hit. One such eviction ends the
+    /// pass — the rest of the cache is no more likely to be free.
+    const FUTILE_EVICTION_BYTES: u64 = 1 << 20;
+
     pub fn evictLruToAdmit(
         self: *HotPrefixCache,
         seq_tokens: u64,
         ctx: ?*anyopaque,
         fits: *const fn (?*anyopaque) bool,
-        protect_mru: bool,
+        protect_restored: bool,
     ) EvictionReport {
         var report = EvictionReport{};
         while (!fits(ctx)) {
-            if (self.entries.items.len == 0) break;
-            if (protect_mru and self.entries.items.len == 1) break;
-            const before = self.current_kv_bytes;
-            self.evictOneLru("admitting a long prefill");
+            const idx = self.lruIndexExcluding(if (protect_restored) self.last_restored_used else null) orelse break;
+            // Accounting bytes are what the entry was BILLED; live bytes are
+            // what the allocator actually got back. They differ whenever a
+            // snapshot refcount-shares its buffers with a live cache — the
+            // restored entry does by construction, and so does anything a
+            // still-decoding slot is sitting on. Reporting the accounting
+            // number as "freed" is how an eviction pass wipes the cache for
+            // nothing and then refuses the request anyway.
+            var live_before: usize = 0;
+            _ = mlx.mlx_get_active_memory(&live_before);
+            const acct_before = self.current_kv_bytes;
+            self.evictAt(idx, "admitting a long prefill");
+            var live_after: usize = 0;
+            _ = mlx.mlx_get_active_memory(&live_after);
+            const freed_live: u64 = @as(u64, live_before) -| @as(u64, live_after);
             report.entries += 1;
-            report.bytes += before -| self.current_kv_bytes;
+            report.bytes += freed_live;
+            report.accounted_bytes += acct_before -| self.current_kv_bytes;
+            if (freed_live < FUTILE_EVICTION_BYTES) {
+                report.shared_stop = true;
+                break;
+            }
         }
         report.admitted = fits(ctx);
         if (report.entries > 0) {
-            log.info("  [hot-cache] evicted {d} entries ({d} MB) to admit a {d}-token prefill\n", .{
-                report.entries, report.bytes / (1024 * 1024), seq_tokens,
+            log.info("  [hot-cache] evicted {d} entries ({d} MB live, {d} MB billed) to admit a {d}-token prefill{s}\n", .{
+                report.entries,
+                report.bytes / (1024 * 1024),
+                report.accounted_bytes / (1024 * 1024),
+                seq_tokens,
+                if (report.shared_stop) " — stopped: the next entry is shared with a live request" else "",
             });
         }
         return report;
+    }
+
+    /// Least-recently-used entry index, skipping the one whose `last_used`
+    /// equals `protect`. Null when nothing is evictable.
+    fn lruIndexExcluding(self: *const HotPrefixCache, protect: ?u64) ?usize {
+        var best: ?usize = null;
+        var best_used: u64 = std.math.maxInt(u64);
+        for (self.entries.items, 0..) |*e, i| {
+            if (protect) |p| {
+                if (e.last_used == p) continue;
+            }
+            if (e.last_used < best_used) {
+                best_used = e.last_used;
+                best = i;
+            }
+        }
+        return best;
     }
 
     fn logResident(self: *const HotPrefixCache) void {
@@ -3206,75 +3267,77 @@ test "prefix cache: an inherited checkpoint SHARES the donor's buffers and is bu
     try testing.expectEqual(@as(f32, 1000.0), pcSsmVal(dst[0].ssm_state, 0, s));
 }
 
-test "evictLruToAdmit: the cache gives memory back to admit a prefill, oldest first, and never the entry in use" {
-    // Issue #353, the user's requirement in their own words: "I don't want
-    // OOM after 400k. Limit cache while free memory still left." Before this,
-    // a 458k-token prefill was refused (or, worse, admitted and fatal) while
-    // the cache sat on a 6.5 GB entry from the previous request.
+test "evictLruToAdmit: oldest first, never the entry THIS request restored, and shared bytes are not counted as freed" {
+    // Issue #353 and its audit. The user's rule is "limit cache while free
+    // memory still left", so a long prefill evicts rather than being refused —
+    // but two things make an eviction pass a lie if they are not handled:
+    //
+    //   * "most recently used" is not "the entry this request restored". A
+    //     concurrent commit bumps the counter past us, and then the pass
+    //     evicts the very entry the slot is decoding on.
+    //   * a restored entry's buffers are refcount-SHARED with the live cache,
+    //     so dropping it returns NOTHING to the allocator. Counting its
+    //     billed bytes as freed is how a pass wipes the cache and then
+    //     refuses the request anyway.
     const s = mlx.gpuStream();
     var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
     defer hc.deinit();
 
-    var toks_a: [600]u32 = undefined;
+    // Entries big enough for a live free to be visible (8 layers x 4096
+    // tokens x 64 B ~ 2 MB each, over FUTILE_EVICTION_BYTES).
+    var toks_a: [4096]u32 = undefined;
     for (&toks_a, 0..) |*t, i| t.* = @intCast(i + 1);
-    var toks_b: [600]u32 = undefined;
-    for (&toks_b, 0..) |*t, i| t.* = @intCast(i + 10_001);
-    var toks_c: [600]u32 = undefined;
-    for (&toks_c, 0..) |*t, i| t.* = @intCast(i + 20_001);
+    var toks_b: [4096]u32 = undefined;
+    for (&toks_b, 0..) |*t, i| t.* = @intCast(i + 1_000_001);
+    var toks_c: [4096]u32 = undefined;
+    for (&toks_c, 0..) |*t, i| t.* = @intCast(i + 2_000_001);
 
     inline for (.{ &toks_a, &toks_b, &toks_c }) |toks| {
-        var cache = try KVCache.init(testing.allocator, 1);
+        var cache = try KVCache.init(testing.allocator, 8);
         defer cache.deinit();
-        try testFillCache(&cache, s, 1, 600);
+        try testFillCache(&cache, s, 8, 4096);
         try hc.commit(&cache, toks, false);
     }
     try testing.expectEqual(@as(usize, 3), hc.entryCount());
-    try testing.expect(hc.residentBytes() > 0);
 
-    // A request that fits once ONE entry is gone evicts exactly one, and it
-    // is the least recently used (A, committed first).
-    const Fits = struct {
-        cache: *HotPrefixCache,
-        want_below: u64,
-        fn call(ctx: ?*anyopaque) bool {
-            const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            return self.cache.residentBytes() <= self.want_below;
-        }
-    };
-    const per_entry = hc.residentBytes() / 3;
-    var probe = Fits{ .cache = &hc, .want_below = per_entry * 2 };
-    const one = hc.evictLruToAdmit(458_832, &probe, Fits.call, true);
-    try testing.expect(one.admitted);
-    try testing.expectEqual(@as(usize, 1), one.entries);
-    try testing.expect(one.bytes > 0);
-    try testing.expectEqual(@as(usize, 2), hc.entryCount());
-    // A is gone, C (the most recently used) is not.
-    var probe_lookup: usize = 0;
-    var cache_a = try KVCache.init(testing.allocator, 1);
-    defer cache_a.deinit();
-    const miss_a = try hc.lookupAndRestore(&cache_a, &probe_lookup, null, s, &toks_a, false, 0, null, null);
-    try testing.expect(!miss_a.full_match);
+    // THIS request restores B — the middle entry, so "most recently used"
+    // and "restored" are only the same by luck. The target cache stays alive
+    // for the rest of the test: that is what makes B's buffers shared.
+    var live_b = try KVCache.init(testing.allocator, 8);
+    defer live_b.deinit();
+    var moe_off: usize = 0;
+    const hit = try hc.lookupAndRestore(&live_b, &moe_off, null, s, &toks_b, false, 0, null, null);
+    try testing.expect(hit.full_match);
+    try testing.expect(hc.last_restored_used != null);
 
-    // A request that does not fit even with an empty cache reports
-    // `admitted = false` — the caller refuses it by NAME rather than
-    // admitting a prefill that would take the working set down.
-    // (`want_below = 0` would not do: an emptied cache satisfies it. The
-    // request that cannot be served is the one no amount of cache fits.)
     const Never = struct {
         fn call(ctx: ?*anyopaque) bool {
             _ = ctx;
             return false;
         }
     };
-    const none = hc.evictLruToAdmit(458_832, null, Never.call, true);
-    try testing.expect(!none.admitted);
-    // …and `protect_mru` kept the entry this request restored from: one
-    // entry survives even a hopeless eviction pass.
+    // A pass that can never be satisfied still stops at the restored entry.
+    const rep = hc.evictLruToAdmit(458_832, null, Never.call, true);
+    try testing.expect(!rep.admitted);
+    try testing.expectEqual(@as(usize, 2), rep.entries); // A and C, oldest first
     try testing.expectEqual(@as(usize, 1), hc.entryCount());
-    // Without the protection the same pass empties the cache — and STILL
-    // reports `admitted = false`, which is what makes the caller refuse by
-    // name instead of starting a prefill the machine cannot finish.
+    // …and the survivor is B, by identity.
+    var probe_cache = try KVCache.init(testing.allocator, 8);
+    defer probe_cache.deinit();
+    var off2: usize = 0;
+    const still_b = try hc.lookupAndRestore(&probe_cache, &off2, null, s, &toks_b, false, 0, null, null);
+    try testing.expect(still_b.full_match);
+    // Evicting entries nothing else holds returns REAL memory.
+    try testing.expect(rep.bytes > 0);
+    try testing.expect(rep.accounted_bytes >= rep.bytes);
+
+    // Unprotected, B goes too — and because two live caches still hold its
+    // buffers, the allocator gets ~nothing back, which the pass NOTICES
+    // instead of reporting its billed bytes as freed.
     const rest = hc.evictLruToAdmit(458_832, null, Never.call, false);
     try testing.expect(!rest.admitted);
     try testing.expectEqual(@as(usize, 0), hc.entryCount());
+    try testing.expect(rest.accounted_bytes > 0);
+    try testing.expect(rest.bytes < rest.accounted_bytes);
+    try testing.expect(rest.shared_stop);
 }

@@ -5440,6 +5440,11 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             };
             if (!Probe.call(&probe)) {
                 const report = if (sch.hot_prefix_cache) |hc|
+                    // `true` = never evict the entry THIS request restored
+                    // from: its buffers are refcount-shared with the slot's
+                    // cache, so dropping it frees nothing and only throws
+                    // away the hit (the cache records the identity at
+                    // restore; "most recently used" is a different claim).
                     hc.evictLruToAdmit(slot.full_prompt.len, &probe, Probe.call, true)
                 else
                     prefix_cache_mod.EvictionReport{ .admitted = false };
