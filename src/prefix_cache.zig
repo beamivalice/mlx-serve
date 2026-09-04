@@ -183,6 +183,15 @@ pub const DflashCommit = struct { cache: *const KVCache, base_pos: usize };
 /// written on every path so the caller can build `DflashCtx` from it.
 pub const DflashTarget = struct { cache: *KVCache, base_pos: *usize };
 
+/// What `evictLruToAdmit` gave up, and whether it was enough.
+pub const EvictionReport = struct {
+    entries: usize = 0,
+    bytes: u64 = 0,
+    /// False means the cache is empty (or down to the entry this request is
+    /// using) and the request STILL does not fit — refuse it by name.
+    admitted: bool = false,
+};
+
 pub const HotPrefixCache = struct {
     entries: std.ArrayList(Entry),
     max_entries: u32,
@@ -1518,6 +1527,57 @@ pub const HotPrefixCache = struct {
                 reason, tokens_len, kv_mb,
             });
         }
+    }
+
+    /// Bytes the cache currently holds resident. A hint for the connection
+    /// thread's admission guard (it may race a commit by one entry); the
+    /// decision that MATTERS is made on the inference thread by
+    /// `evictLruToAdmit`, which re-reads live memory after every eviction.
+    pub fn residentBytes(self: *const HotPrefixCache) u64 {
+        return self.current_kv_bytes;
+    }
+
+    /// LIMIT THE CACHE WHILE MEMORY IS LEFT. Evict least-recently-used
+    /// entries until `fits()` says the request fits, and report what it cost.
+    ///
+    /// A cached prefix is an OPTIMIZATION; the request in front of us is the
+    /// work. Refusing a 450k-token prefill while holding a 6.5 GB entry from
+    /// the previous one — which is what the guard did before #353 — trades a
+    /// request the machine can serve for a cache hit nobody asked for. With
+    /// `--prefix-cache-disk` on, the evicted entry is still on the SSD tier,
+    /// so nothing is lost but the restore time.
+    ///
+    /// NEVER evicts the entry this request restored from: a restore bumps
+    /// that entry to MOST recently used and eviction takes the LEAST, so it
+    /// goes last by construction — and the loop stops before the final entry
+    /// when it is the one that was just touched (`protect_mru`).
+    ///
+    /// `fits` is re-asked after every eviction rather than compared against a
+    /// precomputed shortfall: freeing an entry moves live MLX memory, and the
+    /// one estimator that knows the bill is the one that must answer (#126).
+    pub fn evictLruToAdmit(
+        self: *HotPrefixCache,
+        seq_tokens: u64,
+        ctx: ?*anyopaque,
+        fits: *const fn (?*anyopaque) bool,
+        protect_mru: bool,
+    ) EvictionReport {
+        var report = EvictionReport{};
+        while (!fits(ctx)) {
+            if (self.entries.items.len == 0) break;
+            if (protect_mru and self.entries.items.len == 1) break;
+            const before = self.current_kv_bytes;
+            self.evictOneLru("admitting a long prefill");
+            report.entries += 1;
+            report.bytes += before -| self.current_kv_bytes;
+        }
+        report.admitted = fits(ctx);
+        if (report.entries > 0) {
+            log.info("  [hot-cache] evicted {d} entries ({d} MB) to admit a {d}-token prefill\n", .{
+                report.entries, report.bytes / (1024 * 1024), seq_tokens,
+            });
+        }
+        return report;
     }
 
     fn logResident(self: *const HotPrefixCache) void {
@@ -3147,3 +3207,66 @@ test "prefix cache: an inherited checkpoint SHARES the donor's buffers and is bu
     try testing.expectEqual(@as(f32, 1000.0), pcSsmVal(dst[0].ssm_state, 0, s));
 }
 
+test "evictLruToAdmit: the cache gives memory back to admit a prefill, oldest first, and never the entry in use" {
+    // Issue #353, the user's requirement in their own words: "I don't want
+    // OOM after 400k. Limit cache while free memory still left." Before this,
+    // a 458k-token prefill was refused (or, worse, admitted and fatal) while
+    // the cache sat on a 6.5 GB entry from the previous request.
+    const s = mlx.gpuStream();
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+
+    var toks_a: [600]u32 = undefined;
+    for (&toks_a, 0..) |*t, i| t.* = @intCast(i + 1);
+    var toks_b: [600]u32 = undefined;
+    for (&toks_b, 0..) |*t, i| t.* = @intCast(i + 10_001);
+    var toks_c: [600]u32 = undefined;
+    for (&toks_c, 0..) |*t, i| t.* = @intCast(i + 20_001);
+
+    inline for (.{ &toks_a, &toks_b, &toks_c }) |toks| {
+        var cache = try KVCache.init(testing.allocator, 1);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 1, 600);
+        try hc.commit(&cache, toks, false);
+    }
+    try testing.expectEqual(@as(usize, 3), hc.entryCount());
+    try testing.expect(hc.residentBytes() > 0);
+
+    // A request that fits once ONE entry is gone evicts exactly one, and it
+    // is the least recently used (A, committed first).
+    const Fits = struct {
+        cache: *HotPrefixCache,
+        want_below: u64,
+        fn call(ctx: ?*anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            return self.cache.residentBytes() <= self.want_below;
+        }
+    };
+    const per_entry = hc.residentBytes() / 3;
+    var probe = Fits{ .cache = &hc, .want_below = per_entry * 2 };
+    const one = hc.evictLruToAdmit(458_832, &probe, Fits.call, true);
+    try testing.expect(one.admitted);
+    try testing.expectEqual(@as(usize, 1), one.entries);
+    try testing.expect(one.bytes > 0);
+    try testing.expectEqual(@as(usize, 2), hc.entryCount());
+    // A is gone, C (the most recently used) is not.
+    var probe_lookup: usize = 0;
+    var cache_a = try KVCache.init(testing.allocator, 1);
+    defer cache_a.deinit();
+    const miss_a = try hc.lookupAndRestore(&cache_a, &probe_lookup, null, s, &toks_a, false, 0, null, null);
+    try testing.expect(!miss_a.full_match);
+
+    // A request that does not fit even with an empty cache reports
+    // `admitted = false` — the caller refuses it by NAME rather than
+    // admitting a prefill that would take the working set down.
+    var impossible = Fits{ .cache = &hc, .want_below = 0 };
+    const none = hc.evictLruToAdmit(458_832, &impossible, Fits.call, true);
+    try testing.expect(!none.admitted);
+    // …and `protect_mru` kept the entry this request restored from: one
+    // entry survives even a hopeless eviction pass.
+    try testing.expectEqual(@as(usize, 1), hc.entryCount());
+    // Without the protection the same pass empties the cache.
+    const rest = hc.evictLruToAdmit(458_832, &impossible, Fits.call, false);
+    try testing.expect(!rest.admitted);
+    try testing.expectEqual(@as(usize, 0), hc.entryCount());
+}

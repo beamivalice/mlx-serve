@@ -1235,6 +1235,11 @@ pub fn serve(
     defer scheduler.deinit();
     global_scheduler = scheduler;
     defer global_scheduler = null;
+    // The inference thread's evict-or-refuse hook (issue #353). Installed
+    // beside `global_scheduler` because it answers with the same estimator
+    // this module owns, and the scheduler deliberately has no server import.
+    scheduler_mod.prefill_admission_fits = &prefillFitsNow;
+    defer scheduler_mod.prefill_admission_fits = null;
 
     // Gauge sampler: samples instantaneous system + queue state every 2 s and
     // writes the metrics gauges. Only runs when --metrics is on. Trivial cost
@@ -3343,11 +3348,33 @@ fn slotFailure(slot: *scheduler_mod.Slot) anyerror {
 /// line, the only place that knows which allocation failed.
 const GEN_OOM_MSG = "The engine ran out of GPU memory during this request and it was abandoned. The server is still running. Reduce the prompt length, lower --ctx-size, or free memory on the machine.";
 
-fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_len: usize, max_tokens: u32, config: *const model_mod.ModelConfig, is_anthropic: bool, kv_override: ?transformer_mod.KVQuantConfig, lm: *const LoadedModel, unchunked_prefill: bool) !bool {
-    if (!mlxMemoryGuardApplies(lm.ds4_engine != null, lm.llama_engine != null)) return true;
-    const heads = config.num_attention_heads;
-    if (heads == 0) return true; // unknown architecture, skip check
+/// The admission bill and the headroom it is compared against, as ONE number
+/// each. Extracted so the connection thread's guard and the inference
+/// thread's evict-or-refuse decision cannot compute the bill differently
+/// (#126: a gate that runs before the estimator that knows better IS the
+/// estimator).
+pub const AdmissionBill = struct {
+    needed: u64 = 0,
+    available: u64 = 0,
+    /// Bytes the hot prefix cache is holding that could be given back. A
+    /// racy hint on the connection thread; exact on the inference thread.
+    evictable: u64 = 0,
 
+    pub fn fits(self: AdmissionBill) bool {
+        return self.needed <= self.available;
+    }
+
+    /// Fits once the cache has given back everything it holds. The guard
+    /// admits on THIS and the inference thread then evicts only as much as it
+    /// has to — a cached prefix is an optimization, the request is the work.
+    pub fn fitsAfterEviction(self: AdmissionBill) bool {
+        return self.needed <= self.available +| self.evictable;
+    }
+};
+
+pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_override: ?transformer_mod.KVQuantConfig, unchunked_prefill: bool) AdmissionBill {
+    const heads = config.num_attention_heads;
+    if (heads == 0) return .{ .needed = 0, .available = std.math.maxInt(u64) };
     const seq: u64 = @intCast(prompt_len);
     const layers: u64 = config.num_hidden_layers;
     const kv_heads: u64 = config.num_key_value_heads;
@@ -3396,12 +3423,49 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_len:
     _ = mlx.mlx_get_active_memory(&active_mem);
     const total_limit: u64 = currentGpuMemoryCeiling(active_mem);
     const available = if (total_limit > active_mem) total_limit - active_mem else 0;
+    const evictable: u64 = if (global_scheduler) |sch|
+        (if (sch.hot_prefix_cache) |hc| hc.residentBytes() else 0)
+    else
+        0;
+    return .{ .needed = needed, .available = available, .evictable = evictable };
+}
 
+/// Inference-thread predicate behind `Scheduler`'s admission hook: does this
+/// request fit RIGHT NOW, with live memory re-read? Re-asked after every
+/// hot-cache eviction, so the estimator — not a precomputed shortfall —
+/// decides when to stop evicting.
+pub fn prefillFitsNow(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32) bool {
+    return prefillAdmissionBill(config, prompt_len, max_tokens, null, false).fits();
+}
+
+fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_len: usize, max_tokens: u32, config: *const model_mod.ModelConfig, is_anthropic: bool, kv_override: ?transformer_mod.KVQuantConfig, lm: *const LoadedModel, unchunked_prefill: bool) !bool {
+    if (!mlxMemoryGuardApplies(lm.ds4_engine != null, lm.llama_engine != null)) return true;
+    if (config.num_attention_heads == 0) return true; // unknown architecture, skip check
+    const bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_override, unchunked_prefill);
+    const needed = bill.needed;
+    const available = bill.available;
+    // LIMIT THE CACHE WHILE MEMORY IS LEFT (issue #353). A resident hot-cache
+    // entry is an optimization; the request in front of us is the work. When
+    // the bill only fails because the cache is holding memory, ADMIT — the
+    // inference thread evicts LRU entries until it fits (they survive on the
+    // SSD tier when --prefix-cache-disk is on) and refuses by name only if
+    // the cache is empty and it still does not fit. Refusing here would trade
+    // a request the machine can serve for a cache hit nobody asked for.
+    if (needed > available and bill.fitsAfterEviction()) {
+        log.info("  prompt {d} tokens needs ~{d}MB, ~{d}MB available + ~{d}MB evictable hot cache — admitting, the prefill will evict\n", .{
+            prompt_len, needed / (1024 * 1024), available / (1024 * 1024), bill.evictable / (1024 * 1024),
+        });
+        return true;
+    }
     if (needed > available) {
         const needed_mb = needed / (1024 * 1024);
         const avail_mb = available / (1024 * 1024);
         log.warn("  prompt {d} tokens needs ~{d}MB (KV+working+margin), ~{d}MB available — rejecting\n", .{ prompt_len, needed_mb, avail_mb });
-        const msg = try std.fmt.allocPrint(allocator, "Prompt ({d} tokens) requires ~{d}MB GPU memory but only ~{d}MB available. Reduce prompt size or use a smaller model.", .{ prompt_len, needed_mb, avail_mb });
+        // A refusal quotes the numbers it COMPARED — including the hot cache,
+        // because the operator's first question is "why didn't it just drop a
+        // cache entry?" and the honest answer here is that there was nothing
+        // left to drop (issue #353).
+        const msg = try std.fmt.allocPrint(allocator, "Prompt ({d} tokens) requires ~{d}MB GPU memory but only ~{d}MB is available and the hot prefix cache holds ~{d}MB more, which is not enough. Reduce prompt size, lower --ctx-size, or use a smaller model.", .{ prompt_len, needed_mb, avail_mb, bill.evictable / (1024 * 1024) });
         defer allocator.free(msg);
         if (is_anthropic) {
             try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);

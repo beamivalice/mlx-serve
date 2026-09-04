@@ -297,6 +297,14 @@ pub const SubmitParams = struct {
     model: *model_registry_mod.LoadedModel,
 };
 
+/// Set by `server.installPrefillAdmission` at startup: does a request of this
+/// shape fit in GPU memory right now? A function pointer rather than an
+/// import because the scheduler deliberately has no server.zig dependency —
+/// the same shape as `prefix_cache_mem_resolver`. Null in unit tests and on
+/// hosts that never route through the HTTP server, which disables the
+/// evict-to-admit path entirely (behaviour identical to before #353).
+pub var prefill_admission_fits: ?*const fn (*const model_mod.ModelConfig, usize, u32) bool = null;
+
 pub const SlotState = enum { pending_prefill, decoding, finished, errored };
 
 /// Result of `Slot.waitNext`. Driven by the inference thread; consumed by
@@ -5357,6 +5365,53 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // snapshot work that would just be discarded.
     const cp_stride: u32 = if (slot.model.prefix_cache != null) slot.model.ssm_checkpoint_stride else 0;
     const cp_max: u32 = slot.model.ssm_checkpoint_max;
+
+    // LIMIT THE CACHE WHILE MEMORY IS LEFT (issue #353). The connection
+    // thread's guard admits a request whose bill fits only once the hot cache
+    // gives memory back; this is where it gives it back. Here — not there —
+    // because the inference thread is the SOLE mlx caller (even frees), and
+    // because the prefix restore has already happened, so the entry this
+    // request is using is the MOST recently used one and LRU eviction reaches
+    // it last (`protect_mru`).
+    //
+    // The estimator is re-asked after every eviction rather than compared
+    // against a precomputed shortfall: freeing an entry moves live MLX
+    // memory, and the gate that runs before the estimator that knows better
+    // IS the estimator (#126).
+    if (prefill_admission_fits) |fits_fn| {
+        if (slot.model.config) |cfg| {
+            const Probe = struct {
+                cfg: *const model_mod.ModelConfig,
+                seq: usize,
+                max_tokens: u32,
+                fits: *const fn (*const model_mod.ModelConfig, usize, u32) bool,
+                fn call(ctx: ?*anyopaque) bool {
+                    const self: *@This() = @ptrCast(@alignCast(ctx.?));
+                    return self.fits(self.cfg, self.seq, self.max_tokens);
+                }
+            };
+            var probe = Probe{
+                .cfg = cfg,
+                .seq = slot.full_prompt.len,
+                .max_tokens = slot.max_tokens,
+                .fits = fits_fn,
+            };
+            if (!Probe.call(&probe)) {
+                const report = if (sch.hot_prefix_cache) |hc|
+                    hc.evictLruToAdmit(slot.full_prompt.len, &probe, Probe.call, true)
+                else
+                    prefix_cache_mod.EvictionReport{ .admitted = false };
+                if (!report.admitted) {
+                    // Nothing left to give back. Refuse by NAME — the memory
+                    // class, so the client gets a 503 that says so rather
+                    // than a dead connection (or, before the MLX error latch,
+                    // a dead server).
+                    log.warn("[scheduler] prefill refused: {d} tokens do not fit even with an empty hot cache\n", .{slot.full_prompt.len});
+                    return error.OutOfMemory;
+                }
+            }
+        }
+    }
 
     // Chunk-boundary decode yields: the hook advances already-decoding
     // streams between this prefill's chunks. Ticks hosted here are billed
