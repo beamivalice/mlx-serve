@@ -3777,14 +3777,53 @@ fn qsaAttnEnvInt(cache: *?c_int, name: [*:0]const u8, dflt: c_int) c_int {
     return v;
 }
 
-/// Splits per (row, kv head). Derived from S and Hk ALONE, never from kv or
-/// from the row's key count: NSPLIT is a template, so anything kv-dependent
-/// here would rebuild the config every round as the cache grows — which is
-/// exactly the bug removed from `QsaAttnCfgKey`.
-/// `MLX_SERVE_QSA_ATTN_NSPLIT=<n>` overrides (absent or 0 = auto).
-pub fn qsaAttnNSplit(seq_len: c_int, h_kv: c_int) c_int {
-    const natural = seq_len * h_kv;
-    if (natural <= 0) return 1;
+/// Splits per (row, kv head).
+///
+/// Takes NO arguments, deliberately. It used to take (seq_len, h_kv) and
+/// derive the count from them; once the sweep replaced that derivation with a
+/// measured constant the parameters went inert, and a signature that still
+/// asks for them claims a width-dependence the body does not have. If a later
+/// sweep earns a per-width table the arguments come back with it.
+///
+/// Whatever replaces this must stay independent of kv and of the row's key
+/// count: NSPLIT is a template, so a kv-dependent split count would put kv
+/// back into `QsaAttnCfgKey` through the side door and restore the per-round
+/// rebuild. `MLX_SERVE_QSA_ATTN_NSPLIT=<n>` overrides (absent or 0 = auto).
+/// Resolve every lazily-cached QSA env read ONCE, from the main thread, before
+/// any other thread exists.
+///
+/// Each of these is a `?bool`/`?c_int` filled on first touch, and first touch
+/// is a race: the HTTP thread parses a request and asks whether an arm is
+/// enabled, while the inference thread asks the same question inside a
+/// forward. A non-atomic optional written from two threads is UB, and the
+/// values are process constants read from the environment, so the fix is to
+/// stop resolving them lazily rather than to make the store atomic. Called
+/// from `main()` beside `applyMlxCacheLimit`.
+///
+/// A new lazily-cached env read belongs in this list; the scan test below
+/// requires every `qsa_*_cached`/`qsa_*_env` var to have a reader named here.
+pub fn warmQsaEnvCaches() void {
+    _ = qsaFusedEnabled();
+    _ = qsaGatherEnabled();
+    _ = qsaGatherMinKv();
+    _ = qsaGatherBk();
+    _ = qsaDecodeGatherEnabled();
+    _ = qsaVerifyGatherEnabled();
+    _ = qsaVerifyGatherMinKv();
+    _ = qsaSelectEnabledWarm();
+    _ = qsaSelectTg();
+    _ = qsaAttnKernelEnabled();
+    _ = qsaAttnNSplit();
+    _ = qsaAttnMinS();
+}
+
+/// `qsaSelectKernelEnabled` consults an override first, so warming it through
+/// a wrapper keeps the warm path honest about what it is caching.
+fn qsaSelectEnabledWarm() bool {
+    return qsaSelectKernelEnabled();
+}
+
+pub fn qsaAttnNSplit() c_int {
     const forced = qsa_attn_nsplit_override orelse qsaAttnEnvInt(&qsa_attn_nsplit_env, "MLX_SERVE_QSA_ATTN_NSPLIT", 0);
     if (forced > 0) {
         var f: c_int = 1;
@@ -4057,7 +4096,7 @@ pub fn qsaSparseAttn(
     const kernel = getQsaAttnQKernel() catch return null;
     const merge_kernel = getQsaAttnMergeKernel() catch return null;
     const nsg: c_int = @divTrunc(gqa + 7, 8);
-    const nsplit = qsaAttnNSplit(seq_len, h_kv);
+    const nsplit = qsaAttnNSplit();
     const scl_data = [_]f32{attn_scale};
     const one = [_]c_int{1};
     const scl = mlx.mlx_array_new_data(&scl_data, &one, 1, .float32);
@@ -39608,7 +39647,7 @@ test "qsa sparse attn: the split-K merge is invariant in the split count (1, 8, 
     };
     for ([_]c_int{ 1, 8, 64 }) |ns| {
         qsa_attn_nsplit_override = ns;
-        try std.testing.expectEqual(ns, qsaAttnNSplit(seq, 2));
+        try std.testing.expectEqual(ns, qsaAttnNSplit());
         const got = (try qsaSparseAttn(s, q, &view, blocks, ratio, scale)) orelse return error.SparseAttnDeclined;
         defer _ = mlx.mlx_array_free(got);
         const d = try attn256MaxDiff(got, ref, s);
@@ -39628,25 +39667,65 @@ test "qsa sparse attn: the split-K merge is invariant in the split count (1, 8, 
     }
 }
 
+test "scan: every lazily-cached QSA env read is warmed from main, not raced into" {
+    // L20. These caches are `?bool`/`?c_int` filled on FIRST TOUCH, and first
+    // touch happens on whichever thread asks first — the HTTP thread parsing a
+    // request, or the inference thread inside a forward. A non-atomic optional
+    // written from two threads is UB. They are process constants read from the
+    // environment, so the fix is to resolve them eagerly on the main thread;
+    // this scan keeps a new one from being added lazily and forgotten.
+    const src = @embedFile("transformer.zig");
+    const fn_start = std.mem.indexOf(u8, src, "pub fn warmQsaEnv" ++ "Caches() void {").?;
+    const body_end = std.mem.indexOfPos(u8, src, fn_start, "\n}\n").?;
+    const body = src[fn_start..body_end];
+
+    // Every `var qsa_*: ?bool` / `?c_int` in the file is an env cache (kernel
+    // handles are `?mlx.mlx_fast_metal_kernel`, config caches are structs).
+    var declared: usize = 0;
+    var it = std.mem.tokenizeScalar(u8, src, '\n');
+    while (it.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " ");
+        if (!std.mem.startsWith(u8, trimmed, "var qsa_")) continue;
+        const is_bool = std.mem.indexOf(u8, trimmed, ": ?bool") != null;
+        const is_int = std.mem.indexOf(u8, trimmed, ": ?c_int") != null;
+        if (!is_bool and !is_int) continue;
+        // Overrides are set by tests, never read from the environment.
+        if (std.mem.indexOf(u8, trimmed, "_override") != null) continue;
+        declared += 1;
+    }
+    try std.testing.expect(declared > 0);
+
+    // One warming read per cache, at least. `_ = ` is how the body calls them.
+    var warmed: usize = 0;
+    var wt = std.mem.tokenizeScalar(u8, body, '\n');
+    while (wt.next()) |line| {
+        if (std.mem.indexOf(u8, line, "_ = qsa") != null) warmed += 1;
+    }
+    if (warmed < declared) {
+        std.debug.print("[scan] {d} lazily-cached QSA env vars, only {d} warmed in warmQsaEnvCaches\n", .{ declared, warmed });
+    }
+    try std.testing.expect(warmed >= declared);
+
+    // ...and main() must actually call it, or the list is decoration.
+    const main_src = @embedFile("main.zig");
+    try std.testing.expect(std.mem.indexOf(u8, main_src, "warmQsaEnv" ++ "Caches()") != null);
+}
+
 test "qsa sparse attn: NSPLIT is one MEASURED constant, and the width floor binds the DISPATCH" {
     // The default is flat because the sweep says so: every split count 8..64
     // wins, and only S=6's 16-vs-32 (2.9% over a 1.2% floor) is resolved. A
     // per-width table would be fitting two points, one of them noise.
     defer qsa_attn_nsplit_override = null;
     qsa_attn_nsplit_override = null;
-    for ([_]c_int{ 1, 2, 3, 4, 6, 8, 15 }) |seq| {
-        for ([_]c_int{ 1, 2, 4, 8 }) |hk| {
-            try std.testing.expectEqual(QSA_ATTN_NSPLIT_DEFAULT, qsaAttnNSplit(seq, hk));
-        }
-    }
+    try std.testing.expectEqual(QSA_ATTN_NSPLIT_DEFAULT, qsaAttnNSplit());
     try std.testing.expectEqual(@as(c_int, 16), QSA_ATTN_NSPLIT_DEFAULT);
     // The override still rounds up to a power of two, within the ceiling.
     qsa_attn_nsplit_override = 8;
-    try std.testing.expectEqual(@as(c_int, 8), qsaAttnNSplit(6, 2));
+    try std.testing.expectEqual(@as(c_int, 8), qsaAttnNSplit());
     qsa_attn_nsplit_override = 5;
-    try std.testing.expectEqual(@as(c_int, 8), qsaAttnNSplit(6, 2));
+    try std.testing.expectEqual(@as(c_int, 8), qsaAttnNSplit());
     qsa_attn_nsplit_override = 1000;
-    try std.testing.expectEqual(QSA_ATTN_MAX_NSPLIT, qsaAttnNSplit(6, 2));
+    try std.testing.expectEqual(QSA_ATTN_MAX_NSPLIT, qsaAttnNSplit());
     qsa_attn_nsplit_override = null;
 
     // The width floor: default excludes decode, the lever includes it.

@@ -370,6 +370,11 @@ pub fn main(init: std.process.Init) !void {
     // --pld* flags. See server.mlxCacheLimitBytes for why MLX's own default
     // (~121 GB on a 128 GB Mac) is no defense.
     server_mod.applyMlxCacheLimit();
+    // Resolve every lazily-cached QSA env read here, on the main thread,
+    // before the HTTP and inference threads exist: first touch of a
+    // `?bool`/`?c_int` cache from two threads is a non-atomic race, and these
+    // are process constants.
+    @import("transformer.zig").warmQsaEnvCaches();
 
     // And make an MLX failure an ERROR rather than the end of the process.
     // mlx-c's default handler prints and calls exit(-1), so a Metal
