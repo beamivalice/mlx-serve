@@ -4632,3 +4632,34 @@ predictable probe (`user=368b`, "Repeat the following passage exactly"), with th
   own two boots differ by 30% on predictable, which is larger than any effect
   measured here. The persisted table must be restored before EVERY boot (not
   disabled — the live table IS the subject) or the arms teach each other.
+
+## The QSA tie bias was a MAGNITUDE contract, and the profiler that priced the fix could not see it (2026-09-04)
+
+`qsaSelectBlocks` picks each query row's top-512 indexer blocks. relu leaves many EXACT zeros in the score row, so which of several tied blocks gets picked is a real decision, and the reference (`torch.topk`) makes it by taking the LOWER index. Ours reproduced that by subtracting an index-ascending bias before `argpartition`: `biased = score - idx * 1e-7`, so on a tie the lower index is strictly larger and wins.
+
+That is not a tie rule, it is a tie rule **with a magnitude precondition nobody wrote down**. The bias only survives the f32 rounding of the subtraction. One ulp at score `v` is `v * 2^-23`, so the 1e-7 step between ADJACENT blocks vanishes once `|v| > ~0.84`, and from there the tie goes back to argpartition's internal order — which is arbitrary, not reliably lower or higher. At `v = 625` the whole bias across a 2048-block row collapses into **four** distinct f32 values: ~512 blocks share each one, and inside a group the "rule" is a coin flip. An indexer score is a relu sum over four heads of `q·k`; it is nowhere near 0.84. So the shipping chain had **never** implemented the reference tie rule on production scores — only on a toy grid.
+
+It surfaced the only way it could: the fused replacement's first parity run went red at nb=2048, slot 341, chain 1370 vs kernel 1369 on two blocks with equal scores. The kernel was right.
+
+**The fused arm.** `msv_qsa_select` (`qsaSelectTopBlocks`, kill switch `MLX_SERVE_QSA_SELECT_KERNEL=0`) replaces the whole composed tail — bias → visibility `-inf` where → `argpartition` → slice → astype → `take_along_axis` → INT_MAX where → `sort` — with ONE dispatch, one threadgroup per query row. An MSD radix select over the score's monotone f32 ordinal (digits 11/11/10, a 2048-bin threadgroup histogram = 8 KiB, early exit the moment a bin's whole count is what is still needed, so the row is read 2-3 times) finds the threshold ordinal `T` and how many `== T` elements to take. Then one ascending compaction pass: an element is selected iff `ord > T`, or `ord == T` and its rank among the equals is below the quota, and its output slot is the number of selected elements with a SMALLER index — two running prefix sums give that directly, so **the row is born sorted and there is no sort pass at all**. The tie rule is exact by construction and independent of magnitude. `nb` rides the input SHAPE, never a template arg: it grows every `ratio` tokens of a generation and a template value would JIT a fresh specialization per decode step.
+
+**Measured (M5 Max, mixed-4-8bit pack, one binary, `MLX_SERVE_QSA_VERIFY_EXACT=0`).**
+
+Forward µbench, 8 boots, order off/on/on/off per width:
+
+| S | ms/forward off → on | eval (GPU) off → on | ops/forward |
+|---|---|---|---|
+| 1 | 19.591 → 19.645 (+0.27%) | 17.928 → 17.968 (+0.22%) | 4895 → 4859 |
+| 6 | 45.048 → 44.719 (−0.73%) | 43.061 → 42.749 (−0.72%) | 6657 → 6538 |
+
+Decode is a **wash** — opposite signs, same magnitude, and the S=1 `off` arm alone drifted 20.098 → 19.084 (−5.0%) between its own two boots with both `on` boots inside that interval. Prefill is where it pays: two cold 62752-token prefills per arm, 1142 → 1189 (+4.2%) and 1041 → 1147 (+10.1%), TTFT 55.0 → 52.8 s and 60.3 → 54.7 s. The reason is geometry, and it is inherent: at S=1 the kernel runs ONE threadgroup for ONE row, twelve dependent times per forward, with the GPU otherwise idle; at prefill the same code runs 1024-2048 rows as 1024-2048 threadgroups in one dispatch. Replacing ten dispatches with one does not help when neither was the bottleneck.
+
+**The meta-lesson: a per-layer eval profiler cannot price a dispatch-count term.** The work was commissioned off `QWEN4_PROFILE_QSA`, which reported the select at ~0.31 ms/layer — 3.7 ms of a 20 ms forward, "the largest remaining S=1 term". Re-run as a same-barrier A/B it says 1.520 ms/layer at S=1 for BOTH arms, against a forward that is only 1.63 ms/layer: the profiler's `mlx_array_eval` drains the whole layer's queued work into the timed region, so it was never measuring the select. The clean cell is S=6, where the block really is 0.330 → 0.310 ms/layer (−6%): 0.02 × 12 = 0.24 ms of a 44.7 ms forward = 0.54%, which is exactly the −0.73% the µbench saw independently. A barrier-based profiler measures *latency you inserted*; to price a term that is many small dependent dispatches, A/B the whole forward, or expect to ship a kernel for a number that was never there.
+
+**Output impact.** Ties are common: 140 of 8192 selected slots differ between the arms at production magnitude (all of them tied blocks — bar is the selected SCORE multiset per row, not the id list, because one differing pick shifts every later slot of an ascending list). On a 62.7k prompt the greedy completions diverged once, at char 50, and the `off` arm's top-2 gap at that token was **0.0000 nats** — an exact tie, i.e. the change moved the output precisely where the model was indifferent. MTP-vs-serial parity held on both arms at 0.1250 nats, inside the 0.15 bar.
+
+Rules that came out of it:
+
+- **A float tie-break bias is only a tie-break where it exceeds the ulp at the values it is added to.** Either derive it from the operand's magnitude, or do not encode ordering in float arithmetic at all — order on a monotone integer key, which is what the kernel does.
+- **A parity test whose reference is the incumbent can only find disagreements, not decide them.** Both arms here are measured against `qsaExactTopHost` (score desc, index asc). The incumbent is held to the same bar, and only on the small-magnitude grid where its bias actually resolves — the regime split IS the finding.
+- **"Arbitrary" is not "reliably wrong".** A first attempt to assert the chain picks the higher index was flaky; what is deterministic is the CAUSE (4 vs 2048 distinct biased values, pure f32) and the kernel's own agreement with the reference.
