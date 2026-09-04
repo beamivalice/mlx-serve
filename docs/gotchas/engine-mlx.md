@@ -4932,3 +4932,100 @@ which the next MTP round then drafts from. It is now a real branch through
 `.stay_disabled` arm takes (`mtpSerialGiveUp`: finish this request serial, log
 once). The rule generalizes: an invariant that protects a SERVING path is a
 runtime check; `std.debug.assert` is for invariants a test can violate.
+
+### The adaptive switch's denominator: a measured numerator over a modeled one
+
+The first version of the switch priced a speculative round as
+
+    measuredMs(m_lo, bucket) / mtpEvExpectedTokens(mtp_ev_accept, m_lo)
+
+and compared that with the bucket's measured serial token. The numerator is a
+real number off a real clock. The denominator is a model: `mtp_ev_accept[k]` is
+a per-index EMA of "was draft k accepted" and `mtpEvExpectedTokens` returns
+`1 + sum_k prod_{j<=k} a[j]` — a product of MARGINALS.
+
+The 2026-09-04 A/B on qwen4_exp at 62.7k made the cost visible. The controller
+switched to serial on four prose requests. On those same requests MTP was
+running at 56.8 tok/s against serial's 51.6: the switch was wrong every time,
+and each one cost about 10%.
+
+The EMAs were not cold. The second request inherited the first's converged
+surface through the EV seed, and the first's own `acc_idx` was
+`0.63/0.46/0.32`. Two structural biases do the damage instead:
+
+1. **Independence.** Acceptance is strongly positively correlated *within* a
+   round — a predictable stretch of text takes every draft, a hard one takes
+   none. A product of marginals is `prod E[]`, the truth is `E[prod]`, and for
+   positively correlated terms `E[prod] > prod E[]`. The chain is biased low by
+   construction, and no amount of convergence fixes it.
+2. **Two different rounds.** `measuredMs` is a realized round including
+   whatever the extension did (`ext_rounds` ran 1-26 in these logs). The chain
+   models a round with NO extension. Numerator and denominator described
+   different objects.
+
+Measured against the SAME cell's own `tok` column, the modeled token count ran
+12-31% low at every switch:
+
+| event | width | modeled | cell `tok` | error |
+|---|---|---|---|---|
+| b1 long1 | w2 | 1.81 | 2.28 | -21% |
+| b1 long2 | w2 | 1.81 | 2.32 | -22% |
+| b4 long1 | w4 | 1.84 | 2.67 | -31% |
+| b4 long2 | w1 | 1.46 | 1.66 | -12% |
+
+The fix is smaller than it looks: **the measured denominator was already in the
+cell that supplied the numerator.** `Cell` stores `ms` and `tok` folded from the
+same rounds, and `Table.msPerTok` divides them. The controller took `ms` and
+threw `tok` away.
+
+Why the model was there at all is worth keeping in mind, because it is not a
+silly mistake. `mtpEvExpectedTokens` is correct for the job it was written for:
+RANKING widths inside `mtpEvPlanSrc`. A bias that multiplies every width by
+roughly the same factor cancels in a ranking. It does not cancel in a LEVEL
+comparison against an unrelated quantity, and the serial vote is a level
+comparison. **A ratio is only a measurement when both terms come from the same
+rounds.**
+
+The shipped rule requires two measured prices, both past `serial x (1 + 5%)`,
+three rounds running:
+
+- `Table.msPerTok(m_lo, bucket)` — cross-request, but its `tok` is a workload
+  MIXTURE, so a bucket fed mostly by code reads optimistic on prose.
+- `MtpPriceWindow` — this request's realized ms per emitted token over the last
+  16 non-trial rounds. Immune to the mixture, but per-request and null until
+  FULL.
+
+Their failure modes are disjoint, a wrong switch costs ~10% and a missed one
+costs nothing today, so `serial` needs both to agree. Replayed against the four
+real events, rule A alone is 4/4 correct and the shipped A-AND-B rule is 4/4;
+the window UNGATED is 3/4, and its one miss is instructive — it voted at round
+~3 on a request whose nine rounds were all prefix-cache-restore warmup
+(`avg_per_round` 0.89, `round_ms` 45.69 -> 24.17 ms/tok). The full-window gate
+is what excludes that, and it is why the window is a ring rather than the
+`mtp_ev_round_ms` EMA sitting next to it: an EMA cannot express "full".
+
+Width trials are skipped in the window (a trial deliberately prices a width the
+plan rejected, and 3 of 16 rounds at a rejected width would poison it);
+extension rounds are kept, because the vote asks whether the whole speculation
+is worth running and an extension is part of it.
+
+### The switch has a floor as well as a ceiling
+
+The same A/B recorded 14 switches, and 11 of them were in the `<2k` bucket —
+every one an llmprobe request. Short context is the worst place to be wrong:
+llmprobe's predictable cell runs ~151 tok/s speculating against roughly 95
+serial, so a bad switch costs ~2x there against ~10% at 62.7k. It is also the
+one regime the feature was never argued for; the case for it begins past 32k,
+where a verify row becomes bytes.
+
+`MLX_SERVE_MTP_ADAPTIVE_MIN_KV` (default 8192) gates the vote AND the probe
+from one predicate above both — a probe below the floor would spend 8 serial
+tokens teaching a bucket that is never allowed to decide. It is the symmetric
+knob to `--max-mtp-ctx`: a ceiling past which speculation stays off, a floor
+below which it stays on.
+
+The guard lesson is separate and more general: the first version of
+`tests/test_mtp_adaptive.sh` asserted "the short request does not switch" with
+ONE fresh-state request, and that check passed on the very boots where eleven
+short-context switches were happening. A bucket that only matures over many
+requests cannot be probed with one. The assertion is now a 12-request burst.
