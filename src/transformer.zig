@@ -3246,12 +3246,19 @@ fn getQsaSelectKernel() !mlx.mlx_fast_metal_kernel {
 
 /// The config bakes the OUTPUT shape and the grid, so it is keyed on the FULL
 /// input shape (rows AND nb) plus K — never on a product (the ShapeKey rule).
-const QsaSelectCfgKey = struct { shape: ShapeKey, k: c_int, tg: c_int };
-var qsa_select_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
-var qsa_select_cfg_key: QsaSelectCfgKey = std.mem.zeroes(QsaSelectCfgKey);
-/// Rebuild counter — the only externally visible difference between a config
-/// cache hit and a rebuild (the dispatch is identical either way).
-pub var qsa_select_cfg_builds: usize = 0;
+/// Keyed on what the CONFIG reads and nothing else: the output shape is
+/// [1, rows, kb], the grid is (tg, rows, 1) and the templates are TGS and K.
+/// `nb` reached this key through the scores ShapeKey and is gone — the kernel
+/// takes it from `scores_shape` at runtime, and since nb is floor(kv/ratio) it
+/// advances every `ratio` decode tokens, so carrying it here rebuilt an
+/// identical config a few times a second at long context. Same defect the attn
+/// key already shed.
+const QsaSelectCfgKey = struct { rows: c_int, k: c_int, tg: c_int };
+var qsa_select_cfgs = QsaCfgCache(QsaSelectCfgKey, 1){};
+/// Build counter, forwarded from the LRU so tests and meters keep one name.
+pub fn qsaSelectCfgBuilds() usize {
+    return qsa_select_cfgs.builds;
+}
 var qsa_select_engaged_bits: OneShotBits = .{};
 
 pub var qsa_select_kernel_override: ?bool = null;
@@ -3316,10 +3323,8 @@ pub fn qsaSelectTopBlocks(
 
     const kernel = getQsaSelectKernel() catch return null;
     const tg = qsaSelectTg();
-    const key = QsaSelectCfgKey{ .shape = ShapeKey.from(ssh), .k = kb, .tg = tg };
-    if (qsa_select_cfg == null or !std.meta.eql(qsa_select_cfg_key, key)) {
-        if (qsa_select_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
-        qsa_select_cfg = null;
+    const key = QsaSelectCfgKey{ .rows = rows, .k = kb, .tg = tg };
+    const sel_cfgs: [1]mlx.mlx_fast_metal_kernel_config = qsa_select_cfgs.get(key) orelse blk: {
         const config = mlx.mlx_fast_metal_kernel_config_new();
         errdefer _ = mlx.mlx_fast_metal_kernel_config_free(config);
         const o_shape = [_]c_int{ 1, rows, kb };
@@ -3328,17 +3333,16 @@ pub fn qsaSelectTopBlocks(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, tg, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "TGS", tg));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "K", kb));
-        qsa_select_cfg = config;
-        qsa_select_cfg_key = key;
-        qsa_select_cfg_builds += 1;
-    }
+        qsa_select_cfgs.put(key, .{config});
+        break :blk .{config};
+    };
 
     const inputs_arr = [_]mlx.mlx_array{ scores, bounds };
     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
     var outputs_vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outputs_vec);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, qsa_select_cfg.?, s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, sel_cfgs[0], s));
     if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
@@ -3878,8 +3882,85 @@ pub fn qsaAttnKernelEnabled() bool {
 /// `qsaAttnNSplit` derives it from S and Hk alone: a kv-derived split count
 /// would put kv back in the key through the side door and restore the
 /// per-round rebuild.
+/// A small LRU of metal_kernel configs.
+///
+/// Both QSA config caches were ONE fixed slot, which is only ever right when
+/// the shape is stable. It is not: adaptive MTP alternates verify widths
+/// within a single request (2, then 3, then 6 as the planner moves), and every
+/// change tore the slot down and rebuilt it. Four slots cover the deployed
+/// width set with room to spare, and the repo's own rule applies — a cache
+/// that hands out BORROWED handles evicts LRU, never a fixed slot.
+///
+/// `NCFG` is how many configs one key owns (the split-K attention arm owns
+/// two: the split pass and the merge pass). Handles are borrowed: the cache
+/// frees them on eviction and the caller must not.
+fn QsaCfgCache(comptime Key: type, comptime NCFG: usize) type {
+    return struct {
+        const Self = @This();
+        pub const SLOTS: usize = 4;
+        /// Named so the default can be written as an array literal: an
+        /// inline `?T{null}` parses as a struct initializer of `T`, not as an
+        /// optional holding null.
+        const MaybeCfg = ?mlx.mlx_fast_metal_kernel_config;
+        const Entry = struct {
+            key: Key = std.mem.zeroes(Key),
+            cfg: [NCFG]MaybeCfg = @splat(null),
+            stamp: u64 = 0,
+        };
+        entries: [SLOTS]Entry = @splat(.{}),
+        clock: u64 = 0,
+        /// Build counter — the only externally visible difference between a
+        /// cache hit and a rebuild. The configs are identical either way.
+        builds: usize = 0,
+
+        fn get(self: *Self, key: Key) ?[NCFG]mlx.mlx_fast_metal_kernel_config {
+            for (&self.entries) |*e| {
+                if (e.cfg[0] == null) continue;
+                if (!std.meta.eql(e.key, key)) continue;
+                self.clock += 1;
+                e.stamp = self.clock;
+                var out: [NCFG]mlx.mlx_fast_metal_kernel_config = undefined;
+                for (e.cfg, 0..) |c, i| out[i] = c.?;
+                return out;
+            }
+            return null;
+        }
+
+        fn put(self: *Self, key: Key, cfg: [NCFG]mlx.mlx_fast_metal_kernel_config) void {
+            var victim: usize = 0;
+            var oldest: u64 = std.math.maxInt(u64);
+            for (&self.entries, 0..) |*e, i| {
+                if (e.cfg[0] == null) {
+                    victim = i;
+                    oldest = 0;
+                    break;
+                }
+                if (e.stamp < oldest) {
+                    oldest = e.stamp;
+                    victim = i;
+                }
+            }
+            const e = &self.entries[victim];
+            for (&e.cfg) |*c| {
+                if (c.*) |cc| _ = mlx.mlx_fast_metal_kernel_config_free(cc);
+                c.* = null;
+            }
+            e.key = key;
+            for (cfg, 0..) |c, i| e.cfg[i] = c;
+            self.clock += 1;
+            e.stamp = self.clock;
+            self.builds += 1;
+        }
+    };
+}
+
 const QsaAttnCfgKey = struct {
     q_shape: ShapeKey,
+    /// The kv-head count shapes the grid (`h_kv * nsg`) and is NOT recoverable
+    /// from the q shape — `gqa` is, but only together with h_kv. Latent on the
+    /// 24q/2kv pack because nothing else varies it; wrong the moment a second
+    /// geometry loads into the same process.
+    h_kv: c_int,
     bits: u8,
     gs: u32,
     nsg: c_int,
@@ -3887,12 +3968,11 @@ const QsaAttnCfgKey = struct {
     ratio: c_int,
     dtype: mlx.mlx_dtype,
 };
-var qsa_attn_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
-var qsa_attn_merge_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
-var qsa_attn_cfg_key: QsaAttnCfgKey = std.mem.zeroes(QsaAttnCfgKey);
-/// Rebuild counter — the only externally visible difference between a config
-/// cache hit and a rebuild.
-pub var qsa_attn_cfg_builds: usize = 0;
+var qsa_attn_cfgs = QsaCfgCache(QsaAttnCfgKey, 2){};
+/// Build counter, forwarded from the LRU so tests and meters keep one name.
+pub fn qsaAttnCfgBuilds() usize {
+    return qsa_attn_cfgs.builds;
+}
 var qsa_attn_engaged_bits: OneShotBits = .{};
 
 /// One fused sparse-attention dispatch for a verify-width block
@@ -3985,6 +4065,7 @@ pub fn qsaSparseAttn(
 
     const key = QsaAttnCfgKey{
         .q_shape = ShapeKey.from(qs),
+        .h_kv = h_kv,
         .bits = kv_view.bits,
         .gs = kv_view.group_size,
         .nsg = nsg,
@@ -3992,11 +4073,7 @@ pub fn qsaSparseAttn(
         .ratio = ratio,
         .dtype = .bfloat16,
     };
-    if (qsa_attn_cfg == null or qsa_attn_merge_cfg == null or !std.meta.eql(qsa_attn_cfg_key, key)) {
-        if (qsa_attn_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
-        if (qsa_attn_merge_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
-        qsa_attn_cfg = null;
-        qsa_attn_merge_cfg = null;
+    const cfgs: [2]mlx.mlx_fast_metal_kernel_config = qsa_attn_cfgs.get(key) orelse blk: {
 
         // Split pass: one threadgroup per (row, kv head, split), each writing
         // its own unnormalized accumulator and (m, l) pair.
@@ -4026,11 +4103,9 @@ pub fn qsaSparseAttn(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(mconfig, 256, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(mconfig, "T", .bfloat16));
 
-        qsa_attn_cfg = config;
-        qsa_attn_merge_cfg = mconfig;
-        qsa_attn_cfg_key = key;
-        qsa_attn_cfg_builds += 1;
-    }
+        qsa_attn_cfgs.put(key, .{ config, mconfig });
+        break :blk .{ config, mconfig };
+    };
 
     const inputs_arr = [_]mlx.mlx_array{
         q_rope,
@@ -4047,7 +4122,7 @@ pub fn qsaSparseAttn(
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
     var parts_vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(parts_vec);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&parts_vec, kernel, inputs_vec, qsa_attn_cfg.?, s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&parts_vec, kernel, inputs_vec, cfgs[0], s));
     if (mlx.mlx_vector_array_size(parts_vec) != 2) return error.MetalKernelBadOutputCount;
     var pacc = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(pacc);
@@ -4061,7 +4136,7 @@ pub fn qsaSparseAttn(
     defer _ = mlx.mlx_vector_array_free(merge_vec);
     var outputs_vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outputs_vec);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, merge_kernel, merge_vec, qsa_attn_merge_cfg.?, s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, merge_kernel, merge_vec, cfgs[1], s));
     if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
@@ -39850,30 +39925,43 @@ test "qsa sparse attn: the config key is kv- and kb-INDEPENDENT (one build per w
 
     // Normalize first. This is ONE global slot shared with every other test in
     // the file, and the parity test above ends on a key identical to ours — so
-    // measuring from a "cold" slot is an order dependency, not a property.
-    // This call leaves the slot keyed on our width however it started.
+    // measuring from a "cold" cache is an order dependency, not a property.
+    // This call leaves OUR width resident however the cache started.
     try Run.once(s, ta, rnd, 6, 4096, 64);
-    const base = qsa_attn_cfg_builds;
+    const base = qsaAttnCfgBuilds();
     // Same shape three more times: the cached config serves all of them.
     for (0..3) |_| try Run.once(s, ta, rnd, 6, 4096, 64);
-    try std.testing.expectEqual(base, qsa_attn_cfg_builds);
+    try std.testing.expectEqual(base, qsaAttnCfgBuilds());
     // A GROWING kv at a fixed width is the served decode round. This is the
     // regression: every one of these used to be a rebuild.
     try Run.once(s, ta, rnd, 6, 8192, 64);
     try Run.once(s, ta, rnd, 6, 12288, 64);
     try Run.once(s, ta, rnd, 6, 20000, 64);
-    try std.testing.expectEqual(base, qsa_attn_cfg_builds);
+    try std.testing.expectEqual(base, qsaAttnCfgBuilds());
     // A new kb is likewise a runtime shape, not a config input.
     try Run.once(s, ta, rnd, 6, 20000, 128);
-    try std.testing.expectEqual(base, qsa_attn_cfg_builds);
+    try std.testing.expectEqual(base, qsaAttnCfgBuilds());
     // A new width IS a new grid, new output shapes and a new NSPLIT.
     try Run.once(s, ta, rnd, 7, 4096, 64);
-    try std.testing.expectEqual(base + 1, qsa_attn_cfg_builds);
-    // ...and going back to a width already built is still one more build,
-    // because this is a single slot, not a map. That is deliberate: a served
-    // request holds one width for a whole round.
+    try std.testing.expectEqual(base + 1, qsaAttnCfgBuilds());
+    // ...and coming BACK to a width already built is now free. This is the
+    // point of the LRU: adaptive MTP alternates verify widths inside one
+    // request, and a single slot rebuilt on every alternation.
     try Run.once(s, ta, rnd, 6, 4096, 64);
-    try std.testing.expectEqual(base + 2, qsa_attn_cfg_builds);
+    try std.testing.expectEqual(base + 1, qsaAttnCfgBuilds());
+    // Alternate three widths for several rounds — the deployed pattern. All
+    // three fit, so after the first sight of each there are no more builds.
+    try Run.once(s, ta, rnd, 3, 4096, 64);
+    const after_three = qsaAttnCfgBuilds();
+    for (0..3) |_| {
+        try Run.once(s, ta, rnd, 6, 4096, 64);
+        try Run.once(s, ta, rnd, 7, 4096, 64);
+        try Run.once(s, ta, rnd, 3, 4096, 64);
+    }
+    try std.testing.expectEqual(after_three, qsaAttnCfgBuilds());
+    // Past SLOTS distinct widths the LRU evicts, so the oldest costs a build
+    // again — bounded churn, not the unbounded thrash of one slot.
+    try std.testing.expect(@TypeOf(qsa_attn_cfgs).SLOTS == 4);
 }
 
 test "the fused QSA sparse attention ships a kill switch, a GPU-stream guard, a one-shot engaged log and no per-token template" {
@@ -39910,6 +39998,13 @@ test "the fused QSA sparse attention ships a kill switch, a GPU-stream guard, a 
     try std.testing.expect(@TypeOf(@as(QsaAttnCfgKey, undefined).q_shape) == ShapeKey);
     try std.testing.expect(!@hasField(QsaAttnCfgKey, "kv"));
     try std.testing.expect(!@hasField(QsaAttnCfgKey, "kb"));
+    // ...and everything it DOES read. `h_kv` shapes the grid (h_kv * nsg) and
+    // is not recoverable from the q shape alone: latent on a 24q/2kv pack,
+    // wrong the moment a second geometry shares the process.
+    try std.testing.expect(@hasField(QsaAttnCfgKey, "h_kv"));
+    // The select key carries no shape at all — only what its config reads.
+    try std.testing.expect(!@hasField(QsaSelectCfgKey, "shape"));
+    try std.testing.expect(@hasField(QsaSelectCfgKey, "rows"));
     // NSPLIT changes the grid and both output shapes, so it IS a key field.
     try std.testing.expect(@hasField(QsaAttnCfgKey, "nsplit"));
 
@@ -45756,22 +45851,29 @@ test "qsa select kernel: the config is cached per FULL shape and rebuilt when ro
         }
     };
 
-    const base = qsa_select_cfg_builds;
+    // Normalize first: one global cache shared with every test in the file.
     try Run.once(s, ta, 4, 64, k);
-    try testing.expectEqual(base + 1, qsa_select_cfg_builds);
+    const base = qsaSelectCfgBuilds();
     // Same shape, three more calls: the cached config serves all of them.
     for (0..3) |_| try Run.once(s, ta, 4, 64, k);
-    try testing.expectEqual(base + 1, qsa_select_cfg_builds);
-    // A new ROW count is a new output shape and a new grid.
+    try testing.expectEqual(base, qsaSelectCfgBuilds());
+    // REVERSED from what this test used to assert. `nb` reached the key
+    // through the scores ShapeKey and forced a rebuild; nothing in the config
+    // reads it (output [1, rows, kb], grid (tg, rows, 1), templates TGS and
+    // K). Since nb is floor(kv/ratio) it advances every `ratio` decode
+    // tokens, so this was an identical config rebuilt a few times a second at
+    // long context — the same defect the attn key already shed.
+    try Run.once(s, ta, 4, 128, k);
+    try Run.once(s, ta, 4, 517, k);
+    try Run.once(s, ta, 4, 1027, k);
+    try testing.expectEqual(base, qsaSelectCfgBuilds());
+    // A new ROW count IS a new output shape and a new grid.
     try Run.once(s, ta, 9, 64, k);
-    try testing.expectEqual(base + 2, qsa_select_cfg_builds);
-    // A new nb with the SAME row count and the same element count as no
-    // previous call: keying on a product would miss this.
-    try Run.once(s, ta, 9, 128, k);
-    try testing.expectEqual(base + 3, qsa_select_cfg_builds);
-    // Back to the first shape: one slot, so this rebuilds too.
+    try testing.expectEqual(base + 1, qsaSelectCfgBuilds());
+    // ...and returning to a resident row count is free (LRU, not one slot).
     try Run.once(s, ta, 4, 64, k);
-    try testing.expectEqual(base + 4, qsa_select_cfg_builds);
+    try testing.expectEqual(base + 1, qsaSelectCfgBuilds());
+    try testing.expect(@TypeOf(qsa_select_cfgs).SLOTS == 4);
 }
 
 test "the fused QSA select ships a kill switch, a GPU-stream guard, a one-shot engaged log and nb off the SHAPE" {
@@ -45795,8 +45897,15 @@ test "the fused QSA select ships a kill switch, a GPU-stream guard, a one-shot e
     try testing.expect(std.mem.indexOf(u8, src, "template_arg_int(config, \"" ++ "K\", kb)") != null);
     try testing.expect(std.mem.indexOf(u8, src, "template_arg_int(config, \"" ++ "TGS\"") != null);
 
-    // The config key carries the FULL shape, never a derived product.
-    try testing.expect(@TypeOf(@as(QsaSelectCfgKey, undefined).shape) == ShapeKey);
+    // The config key carries what the config READS and nothing else. It used
+    // to carry the scores ShapeKey, whose third dimension is `nb` — which the
+    // config never reads (output [1, rows, kb], grid (tg, rows, 1), templates
+    // TGS and K) and which advances every `ratio` decode tokens, so it rebuilt
+    // an identical config a few times a second at long context.
+    try testing.expect(!@hasField(QsaSelectCfgKey, "shape"));
+    try testing.expect(@hasField(QsaSelectCfgKey, "rows"));
+    try testing.expect(@hasField(QsaSelectCfgKey, "k"));
+    try testing.expect(@hasField(QsaSelectCfgKey, "tg"));
 
     // Threadgroup memory is an OCCUPANCY decision: the histogram is 2048
     // uints (8 KiB) and the whole kernel must stay under ~10 KiB.
