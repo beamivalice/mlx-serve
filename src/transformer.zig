@@ -4947,6 +4947,19 @@ pub const KVCache = struct {
     /// on the cache so `snapshot`/`restore` can refcount-share through it
     /// (immutable post-init, safe to alias across snapshots).
     quant_state: ?kv_quant.TurboState,
+    /// Capacity, in tokens, this cache was asked to hold up front — the
+    /// admission bill's `reservedCacheTokens`. Zero (the default) keeps the
+    /// pre-#353 proportional growth exactly.
+    ///
+    /// A grow is NOT in place: `growQuantBuf` allocates the whole new capacity
+    /// with `mlx_zeros` and `slice_update`s the old buffer into it, so both
+    /// live in the chunk's lazy graph until its eval. Over a 458,832-token
+    /// prefill that peak carries a second copy of ~6 GB of KV — a term
+    /// `PREFILL_RUNTIME_FLOOR_BYTES` prices at a flat 512 MB. Reserving the
+    /// whole capacity on the FIRST grow removes the transient instead of
+    /// pricing it: one allocation, no coexistence, and the guard bills the
+    /// reservation it can see.
+    reserve_tokens: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, num_layers: u32) !KVCache {
         return initWithConfig(allocator, num_layers, KVQuantConfig.dense);
@@ -5100,6 +5113,58 @@ pub const KVCache = struct {
         return nextCapacityPolicy(current_cap, needed, kvGrowLinear());
     }
 
+    /// Tokens of capacity a request reserves: its prompt, the generation it is
+    /// allowed, and one chunk of slack so the last partial chunk cannot tip it
+    /// over. PURE, and the ONE definition — the admission guard bills exactly
+    /// this and the cache allocates exactly this, so the estimate and the
+    /// allocation cannot drift (`server.reservedCacheTokens` delegates here).
+    pub fn reservedTokens(seq: u64, max_tokens: u64, chunk: u64) u64 {
+        // Short prompts keep the proportional policy untouched. Growth
+        // coexistence only matters once the buffer is big enough for a second
+        // copy to be worth gigabytes, and reserving up front costs a short
+        // request the whole `max_tokens` of KV it may never generate.
+        if (seq < RESERVE_MIN_TOKENS) return 0;
+        return seq +| max_tokens +| @max(chunk, 1);
+    }
+
+    /// Prompt length at or above which a request reserves its capacity. Below
+    /// it the flat runtime floor already covers the transient and the
+    /// pre-#353 behaviour is preserved byte for byte. 32k tokens is one order
+    /// of magnitude above the prompts the floor was measured on and two below
+    /// the length where the coexistence became gigabytes.
+    pub const RESERVE_MIN_TOKENS: u64 = 32768;
+
+    /// Ask this cache to hold `tokens` up front. Idempotent and monotone: a
+    /// reservation never shrinks a buffer that is already larger.
+    /// `MLX_SERVE_KV_RESERVE=0` restores pure proportional growth.
+    pub fn reserve(self: *KVCache, tokens: usize) void {
+        if (!kvReserveEnabled()) return;
+        if (tokens > self.reserve_tokens) self.reserve_tokens = tokens;
+    }
+
+    var kv_reserve_cache: ?bool = null;
+    fn kvReserveEnabled() bool {
+        if (kv_reserve_cache) |v| return v;
+        var on = true;
+        if (std.c.getenv("MLX_SERVE_KV_RESERVE")) |p| {
+            on = !std.mem.eql(u8, std.mem.span(p), "0");
+        }
+        kv_reserve_cache = on;
+        return on;
+    }
+
+    /// The capacity a grow actually takes: the proportional policy, raised to
+    /// the reservation when there is one. Every grow site reads THIS, so a
+    /// reserved cache grows exactly once.
+    fn nextCapacityReserved(self: *const KVCache, current_cap: usize, needed: usize) usize {
+        const policy = nextCapacity(current_cap, needed);
+        if (self.reserve_tokens <= policy) return policy;
+        // Round the reservation the same way the policy rounds, so the two
+        // arms cannot produce off-by-a-chunk buffers for the same request.
+        const n_chunks = (self.reserve_tokens + chunk_step - 1) / chunk_step;
+        return n_chunks * chunk_step;
+    }
+
     /// Kill-switch for the growth policy: `MLX_SERVE_KV_GROW=linear` restores
     /// the pre-#110 fixed +256 growth for same-boot A/Bs.
     var kv_grow_linear_cache: ?bool = null;
@@ -5219,7 +5284,7 @@ pub const KVCache = struct {
         if (!entry.initialized or entry.offset + new_len > bufferCapacity(entry.keys)) {
             const needed = entry.offset + new_len;
             const cur_cap = if (entry.initialized) bufferCapacity(entry.keys) else 0;
-            const new_cap: c_int = @intCast(nextCapacity(cur_cap, needed));
+            const new_cap: c_int = @intCast(self.nextCapacityReserved(cur_cap, needed));
 
             try growQuantBuf(s, &entry.keys, entry.initialized, entry.offset, new_cap, B, heads, q_last, .uint32);
             try growQuantBuf(s, &entry.values, entry.initialized, entry.offset, new_cap, B, heads, vq_last, .uint32);
@@ -5312,7 +5377,7 @@ pub const KVCache = struct {
             const dtype = mlx.mlx_array_dtype(new_k);
             const needed = entry.offset + new_len;
             const cur_cap = if (entry.initialized) bufferCapacity(entry.keys) else 0;
-            const new_cap: c_int = @intCast(nextCapacity(cur_cap, needed));
+            const new_cap: c_int = @intCast(self.nextCapacityReserved(cur_cap, needed));
             const initialized = entry.initialized;
             try growQuantBuf(s, &entry.keys, initialized, entry.offset, new_cap, B, heads, head_dim, dtype);
             try growQuantBuf(s, &entry.values, initialized, entry.offset, new_cap, B, heads, v_head_dim, dtype);
@@ -44110,4 +44175,72 @@ test "the fused QSA select ships a kill switch, a GPU-stream guard, a one-shot e
     // Threadgroup memory is an OCCUPANCY decision: the histogram is 2048
     // uints (8 KiB) and the whole kernel must stay under ~10 KiB.
     try testing.expect(std.mem.indexOf(u8, QSA_SELECT_KERNEL_SOURCE, "BINS  = 2048u") != null);
+test "a reserved KV cache grows ONCE: no old+new buffer coexists during a long prefill" {
+    const t = std.testing;
+    // Issue #353. `growQuantBuf` allocates the whole new capacity and
+    // slice_updates the old buffer into it, so every grow inside a chunk's
+    // lazy graph holds two copies. Walking a 458,832-token prompt at chunk
+    // 4096 under the proportional policy is a LADDER of such grows — the last
+    // ones over ~6 GB of 8-bit KV.
+    const seq: usize = 458_832;
+    const chunk: usize = 4096;
+    var cap: usize = 0;
+    var pos: usize = 0;
+    var grows: usize = 0;
+    while (pos < seq) {
+        const end = @min(pos + chunk, seq);
+        if (end > cap) {
+            cap = KVCache.nextCapacityPolicy(cap, end, false);
+            grows += 1;
+        }
+        pos = end;
+    }
+    // The unreserved ladder is what it is; the point is that it is many, and
+    // the LAST one duplicates the whole cache.
+    try t.expect(grows > 20);
+
+    // Reserved: one allocation, sized to the reservation, and the walk never
+    // grows again.
+    const reserved: usize = @intCast(KVCache.reservedTokens(seq, 2048, chunk));
+    try t.expectEqual(seq + 2048 + chunk, reserved);
+    var rcache = KVCache{
+        .entries = &.{},
+        .step = 0,
+        .allocator = t.allocator,
+        .config = KVQuantConfig.dense,
+        .quant_state = null,
+    };
+    rcache.reserve(reserved);
+    var rcap: usize = 0;
+    var rpos: usize = 0;
+    var rgrows: usize = 0;
+    while (rpos < seq) {
+        const end = @min(rpos + chunk, seq);
+        if (end > rcap) {
+            rcap = rcache.nextCapacityReserved(rcap, end);
+            rgrows += 1;
+        }
+        rpos = end;
+    }
+    try t.expectEqual(@as(usize, 1), rgrows);
+    try t.expect(rcap >= reserved);
+    // The generation the request is allowed fits too — the reservation is
+    // what the admission guard billed, so decode must not grow either.
+    try t.expect(rcap >= seq + 2048);
+
+    // A request under the threshold reserves nothing: byte-identical
+    // behaviour for every prompt the flat runtime floor was measured on.
+    try t.expectEqual(@as(u64, 0), KVCache.reservedTokens(4096, 2048, chunk));
+    var small = KVCache{
+        .entries = &.{},
+        .step = 0,
+        .allocator = t.allocator,
+        .config = KVQuantConfig.dense,
+        .quant_state = null,
+    };
+    small.reserve(@intCast(KVCache.reservedTokens(4096, 2048, chunk)));
+    try t.expectEqual(
+        KVCache.nextCapacityPolicy(1024, 2048, KVCache.kvGrowLinear()),
+        small.nextCapacityReserved(1024, 2048),
+    );
 }

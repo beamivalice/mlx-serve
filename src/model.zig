@@ -807,6 +807,28 @@ pub const ModelConfig = struct {
         return n * hd * 2 + n * hd * 2 / ratio;
     }
 
+    /// Bytes ONE SSM checkpoint holds: the recurrent state plus the conv
+    /// window of every LINEAR layer, materialized (`captureSsmCheckpoint`
+    /// forces an owned copy of each). The QSA key history is deliberately NOT
+    /// here — checkpoints stopped cloning it, and `qsaHistoryBytesPerToken`
+    /// bills the one live copy.
+    ///
+    /// GatedDeltaNet state is `[B, v_heads, v_head_dim, key_head_dim]` bf16
+    /// and the conv window is `[B, kernel-1, 2*key_dim + value_dim]` bf16 —
+    /// the shapes `gatedDeltaNet` allocates. Zero on an arch with no linear
+    /// layers (nothing to checkpoint).
+    pub fn ssmCheckpointBytes(self: *const ModelConfig) u64 {
+        if (self.linear_num_value_heads == 0) return 0;
+        const linear_layers: u64 = @as(u64, self.num_hidden_layers) -| self.attnCacheLayerCount();
+        if (linear_layers == 0) return 0;
+        const state: u64 = @as(u64, self.linear_num_value_heads) *
+            @as(u64, self.linear_value_head_dim) * @as(u64, self.linear_key_head_dim) * 2;
+        const conv_dim: u64 = 2 * @as(u64, self.linear_num_key_heads) * self.linear_key_head_dim +
+            @as(u64, self.linear_num_value_heads) * self.linear_value_head_dim;
+        const conv: u64 = @as(u64, self.linear_conv_kernel_dim) -| 1;
+        return linear_layers * (state + conv * conv_dim * 2);
+    }
+
     pub fn isMoe(self: *const ModelConfig) bool {
         return self.num_experts > 0;
     }

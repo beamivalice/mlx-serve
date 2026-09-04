@@ -2092,6 +2092,25 @@ pub const Generator = struct {
             // mtp.SUGGESTED_HISTORY_WINDOW). 0 = capture every chunk.
             const mtp_hist_window = effectiveMtpHistoryWindow(prefix_len, mtp_history_window_override);
 
+            // Reserve the whole request's cache capacity BEFORE the first
+            // chunk writes. A grow is not in place — `growQuantBuf` allocates
+            // the new capacity with `mlx_zeros` and slice_updates the old
+            // buffer into it, and both stay live in the chunk's lazy graph
+            // until its eval — so a long prefill's peak carried a second copy
+            // of everything accumulated so far (~7.75 GB at 458,832 tokens on
+            // qwen4_exp; the runtime floor prices it at a flat 512 MB, issue
+            // #353). One allocation up front removes the transient instead of
+            // pricing it, and it is exactly what the admission guard billed:
+            // both sides call `KVCache.reservedTokens`.
+            // On `ctx.cache`, not `xfm.cache`: the scheduler swaps a slot's
+            // own cache onto the forward context, and the reservation belongs
+            // to the buffers this prefill will actually write.
+            ctx.cache.reserve(@intCast(transformer_mod.KVCache.reservedTokens(
+                prompt_ids.len,
+                max_tokens,
+                default_chunk,
+            )));
+
             var pos: usize = 0;
             while (pos < loop_end) {
                 // Abandoned-request abort: the client disconnected and the
