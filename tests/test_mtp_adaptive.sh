@@ -374,6 +374,40 @@ else
     ok "kill switch: no probe ran (serial_cell=$B_CELL, informational)"
 fi
 
+# ── Boot R: re-entry, only when the lever enables it ─────────────────────
+# `MLX_SERVE_MTP_ADAPTIVE_REENTRY_TOKENS` is 0 by default (crossing-only), so
+# this boot is SKIPPED unless the lever is set. What it pins is the auditor's
+# question: a serial block advances the trunk while the head's `seq_offset`
+# stays put, and `qwen4MtpForward` refuses a mismatched offset with
+# `error.MtpPositionGap` — an error mid-generation, not a degradation. So a
+# switch followed by a re-entry must either come back cleanly or decline in
+# the log; it must never surface that error.
+if [ -n "${MLX_SERVE_MTP_ADAPTIVE_REENTRY_TOKENS:-}" ] &&
+   [ "${MLX_SERVE_MTP_ADAPTIVE_REENTRY_TOKENS:-0}" != "0" ]; then
+    echo "== boot R: re-entry enabled (REENTRY_TOKENS=$MLX_SERVE_MTP_ADAPTIVE_REENTRY_TOKENS) =="
+    LOG_R=/tmp/mtp_adaptive_reentry.log
+    start_server "$LOG_R" "" || bad "re-entry boot" "server did not become ready"
+    # Teach the bucket a serial cell, then a long MTP reply with room to
+    # switch AND to re-enter at least once.
+    req "$WORK/long_serial.json" "$LOG_R" "$WORK/r_serial.slice" >/dev/null ||
+        bad "re-entry boot" "serial request failed"
+    req "$WORK/long_mtp.json" "$LOG_R" "$WORK/r_long.slice" >/dev/null ||
+        bad "re-entry boot" "long MTP request failed"
+    stop_server
+    if grep -q "MtpPositionGap" "$LOG_R"; then
+        bad "re-entry" "error.MtpPositionGap surfaced — the head resumed out of sync"
+        grep -n "MtpPositionGap" "$LOG_R" | head -3 | sed 's/^/      /'
+    else
+        ok "re-entry produced no MtpPositionGap"
+    fi
+    if grep -q "re-entry declined" "$LOG_R"; then
+        echo "      (re-entry was DECLINED — head out of sync, which is the safe arm)"
+        grep -- "re-entry declined" "$LOG_R" | head -2 | sed 's/^/      /'
+    fi
+else
+    echo "== boot R: SKIPPED (set MLX_SERVE_MTP_ADAPTIVE_REENTRY_TOKENS to exercise re-entry) =="
+fi
+
 # ── Boot C: a model that never speculates must not write a round-cost table ──
 # Persistence is ON here (no MLX_SERVE_ROUND_COST_PERSIST=0) but HOME is the
 # isolated one, so the only table this server could write is the one we check.
@@ -427,5 +461,5 @@ else
 fi
 
 echo
-echo "── $PASS passed, $FAIL failed ── (logs: $LOG_A, $LOG_B, $LOG_C)"
+echo "── $PASS passed, $FAIL failed ── (logs: $LOG_A, $LOG_B, $LOG_C${LOG_R:+, $LOG_R})"
 [ "$FAIL" -eq 0 ] || exit 1

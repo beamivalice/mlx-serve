@@ -5406,9 +5406,30 @@ pub const Generator = struct {
             const b = self.mtpAdaptiveBucket(self.mtpKvLen());
             const prev_bucket = self.mtp_adaptive.bucket;
             const prev_arm = self.mtp_adaptive.arm;
-            const action = self.mtp_adaptive.serialTick(b);
+            const action = self.mtp_adaptive.serialTick(b, mtpAdaptiveReentryTokens());
             self.mtpAdaptiveSyncWindow(prev_bucket, prev_arm);
-            if (action == .to_mtp) {
+            // Re-entry only when the head can PROVE it is in sync: the next
+            // round's offset must be the one `qwen4MtpForward` demands, or it
+            // returns `error.MtpPositionGap` and kills the request instead of
+            // degrading. A serial block moves the trunk and not the head, so
+            // this is exactly the transition that could break it. A decline
+            // LATCHES — the drift cannot shrink on its own, so re-asking every
+            // period would just log the same refusal forever — and the request
+            // simply carries on down the serial branch below.
+            var may_reenter = action == .to_mtp;
+            if (may_reenter) {
+                if (self.mtpHeadDriftNow()) |drift| {
+                    if (drift != 0) {
+                        log.info(
+                            "  [mtp] adaptive: re-entry declined (head out of sync by {d}) -> serial for the rest of the request\n",
+                            .{drift},
+                        );
+                        self.mtp_adaptive.declineReentry();
+                        may_reenter = false;
+                    }
+                }
+            }
+            if (may_reenter) {
                 log.info(
                     "  [mtp] adaptive: kv {d} crossed into bucket {s} -> mtp\n",
                     .{ self.mtpKvLen(), round_cost.BUCKET_NAMES[b] },
@@ -7860,9 +7881,12 @@ pub const Generator = struct {
         /// The bucket the standing choice was decided in.
         bucket: ?usize = null,
         /// Serial ticks since the arm went serial (or since the last
-        /// re-decision). Drives the periodic re-open — see
-        /// `REDECIDE_SERIAL_TOKENS`.
+        /// re-decision). Drives the periodic re-open.
         serial_ticks: u32 = 0,
+        /// A re-entry was refused because the head could not prove its
+        /// position bookkeeping was in sync. The drift cannot shrink by
+        /// itself, so this latches for the request.
+        reentry_declined: bool = false,
         /// Round index of the last `round()`. `mtpRoundPlan` has TWO call
         /// sites per round (the cross-round pre-draft at the previous
         /// round's tail, and the round entry when there is no pre-draft), so
@@ -7916,7 +7940,16 @@ pub const Generator = struct {
         /// again — so at ~1 token per round this costs roughly 3-7% of the
         /// interval when MTP is genuinely the worse arm. 512 keeps that small
         /// while still re-testing several times inside one long reply.
-        pub const REDECIDE_SERIAL_TOKENS: u32 = 512;
+        /// Default OFF. A re-decision means a RE-ENTRY, and re-entry after a
+        /// serial block resumes a head whose committed history did not grow
+        /// across the block — it drafts from a content gap. Until a
+        /// head-follow exists (running the head over the serial tokens so its
+        /// history keeps up), paying an exit ramp to resume a degraded head on
+        /// a timer is not obviously a win. `MLX_SERVE_MTP_ADAPTIVE_REENTRY_TOKENS`
+        /// turns it on; 0 (the default) leaves a crossing as the only trigger.
+        pub const REDECIDE_SERIAL_TOKENS_DEFAULT: u32 = 0;
+        /// The value the lever selects when it is enabled without a number.
+        pub const REDECIDE_SERIAL_TOKENS_ON: u32 = 512;
 
         /// One serial tick while the adaptive arm holds. Returns `.to_mtp`
         /// when the decision should be re-opened: on a bucket CROSSING (the
@@ -7925,12 +7958,22 @@ pub const Generator = struct {
         /// the arm goes back to `.undecided` with a clean streak, so the next
         /// vote decides on fresh measurements rather than inheriting the old
         /// verdict.
-        pub fn serialTick(self: *MtpAdaptive, bucket: usize) MtpAdaptiveAction {
+        /// Latch a refused re-entry: back to the serial arm, and never ask
+        /// again for this request.
+        pub fn declineReentry(self: *MtpAdaptive) void {
+            self.arm = .serial;
+            self.serial_ticks = 0;
+            self.reentry_declined = true;
+        }
+
+        pub fn serialTick(self: *MtpAdaptive, bucket: usize, redecide_tokens: u32) MtpAdaptiveAction {
+            if (self.reentry_declined) return .none;
             if (self.arm != .serial) return .none;
             if (self.bucket) |b| {
                 if (b == bucket) {
+                    if (redecide_tokens == 0) return .none; // crossing-only
                     self.serial_ticks +|= 1;
-                    if (self.serial_ticks < REDECIDE_SERIAL_TOKENS) return .none;
+                    if (self.serial_ticks < redecide_tokens) return .none;
                     return self.reopen(bucket);
                 }
             }
@@ -7986,6 +8029,18 @@ pub const Generator = struct {
         return v;
     }
 
+    var mtp_reentry_tokens_cache: ?u32 = null;
+    /// `MLX_SERVE_MTP_ADAPTIVE_REENTRY_TOKENS`: 0 / unset = crossing-only
+    /// re-entry (the default); a bare `1` selects the tuned 512; any other
+    /// number is taken literally.
+    fn mtpAdaptiveReentryTokens() u32 {
+        if (mtp_reentry_tokens_cache) |v| return v;
+        const n = readEnvUsize("MLX_SERVE_MTP_ADAPTIVE_REENTRY_TOKENS", MtpAdaptive.REDECIDE_SERIAL_TOKENS_DEFAULT);
+        const v: u32 = if (n == 1) MtpAdaptive.REDECIDE_SERIAL_TOKENS_ON else @intCast(@min(n, @as(usize, std.math.maxInt(u32))));
+        mtp_reentry_tokens_cache = v;
+        return v;
+    }
+
     var mtp_adaptive_min_kv_cache: ?u32 = null;
     fn mtpAdaptiveMinKv() u32 {
         if (mtp_adaptive_min_kv_cache) |v| return v;
@@ -8002,6 +8057,42 @@ pub const Generator = struct {
         const v: u32 = @intCast(@max(@as(usize, 1), @min(n, 64)));
         mtp_adaptive_confirm_cache = v;
         return v;
+    }
+
+    /// Is the head's position bookkeeping in sync with what its next forward
+    /// will demand? `Transformer.qwen4MtpForward` refuses with
+    /// `error.MtpPositionGap` unless
+    ///
+    ///     pos_offset == pos_base + seq_offset
+    ///
+    /// with one escape: at `seq_offset == 0` it re-seeds `pos_base` from the
+    /// incoming offset, so a fresh head always agrees. Pure, so the rule is
+    /// testable on synthetic offsets. Returns the DRIFT (0 = in sync) rather
+    /// than a bool, so the decline can say by how much.
+    pub fn mtpHeadPositionDrift(pos_base: i64, seq_offset: usize, next_pos_offset: i64) i64 {
+        if (seq_offset == 0) return 0;
+        return next_pos_offset - (pos_base + @as(i64, @intCast(seq_offset)));
+    }
+
+    /// The drift the NEXT round would hit, computed the way the round itself
+    /// computes its offset: `mtpRoundOff0` over the head's own cache, plus
+    /// one (the head's query sits at r+1). Null = no head state to check.
+    ///
+    /// A serial block advances the TRUNK by its length while the head's
+    /// `seq_offset` deliberately stays put — no trunk hidden is captured for
+    /// those tokens — which is why re-entry has to prove this rather than
+    /// assume it. The sidecar arm has no such guard and is always in sync.
+    fn mtpHeadDriftNow(self: *const Generator) ?i64 {
+        if (self.mtp_cache == null) return null;
+        const mc = &self.mtp_cache.?;
+        return switch (mc.*) {
+            .qwen => 0,
+            .qwen4 => |t| blk: {
+                const m = &(t.qwen4_mtp orelse break :blk 0);
+                const off0 = mtpRoundOff0(self.mtp_hist_stash, mc.step());
+                break :blk mtpHeadPositionDrift(@intCast(m.pos_base), m.seq_offset, @intCast(off0 + 1));
+            },
+        };
     }
 
     /// May this request resume MTP after a serial block? The head's
@@ -14115,12 +14206,12 @@ test "mtpAdaptiveRegimeMoved: a switch either way, or a crossing, drops the pric
     try testing.expect(G.mtpAdaptiveRegimeMoved(pb, pa, a.bucket, a.arm));
     pb = a.bucket;
     pa = a.arm;
-    _ = a.serialTick(6); // crossing: re-opens the decision
+    _ = a.serialTick(6, 0); // crossing: re-opens the decision
     try testing.expect(G.mtpAdaptiveRegimeMoved(pb, pa, a.bucket, a.arm));
     // A tick that changes nothing must NOT drop the window, or it can never fill.
     pb = a.bucket;
     pa = a.arm;
-    _ = a.serialTick(6);
+    _ = a.serialTick(6, 0);
     try testing.expect(!G.mtpAdaptiveRegimeMoved(pb, pa, a.bucket, a.arm));
 }
 
@@ -14258,63 +14349,81 @@ test "MtpAdaptive: the switch needs CONFIRM consecutive rounds, counted once per
     try testing.expectEqual(G.MtpAdaptiveAction.to_serial, f.round(0, 3, .serial, 0));
 }
 
-test "MtpAdaptive: serial re-opens on a crossing AND periodically inside a bucket (M16)" {
+test "MtpAdaptive: crossing always re-opens; the periodic re-open is OFF by default (M16)" {
     const G = Generator;
-    const N = G.MtpAdaptive.REDECIDE_SERIAL_TOKENS;
-    var a = G.MtpAdaptive{};
-    // Not on the serial arm: a tick is nobody's business.
-    try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(4));
-    try testing.expectEqual(G.MtpAdaptiveArm.undecided, a.arm);
+    const N = G.MtpAdaptive.REDECIDE_SERIAL_TOKENS_ON;
+    // Default is crossing-only: a re-entry resumes a head whose committed
+    // history did not grow across the block, so paying an exit ramp on a timer
+    // is not a proven win until a head-follow exists.
+    try testing.expectEqual(@as(u32, 0), G.MtpAdaptive.REDECIDE_SERIAL_TOKENS_DEFAULT);
 
-    _ = a.round(0, 3, .serial, 1);
-    try testing.expectEqual(G.MtpAdaptiveArm.serial, a.arm);
-    // Sticky for the whole re-decision interval, then it re-opens ONCE.
+    var off = G.MtpAdaptive{};
+    _ = off.round(0, 3, .serial, 1);
     var i: u32 = 0;
-    while (i < N - 1) : (i += 1) {
-        try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(3));
+    while (i < N * 2) : (i += 1) {
+        try testing.expectEqual(G.MtpAdaptiveAction.none, off.serialTick(3, 0));
     }
-    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, a.serialTick(3));
-    try testing.expectEqual(G.MtpAdaptiveArm.undecided, a.arm);
-    try testing.expectEqual(@as(u32, 0), a.confirm);
-    // Re-opened means re-opened: it does not fire again on the next tick.
-    try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(3));
+    try testing.expectEqual(G.MtpAdaptiveArm.serial, off.arm);
+    // ...but a CROSSING re-opens even with the timer off.
+    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, off.serialTick(4, 0));
 
-    // The top bucket is UNBOUNDED, so a crossing may never come. A request
-    // that switched at 260k must still get to re-decide before 1M.
+    // With the lever on, the timer fires — including in the UNBOUNDED top
+    // bucket, where a crossing may never come.
+    var a = G.MtpAdaptive{};
+    _ = a.round(0, 3, .serial, 1);
+    i = 0;
+    while (i < N - 1) : (i += 1) try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(3, N));
+    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, a.serialTick(3, N));
+    try testing.expectEqual(G.MtpAdaptiveArm.undecided, a.arm);
+    try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(3, N)); // not twice
+
     var top = G.MtpAdaptive{};
     const b_top = round_cost.bucketFor(300_000);
-    try testing.expectEqual(b_top, round_cost.bucketFor(900_000)); // same bucket
+    try testing.expectEqual(b_top, round_cost.bucketFor(900_000));
     _ = top.round(0, b_top, .serial, 1);
     var fired: u32 = 0;
     i = 0;
     while (i < N * 3) : (i += 1) {
-        if (top.serialTick(b_top) == .to_mtp) {
+        if (top.serialTick(b_top, N) == .to_mtp) {
             fired += 1;
-            _ = top.round(i, b_top, .serial, 1); // loses again, back to serial
+            _ = top.round(i, b_top, .serial, 1);
         }
     }
     try testing.expectEqual(@as(u32, 3), fired);
 
-    // A CROSSING still re-opens immediately, without waiting for the period.
-    var c = G.MtpAdaptive{};
-    _ = c.round(0, 3, .serial, 1);
-    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, c.serialTick(4));
-    try testing.expectEqual(G.MtpAdaptiveArm.undecided, c.arm);
-    try testing.expectEqual(@as(u32, 0), c.serial_ticks);
-    // ...and only from the serial arm, which this is no longer on.
-    try testing.expectEqual(G.MtpAdaptiveAction.none, c.serialTick(3));
-    _ = c.round(1, 4, .serial, 1);
-    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, c.serialTick(3));
-
-    // Entering serial restarts the clock, so a re-decision measures the new
-    // stretch rather than inheriting ticks from the previous one.
+    // Entering serial restarts the clock.
     var d = G.MtpAdaptive{};
     _ = d.round(0, 3, .serial, 1);
     i = 0;
-    while (i < N / 2) : (i += 1) _ = d.serialTick(3);
-    _ = d.round(1, 3, .mtp, 1); // back to mtp
-    _ = d.round(2, 3, .serial, 1); // and serial again
+    while (i < N / 2) : (i += 1) _ = d.serialTick(3, N);
+    _ = d.round(1, 3, .mtp, 1);
+    _ = d.round(2, 3, .serial, 1);
     try testing.expectEqual(@as(u32, 0), d.serial_ticks);
+}
+
+test "mtpHeadPositionDrift: re-entry may only resume a head that is provably in sync" {
+    const G = Generator;
+    // `qwen4MtpForward` demands pos_offset == pos_base + seq_offset.
+    try testing.expectEqual(@as(i64, 0), G.mtpHeadPositionDrift(100, 20, 120));
+    // A serial block of L moves the TRUNK and not the head: if the next
+    // offset were absolute it would run ahead by exactly L.
+    try testing.expectEqual(@as(i64, 7), G.mtpHeadPositionDrift(100, 20, 127));
+    try testing.expectEqual(@as(i64, -3), G.mtpHeadPositionDrift(100, 20, 117));
+    // seq_offset == 0 re-seeds pos_base, so a fresh head always agrees —
+    // whatever offset it is handed.
+    try testing.expectEqual(@as(i64, 0), G.mtpHeadPositionDrift(100, 0, 999));
+    try testing.expectEqual(@as(i64, 0), G.mtpHeadPositionDrift(0, 0, 0));
+
+    // A refused re-entry LATCHES: the drift cannot shrink on its own, so the
+    // request must not keep asking (and keep logging) every period.
+    var a = G.MtpAdaptive{};
+    _ = a.round(0, 3, .serial, 1);
+    a.declineReentry();
+    try testing.expect(a.reentry_declined);
+    try testing.expectEqual(G.MtpAdaptiveArm.serial, a.arm);
+    try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(4, 512)); // crossing
+    var i: u32 = 0;
+    while (i < 2000) : (i += 1) try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(3, 512));
 }
 
 test "mtpSerialProbeArm: bounded RETRIES per bucket, and none once the cell is trusted (M15)" {
@@ -14446,6 +14555,14 @@ test "the adaptive decision is read after the EV plan, before the width trial, a
     const reentry_win = src[fn_at .. reentry_at + 64];
     try testing.expect(std.mem.indexOf(u8, reentry_win, "self.mtpAdaptive" ++ "Bucket(self.mtpKvLen())") != null);
     try testing.expect(std.mem.indexOf(u8, reentry_win, "round_cost.bucket" ++ "For(self.mtpKvLen())") == null);
+    // Re-entry is gated on the head PROVING its position bookkeeping is in
+    // sync: `qwen4MtpForward` returns `error.MtpPositionGap` rather than
+    // degrading, and a serial block is exactly the transition that moves the
+    // trunk without moving the head.
+    const gate_win = src[reentry_at .. reentry_at + 1400];
+    try testing.expect(std.mem.indexOf(u8, gate_win, "self.mtpHeadDrift" ++ "Now()") != null);
+    try testing.expect(std.mem.indexOf(u8, gate_win, "declineRe" ++ "entry()") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "re-entry declined (head out of sync by {d})") != null);
 
     // Every serial tick folds through ONE helper, and that helper is GATED
     // (H8): a model with no MTP head must not fold a cell nothing reads, nor
