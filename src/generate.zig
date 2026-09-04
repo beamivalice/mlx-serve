@@ -7859,6 +7859,10 @@ pub const Generator = struct {
         confirm: u32 = 0,
         /// The bucket the standing choice was decided in.
         bucket: ?usize = null,
+        /// Serial ticks since the arm went serial (or since the last
+        /// re-decision). Drives the periodic re-open — see
+        /// `REDECIDE_SERIAL_TOKENS`.
+        serial_ticks: u32 = 0,
         /// Round index of the last `round()`. `mtpRoundPlan` has TWO call
         /// sites per round (the cross-round pre-draft at the previous
         /// round's tail, and the round entry when there is no pre-draft), so
@@ -7893,25 +7897,50 @@ pub const Generator = struct {
                     if (self.confirm < @max(@as(u32, 1), need)) return .none;
                     self.confirm = 0;
                     self.arm = .serial;
+                    self.serial_ticks = 0;
                     self.switches += 1;
                     return .to_serial;
                 },
             }
         }
 
-        /// One serial tick while the adaptive arm holds. The choice is
-        /// sticky for the rest of the request with exactly ONE exception:
-        /// the request generated its way into a different KV bucket, so
-        /// neither number it compared describes this round any more. Coming
-        /// back costs an exit ramp, so this fires once per crossing — never
-        /// per tick — and hands the confirm loop a clean slate.
+        /// Serial tokens after which the decision is re-opened INSIDE the
+        /// same bucket. Without it the only re-entry trigger is a bucket
+        /// crossing, and the top bucket is unbounded: a request that switched
+        /// at 260k stayed serial to 1M no matter how the measurements moved.
+        /// It also covers the ordinary long generation that never leaves the
+        /// bucket it switched in.
+        ///
+        /// The re-decision is not free — re-entry pays the exit ramp, and the
+        /// price window needs `MTP_PRICE_WINDOW` rounds before it may vote
+        /// again — so at ~1 token per round this costs roughly 3-7% of the
+        /// interval when MTP is genuinely the worse arm. 512 keeps that small
+        /// while still re-testing several times inside one long reply.
+        pub const REDECIDE_SERIAL_TOKENS: u32 = 512;
+
+        /// One serial tick while the adaptive arm holds. Returns `.to_mtp`
+        /// when the decision should be re-opened: on a bucket CROSSING (the
+        /// numbers it compared priced another context), or every
+        /// `REDECIDE_SERIAL_TOKENS` ticks inside the same bucket. Either way
+        /// the arm goes back to `.undecided` with a clean streak, so the next
+        /// vote decides on fresh measurements rather than inheriting the old
+        /// verdict.
         pub fn serialTick(self: *MtpAdaptive, bucket: usize) MtpAdaptiveAction {
             if (self.arm != .serial) return .none;
             if (self.bucket) |b| {
-                if (b == bucket) return .none;
+                if (b == bucket) {
+                    self.serial_ticks +|= 1;
+                    if (self.serial_ticks < REDECIDE_SERIAL_TOKENS) return .none;
+                    return self.reopen(bucket);
+                }
             }
+            return self.reopen(bucket);
+        }
+
+        fn reopen(self: *MtpAdaptive, bucket: usize) MtpAdaptiveAction {
             self.bucket = bucket;
             self.confirm = 0;
+            self.serial_ticks = 0;
             self.arm = .undecided;
             self.switches += 1;
             return .to_mtp;
@@ -14229,28 +14258,63 @@ test "MtpAdaptive: the switch needs CONFIRM consecutive rounds, counted once per
     try testing.expectEqual(G.MtpAdaptiveAction.to_serial, f.round(0, 3, .serial, 0));
 }
 
-test "MtpAdaptive: serial is sticky except for ONE re-decision per bucket crossing" {
+test "MtpAdaptive: serial re-opens on a crossing AND periodically inside a bucket (M16)" {
     const G = Generator;
+    const N = G.MtpAdaptive.REDECIDE_SERIAL_TOKENS;
     var a = G.MtpAdaptive{};
-    // Not on the serial arm: a crossing is nobody's business.
+    // Not on the serial arm: a tick is nobody's business.
     try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(4));
     try testing.expectEqual(G.MtpAdaptiveArm.undecided, a.arm);
 
     _ = a.round(0, 3, .serial, 1);
     try testing.expectEqual(G.MtpAdaptiveArm.serial, a.arm);
-    // Same bucket, however many ticks: sticky.
+    // Sticky for the whole re-decision interval, then it re-opens ONCE.
     var i: u32 = 0;
-    while (i < 100) : (i += 1) try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(3));
-    // The crossing re-opens the decision exactly once, with a clean streak.
-    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, a.serialTick(4));
+    while (i < N - 1) : (i += 1) {
+        try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(3));
+    }
+    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, a.serialTick(3));
     try testing.expectEqual(G.MtpAdaptiveArm.undecided, a.arm);
     try testing.expectEqual(@as(u32, 0), a.confirm);
-    try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(4));
-    // Falling back into the old bucket is a crossing too — but only from the
-    // serial arm, which this is no longer on.
+    // Re-opened means re-opened: it does not fire again on the next tick.
     try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(3));
-    _ = a.round(1, 4, .serial, 1);
-    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, a.serialTick(3));
+
+    // The top bucket is UNBOUNDED, so a crossing may never come. A request
+    // that switched at 260k must still get to re-decide before 1M.
+    var top = G.MtpAdaptive{};
+    const b_top = round_cost.bucketFor(300_000);
+    try testing.expectEqual(b_top, round_cost.bucketFor(900_000)); // same bucket
+    _ = top.round(0, b_top, .serial, 1);
+    var fired: u32 = 0;
+    i = 0;
+    while (i < N * 3) : (i += 1) {
+        if (top.serialTick(b_top) == .to_mtp) {
+            fired += 1;
+            _ = top.round(i, b_top, .serial, 1); // loses again, back to serial
+        }
+    }
+    try testing.expectEqual(@as(u32, 3), fired);
+
+    // A CROSSING still re-opens immediately, without waiting for the period.
+    var c = G.MtpAdaptive{};
+    _ = c.round(0, 3, .serial, 1);
+    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, c.serialTick(4));
+    try testing.expectEqual(G.MtpAdaptiveArm.undecided, c.arm);
+    try testing.expectEqual(@as(u32, 0), c.serial_ticks);
+    // ...and only from the serial arm, which this is no longer on.
+    try testing.expectEqual(G.MtpAdaptiveAction.none, c.serialTick(3));
+    _ = c.round(1, 4, .serial, 1);
+    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, c.serialTick(3));
+
+    // Entering serial restarts the clock, so a re-decision measures the new
+    // stretch rather than inheriting ticks from the previous one.
+    var d = G.MtpAdaptive{};
+    _ = d.round(0, 3, .serial, 1);
+    i = 0;
+    while (i < N / 2) : (i += 1) _ = d.serialTick(3);
+    _ = d.round(1, 3, .mtp, 1); // back to mtp
+    _ = d.round(2, 3, .serial, 1); // and serial again
+    try testing.expectEqual(@as(u32, 0), d.serial_ticks);
 }
 
 test "mtpSerialProbeArm: bounded RETRIES per bucket, and none once the cell is trusted (M15)" {
