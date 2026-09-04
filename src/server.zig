@@ -3275,10 +3275,11 @@ pub fn statePerTokenBilled(config: *const model_mod.ModelConfig) u64 {
 ///
 /// The guard bills the reservation, so the guard and the allocator are the
 /// same number by construction. PURE.
-pub fn reservedCacheTokens(seq: u64, max_tokens: u64, chunk: u64) u64 {
+pub fn reservedCacheTokens(seq: u64, max_tokens: u64, chunk: u64, ctx: u64) u64 {
     // Delegates: the cache's own definition is the authority, so the number
-    // the guard bills and the number the allocator takes cannot drift.
-    return transformer_mod.KVCache.reservedTokens(seq, max_tokens, chunk);
+    // the guard bills and the number the allocator takes cannot drift — the
+    // context bound included.
+    return transformer_mod.KVCache.reservedTokens(seq, max_tokens, chunk, ctx);
 }
 
 /// Bytes of SSM checkpoints a prefill of `seq` tokens is still HOLDING when it
@@ -3312,7 +3313,7 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
     // keeps the proportional growth policy). The prompt's own rows are still
     // billed, so floor the reserved length at `seq`: short prompts then bill
     // exactly what they did before, with no headroom term.
-    const reserved = @max(reservedCacheTokens(seq, max_tokens, chunk), seq);
+    const reserved = @max(reservedCacheTokens(seq, max_tokens, chunk, getEffectiveContextLength(config)), seq);
     // Only the HEADROOM is new here: `prefillMemoryNeeded` already bills
     // `seq * kv_per_tok` for the prompt's own rows.
     const kv_per_tok = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);
@@ -5800,11 +5801,15 @@ fn handleChatCompletions(
         return;
     }
 
-    // Check if attention computation would exceed GPU memory
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, max_tokens, config, false, kv_quant_override, lm, generate_mod.visionPrefillUnchunked(local_ve != null))) return;
-
-    // Clamp max_tokens to stay within context window
+    // Clamp max_tokens FIRST: the memory guard bills the generation
+    // headroom the request will RESERVE, and an omitted max_tokens is the
+    // `omittedMaxTokensDefault` sentinel (maxInt(u32)/4) — billing that
+    // unclamped refuses every prompt past the reservation threshold.
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
+
+    // Check if attention computation would exceed GPU memory.
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, effective_max_tokens, config, false, kv_quant_override, lm, generate_mod.visionPrefillUnchunked(local_ve != null))) return;
+
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
 
     // ── Adaptive spec-decode gating ──
@@ -6081,12 +6086,15 @@ fn handleCompletions(
         return;
     }
 
-    // Check if attention computation would exceed GPU memory
-    // (/v1/completions has no per-request kv_quant field -> process default.)
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, max_tokens, config, false, null, lm, false)) return;
-
-    // Clamp max_tokens to stay within context window
+    // Clamp max_tokens FIRST: the memory guard bills the generation
+    // headroom the request will RESERVE, and an omitted max_tokens is the
+    // `omittedMaxTokensDefault` sentinel (maxInt(u32)/4) — billing that
+    // unclamped refuses every prompt past the reservation threshold.
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
+
+    // Check if attention computation would exceed GPU memory.
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, effective_max_tokens, config, false, null, lm, false)) return;
+
 
     // Adaptive spec-decode gate (mirrors chat-completions): novel prompts
     // (low 3-gram repetition) skip PLD/drafter unless explicitly requested.
@@ -12215,10 +12223,15 @@ fn handleAnthropicMessages(
         return;
     }
 
-    // Check if attention computation would exceed GPU memory
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, max_tokens, config, true, kv_quant_override, lm, generate_mod.visionPrefillUnchunked(local_ve != null))) return;
-
+    // Clamp max_tokens FIRST: the memory guard bills the generation
+    // headroom the request will RESERVE, and an omitted max_tokens is the
+    // `omittedMaxTokensDefault` sentinel (maxInt(u32)/4) — billing that
+    // unclamped refuses every prompt past the reservation threshold.
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
+
+    // Check if attention computation would exceed GPU memory.
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, effective_max_tokens, config, true, kv_quant_override, lm, generate_mod.visionPrefillUnchunked(local_ve != null))) return;
+
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
 
     const eos_slice = config.eosTokenSlice();
@@ -13824,8 +13837,14 @@ fn handleResponses(
     }
     const kv_quant_override = parseKvQuantOverride(root);
     const kv_attn_explicit = parseKvAttnExplicit(root);
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, max_tokens, config, false, kv_quant_override, lm, generate_mod.visionPrefillUnchunked(local_ve != null))) return;
+    // Clamp max_tokens FIRST: the memory guard bills the generation
+    // headroom the request will RESERVE, and an omitted max_tokens is the
+    // `omittedMaxTokensDefault` sentinel (maxInt(u32)/4) — billing that
+    // unclamped refuses every prompt past the reservation threshold.
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
+
+    // Check if attention computation would exceed GPU memory.
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, effective_max_tokens, config, false, kv_quant_override, lm, generate_mod.visionPrefillUnchunked(local_ve != null))) return;
 
     // ── sampling ──
     var sampling = generate_mod.SamplingParams{
@@ -19088,4 +19107,106 @@ test "the 458k prefill's two unbilled terms are billed: retained checkpoints and
     const short = prefillRequestTerms(&cfg, 4096, 2048, 8, chunk);
     try t.expectEqual(@as(u64, 0), short.reserved_kv_bytes);
     try t.expectEqual(4096 * statePerTokenBilled(&cfg), short.state_bytes);
+}
+
+test "the reservation is bounded by the CONTEXT: an omitted max_tokens cannot bill 26 TB" {
+    const t = std.testing;
+    // Live defect found auditing the #353 branch. An omitted `max_tokens` is
+    // the `omittedMaxTokensDefault` sentinel — maxInt(u32)/4 = 1,073,741,823 —
+    // which `clampMaxTokens` reduces to `context - prompt` on the NEXT line.
+    // The memory guard used to run BEFORE that line, so the reservation term
+    // billed a billion tokens of KV (~26 TB on qwen4_exp at 8-bit) and every
+    // prompt past RESERVE_MIN_TOKENS with no max_tokens field was refused 400.
+    const KVCache = transformer_mod.KVCache;
+    const ctx: u64 = 262_144;
+    const seq: u64 = 50_000;
+    const sentinel: u64 = omittedMaxTokensDefault(@intCast(ctx));
+    try t.expectEqual(@as(u64, std.math.maxInt(u32) / 4), sentinel);
+
+    // Two independent bounds, because a reservation is a number two
+    // subsystems must agree on and neither may trust its caller for it.
+    // (1) The cache clamps: the generation cannot exceed what is left of the
+    //     context, so the reservation cannot exceed the context plus a chunk.
+    const reserved = KVCache.reservedTokens(seq, sentinel, 4096, ctx);
+    try t.expectEqual(ctx + 4096, reserved);
+    try t.expect(reserved < ctx * 2);
+    // (2) The four surfaces clamp FIRST and hand the guard the clamped value.
+    const clamped: u64 = clampMaxTokens(@intCast(sentinel), @intCast(seq), @intCast(ctx));
+    try t.expectEqual(ctx - seq, clamped);
+    try t.expectEqual(reserved, KVCache.reservedTokens(seq, clamped, 4096, ctx));
+
+    // An explicit max_tokens under the remaining window is untouched, and a
+    // caller that names no context (unit tests) is not clamped at all.
+    try t.expectEqual(seq + 2048 + 4096, KVCache.reservedTokens(seq, 2048, 4096, ctx));
+    try t.expectEqual(seq + sentinel + 4096, KVCache.reservedTokens(seq, sentinel, 4096, 0));
+    // A prompt that already fills the context reserves no generation headroom.
+    try t.expectEqual(ctx + 4096, KVCache.reservedTokens(ctx, sentinel, 4096, ctx));
+
+    // And the bill that the guard computes for such a request stays inside a
+    // sane envelope instead of exceeding every machine ever built.
+    const cfg = qwen4ExpOomConfig();
+    const terms = prefillRequestTerms(&cfg, seq, clamped, 8, 4096);
+    try t.expect(terms.reserved_kv_bytes < 4 * 1024 * 1024 * 1024);
+}
+
+test "every text surface clamps max_tokens BEFORE it bills the memory guard" {
+    // Class guard for the above: the ordering is the fix, and it is invisible
+    // at the call site — both lines mention `max_tokens`, and the wrong order
+    // compiles and serves every short prompt correctly. Four surfaces
+    // (/v1/chat/completions, /v1/completions, /v1/messages, /v1/responses):
+    // each must compute `effective_max_tokens` and then hand THAT to the
+    // guard. Needles are split so this test's own source never matches.
+    const t = std.testing;
+    const src = @embedFile("server.zig");
+    const guard = "checkAttention" ++ "Memory(allocator, stream, prompt_ids.len, effective_max_tokens,";
+    const clamp = "const effective_max_tokens = clamp" ++ "MaxTokens(max_tokens, prompt_ids.len, effective_ctx);";
+    try t.expectEqual(@as(usize, 4), std.mem.count(u8, src, guard));
+    try t.expectEqual(@as(usize, 4), std.mem.count(u8, src, clamp));
+    // No surface may pass the RAW value.
+    try t.expectEqual(@as(usize, 0), std.mem.count(u8, src, "checkAttention" ++ "Memory(allocator, stream, prompt_ids.len, max_tokens,"));
+    // …and every guard call is PRECEDED by its own clamp: walk the four in
+    // order and require a clamp between each guard and the one before it.
+    var at: usize = 0;
+    var seen: usize = 0;
+    while (std.mem.indexOfPos(u8, src, at, guard)) |g| {
+        const c = std.mem.lastIndexOf(u8, src[0..g], clamp) orelse return error.ClampMissingBeforeGuard;
+        try t.expect(c < g);
+        // The clamp must be the one for THIS surface, not a previous
+        // surface's: nothing but whitespace, comments and the kv-override
+        // parse sits between them, so the span stays small.
+        try t.expect(g - c < 900);
+        seen += 1;
+        at = g + 1;
+    }
+    try t.expectEqual(@as(usize, 4), seen);
+}
+
+test "the admission probe bills the request's OWN kv-quant and chunking, not the process defaults" {
+    // The inference thread's evict-to-admit probe and the connection thread's
+    // guard must produce the SAME number for the same request (#126). The
+    // probe used to hardcode `kv_override = null` and `unchunked = false`, so
+    // a `kv_quant: 4` request priced its cache at fp16 on the inference
+    // thread — over-billing ~2.4x, evicting a hot cache that did not need to
+    // go, and able to refuse by name a request already admitted.
+    const t = std.testing;
+    const cfg = qwen4ExpOomConfig();
+    const seq: usize = 200_000;
+    const q4 = transformer_mod.KVQuantConfig.affine(4);
+    const q8 = transformer_mod.KVQuantConfig.affine(8);
+    const bill4 = prefillAdmissionBill(&cfg, seq, 2048, q4, false);
+    const bill8 = prefillAdmissionBill(&cfg, seq, 2048, q8, false);
+    const bill16 = prefillAdmissionBill(&cfg, seq, 2048, transformer_mod.KVQuantConfig.dense, false);
+    // The three widths must be three different numbers, or the override is
+    // being dropped somewhere between the parameter and the estimator.
+    try t.expect(bill4.needed < bill8.needed);
+    try t.expect(bill8.needed < bill16.needed);
+
+    // The probe is a pure forward of its inputs into that one estimator.
+    const src = @embedFile("server.zig");
+    const fwd = "return prefillAdmission" ++ "Bill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill).fits();";
+    try t.expectEqual(@as(usize, 2), std.mem.count(u8, src, fwd)); // the site + this literal
+    // And the scheduler hands it the SLOT's own scheme and vision state.
+    const sched = @embedFile("scheduler.zig");
+    try t.expect(std.mem.indexOf(u8, sched, ".kv_cfg = slot.cache.config,") != null);
+    try t.expect(std.mem.indexOf(u8, sched, ".unchunked = generate_mod.visionPrefillUnchunked(slot.vision_embeddings != null),") != null);
 }

@@ -2105,10 +2105,15 @@ pub const Generator = struct {
             // On `ctx.cache`, not `xfm.cache`: the scheduler swaps a slot's
             // own cache onto the forward context, and the reservation belongs
             // to the buffers this prefill will actually write.
+            // The context bound is the transformer's own: `max_tokens` reaches
+            // us already clamped by the server, but a reservation is a number
+            // two subsystems must agree on and neither may trust its caller
+            // for it (the omitted-max_tokens sentinel, #353 follow-up).
             ctx.cache.reserve(@intCast(transformer_mod.KVCache.reservedTokens(
                 prompt_ids.len,
                 max_tokens,
                 default_chunk,
+                xfm.config.max_position_embeddings,
             )));
 
             var pos: usize = 0;

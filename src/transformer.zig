@@ -5171,13 +5171,24 @@ pub const KVCache = struct {
     /// over. PURE, and the ONE definition — the admission guard bills exactly
     /// this and the cache allocates exactly this, so the estimate and the
     /// allocation cannot drift (`server.reservedCacheTokens` delegates here).
-    pub fn reservedTokens(seq: u64, max_tokens: u64, chunk: u64) u64 {
+    pub fn reservedTokens(seq: u64, max_tokens: u64, chunk: u64, ctx: u64) u64 {
         // Short prompts keep the proportional policy untouched. Growth
         // coexistence only matters once the buffer is big enough for a second
         // copy to be worth gigabytes, and reserving up front costs a short
         // request the whole `max_tokens` of KV it may never generate.
         if (seq < RESERVE_MIN_TOKENS) return 0;
-        return seq +| max_tokens +| @max(chunk, 1);
+        // A request's `max_tokens` is NOT a bound on anything by itself: an
+        // omitted one is `server.omittedMaxTokensDefault` (maxInt(u32)/4), and
+        // reserving that literally is ~26 TB of KV — a bill no machine can
+        // meet, so every prompt past RESERVE_MIN_TOKENS with no max_tokens
+        // field would be refused 400. The generation cannot exceed what is
+        // left of the context, so that is the bound, applied HERE as well as
+        // at the four call sites that clamp: a reservation is a number two
+        // subsystems must agree on, and neither may trust its caller for it.
+        // `ctx == 0` means "unknown" and imposes no clamp (unit tests, and
+        // any future caller with no context to name).
+        const head_room: u64 = if (ctx > seq) @min(max_tokens, ctx - seq) else if (ctx > 0) 0 else max_tokens;
+        return seq +| head_room +| @max(chunk, 1);
     }
 
     /// Prompt length at or above which a request reserves its capacity. Below
@@ -44315,7 +44326,9 @@ test "a reserved KV cache grows ONCE: no old+new buffer coexists during a long p
 
     // Reserved: one allocation, sized to the reservation, and the walk never
     // grows again.
-    const reserved: usize = @intCast(KVCache.reservedTokens(seq, 2048, chunk));
+    // ctx 0 = "no context named" — this test is about the growth ladder,
+    // and the context clamp has its own test in server.zig.
+    const reserved: usize = @intCast(KVCache.reservedTokens(seq, 2048, chunk, 0));
     try t.expectEqual(seq + 2048 + chunk, reserved);
     var rcache = try KVCache.init(t.allocator, 1);
     defer rcache.deinit();
@@ -44339,10 +44352,10 @@ test "a reserved KV cache grows ONCE: no old+new buffer coexists during a long p
 
     // A request under the threshold reserves nothing: byte-identical
     // behaviour for every prompt the flat runtime floor was measured on.
-    try t.expectEqual(@as(u64, 0), KVCache.reservedTokens(4096, 2048, chunk));
+    try t.expectEqual(@as(u64, 0), KVCache.reservedTokens(4096, 2048, chunk, 0));
     var small = try KVCache.init(t.allocator, 1);
     defer small.deinit();
-    small.reserve(@intCast(KVCache.reservedTokens(4096, 2048, chunk)));
+    small.reserve(@intCast(KVCache.reservedTokens(4096, 2048, chunk, 0)));
     try t.expectEqual(
         KVCache.nextCapacityPolicy(1024, 2048, KVCache.kvGrowLinear()),
         small.nextCapacityReserved(1024, 2048),
