@@ -4989,6 +4989,51 @@ pub fn materializedOwnedCopy(s: mlx.mlx_stream, x: mlx.mlx_array) !mlx.mlx_array
     return out;
 }
 
+/// A second owner for `cp`'s state: fresh handles and a fresh layer slice,
+/// refcount-SHARING every underlying buffer (`mlx_array_set`, the same idiom
+/// `ssmSnapshot` and `KVCache.snapshot` use). Both checkpoints then free
+/// independently and the DATA outlives whichever dies first.
+///
+/// This is what makes checkpoint inheritance cheap enough to be unconditional:
+/// a commit built on a restored prefix carries the donor entry's checkpoints
+/// without re-copying multi-GB of GDN state, and evicting the donor later
+/// frees nothing the inheritor still needs. `captureSsmCheckpoint` must
+/// MATERIALIZE (its sources are slices of a live prefill graph); a checkpoint
+/// is already materialized, so sharing it aliases nothing transient.
+pub fn shareSsmCheckpoint(allocator: std.mem.Allocator, cp: *const SSMCheckpoint) !SSMCheckpoint {
+    const layers = try allocator.alloc(SSMCacheEntrySnapshot, cp.layers.len);
+    var built: usize = 0;
+    errdefer {
+        for (layers[0..built]) |*l| ssmSnapshotDeinit(l);
+        allocator.free(layers);
+    }
+    for (cp.layers, 0..) |*src, i| {
+        var out: SSMCacheEntrySnapshot = .{
+            .conv_state = mlx.mlx_array_new(),
+            .ssm_state = mlx.mlx_array_new(),
+            .initialized = src.initialized,
+        };
+        // Per-field null guards: mlx_array_set on a null source aborts the
+        // process via mlx-c's default error handler (see `ssmSnapshot`).
+        if (src.conv_state.ctx != null) _ = mlx.mlx_array_set(&out.conv_state, src.conv_state);
+        if (src.ssm_state.ctx != null) _ = mlx.mlx_array_set(&out.ssm_state, src.ssm_state);
+        if (src.aux_state.ctx != null) {
+            out.aux_state = mlx.mlx_array_new();
+            _ = mlx.mlx_array_set(&out.aux_state, src.aux_state);
+        }
+        if (src.qsa_pooled.ctx != null) {
+            out.qsa_pooled = mlx.mlx_array_new();
+            _ = mlx.mlx_array_set(&out.qsa_pooled, src.qsa_pooled);
+        }
+        out.qsa_ratio = src.qsa_ratio;
+        out.ple_prev = src.ple_prev;
+        out.ple_prev_valid = src.ple_prev_valid;
+        layers[i] = out;
+        built = i + 1;
+    }
+    return .{ .pos = cp.pos, .layers = layers };
+}
+
 /// Restore every layer of `ssm_entries` from `cp`. Mirrors the per-layer
 /// `ssmRestore` pattern — null-safe on either side.
 pub fn restoreSsmCheckpoint(
