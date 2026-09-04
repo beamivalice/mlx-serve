@@ -750,7 +750,16 @@ test "wired fit target: zero headroom, clamped, declines empty" {
 var mlx_error_latched = std.atomic.Value(bool).init(false);
 var mlx_error_buf: [512]u8 = undefined;
 var mlx_error_len: usize = 0;
-var mlx_error_mtx: std.Thread.Mutex = .{};
+/// A pthread mutex, not `std.Io.Mutex`, for `log.zig`'s reason and one more:
+/// mlx-c calls the handler from whatever thread raised — an MLX stream thread
+/// included — and none of them carry an `Io` handle.
+var mlx_error_mtx: std.c.pthread_mutex_t = .{};
+fn lockErrBuf() void {
+    _ = std.c.pthread_mutex_lock(&mlx_error_mtx);
+}
+fn unlockErrBuf() void {
+    _ = std.c.pthread_mutex_unlock(&mlx_error_mtx);
+}
 
 /// Classification of a latched mlx-c message. Memory failures must reach the
 /// client as a memory 503 (`ModelRegistry.loadErrorFromName` keeps BOTH
@@ -783,8 +792,8 @@ pub fn mlxErrorIsMemory(msg: []const u8) bool {
 fn latchMlxError(msg: [*:0]const u8, data: ?*anyopaque) callconv(.c) void {
     _ = data;
     const span = std.mem.span(msg);
-    mlx_error_mtx.lock();
-    defer mlx_error_mtx.unlock();
+    lockErrBuf();
+    defer unlockErrBuf();
     // FIRST error wins: mlx preserves the earliest error for the same reason
     // (a poisoned stream produces follow-on noise that hides the cause).
     if (!mlx_error_latched.load(.acquire)) {
@@ -822,8 +831,8 @@ pub fn errorPending() bool {
 /// after another MLX call has run.
 pub fn takeError(buf: []u8) ?[]const u8 {
     if (!mlx_error_latched.load(.acquire)) return null;
-    mlx_error_mtx.lock();
-    defer mlx_error_mtx.unlock();
+    lockErrBuf();
+    defer unlockErrBuf();
     const n = @min(mlx_error_len, buf.len);
     @memcpy(buf[0..n], mlx_error_buf[0..n]);
     mlx_error_len = 0;
@@ -954,7 +963,7 @@ test "the injected MLX error costs ONE checkError and the engine keeps working a
     const s = gpuStream();
     const shape = [_]c_int{2};
     const data = [_]f32{ 1.5, 2.5 };
-    var a = mlx_array_new_data(@ptrCast(&data), &shape, 1, .float32);
+    const a = mlx_array_new_data(@ptrCast(&data), &shape, 1, .float32);
     defer _ = mlx_array_free(a);
     var sum = mlx_array_new();
     defer _ = mlx_array_free(sum);

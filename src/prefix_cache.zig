@@ -3126,7 +3126,6 @@ test "prefix cache: the no-match lookup arm consults missKind, never returns sil
     try testing.expect(probe_at < filter_at);
 }
 
-
 test "prefix cache: an inherited checkpoint SHARES the donor's buffers and is budget-bounded" {
     // The two claims inheritance rests on. (1) Sharing: a clone must outlive
     // the donor — the ladder's whole point is that evicting the entry we
