@@ -242,7 +242,7 @@ With `tools`, tokens buffer for detection (all tag families + raw JSON); thinkin
 - **A long job's abort must not depend on the RESPONSE SHAPE** (`gen_sse.StreamCtx.stream`): probe is `Conn.peerClosed`; `stream:false` no-ops the event cb; cancel arms report `error.Cancelled`.
 - **Non-text model on a text surface must 400 BEFORE prefill** (`textGenRejectReason`, arch_hint peek + post-load). New surface → `isTextGenRoute`; new modality → `modalityFromType`.
 - **An arg loop with no else branch is a silent flag eater** (`cli.classifyUnparsedArg`). Every `--flag` any script or `ServerOptions.toCLIArgs` passes must be in main.zig's match list. Related settings travel as ONE value (`server.PldDefaults`); guard `tests/test_headless_spec_flags.sh`.
-- **A client-supplied PATH is proven on OUR side of the mlx boundary** (`lora.loadFile` stat → 400; an MLX error KILLS the process).
+- **A client-supplied PATH is proven on OUR side of the mlx boundary** (`lora.loadFile` stat → 400).
 - **Hand-written error text is not JSON**: escape at the SINK (`gen_sse.jsonEscapeMessage`), truncate on a UTF-8 boundary.
 - **Endpoint EXISTENCE must not depend on model state, and the 404 lands BEFORE the model is resolved** (a typo'd `/v1/load` once cost 2m42s + 121 GB): gate is unconditional, above every load, below the LAN proxy, ONE copy; `ROUTE_PATHS` scan-pinned. Guard: `tests/test_route_404_no_load.sh`.
 - **A launch flag that shapes a LOAD must be retained on the Scheduler**: `ensureLoaded`'s cold-load `LoadRequest` is a SECOND construction site (prefix-cache, MTP, llama, drafter, ssd all bit). `--drafter <path>` is the exception: applied only when the entry IS the launch model (`coldLoadDrafterDir`). Guards: source scan + `tests/test_cold_load_launch_flags.sh`.
