@@ -43,6 +43,33 @@ const ssmCheckpointBytes = transformer_mod.ssmCheckpointBytes;
 /// commit time instead of claim time.
 pub const MIN_CANCELLED_COMMIT_TOKENS: usize = 256;
 
+/// Why a lookup that found a real raw token match still restored nothing.
+/// `findBestRestorableMatch` `continue`s every candidate whose highest SSM
+/// checkpoint sits past the shared prefix, so a hybrid lookup can return null
+/// with a 393k-token raw match behind it — and the `match == null` arm used to
+/// log NOTHING, leaving a 560 s cold prefill with no `[hot-cache]` line at all.
+/// Pure so the policy is unit-testable without a cache.
+pub const MissKind = enum {
+    /// Nothing worth naming: no key-compatible entry, or a shared prefix under
+    /// the commit floor. An ordinary cold start; stays quiet.
+    cold,
+    /// Entries shared a real prefix and not one of them could restore it.
+    /// This is the expensive miss and it owes a line.
+    no_checkpoint,
+};
+
+/// What `findBestRestorableMatch` saw before its restorability filter ran:
+/// how many key-compatible entries it considered and the longest RAW token
+/// match among them. The filter's `continue`s destroy both, which is why a
+/// hybrid miss could not name itself.
+pub const MatchProbe = struct { candidates: usize = 0, best_raw: usize = 0 };
+
+pub fn missKind(candidates: usize, best_raw: usize) MissKind {
+    if (candidates == 0) return .cold;
+    if (best_raw < MIN_CANCELLED_COMMIT_TOKENS) return .cold;
+    return .no_checkpoint;
+}
+
 /// Result of a cache lookup. Tells the caller how many tokens of `prompt_ids`
 /// are already in the live cache after a successful restore — the caller
 /// then prefills only the trailing diverged tokens (`prompt_ids[matched..]`).
@@ -480,6 +507,7 @@ pub const HotPrefixCache = struct {
         media_start: ?usize,
         quant_config: kv_quant.KVQuantConfig,
         require_ssm_checkpoint: bool,
+        probe: ?*MatchProbe,
     ) ?struct { idx: usize, shared: usize } {
         var best_idx: ?usize = null;
         var best_shared: usize = 0;
@@ -503,6 +531,14 @@ pub const HotPrefixCache = struct {
             var shared: usize = 0;
             while (shared < max_shared and e.tokens[shared] == prompt_ids[shared]) shared += 1;
 
+            // Record the RAW match before the restorability filter can drop
+            // this candidate — a null return with a long raw match is the
+            // expensive miss, and the only place that fact still exists.
+            if (probe) |p| {
+                p.candidates += 1;
+                if (shared > p.best_raw) p.best_raw = shared;
+            }
+
             const effective = if (require_ssm_checkpoint) blk: {
                 const cps = e.ssm_checkpoints orelse continue;
                 const cp = highestCheckpointAtOrBelow(cps, shared) orelse continue;
@@ -521,7 +557,7 @@ pub const HotPrefixCache = struct {
     }
 
     fn findBestMatch(self: *const HotPrefixCache, prompt_ids: []const u32, has_tools: bool, vision_key: u64, quant_config: kv_quant.KVQuantConfig) ?struct { idx: usize, shared: usize } {
-        const match = self.findBestRestorableMatch(prompt_ids, has_tools, vision_key, null, quant_config, false) orelse return null;
+        const match = self.findBestRestorableMatch(prompt_ids, has_tools, vision_key, null, quant_config, false, null) orelse return null;
         return .{ .idx = match.idx, .shared = match.shared };
     }
 
@@ -572,6 +608,7 @@ pub const HotPrefixCache = struct {
         dflash_target: ?DflashTarget,
         mtp_target: ?DflashTarget,
     ) !LookupResult {
+        var probe: MatchProbe = .{};
         const match = self.findBestRestorableMatch(
             prompt_ids,
             has_tools,
@@ -579,6 +616,7 @@ pub const HotPrefixCache = struct {
             media_start,
             target_cache.config,
             target_ssm_entries != null,
+            &probe,
         );
 
         // ── SSD tier: consult when it can beat the RAM match meaningfully
@@ -663,6 +701,17 @@ pub const HotPrefixCache = struct {
             try target_cache.truncate(0, s);
             if (target_ssm_entries) |entries| resetSsmEntries(entries);
             target_moe_seq_offset.* = 0;
+            // The filter dropped every candidate. This arm used to be silent,
+            // so a 393k-token prompt that the cache almost had cold-prefilled
+            // for 560 s with no `[hot-cache]` line at all. Same phrasing as
+            // the one-entry miss below — one string to grep for.
+            switch (missKind(probe.candidates, probe.best_raw)) {
+                .cold => {},
+                .no_checkpoint => log.info(
+                    "  [hot-cache] hybrid miss (no checkpoint ≤ {d} of {d} in {d} entries); cold prefill\n",
+                    .{ probe.best_raw, prompt_ids.len, probe.candidates },
+                ),
+            }
             return .{ .matched = 0, .full_match = false };
         }
         const m = match.?;
@@ -2980,6 +3029,46 @@ test "HotPrefixCache: a commit from a restored prefix inherits the donor's check
     // The restored state is the checkpoint A captured at 16 (srcs[1]).
     try testing.expectEqual(@as(f32, 200.0), pcSsmVal(target_ssm[0].conv_state, 0, s));
 }
+
+test "prefix cache: a hybrid miss with a raw token match names itself" {
+    // The silent null: `findBestRestorableMatch` rejects every candidate that
+    // has no SSM checkpoint at or below its shared prefix, so the lookup can
+    // return null with a LONG raw match behind it — and the `match == null`
+    // arm logged nothing at all. `missKind` is the seam: a genuinely cold
+    // cache stays quiet, an expensive miss gets a line.
+    try testing.expectEqual(MissKind.cold, missKind(0, 0));
+    try testing.expectEqual(MissKind.cold, missKind(0, 100_000));
+    try testing.expectEqual(MissKind.cold, missKind(3, 0));
+    // Below the commit floor there was never a prefix worth restoring.
+    try testing.expectEqual(MissKind.cold, missKind(3, MIN_CANCELLED_COMMIT_TOKENS - 1));
+    // At and above it, a cold prefill of that many tokens owes an explanation.
+    try testing.expectEqual(MissKind.no_checkpoint, missKind(1, MIN_CANCELLED_COMMIT_TOKENS));
+    try testing.expectEqual(MissKind.no_checkpoint, missKind(4, 393_000));
+}
+
+test "prefix cache: the no-match lookup arm consults missKind, never returns silently" {
+    // Class guard for the 560 s unexplained cold prefill: every early return
+    // from the lookup owes a reason. The `match == null` arm is the one that
+    // had none, and it is reachable only through this file.
+    const source = @embedFile("prefix_cache.zig");
+    const start = std.mem.indexOf(u8, source, "if (match == null) {") orelse
+        return error.MissingNoMatchArm;
+    const arm = source[start .. start + 900];
+    const end = std.mem.indexOf(u8, arm, "return .{ .matched = 0, .full_match = false };") orelse
+        return error.MissingNoMatchReturn;
+    try testing.expect(std.mem.indexOf(u8, arm[0..end], "missKind(") != null);
+    try testing.expect(std.mem.indexOf(u8, arm[0..end], "[hot-cache] hybrid miss") != null);
+    // The probe must be filled BEFORE the restorability filter can `continue`
+    // a candidate away, or `best_raw` is always 0 and the line never fires.
+    const fbr = std.mem.indexOf(u8, source, "fn findBestRestorableMatch(") orelse
+        return error.MissingFinder;
+    const body = source[fbr .. fbr + 2600];
+    const probe_at = std.mem.indexOf(u8, body, "if (probe) |p| {") orelse return error.MissingProbe;
+    const filter_at = std.mem.indexOf(u8, body, "const effective = if (require_ssm_checkpoint)") orelse
+        return error.MissingFilter;
+    try testing.expect(probe_at < filter_at);
+}
+
 
 test "prefix cache: an inherited checkpoint SHARES the donor's buffers and is budget-bounded" {
     // The two claims inheritance rests on. (1) Sharing: a clone must outlive
