@@ -6911,6 +6911,62 @@ pub const PlePending = struct {
     capture: bool,
 };
 
+/// The nb-keyed constants of the QSA block selection. Both consumers
+/// (`qsaBlockVisibility`'s block-end column and `qsaTopBlocks`' tie bias)
+/// depend on nothing but the block count and the compress ratio, and every
+/// one of qwen4_exp's 12 full-attention layers asks for the same pair inside
+/// one forward — so they are built ONCE and reused, not rebuilt 12 times.
+///
+/// Keyed on (nb, ratio): a mismatch REBUILDS. The cache can never hand back a
+/// table sized for a different block count, so the values a layer reads are
+/// exactly the values the per-layer build produced.
+const QsaBlockConsts = struct {
+    nb: c_int = 0,
+    ratio: c_int = 0,
+    /// int32 `[1, nb]`: the last cache position of each complete block,
+    /// `ratio*b + ratio - 1`.
+    blk_end2: mlx.mlx_array = .{ .ctx = null },
+    /// f32 `[nb]`: `b * 1e-7`, the index-descending bias that reproduces
+    /// torch.topk's lower-index-wins over the exact zeros relu leaves.
+    tie_bias: mlx.mlx_array = .{ .ctx = null },
+    /// Rebuild counter. The ONLY externally visible difference between a
+    /// cache hit and a rebuild — the arrays are identical either way.
+    builds: usize = 0,
+
+    fn deinit(self: *QsaBlockConsts) void {
+        if (self.blk_end2.ctx != null) _ = mlx.mlx_array_free(self.blk_end2);
+        if (self.tie_bias.ctx != null) _ = mlx.mlx_array_free(self.tie_bias);
+        self.blk_end2 = .{ .ctx = null };
+        self.tie_bias = .{ .ctx = null };
+        self.nb = 0;
+        self.ratio = 0;
+    }
+
+    /// After this returns, `blk_end2`/`tie_bias` are BORROWED handles valid
+    /// until the next `ensure` with a different key (mlx ops retain their
+    /// inputs, so a graph already built on them stays valid regardless).
+    fn ensure(self: *QsaBlockConsts, s: mlx.mlx_stream, nb: c_int, ratio: c_int) !void {
+        if (self.blk_end2.ctx != null and self.nb == nb and self.ratio == ratio) return;
+        self.deinit();
+        errdefer self.deinit();
+        var blk_end = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(blk_end);
+        try mlx.check(mlx.mlx_arange(&blk_end, @floatFromInt(ratio - 1), @floatFromInt(nb * ratio), @floatFromInt(ratio), .int32, s));
+        self.blk_end2 = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&self.blk_end2, blk_end, &[_]c_int{ 1, nb }, 2, s));
+        var blk_idx_f = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(blk_idx_f);
+        try mlx.check(mlx.mlx_arange(&blk_idx_f, 0, @floatFromInt(nb), 1.0, .float32, s));
+        const tie_eps = mlx.mlx_array_new_float(1e-7);
+        defer _ = mlx.mlx_array_free(tie_eps);
+        self.tie_bias = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_multiply(&self.tie_bias, blk_idx_f, tie_eps, s));
+        self.nb = nb;
+        self.ratio = ratio;
+        self.builds += 1;
+    }
+};
+
 // ── Decode quantized-KV attention kernel (docs/kv-quant-perf.md) ──
 //
 // The composed fused path (quantAttention: qmm → softmax → qmm) measured
@@ -7909,6 +7965,9 @@ pub const Transformer = struct {
     /// fixture is the tighter bar for the MATH.
     qwen4_stream_f32: bool = false,
     qwen4_mixer: ?HcWeights = null,
+    /// nb-keyed QSA block constants, built once per (nb, ratio) instead of
+    /// once per full-attention layer. See `QsaBlockConsts`.
+    qsa_consts: QsaBlockConsts = .{},
     /// qwen4_exp MTP head (one hyper-connected QSA+MoE layer over the trunk's
     /// pre-mixer stream + next-token embedding). Loaded when the pack carries
     /// `mtp.*`; served by `qwen4MtpForward`. Not yet wired into spec decode.
@@ -9376,6 +9435,7 @@ pub const Transformer = struct {
         if (self.yarn_mscale) |m| _ = mlx.mlx_array_free(m);
         if (self.yarn_inv_freq) |f| self.allocator.free(f);
         if (self.suppress_mask) |m| _ = mlx.mlx_array_free(m);
+        self.qsa_consts.deinit();
         self.yarn_mscale_cast.deinit();
         if (self.prompt_cache) |*pc| pc.deinit();
         self.cache.deinit();
@@ -13541,7 +13601,7 @@ pub const Transformer = struct {
                 std.debug.print("\n", .{});
             }
         }
-        const vis3 = try qsaBlockVisibility(self.s, offset, seq_len, nb, ratio);
+        const vis3 = try self.qsaBlockVisibility(offset, seq_len, nb, ratio);
         defer _ = mlx.mlx_array_free(vis3);
 
         var blk_sel = mlx.mlx_array_new();
@@ -13549,7 +13609,7 @@ pub const Transformer = struct {
         if (nb <= block_topk) {
             try mlx.check(mlx.mlx_array_set(&blk_sel, vis3));
         } else {
-            const part = try qsaTopBlocks(self.s, scores, vis3, nb, block_topk);
+            const part = try self.qsaTopBlocks(scores, vis3, nb, ratio, block_topk);
             defer _ = mlx.mlx_array_free(part);
             var top_idx = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(top_idx);
@@ -13568,23 +13628,20 @@ pub const Transformer = struct {
     }
 
     /// Block visibility [1,S,nb]: block blk is complete for the query at
-    /// cache position p iff blk*ratio + ratio - 1 <= p.
-    fn qsaBlockVisibility(s: mlx.mlx_stream, offset: c_int, seq_len: c_int, nb: c_int, ratio: c_int) !mlx.mlx_array {
+    /// cache position p iff blk*ratio + ratio - 1 <= p. The block-end column
+    /// depends only on (nb, ratio) and comes from `qsa_consts`.
+    fn qsaBlockVisibility(self: *Transformer, offset: c_int, seq_len: c_int, nb: c_int, ratio: c_int) !mlx.mlx_array {
+        const s = self.s;
+        try self.qsa_consts.ensure(s, nb, ratio);
         var pos_col = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(pos_col);
         try mlx.check(mlx.mlx_arange(&pos_col, @floatFromInt(offset), @floatFromInt(offset + seq_len), 1.0, .int32, s));
         var pos2 = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(pos2);
         try mlx.check(mlx.mlx_reshape(&pos2, pos_col, &[_]c_int{ seq_len, 1 }, 2, s));
-        var blk_end = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(blk_end);
-        try mlx.check(mlx.mlx_arange(&blk_end, @floatFromInt(ratio - 1), @floatFromInt(nb * ratio), @floatFromInt(ratio), .int32, s));
-        var blk_end2 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(blk_end2);
-        try mlx.check(mlx.mlx_reshape(&blk_end2, blk_end, &[_]c_int{ 1, nb }, 2, s));
         var vis = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(vis);
-        try mlx.check(mlx.mlx_less_equal(&vis, blk_end2, pos2, s)); // [S, nb]
+        try mlx.check(mlx.mlx_less_equal(&vis, self.qsa_consts.blk_end2, pos2, s)); // [S, nb]
         var vis3 = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_expand_dims(&vis3, vis, 0, s)); // [1,S,nb]
         return vis3;
@@ -13594,20 +13651,14 @@ pub const Transformer = struct {
     /// `block_topk` columns are the picks. torch.topk keeps the LOWER index
     /// among equal scores (relu leaves many exact zeros): a tiny
     /// index-descending bias reproduces it.
-    fn qsaTopBlocks(s: mlx.mlx_stream, scores: mlx.mlx_array, vis3: mlx.mlx_array, nb: c_int, block_topk: c_int) !mlx.mlx_array {
+    fn qsaTopBlocks(self: *Transformer, scores: mlx.mlx_array, vis3: mlx.mlx_array, nb: c_int, ratio: c_int, block_topk: c_int) !mlx.mlx_array {
+        const s = self.s;
+        try self.qsa_consts.ensure(s, nb, ratio);
         const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
         defer _ = mlx.mlx_array_free(neg_inf);
-        var blk_idx_f = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(blk_idx_f);
-        try mlx.check(mlx.mlx_arange(&blk_idx_f, 0, @floatFromInt(nb), 1.0, .float32, s));
-        const tie_eps = mlx.mlx_array_new_float(1e-7);
-        defer _ = mlx.mlx_array_free(tie_eps);
-        var bias = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(bias);
-        try mlx.check(mlx.mlx_multiply(&bias, blk_idx_f, tie_eps, s));
         var biased = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(biased);
-        try mlx.check(mlx.mlx_subtract(&biased, scores, bias, s));
+        try mlx.check(mlx.mlx_subtract(&biased, scores, self.qsa_consts.tie_bias, s));
         var masked = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(masked);
         try mlx.check(mlx.mlx_where(&masked, vis3, biased, neg_inf, s));
@@ -13669,7 +13720,7 @@ pub const Transformer = struct {
             var scores = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(scores);
             try mlx.check(mlx.mlx_sum_axis(&scores, relu, 1, false, self.s)); // [1,rows,nb]
-            const vis3 = try qsaBlockVisibility(self.s, offset + r0, rows, nb, ratio);
+            const vis3 = try self.qsaBlockVisibility(offset + r0, rows, nb, ratio);
             defer _ = mlx.mlx_array_free(vis3);
 
             var top_idx = mlx.mlx_array_new();
@@ -13677,7 +13728,7 @@ pub const Transformer = struct {
             if (canonical.ctx != null) {
                 try mlx.check(mlx.mlx_broadcast_to(&top_idx, canonical, &[_]c_int{ 1, rows, nb }, 3, self.s));
             } else {
-                const part = try qsaTopBlocks(self.s, scores, vis3, nb, block_topk);
+                const part = try self.qsaTopBlocks(scores, vis3, nb, ratio, block_topk);
                 defer _ = mlx.mlx_array_free(part);
                 var tail = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(tail);
@@ -42211,4 +42262,43 @@ test "the qwen4 EV seed width is mtp.MAX_DEPTH itself, not a mirrored constant" 
     const source = @embedFile("transformer.zig");
     try testing.expect(std.mem.indexOf(u8, source, "ev_seed_accept: ?[mtp_mod.MAX_DEPTH]f32") != null);
     try testing.expect(std.mem.indexOf(u8, source, "const mtp_mod = @import(\"mtp.zig\");") != null);
+}
+
+test "qsa block constants: one build per nb, not one per full-attention layer" {
+    // qwen4_exp runs 12 full-attention layers per forward and every one of them
+    // asked `qsaBlockVisibility`/`qsaTopBlocks` for the SAME nb-keyed aranges.
+    // `builds` is the only externally visible difference between "cached" and
+    // "rebuilt" — the VALUES are identical either way, which is the point.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var qc: QsaBlockConsts = .{};
+    defer qc.deinit();
+
+    try qc.ensure(s, 6, 4);
+    try testing.expectEqual(@as(usize, 1), qc.builds);
+    const first_end = qc.blk_end2.ctx;
+    const first_bias = qc.tie_bias.ctx;
+    for (0..11) |_| try qc.ensure(s, 6, 4); // layers 2..12 of the same forward
+    try testing.expectEqual(@as(usize, 1), qc.builds);
+    try testing.expect(qc.blk_end2.ctx == first_end);
+    try testing.expect(qc.tie_bias.ctx == first_bias);
+
+    // Values: block ends `ratio*b + ratio-1`, and the index-descending tie bias.
+    var ends = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ends);
+    try mlx.check(mlx.mlx_astype(&ends, qc.blk_end2, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(ends));
+    const ev = mlx.mlx_array_data_float32(ends).?;
+    for (0..6) |b| try testing.expectEqual(@as(f32, @floatFromInt(4 * b + 3)), ev[b]);
+    try mlx.check(mlx.mlx_array_eval(qc.tie_bias));
+    const bv = mlx.mlx_array_data_float32(qc.tie_bias).?;
+    for (0..6) |b| try testing.expectEqual(@as(f32, @floatFromInt(b)) * 1e-7, bv[b]);
+
+    // A newly completed block is a NEW table, never a stale one.
+    try qc.ensure(s, 7, 4);
+    try testing.expectEqual(@as(usize, 2), qc.builds);
+    try testing.expectEqual(@as(c_int, 7), mlx.getShape(qc.blk_end2)[1]);
+    // Same nb, different ratio: also a different table.
+    try qc.ensure(s, 7, 8);
+    try testing.expectEqual(@as(usize, 3), qc.builds);
 }
