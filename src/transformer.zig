@@ -4372,12 +4372,65 @@ fn qsaMaskFromBlockSel(s: mlx.mlx_stream, blk_sel: mlx.mlx_array, offset: c_int,
 /// Bound on the per-chunk [n_idx, rows, nb] f32 indexer score sheet: the
 /// prefill selection runs in row chunks so 4096 rows x 64k blocks x 4 heads
 /// (4.3 GB at 256k) never materializes at once.
-pub const QSA_SCORE_SHEET_BUDGET: u64 = 256 << 20;
+///
+/// It is a LEVER, not a constant, because at long context it decides the
+/// prefill's row chunk and nothing else does: at kv 383k (nb ~95.8k, n_idx 4)
+/// 256 MB leaves room for only ~171 rows, so a 4096-token prefill chunk is
+/// re-split into 24 indexer passes and each one re-reads the whole pooled key
+/// bank. That is why widening the prefill chunk from 1024 to 2048 bought
+/// +9/+16/+25% at the 64k/128k/256k rungs but only +4% at 374k — past ~100k
+/// blocks the sheet budget, not the chunk, is the binding constraint.
+/// `MLX_SERVE_QSA_SCORE_SHEET_MB` moves it; absent or 0 keeps the measured
+/// default. Both the forward (`qsaSelectBlocks`) and the memory bill
+/// (`qsaPrefillTransientBytes` -> `server.qsaMaskBytes`) read it through
+/// `qsaScoreRowsPerChunk`, so a wider sheet is BILLED to the admission guard,
+/// never just spent — the "guards and dispatch must never drift" rule.
+pub const QSA_SCORE_SHEET_BUDGET_MB_DEFAULT: u64 = 256;
+
+/// Upper bound on the lever. A sheet is a per-layer prefill transient and the
+/// guard bills it against the Metal working set; 4 GB is already far past any
+/// measured win and keeps a fat-fingered value from turning into an
+/// uncatchable Metal OOM rather than a named 400.
+pub const QSA_SCORE_SHEET_BUDGET_MB_MAX: u64 = 4096;
+
+var qsa_score_sheet_mb_cached: ?u64 = null;
+/// Test seam: set to bypass the env read entirely (same shape as the other
+/// QSA overrides). Cleared by tests that set it.
+pub var qsa_score_sheet_mb_override: ?u64 = null;
+var qsa_score_sheet_logged: bool = false;
+
+/// PURE: resolve the raw env value to a megabyte count. Absent, empty,
+/// unparseable, or 0 = the measured default; anything above the cap clamps to
+/// the cap (a clamp, never a refusal — this is a tuning knob, not a contract).
+pub fn qsaScoreSheetMbFrom(raw: ?[]const u8) u64 {
+    const text = raw orelse return QSA_SCORE_SHEET_BUDGET_MB_DEFAULT;
+    if (text.len == 0) return QSA_SCORE_SHEET_BUDGET_MB_DEFAULT;
+    const parsed = std.fmt.parseInt(u64, text, 10) catch return QSA_SCORE_SHEET_BUDGET_MB_DEFAULT;
+    if (parsed == 0) return QSA_SCORE_SHEET_BUDGET_MB_DEFAULT;
+    return @min(parsed, QSA_SCORE_SHEET_BUDGET_MB_MAX);
+}
+
+/// The live sheet budget in BYTES. Read once (the env is process-wide and the
+/// value shapes a memory bill that must not change mid-session), and said once
+/// when it is not the default so a widened sheet never reads as an
+/// unexplained memory change.
+pub fn qsaScoreSheetBudget() u64 {
+    if (qsa_score_sheet_mb_override) |mb| return mb << 20;
+    if (qsa_score_sheet_mb_cached) |mb| return mb << 20;
+    const raw = std.c.getenv("MLX_SERVE_QSA_SCORE_SHEET_MB");
+    const mb = qsaScoreSheetMbFrom(if (raw) |r| std.mem.sliceTo(r, 0) else null);
+    qsa_score_sheet_mb_cached = mb;
+    if (mb != QSA_SCORE_SHEET_BUDGET_MB_DEFAULT and !qsa_score_sheet_logged) {
+        qsa_score_sheet_logged = true;
+        log.info("[qsa] score sheet budget: {d} MB (MLX_SERVE_QSA_SCORE_SHEET_MB; default {d})\n", .{ mb, QSA_SCORE_SHEET_BUDGET_MB_DEFAULT });
+    }
+    return mb << 20;
+}
 
 pub fn qsaScoreRowsPerChunk(n_idx: u64, nb: u64, rows: u64) u64 {
     const per_row = n_idx * nb * 4;
     if (per_row == 0) return rows;
-    return @max(16, @min(rows, QSA_SCORE_SHEET_BUDGET / per_row));
+    return @max(16, @min(rows, qsaScoreSheetBudget() / per_row));
 }
 
 /// Prefill transient of the block-gathered QSA path for ONE live layer:
@@ -14541,7 +14594,7 @@ pub const Transformer = struct {
     /// Prefill block selection for the gather kernel: per row the top-k
     /// visible blocks ascending, INT_MAX past the row's count ([1,S,kb]
     /// int32). Row-chunked so the [n_idx, rows, nb] f32 score sheet stays
-    /// under QSA_SCORE_SHEET_BUDGET. `k32t` is the pooled key bank
+    /// under `qsaScoreSheetBudget()`. `k32t` is the pooled key bank
     /// [1,1,hd,nb] f32.
     fn qsaSelectBlocks(self: *Transformer, q_rope: mlx.mlx_array, k32t: mlx.mlx_array, offset: c_int, seq_len: c_int, nb: c_int, block_topk: c_int) !mlx.mlx_array {
         const n_idx: c_int = @intCast(self.config.indexer_n_heads);
@@ -43677,6 +43730,65 @@ test "qsa visibility skip: bit-identical selection where it is an identity, and 
     const f = try t.qsaChunkSelect(scores, canonical, row0_all, rows, nb, ratio, nb, nb, false);
     defer _ = mlx.mlx_array_free(f);
     try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(e, f, s));
+}
+
+test "qsa score sheet budget: the env parser, and the row chunk it buys at nb 95k" {
+    const t = std.testing;
+    // Parser. Absent / empty / unparseable / 0 all mean "the measured
+    // default": a lever whose bad value silently becomes 0 rows would divide
+    // the prefill into 16-row passes, which is far worse than doing nothing.
+    try t.expectEqual(QSA_SCORE_SHEET_BUDGET_MB_DEFAULT, qsaScoreSheetMbFrom(null));
+    try t.expectEqual(QSA_SCORE_SHEET_BUDGET_MB_DEFAULT, qsaScoreSheetMbFrom(""));
+    try t.expectEqual(QSA_SCORE_SHEET_BUDGET_MB_DEFAULT, qsaScoreSheetMbFrom("wide"));
+    try t.expectEqual(QSA_SCORE_SHEET_BUDGET_MB_DEFAULT, qsaScoreSheetMbFrom("0"));
+    try t.expectEqual(@as(u64, 1024), qsaScoreSheetMbFrom("1024"));
+    // Above the cap clamps rather than refusing: this is a tuning knob.
+    try t.expectEqual(QSA_SCORE_SHEET_BUDGET_MB_MAX, qsaScoreSheetMbFrom("999999"));
+
+    // The arithmetic the lever exists for. Qwen3.8-Flash-Next at the 374k
+    // rung: kv 383205, ratio 4 -> nb 95801, n_idx 4, prefill chunk 4096.
+    // At the 256 MB default the sheet fits ~175 rows, so ONE 4096-row chunk
+    // is re-split into 24 indexer passes, each re-reading the whole pooled
+    // key bank; at 1024 MB it is 6. That ratio is the whole hypothesis.
+    const n_idx: u64 = 4;
+    const nb: u64 = 383205 / 4;
+    const chunk: u64 = 4096;
+    const prev = qsa_score_sheet_mb_override;
+    defer qsa_score_sheet_mb_override = prev;
+
+    qsa_score_sheet_mb_override = 256;
+    const rows_256 = qsaScoreRowsPerChunk(n_idx, nb, chunk);
+    qsa_score_sheet_mb_override = 1024;
+    const rows_1024 = qsaScoreRowsPerChunk(n_idx, nb, chunk);
+
+    try t.expectEqual(@as(u64, (256 << 20) / (4 * nb * 4)), rows_256);
+    try t.expectEqual(rows_256 * 4, rows_1024);
+    try t.expect(rows_256 < chunk and rows_1024 < chunk); // both still row-chunked
+    const passes = struct {
+        fn f(rows: u64, c: u64) u64 {
+            return (c + rows - 1) / rows;
+        }
+    }.f;
+    try t.expectEqual(@as(u64, 24), passes(rows_256, chunk));
+    try t.expectEqual(@as(u64, 6), passes(rows_1024, chunk));
+
+    // A wider sheet must be BILLED, not just spent: the admission guard reads
+    // the same helper through qsaPrefillTransientBytes, so the transient it
+    // reserves grows with the lever. Guards and dispatch must never drift.
+    qsa_score_sheet_mb_override = 256;
+    const bill_256 = qsaPrefillTransientBytes(n_idx, chunk, 383205, 4);
+    qsa_score_sheet_mb_override = 1024;
+    const bill_1024 = qsaPrefillTransientBytes(n_idx, chunk, 383205, 4);
+    try t.expect(bill_1024 > bill_256);
+    // The sheet term is rows x nb x 4 x (2n+4); the selection term is flat in
+    // the lever, so the delta is exactly three more sheets' worth of rows.
+    try t.expectEqual((rows_1024 - rows_256) * nb * 4 * (n_idx * 2 + 4), bill_1024 - bill_256);
+
+    // A short prompt is never widened past its own row count.
+    qsa_score_sheet_mb_override = 4096;
+    try t.expectEqual(@as(u64, 64), qsaScoreRowsPerChunk(n_idx, 1024, 64));
+    // A degenerate nb cannot produce a zero row chunk.
+    try t.expectEqual(@as(u64, 16), qsaScoreRowsPerChunk(n_idx, 1 << 30, 4096));
 }
 
 test "qsa block constants: one build per nb, not one per full-attention layer" {
