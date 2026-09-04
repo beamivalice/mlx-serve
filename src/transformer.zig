@@ -5265,6 +5265,17 @@ pub const SSMCacheEntry = struct {
     /// of the same length from the one it replaced.
     qsa_key_buf: mlx.mlx_array = .{ .ctx = null },
     qsa_key_rows: c_int = 0,
+    /// Pooled-bank accelerators, same discipline as `qsa_key_buf`:
+    /// `qsa_pooled_buf` is the `[B, cap, hd]` capacity buffer `qsa_pooled` is
+    /// the tight view of, so a newly completed block is a `slice_update`
+    /// instead of re-concatenating the whole bank; `qsa_score_bank` is the
+    /// `[B, 1, hd, nb]` f32 operand of the block-score matmul, which only
+    /// changes when a block COMPLETES — at decode, one forward in `ratio`.
+    /// Both keyed on `qsa_pooled_blocks` against the bf16 authority.
+    qsa_pooled_buf: mlx.mlx_array = .{ .ctx = null },
+    qsa_pooled_blocks: c_int = 0,
+    qsa_score_bank: mlx.mlx_array = .{ .ctx = null },
+    qsa_score_blocks: c_int = 0,
 };
 
 /// Free and null a LIVE entry's whole QSA state: the raw-key history, the
@@ -5275,10 +5286,16 @@ pub fn ssmFreeQsaState(e: *SSMCacheEntry) void {
     if (e.aux_state.ctx != null) _ = mlx.mlx_array_free(e.aux_state);
     if (e.qsa_key_buf.ctx != null) _ = mlx.mlx_array_free(e.qsa_key_buf);
     if (e.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(e.qsa_pooled);
+    if (e.qsa_pooled_buf.ctx != null) _ = mlx.mlx_array_free(e.qsa_pooled_buf);
+    if (e.qsa_score_bank.ctx != null) _ = mlx.mlx_array_free(e.qsa_score_bank);
     e.aux_state = .{ .ctx = null };
     e.qsa_key_buf = .{ .ctx = null };
     e.qsa_key_rows = 0;
     e.qsa_pooled = .{ .ctx = null };
+    e.qsa_pooled_buf = .{ .ctx = null };
+    e.qsa_pooled_blocks = 0;
+    e.qsa_score_bank = .{ .ctx = null };
+    e.qsa_score_blocks = 0;
 }
 
 /// Where the next `add` rows of QSA raw-key history go, and how big the
@@ -5293,6 +5310,68 @@ fn qsaKeyAppendPlan(rows: usize, cap: usize, add: usize) QsaKeyAppendPlan {
         .write_at = rows,
         .new_rows = need,
     };
+}
+
+/// Append `chunk` into a pre-grown capacity buffer along `axis` and republish
+/// `view` as the tight `count`-long prefix. `count` is the buffer's logical
+/// extent along that axis and is advanced here. Every other dimension comes
+/// from `chunk` and must match the buffer's.
+///
+/// The published view is dropped FIRST: while it lives it holds a reference
+/// to the buffer's memory, and mlx would then copy the whole buffer instead
+/// of donating it into the update — exactly the copy this pattern removes.
+fn capBufAppend(s: mlx.mlx_stream, buf: *mlx.mlx_array, view: *mlx.mlx_array, count: *c_int, chunk: mlx.mlx_array, axis: usize) !void {
+    const csh = mlx.getShape(chunk);
+    const nd: usize = csh.len;
+    std.debug.assert(nd <= 4 and axis < nd);
+    const add = csh[axis];
+    if (view.ctx != null) _ = mlx.mlx_array_free(view.*);
+    view.* = .{ .ctx = null };
+
+    const cap: usize = if (buf.ctx != null) @intCast(mlx.getShape(buf.*)[axis]) else 0;
+    const plan = qsaKeyAppendPlan(@intCast(count.*), cap, @intCast(add));
+    var start = [_]c_int{ 0, 0, 0, 0 };
+    var stop = [_]c_int{ 0, 0, 0, 0 };
+    const strides = [_]c_int{ 1, 1, 1, 1 };
+    for (csh, 0..) |d, i| stop[i] = d;
+
+    if (plan.new_cap != cap) {
+        var shape = [_]c_int{ 0, 0, 0, 0 };
+        for (csh, 0..) |d, i| shape[i] = d;
+        shape[axis] = @intCast(plan.new_cap);
+        var grown = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(grown);
+        try mlx.check(mlx.mlx_zeros(&grown, &shape, nd, mlx.mlx_array_dtype(chunk), s));
+        if (buf.ctx != null) {
+            if (count.* > 0) {
+                stop[axis] = count.*;
+                var old = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(old);
+                try mlx.check(mlx.mlx_slice(&old, buf.*, &start, nd, &stop, nd, &strides, nd, s));
+                var seeded = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_slice_update(&seeded, grown, old, &start, nd, &stop, nd, &strides, nd, s));
+                _ = mlx.mlx_array_free(grown);
+                grown = seeded;
+            }
+            _ = mlx.mlx_array_free(buf.*);
+        }
+        buf.* = grown;
+    }
+    start[axis] = count.*;
+    stop[axis] = @intCast(plan.new_rows);
+    var updated = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_slice_update(&updated, buf.*, chunk, &start, nd, &stop, nd, &strides, nd, s));
+    _ = mlx.mlx_array_free(buf.*);
+    buf.* = updated;
+    count.* = @intCast(plan.new_rows);
+
+    start[axis] = 0;
+    view.* = mlx.mlx_array_new();
+    errdefer {
+        _ = mlx.mlx_array_free(view.*);
+        view.* = .{ .ctx = null };
+    }
+    try mlx.check(mlx.mlx_slice(view, buf.*, &start, nd, &stop, nd, &strides, nd, s));
 }
 
 /// SSM snapshot value. Holds clones of conv_state and ssm_state via refcount —
@@ -8074,6 +8153,10 @@ pub const Transformer = struct {
     /// `qsa_pooled_rope` key, so a per-forward table never outlives its
     /// forward.
     fwd_gen: u64 = 0,
+    /// Test meter: how many times `qsaScoreBank` rebuilt the transposed f32
+    /// operand. A rebuild is a strided copy of the whole pooled bank; it
+    /// should happen only when a block completes, not once per layer.
+    qsa_score_bank_builds: usize = 0,
     /// qwen4_exp MTP head (one hyper-connected QSA+MoE layer over the trunk's
     /// pre-mixer stream + next-token embedding). Loaded when the pack carries
     /// `mtp.*`; served by `qwen4MtpForward`. Not yet wired into spec decode.
@@ -13432,11 +13515,6 @@ pub const Transformer = struct {
     /// the accelerator is checked against (see `SSMCacheEntry.qsa_key_buf`).
     fn qsaAppendKeys(self: *Transformer, entry: *SSMCacheEntry, k_raw: mlx.mlx_array, offset: c_int) !void {
         const s = self.s;
-        const ksh = mlx.getShape(k_raw); // [B, S, hd]
-        const batch = ksh[0];
-        const add = ksh[1];
-        const hd = ksh[2];
-        const strides3 = [_]c_int{ 1, 1, 1 };
         const held: c_int = if (entry.aux_state.ctx != null) mlx.getShape(entry.aux_state)[1] else 0;
 
         if (!(entry.qsa_key_buf.ctx != null and entry.qsa_key_rows == offset and held == offset)) {
@@ -13450,53 +13528,56 @@ pub const Transformer = struct {
                 entry.qsa_key_rows = held;
             }
         }
-        // Drop the published view BEFORE touching the buffer: while it lives
-        // it holds a reference to the buffer's memory, and mlx would then
-        // COPY the whole history instead of donating it into the update —
-        // exactly the copy this replaces.
-        if (entry.aux_state.ctx != null) _ = mlx.mlx_array_free(entry.aux_state);
-        entry.aux_state = .{ .ctx = null };
+        try capBufAppend(s, &entry.qsa_key_buf, &entry.aux_state, &entry.qsa_key_rows, k_raw, 1);
+    }
 
-        const rows: usize = @intCast(entry.qsa_key_rows);
-        const cap: usize = if (entry.qsa_key_buf.ctx != null) @intCast(mlx.getShape(entry.qsa_key_buf)[1]) else 0;
-        const plan = qsaKeyAppendPlan(rows, cap, @intCast(add));
-        if (plan.new_cap != cap) {
-            const new_cap: c_int = @intCast(plan.new_cap);
-            var grown = mlx.mlx_array_new();
-            errdefer _ = mlx.mlx_array_free(grown);
-            try mlx.check(mlx.mlx_zeros(&grown, &[_]c_int{ batch, new_cap, hd }, 3, mlx.mlx_array_dtype(k_raw), s));
-            if (entry.qsa_key_buf.ctx != null) {
-                if (entry.qsa_key_rows > 0) {
-                    const start = [_]c_int{ 0, 0, 0 };
-                    const stop = [_]c_int{ batch, entry.qsa_key_rows, hd };
-                    var old_rows = mlx.mlx_array_new();
-                    defer _ = mlx.mlx_array_free(old_rows);
-                    try mlx.check(mlx.mlx_slice(&old_rows, entry.qsa_key_buf, &start, 3, &stop, 3, &strides3, 3, s));
-                    var seeded = mlx.mlx_array_new();
-                    try mlx.check(mlx.mlx_slice_update(&seeded, grown, old_rows, &start, 3, &stop, 3, &strides3, 3, s));
-                    _ = mlx.mlx_array_free(grown);
-                    grown = seeded;
-                }
-                _ = mlx.mlx_array_free(entry.qsa_key_buf);
+    /// Extend the pooled block-key bank by `new3` `[B, n_new, hd]` bf16 and
+    /// republish `entry.qsa_pooled` as the tight `[B, nb, hd]` view — the
+    /// authority every snapshot/restore/disk reader sees, byte-identical to
+    /// what the old `concatenate` produced. `nb_cached` is the block count
+    /// read off that authority; a mismatch re-seeds the accelerator.
+    fn qsaAppendPooled(self: *Transformer, entry: *SSMCacheEntry, new3: mlx.mlx_array, nb_cached: c_int) !void {
+        const s = self.s;
+        if (!(entry.qsa_pooled_buf.ctx != null and entry.qsa_pooled_blocks == nb_cached)) {
+            if (entry.qsa_pooled_buf.ctx != null) _ = mlx.mlx_array_free(entry.qsa_pooled_buf);
+            entry.qsa_pooled_buf = .{ .ctx = null };
+            entry.qsa_pooled_blocks = 0;
+            if (nb_cached > 0 and entry.qsa_pooled.ctx != null) {
+                entry.qsa_pooled_buf = try materializedOwnedCopy(s, entry.qsa_pooled);
+                entry.qsa_pooled_blocks = nb_cached;
             }
-            entry.qsa_key_buf = grown;
         }
-        {
-            const start = [_]c_int{ 0, @intCast(plan.write_at), 0 };
-            const stop = [_]c_int{ batch, @intCast(plan.new_rows), hd };
-            var updated = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_slice_update(&updated, entry.qsa_key_buf, k_raw, &start, 3, &stop, 3, &strides3, 3, s));
-            _ = mlx.mlx_array_free(entry.qsa_key_buf);
-            entry.qsa_key_buf = updated;
-        }
-        entry.qsa_key_rows = @intCast(plan.new_rows);
-        entry.aux_state = mlx.mlx_array_new();
-        errdefer {
-            _ = mlx.mlx_array_free(entry.aux_state);
-            entry.aux_state = .{ .ctx = null };
-        }
-        const v_stop = [_]c_int{ batch, entry.qsa_key_rows, hd };
-        try mlx.check(mlx.mlx_slice(&entry.aux_state, entry.qsa_key_buf, &[_]c_int{ 0, 0, 0 }, 3, &v_stop, 3, &strides3, 3, s));
+        try capBufAppend(s, &entry.qsa_pooled_buf, &entry.qsa_pooled, &entry.qsa_pooled_blocks, new3, 1);
+    }
+
+    /// The block-score matmul's key operand: `[B, 1, hd, nb]` f32, the pooled
+    /// bank transposed and up-cast. It is a function of the bank alone, so it
+    /// is rebuilt only when a block COMPLETES — at decode that is one forward
+    /// in `ratio`, where it used to be a strided copy of the whole bank on
+    /// every full-attention layer of every forward. BORROWED.
+    ///
+    /// The rebuild runs the SAME reshape → transpose → astype the per-forward
+    /// build ran, so the operand is bit-identical (and contiguous, so the
+    /// matmul picks the same kernel).
+    fn qsaScoreBank(self: *Transformer, entry: *SSMCacheEntry, batch: c_int, nb: c_int, idx_hd: c_int) !mlx.mlx_array {
+        if (entry.qsa_score_bank.ctx != null and entry.qsa_score_blocks == nb) return entry.qsa_score_bank;
+        if (entry.qsa_score_bank.ctx != null) _ = mlx.mlx_array_free(entry.qsa_score_bank);
+        entry.qsa_score_bank = .{ .ctx = null };
+        entry.qsa_score_blocks = 0;
+        var k_rope = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(k_rope);
+        try mlx.check(mlx.mlx_reshape(&k_rope, entry.qsa_pooled, &[_]c_int{ batch, 1, nb, idx_hd }, 4, self.s)); // [B,1,nb,hd]
+        const kperm = [_]c_int{ 0, 1, 3, 2 };
+        var kt = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(kt);
+        try mlx.check(mlx.mlx_transpose_axes(&kt, k_rope, &kperm, 4, self.s)); // [B,1,hd,nb]
+        var k32 = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(k32);
+        try mlx.check(mlx.mlx_astype(&k32, kt, .float32, self.s));
+        entry.qsa_score_bank = k32;
+        entry.qsa_score_blocks = nb;
+        self.qsa_score_bank_builds += 1;
+        return entry.qsa_score_bank;
     }
 
     /// The pooled-block cos/sin for this forward, built on first ask and
@@ -13733,37 +13814,17 @@ pub const Transformer = struct {
             var new3 = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(new3);
             try mlx.check(mlx.mlx_reshape(&new3, new_rope, &[_]c_int{ batch, n_new, idx_hd }, 3, self.s));
-            var merged = mlx.mlx_array_new();
-            if (entry.qsa_pooled.ctx != null) {
-                const parts = [_]mlx.mlx_array{ entry.qsa_pooled, new3 };
-                const vec = mlx.mlx_vector_array_new_data(&parts, 2);
-                defer _ = mlx.mlx_vector_array_free(vec);
-                try mlx.check(mlx.mlx_concatenate_axis(&merged, vec, 1, self.s));
-                _ = mlx.mlx_array_free(entry.qsa_pooled);
-            } else {
-                _ = mlx.mlx_array_free(merged);
-                merged = try materializedOwnedCopy(self.s, new3);
-            }
-            entry.qsa_pooled = merged;
+            try self.qsaAppendPooled(entry, new3, nb_cached);
         }
         if (std.c.getenv("QWEN4_DEBUG_SCORES") != null) {
             const qs = mlx.getShape(entry.qsa_pooled);
             std.debug.print("[qsa] kv={d} nb={d} cached={d} pooled shape {any} keys {any}\n", .{ kv, nb, nb_cached, qs, mlx.getShape(keys) });
         }
-        var k_rope = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(k_rope);
-        try mlx.check(mlx.mlx_reshape(&k_rope, entry.qsa_pooled, &[_]c_int{ batch, 1, nb, idx_hd }, 4, self.s)); // [B,1,nb,hd]
-
-        // scores[b, s, blk] = Σ_h relu(q_h · k_blk) / sqrt(hd)
-        const kperm = [_]c_int{ 0, 1, 3, 2 };
-        var kt = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(kt);
-        try mlx.check(mlx.mlx_transpose_axes(&kt, k_rope, &kperm, 4, self.s)); // [B,1,hd,nb]
-        // Scores in f32 like the reference (`q.float() @ k.float()`): a bf16
-        // product flips near-tie block picks.
-        var k32 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(k32);
-        try mlx.check(mlx.mlx_astype(&k32, kt, .float32, self.s));
+        // scores[b, s, blk] = Σ_h relu(q_h · k_blk) / sqrt(hd), in f32 like the
+        // reference (`q.float() @ k.float()`) — a bf16 product flips near-tie
+        // block picks. BORROWED from the entry: the operand only changes when
+        // a block COMPLETES.
+        const k32 = try self.qsaScoreBank(entry, batch, nb, idx_hd);
 
         // Block selection (no dense mask) for prefill widths AND decode width:
         // at S==1 the same sorted single-row top-k feeds the decode gatherer
@@ -42696,6 +42757,91 @@ test "qsa key history: capacity-buffer append equals the concatenated reference,
     try t.qsaAppendKeys(&entry, tail2, 12);
     try testing.expectEqual(@as(c_int, 14), mlx.getShape(entry.aux_state)[1]);
     try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(entry.aux_state, reference, s));
+}
+
+test "qsa pooled bank: capacity append equals the concat, and the f32 score operand is rebuilt only when a block completes" {
+    // The bf16 bank is what every snapshot/restore/disk reader sees, so it
+    // must stay byte-for-byte the old `concatenate`. The transposed f32 twin
+    // is a function of that bank alone: 12 layers of one forward must reuse
+    // ONE build, and the build must equal the per-forward
+    // reshape → transpose → astype it replaces.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+
+    var t: Transformer = undefined;
+    t.s = s;
+    t.allocator = testing.allocator;
+    t.qsa_score_bank_builds = 0;
+
+    const hd: c_int = 16;
+    var entry: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true };
+    defer ssmFreeQsaState(&entry);
+
+    var prng = std.Random.DefaultPrng.init(0x9A17_3D02);
+    const rnd = prng.random();
+    var reference = mlx.mlx_array{ .ctx = null };
+    defer if (reference.ctx != null) {
+        _ = mlx.mlx_array_free(reference);
+    };
+    var nb: c_int = 0;
+    var step_i: usize = 0;
+    while (step_i < 400) : (step_i += 1) {
+        const add: c_int = if (step_i == 0) 5 else 1;
+        const new3 = try attn256RandBf16(rnd, &[_]c_int{ 1, add, hd }, s);
+        defer _ = mlx.mlx_array_free(new3);
+        var next_ref = mlx.mlx_array_new();
+        if (reference.ctx != null) {
+            const parts = [_]mlx.mlx_array{ reference, new3 };
+            const vec = mlx.mlx_vector_array_new_data(&parts, 2);
+            defer _ = mlx.mlx_vector_array_free(vec);
+            try mlx.check(mlx.mlx_concatenate_axis(&next_ref, vec, 1, s));
+            _ = mlx.mlx_array_free(reference);
+        } else {
+            _ = mlx.mlx_array_free(next_ref);
+            next_ref = try materializedOwnedCopy(s, new3);
+        }
+        reference = next_ref;
+
+        try t.qsaAppendPooled(&entry, new3, nb);
+        nb += add;
+        try testing.expectEqual(nb, mlx.getShape(entry.qsa_pooled)[1]);
+        try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(entry.qsa_pooled, reference, s));
+    }
+    try testing.expect(mlx.getShape(entry.qsa_pooled_buf)[1] > nb);
+
+    // Twelve full-attention layers of one forward at the same nb: ONE build.
+    const before = t.qsa_score_bank_builds;
+    const bank = try t.qsaScoreBank(&entry, 1, nb, hd);
+    try testing.expectEqual(before + 1, t.qsa_score_bank_builds);
+    for (0..11) |_| {
+        const again = try t.qsaScoreBank(&entry, 1, nb, hd);
+        try testing.expect(again.ctx == bank.ctx);
+    }
+    try testing.expectEqual(before + 1, t.qsa_score_bank_builds);
+    try testing.expectEqual(@as(c_int, hd), mlx.getShape(bank)[2]);
+    try testing.expectEqual(nb, mlx.getShape(bank)[3]);
+
+    // ...and it is the operand the per-forward build produced.
+    {
+        var k_rope = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(k_rope);
+        try mlx.check(mlx.mlx_reshape(&k_rope, entry.qsa_pooled, &[_]c_int{ 1, 1, nb, hd }, 4, s));
+        var kt = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(kt);
+        try mlx.check(mlx.mlx_transpose_axes(&kt, k_rope, &[_]c_int{ 0, 1, 3, 2 }, 4, s));
+        var k32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(k32);
+        try mlx.check(mlx.mlx_astype(&k32, kt, .float32, s));
+        try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(bank, k32, s));
+    }
+
+    // A completed block is a new operand, never the stale one.
+    const one = try attn256RandBf16(rnd, &[_]c_int{ 1, 1, hd }, s);
+    defer _ = mlx.mlx_array_free(one);
+    try t.qsaAppendPooled(&entry, one, nb);
+    _ = try t.qsaScoreBank(&entry, 1, nb + 1, hd);
+    try testing.expectEqual(before + 2, t.qsa_score_bank_builds);
+    try testing.expectEqual(nb + 1, mlx.getShape(entry.qsa_score_bank)[3]);
 }
 
 test "qsa pooled rope: one cos/sin build per forward, not one per full-attention layer" {
