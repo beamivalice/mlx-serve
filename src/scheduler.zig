@@ -5819,12 +5819,17 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
         return;
     }
 
-    // Regular path.
+    // Regular path. This is also where a request that never armed MTP
+    // (`enable_mtp:false`, `--no-mtp`, a non-MTP model) teaches the round-cost
+    // table what a plain serial token costs at this context — the one number
+    // the width planner could never see. `observeSerialTick` owns every drop
+    // rule (contention, block warmup), so the call is unconditional.
     const tok_opt = try gen.next(slot.allocator);
     if (tok_opt == null) {
         finishSlot(sch, slot, gen.finish_reason);
         return;
     }
+    gen.observeSerialTick();
     const t = tok_opt.?;
     // Phase A5: capture per-token logprob. `gen.last_logprob` ownership
     // transfers into slot.logprobs_buf (gen sets the field, we null it here).

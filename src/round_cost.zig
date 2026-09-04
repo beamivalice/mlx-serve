@@ -13,6 +13,16 @@
 //! Buckets = KV length at the round: <2k, 2-4k, 4-8k, 8-16k, 16-32k, 32k+.
 //! Each cell holds an EMA of round ms AND an EMA of emitted tokens — cost is
 //! never stored without the tokens it bought.
+//!
+//! Beside the width grid sits ONE more row: `serial`, the measured ms of a
+//! PLAIN decode token per bucket. It is deliberately not width 0. A width-0
+//! round is a block decoder's serial fallback measured on ITS round clock,
+//! and the width grid interpolates, extrapolates and anchors through its
+//! cells — a serial tick has no head forward, no capture and no verify, so
+//! letting it into the grid would re-anchor `MtpCostSource` and let
+//! `roundMs` lerp a depth-1 round down toward a quantity that is not a
+//! round at all. Kept apart, it answers exactly one question no width can:
+//! is the whole speculation worth running here?
 const std = @import("std");
 
 /// Drafts per round the table covers (MTP depth <= 8, a DFlash block up to 16); index 0 is serial.
@@ -73,8 +83,25 @@ pub const Verdict = enum { folded, reseeded, contended, transition, bad_sample, 
 
 pub const Table = struct {
     cells: [MAX_WIDTH + 1][N_BUCKETS]Cell = @splat(@splat(.{})),
-    /// Samples OFFERED (accepted or not): the reseed clock.
+    /// Measured ms per PLAIN serial decode token, per bucket (`tok` is 1 per
+    /// sample, so `msPerTok` and `ms` agree). Fed by solo serial ticks — a
+    /// request that never armed MTP, one whose speculation turned itself
+    /// off, and the bounded serial probe.
+    serial: [N_BUCKETS]Cell = @splat(.{}),
+    /// One bounded serial probe per (model, bucket) per PROCESS: a bucket
+    /// whose serial cell is untrusted cannot be decided at all, and without
+    /// this a workload that never decodes serially there would never learn
+    /// one. Runtime only — never serialized, so a restored table re-probes
+    /// at most once per boot per bucket.
+    serial_probe_done: [N_BUCKETS]bool = @splat(false),
+    /// Samples OFFERED (accepted or not): the width grid's reseed clock.
     seq: u32 = 0,
+    /// The serial row's OWN reseed clock. It cannot share `seq`: a serial
+    /// tick is a token, a width sample is a round, and a mixed workload runs
+    /// thousands of the former — sharing would take every width cell past
+    /// RESEED_GAP within a second of serial decoding and leave the width
+    /// planner permanently blending at RESEED_WEIGHT.
+    serial_seq: u32 = 0,
     folded: u32 = 0,
     dropped_transition: u32 = 0,
     dropped_contended: u32 = 0,
@@ -92,6 +119,9 @@ pub const Table = struct {
             for (row) |c| {
                 if (c.n > 0) n += 1;
             }
+        }
+        for (self.serial) |c| {
+            if (c.n > 0) n += 1;
         }
         return n;
     }
@@ -116,9 +146,34 @@ pub const Table = struct {
             self.dropped_transition += 1;
             return .transition;
         }
-        const cell = &self.cells[width][bucketFor(kv_len)];
+        return self.foldInto(&self.cells[width][bucketFor(kv_len)], ms, tokens, self.seq);
+    }
+
+    /// Feed one realized PLAIN serial decode token into `serial[bucket]`.
+    /// Same drop rules as `observe` — the caller passes `solo` from the same
+    /// scheduler flag and `transition` for the ticks that follow a
+    /// speculative round (the GPU still holds its tail, so the first ticks
+    /// of a serial block read slow).
+    pub fn observeSerial(self: *Table, kv_len: u32, ms: f32, solo: bool, transition: bool) Verdict {
+        self.serial_seq +%= 1;
+        if (!std.math.isFinite(ms) or ms <= 0) {
+            self.dropped_bad += 1;
+            return .bad_sample;
+        }
+        if (!solo) {
+            self.dropped_contended += 1;
+            return .contended;
+        }
+        if (transition) {
+            self.dropped_transition += 1;
+            return .transition;
+        }
+        return self.foldInto(&self.serial[bucketFor(kv_len)], ms, 1.0, self.serial_seq);
+    }
+
+    fn foldInto(self: *Table, cell: *Cell, ms: f32, tokens: f32, clock: u32) Verdict {
         self.folded += 1;
-        defer cell.last_seen = self.seq;
+        defer cell.last_seen = clock;
         if (cell.n == 0) {
             cell.ms = ms;
             cell.tok = tokens;
@@ -127,12 +182,20 @@ pub const Table = struct {
         }
         // The first MIN_SAMPLES are a running MEAN (an EMA seeded from
         // sample 1 is still sample 1 at n=3); the EMA takes over after.
-        const stale = self.seq -% cell.last_seen > RESEED_GAP;
+        const stale = clock -% cell.last_seen > RESEED_GAP;
         const beta: f32 = if (stale) RESEED_WEIGHT else if (cell.n < MIN_SAMPLES) 1.0 / @as(f32, @floatFromInt(cell.n + 1)) else BETA;
         cell.ms += beta * (ms - cell.ms);
         cell.tok += beta * (tokens - cell.tok);
         cell.n += 1;
         return if (stale) .reseeded else .folded;
+    }
+
+    /// Measured ms of one plain serial token in `bucket` (MIN_SAMPLES
+    /// folded), or null. Never interpolated across buckets and never
+    /// extrapolated: an unmeasured bucket is a bucket with no answer.
+    pub fn serialMsPerTok(self: *const Table, bucket: usize) ?f32 {
+        if (bucket >= N_BUCKETS or self.serial[bucket].n < MIN_SAMPLES) return null;
+        return self.serial[bucket].msPerTok();
     }
 
     fn trusted(self: *const Table, width: u32, bucket: usize) bool {
@@ -519,7 +582,12 @@ pub const WidthChooser = struct {
 // Stale version or unreadable content is a QUIET miss (the kv_disk_cache
 // discipline). `MLX_SERVE_ROUND_COST_PERSIST=0` disables both directions.
 
-pub const STORE_VERSION: u32 = 1;
+/// v2 added the `serial` row. The bump is not decoration: v1 files were
+/// written by a build in which the only "no speculation" evidence was a
+/// width-0 CELL measured on a block decoder's round clock, and a v1 reader
+/// handed a v2 file would silently take the `s` lines for width `s`. A
+/// stale version is a QUIET miss, so the cost of the bump is one re-explore.
+pub const STORE_VERSION: u32 = 2;
 
 pub fn persistEnabled() bool {
     const raw = std.c.getenv("MLX_SERVE_ROUND_COST_PERSIST") orelse return true;
@@ -537,7 +605,8 @@ pub fn cacheKey(buf: []u8, chip: []const u8, model_dir: []const u8, quant: []con
     return std.fmt.bufPrint(buf, "rc{d}-{x:0>16}", .{ STORE_VERSION, h.final() }) catch buf[0..0];
 }
 
-/// `rc1\n` then one `width bucket ms tok n` line per folded cell.
+/// `rc2\n`, then one `width bucket ms tok n` line per folded width cell and
+/// one `s bucket ms tok n` line per folded serial cell.
 pub fn serialize(buf: []u8, t: *const Table) ![]const u8 {
     var w = std.Io.Writer.fixed(buf);
     try w.print("rc{d}\n", .{STORE_VERSION});
@@ -546,6 +615,10 @@ pub fn serialize(buf: []u8, t: *const Table) ![]const u8 {
             if (c.n == 0) continue;
             try w.print("{d} {d} {d:.4} {d:.4} {d}\n", .{ wi, b, c.ms, c.tok, c.n });
         }
+    }
+    for (t.serial, 0..) |c, b| {
+        if (c.n == 0) continue;
+        try w.print("s {d} {d:.4} {d:.4} {d}\n", .{ b, c.ms, c.tok, c.n });
     }
     return w.buffered();
 }
@@ -564,16 +637,20 @@ pub fn parse(text: []const u8) ?Table {
         const l = std.mem.trim(u8, line, " \r");
         if (l.len == 0) continue;
         var f = std.mem.splitScalar(u8, l, ' ');
-        const wi = std.fmt.parseInt(u32, f.next() orelse return null, 10) catch return null;
+        const head_field = f.next() orelse return null;
+        const is_serial = std.mem.eql(u8, head_field, "s");
+        const wi: u32 = if (is_serial) 0 else std.fmt.parseInt(u32, head_field, 10) catch return null;
         const b = std.fmt.parseInt(usize, f.next() orelse return null, 10) catch return null;
         const ms = std.fmt.parseFloat(f32, f.next() orelse return null) catch return null;
         const tok = std.fmt.parseFloat(f32, f.next() orelse return null) catch return null;
         const n = std.fmt.parseInt(u32, f.next() orelse return null, 10) catch return null;
         if (wi > MAX_WIDTH or b >= N_BUCKETS or n == 0) return null;
         if (!std.math.isFinite(ms) or ms <= 0 or !(tok > 0)) return null;
-        t.cells[wi][b] = .{ .ms = ms, .tok = tok, .n = n, .last_seen = 0 };
+        const cell = Cell{ .ms = ms, .tok = tok, .n = n, .last_seen = 0 };
+        if (is_serial) t.serial[b] = cell else t.cells[wi][b] = cell;
     }
     t.seq = RESEED_GAP + 1;
+    t.serial_seq = RESEED_GAP + 1;
     t.restored = t.foldedCells();
     return t;
 }
@@ -807,10 +884,70 @@ test "round_cost: persistence round-trips folded cells, marks them stale, reject
     try testing.expectEqual(Verdict.reseeded, live.observe(4, 1000, 70.0, 4.5, true, false));
     try testing.expectApproxEqAbs(60.0, live.measuredMs(4, 0).?, 1e-3);
     try testing.expect(parse("rc0\n4 0 50 4 3\n") == null);
-    try testing.expect(parse("rc1\n99 0 50 4 3\n") == null);
+    try testing.expect(parse("rc1\n4 0 50 4 3\n") == null); // the pre-serial format is a quiet miss
+    try testing.expect(parse("rc2\n99 0 50 4 3\n") == null);
     try testing.expect(parse("") == null);
     var kb: [64]u8 = undefined;
-    try testing.expect(std.mem.startsWith(u8, cacheKey(&kb, "M4", "/m", "q4g64", "26.4"), "rc1-"));
+    try testing.expect(std.mem.startsWith(u8, cacheKey(&kb, "M4", "/m", "q4g64", "26.4"), "rc2-"));
+}
+
+test "round_cost: the serial row folds, trusts at MIN_SAMPLES and round-trips beside the widths" {
+    var t = Table{};
+    try testing.expect(t.serialMsPerTok(0) == null);
+    // Same drop rules as a round sample; none of them touch the width grid.
+    try testing.expectEqual(Verdict.contended, t.observeSerial(1000, 15.0, false, false));
+    try testing.expectEqual(Verdict.transition, t.observeSerial(1000, 15.0, true, true));
+    try testing.expectEqual(Verdict.bad_sample, t.observeSerial(1000, 0.0, true, false));
+    try testing.expectEqual(Verdict.reseeded, t.observeSerial(1000, 15.0, true, false));
+    _ = t.observeSerial(1000, 17.0, true, false);
+    try testing.expect(t.serialMsPerTok(0) == null); // two samples do not count
+    _ = t.observeSerial(1000, 16.0, true, false);
+    try testing.expectApproxEqAbs(16.0, t.serialMsPerTok(0).?, 1e-4);
+    // A serial cell is never a width: it does not activate the bucket, does
+    // not anchor `narrowestMeasured`, and cannot be lerped through.
+    try testing.expect(!t.active(0));
+    try testing.expect(t.bucketToRead(1000) == null);
+    try testing.expect(t.measuredMs(0, 0) == null);
+    try testing.expect(t.narrowestMeasured(0) == null);
+    // Buckets are independent — an unmeasured one is never filled from a
+    // neighbour (the decision would then compare two different contexts).
+    try testing.expect(t.serialMsPerTok(1) == null);
+    try testing.expect(t.serialMsPerTok(N_BUCKETS) == null);
+
+    feed(&t, 4, 1000, 50.0, 4.0);
+    var buf: [1024]u8 = undefined;
+    const text = try serialize(&buf, &t);
+    try testing.expect(std.mem.indexOf(u8, text, "\ns 0 16.") != null);
+    const back = parse(text) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u32, 2), back.restored); // one width cell + one serial cell
+    try testing.expectApproxEqAbs(16.0, back.serialMsPerTok(0).?, 1e-3);
+    try testing.expectApproxEqAbs(50.0, back.measuredMs(4, 0).?, 1e-3);
+    // A restored table re-probes at most once per boot: the flag is runtime.
+    try testing.expect(!back.serial_probe_done[0]);
+}
+
+test "round_cost: the serial row and the width grid keep SEPARATE reseed clocks" {
+    // A serial tick is a TOKEN and a width sample is a ROUND. Sharing one
+    // clock would take every width cell past RESEED_GAP within a second of
+    // serial decoding, and the width planner would blend every later sample
+    // at RESEED_WEIGHT instead of BETA — forever, on any mixed workload.
+    var t = Table{};
+    feed(&t, 3, 1000, 30.0, 3.0);
+    const w3 = t.measuredMs(3, 0).?;
+    var k: u32 = 0;
+    while (k <= RESEED_GAP * 4) : (k += 1) _ = t.observeSerial(1000, 16.0, true, false);
+    _ = t.observe(3, 1000, 40.0, 3.0, true, false);
+    try testing.expectApproxEqAbs(w3 + BETA * (40.0 - w3), t.measuredMs(3, 0).?, 1e-3);
+
+    // And the other way: rounds do not age the serial cell either.
+    var u = Table{};
+    var i: u32 = 0;
+    while (i < MIN_SAMPLES) : (i += 1) _ = u.observeSerial(1000, 16.0, true, false);
+    const ser = u.serialMsPerTok(0).?;
+    var j: u32 = 0;
+    while (j <= RESEED_GAP * 4) : (j += 1) _ = u.observe(3, 1000, 30.0, 3.0, true, false);
+    _ = u.observeSerial(1000, 20.0, true, false);
+    try testing.expectApproxEqAbs(ser + BETA * (20.0 - ser), u.serialMsPerTok(0).?, 1e-3);
 }
 
 test "round_cost: a clearly worse first sample settles a width" {

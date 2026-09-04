@@ -1382,7 +1382,6 @@ theoretical 16.2) puts the 8K roofline at ~30.9s and both engines within 3-6% of
 Nobody beats anybody by 5% on a dense-27B prefill on this hardware; the winnable margins
 live at short contexts (fixed overheads) and on MoE/small models.
 
-<<<<<<< HEAD
 ### A changed image invalidates state from its media row, not token zero (2026-08-30)
 
 A 135K-token Qwen3.8 vision-agent session alternated healthy ~2K-token tail prefills with
@@ -1404,7 +1403,6 @@ The hermetic regression includes a tempting later checkpoint and requires restor
 boundary. `tests/test_vision_prefix_cache.sh` changes images after a >2K shared text prefix;
 the real Uncensored Qwen3.8 run restored exactly 2,048 tokens after the swap while the short
 foreign-image arm remained cold, 10/10 checks green.
-=======
 ### Hybrid cache lookup must rank the checkpoint it can restore, not the raw token match (2026-08-30)
 
 A 135K-token Qwen3.8 vision-agent session alternated healthy ~2K-token tail prefills with
@@ -4633,6 +4631,7 @@ predictable probe (`user=368b`, "Repeat the following passage exactly"), with th
   measured here. The persisted table must be restored before EVERY boot (not
   disabled — the live table IS the subject) or the arms teach each other.
 
+<<<<<<< HEAD
 ## The QSA tie bias was a MAGNITUDE contract, and the profiler that priced the fix could not see it (2026-09-04)
 
 `qsaSelectBlocks` picks each query row's top-512 indexer blocks. relu leaves many EXACT zeros in the score row, so which of several tied blocks gets picked is a real decision, and the reference (`torch.topk`) makes it by taking the LOWER index. Ours reproduced that by subtracting an index-ascending bias before `argpartition`: `biased = score - idx * 1e-7`, so on a tie the lower index is strictly larger and wins.
@@ -4738,3 +4737,138 @@ already learned this for weights ("a missing tensor is a load ERROR, never
 subsystem, and it is why this bug read as "the server crashed" rather than "one
 request failed".
 
+=======
+## Speculation never compared itself with the serial token it replaces (`MtpAdaptive`)
+
+The EV controller answers "which draft width", and it answers it well: measured
+round costs per KV bucket, hysteresis, width trials, a persisted table. What it
+never asks is whether the round is worth running at all. Every quantity in it is
+a ratio between rounds; the cost of the plain decode step a round replaces enters
+only through the fitted prior, which was calibrated at short context.
+
+The only stop was `MTP_DISABLE_BELOW` (first-draft rate < 0.20) — a MODEL of
+break-even fitted where a verify row costs ~0.1 of a trunk forward, i.e. a dense
+sidecar head. On qwen4_exp a verify row is BYTES: the second row reads its own
+routed experts, and the QSA read grows with kv. Measured on prose:
+
+| context | serial tok/s | MTP tok/s |
+|---|---|---|
+| 62.7k | 55 | 47-58 (auto and forced) |
+| 374k  | 47 | 30 (forced) |
+
+Acceptance sat far above 0.20 the whole time, so nothing turned it off. The
+operator's ceiling (`--max-mtp-ctx`) fixes this by hand, per machine, per model,
+per workload — which is exactly the kind of number the round-cost table exists to
+stop people from typing.
+
+### The shape of the fix
+
+No cost model and no acceptance threshold: the two numbers are compared directly,
+per KV bucket, from what the table already measures.
+
+```
+planned ms/token = roundMs(m_lo) / E[tokens per round at m_lo]
+serial  ms/token = the bucket's measured plain-decode token
+```
+
+- `roundMs(m_lo)` is the table's MEASURED cell at exactly the planned width —
+  never interpolated. An interpolated cost cannot justify leaving speculation.
+- The tokens are the REQUEST's own acceptance EMAs (`mtpEvExpectedTokens`), NOT
+  the table's `tok` column. That column is a mixture of every workload that fed
+  the bucket; planning the base depth from per-request acceptance instead of it
+  measured a loss once already, and this is the same trap one level up — the
+  difference is that here the request-local number is the RIGHT one, because
+  "will MY next round pay" is a per-request question while "what does a w4 round
+  cost" is not.
+- Any missing input (untrusted serial cell, no measured cell at m_lo, warmup) is
+  `.undecided`. A switch is never made from a guess.
+- 5% margin (the table's own `SWITCH_MARGIN`, for the same reason: the two
+  quantities are EMAs measured on different blocks) and 3 consecutive votes.
+
+### The serial cell is not width 0
+
+The table already had a width-0 cell — a block decoder's serial fallback, measured
+on its round clock, and a candidate the `WidthChooser` argmaxes over. It could not
+be reused. The width grid interpolates (`roundMs`), extrapolates (`lastSlope`) and
+anchors (`narrowestMeasured` → `MtpCostSource.scale`) through its cells, and a
+plain decode tick is not a round at all: no head forward, no capture, no verify.
+Letting one into the grid would silently re-anchor the EV planner's floor units
+and let a depth-1 round lerp down toward it. So `Table.serial` is its own row,
+persisted on its own `s <bucket> …` lines, and `STORE_VERSION` went to 2 — a v1
+reader handed a v2 file would take `s` for a width.
+
+### Where the samples come from
+
+Every plain serial decode tick the server runs, through ONE helper
+(`Generator.observeSerialTick`): the scheduler's regular path (a request that
+never armed MTP — `enable_mtp:false`, `--no-mtp`, a non-MTP model — is the only
+source for a bucket nobody speculates in), and the serial block inside `nextMtp`
+(the acceptance floor, `--max-mtp-ctx`, the adaptive switch, the probe). Same drop
+rules as a round: contention only ADDS time, and the first two ticks of a block
+are the previous round's tail.
+
+Plus a bounded probe, because a bucket that only ever speculates would never learn
+a serial token: `mtpSerialProbeArm` runs 8 serial ticks ONCE per (model, bucket)
+per process. The flag is consumed at ARMING, so a second request never re-arms it,
+and the tax is a handful of tokens per model lifetime rather than per request.
+
+### Why this is not the parked arm-probe controller
+
+`parked/mtp-arm-probe-controller` measured both arms inside every request and lost
+3.8% on code: probe tax plus an interrupted width climb. The difference is where
+the measurement lives. There it was per-request and repeated; here it is the
+persisted table's, so deciding costs the request nothing at all — the only thing a
+request can pay for is a cold bucket, once per process.
+
+What IS reused from that branch is the re-entry mechanism, which was sound. Leaving
+MTP is cheap; coming back is not: `next()`'s pipeline always leaves the trunk one
+token AHEAD of what was emitted with no captured hidden, and an MTP round needs
+both `t1 NOT in cache` and an `h_prev` for that exact position.
+`drainPipelineForSpec` lands the first half; `mtpSerialCaptureTick` lands the
+second by forwarding ONE token with capture. Leaving MTP APPLIES the deferred
+history stash instead of dropping it (`mtpDetachHead`), so the head history is
+complete up to the block — it does not grow ACROSS the block, since those tokens'
+trunk hiddens were never captured, and the head resumes with a content gap that
+costs acceptance for a while.
+
+M-RoPE turns are excluded wholesale: there the head ropes at an absolute
+`pos_base + seq_offset`, so a history gap is a wrong answer rather than a slow one.
+They never probe and never come back from an adaptive switch.
+
+### Stickiness
+
+The switch is sticky for the rest of the request, re-decided at the next request
+start (from the EV seed) and ONCE per KV bucket crossing. The crossing case is the
+weak one and is worth naming: within a request kv only RISES, and rising is the
+direction in which MTP gets worse, so a crossing usually re-confirms serial after
+paying the ramp plus three rounds. It is kept because the first decision can be
+made from a neighbouring bucket (`bucketToRead` falls back), and because a request
+that started in a bucket whose cells were stale should not be pinned by it for
+100k tokens.
+
+It is kept for the FIRST measurement, and the exit is already agreed: if the
+crossing re-entry measures as a loss, delete `MtpAdaptive.serialTick` and the
+re-entry block at the top of `nextMtp`, and let the arm be sticky for the whole
+request. Keep the ramp itself (`mtpDetachHead` / `mtpSerialTick` /
+`mtpSerialCaptureTick`) either way — the bounded probe needs it to get back to
+`nextMtp`'s entry invariant, and without it a cold bucket can never be measured
+at all. Do not take the ramp out with the policy.
+
+### Levers
+
+`MLX_SERVE_MTP_ADAPTIVE_SERIAL=0` (whole mechanism; the serial cell keeps being
+measured, so `[spec-stats]` stays comparable across an A/B),
+`MLX_SERVE_MTP_ADAPTIVE_MARGIN`, `MLX_SERVE_MTP_ADAPTIVE_CONFIRM`.
+`--max-mtp-ctx` is checked FIRST in `nextMtp` and is not overridable from here:
+the re-entry keys on the `.adaptive` disable reason, so a ceiling crossing stays
+off for good. `[spec-stats]` carries `adaptive=` and `serial_cell=`; every switch
+logs the two numbers it compared.
+
+One thing the split row still had to be taught: `Table.serial` keeps its OWN
+reseed clock (`serial_seq`). A serial tick is a TOKEN and a width sample is a
+ROUND, and a mixed workload runs thousands of the former. Sharing `seq` would
+push every width cell past `RESEED_GAP` (64) within a second of serial decoding,
+so every later width sample would blend at `RESEED_WEIGHT` 0.5 instead of `BETA`
+0.1 — the width planner permanently reseeding, from a change that was supposed to
+be additive. Pinned both directions by "the serial row and the width grid keep
+SEPARATE reseed clocks".
