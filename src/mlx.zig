@@ -852,38 +852,77 @@ pub fn takeError(buf: []u8) ?[]const u8 {
 /// by `=0`). Resolved once; the armed path costs one relaxed load per prefill
 /// chunk.
 const FAULT_CHUNK_MSG = "[METAL] Command buffer execution failed: Insufficient Memory (injected by MLX_SERVE_MLX_FAULT_CHUNK). at transforms.cpp:15";
-var fault_chunk_at: ?u64 = null;
-var fault_chunk_seen: u64 = 0;
+const FAULT_STEP_MSG = "[METAL] Command buffer execution failed: Insufficient Memory (injected by MLX_SERVE_MLX_FAULT_STEP). at transforms.cpp:15";
 
-fn faultChunkTarget() u64 {
-    if (fault_chunk_at) |v| return v;
-    var v: u64 = 0;
-    if (std.c.getenv("MLX_SERVE_MLX_FAULT_CHUNK")) |pz| {
-        v = std.fmt.parseInt(u64, std.mem.span(pz), 10) catch 0;
-    }
-    fault_chunk_at = v;
-    if (v > 0) log.warn("[mlx] FAULT INJECTION armed: an MLX error will be latched at checkError #{d}\n", .{v});
-    return v;
-}
+/// One armed, self-disarming injector. Two instances: one for the prefill
+/// chunk checkpoint, one for the decode step checkpoint — separate counters
+/// because a test that wants to fail the 3rd DECODE step must not have its
+/// count consumed by the prefill's chunks.
+const FaultSite = struct {
+    env: [:0]const u8,
+    msg: [:0]const u8,
+    at: ?u64 = null,
+    seen: u64 = 0,
 
-/// The one checkpoint the engine calls: turns a latched MLX failure into a
-/// Zig error. `error.OutOfMemory` for the memory class (named memory 503),
-/// `error.MlxFailure` for everything else. Zero cost when nothing is latched
-/// — one relaxed-ordered atomic load.
-pub fn checkError() !void {
-    const target = faultChunkTarget();
-    if (target > 0) {
-        fault_chunk_seen += 1;
-        if (fault_chunk_seen == target) {
-            fault_chunk_at = 0; // one-shot: the next request must run clean
-            latchErrorForTest(FAULT_CHUNK_MSG);
+    fn target(self: *FaultSite) u64 {
+        if (self.at) |v| return v;
+        var v: u64 = 0;
+        if (std.c.getenv(self.env.ptr)) |pz| {
+            v = std.fmt.parseInt(u64, std.mem.span(pz), 10) catch 0;
         }
+        self.at = v;
+        if (v > 0) log.warn("[mlx] FAULT INJECTION armed: {s}=#{d}\n", .{ self.env, v });
+        return v;
     }
+
+    /// Latch this site's message on the n-th call, then disarm — one boot
+    /// exercises both the failure and the recovery.
+    fn maybeFire(self: *FaultSite) void {
+        const t = self.target();
+        if (t == 0) return;
+        self.seen += 1;
+        if (self.seen != t) return;
+        self.at = 0;
+        latchErrorForTest(self.msg);
+    }
+
+    fn reset(self: *FaultSite) void {
+        self.at = null;
+        self.seen = 0;
+    }
+};
+
+var fault_chunk = FaultSite{ .env = "MLX_SERVE_MLX_FAULT_CHUNK", .msg = FAULT_CHUNK_MSG };
+var fault_step = FaultSite{ .env = "MLX_SERVE_MLX_FAULT_STEP", .msg = FAULT_STEP_MSG };
+
+/// Consume a latched MLX failure as a Zig error: `error.OutOfMemory` for the
+/// memory class (named memory 503), `error.MlxFailure` for everything else.
+/// Zero cost when nothing is latched — one acquire load.
+fn consumeLatch() !void {
     if (!mlx_error_latched.load(.acquire)) return;
     var buf: [512]u8 = undefined;
     const msg = takeError(&buf) orelse return;
     if (mlxErrorIsMemory(msg)) return error.OutOfMemory;
     return error.MlxFailure;
+}
+
+/// PREFILL checkpoint: called once per chunk plus once after the last.
+pub fn checkError() !void {
+    fault_chunk.maybeFire();
+    return consumeLatch();
+}
+
+/// DECODE checkpoint: called once per decode tick, after the tick's forward.
+/// A separate entry point ONLY so the two injectors count separately — a
+/// decode-time failure is the same latch and the same errors.
+///
+/// It exists at all because a prefill-only check attributes nothing: a decode
+/// forward that failed left the slot emitting tokens sampled from unwritten
+/// buffers, the request finished 200 with garbage, and the latch was handed
+/// to the NEXT request's first prefill chunk as ITS 503 (#353 follow-up).
+pub fn checkErrorDecode() !void {
+    fault_step.maybeFire();
+    return consumeLatch();
 }
 
 /// Latch a message as if mlx-c had raised it. Tests call it directly; the
@@ -894,8 +933,8 @@ pub fn latchErrorForTest(msg: [:0]const u8) void {
 
 /// TEST-ONLY reset so one test's injector state cannot leak into another.
 pub fn resetFaultChunkForTest() void {
-    fault_chunk_at = null;
-    fault_chunk_seen = 0;
+    fault_chunk.reset();
+    fault_step.reset();
     var buf: [512]u8 = undefined;
     _ = takeError(&buf);
 }
@@ -973,4 +1012,34 @@ test "the injected MLX error costs ONE checkError and the engine keeps working a
     _ = mlx_array_item_float32(&out, sum);
     try t.expectApproxEqAbs(@as(f32, 4.0), out, 1e-6);
     try checkError();
+}
+
+test "a DECODE-time MLX failure is attributed to the decoding request, not the next one" {
+    const t = std.testing;
+    // The third defect of the #353 branch: `checkError` was consumed ONLY by
+    // the prefill chunk loop. A decode forward that failed left the slot
+    // sampling from buffers Metal never wrote — the request finished 200 with
+    // garbage — and the latch waited for the NEXT request's first prefill
+    // chunk, which answered 503 for a failure that was not its own. Two wrong
+    // answers from one error.
+    resetFaultChunkForTest();
+    defer resetFaultChunkForTest();
+
+    // Both checkpoints read the SAME latch: whichever runs first consumes it.
+    try checkError();
+    try checkErrorDecode();
+    latchErrorForTest("[METAL] Command buffer execution failed: Insufficient Memory. at transforms.cpp:15");
+    try t.expectError(error.OutOfMemory, checkErrorDecode());
+    try t.expect(!errorPending());
+    // Consumed by decode means the next prefill is clean — that is the whole
+    // point of attributing it where it happened.
+    try checkError();
+
+    // The two injectors count SEPARATELY: a test that wants to fail the n-th
+    // decode step must not have its count eaten by the prefill's chunks.
+    // (Neither is armed here, so both are inert and this asserts the shape.)
+    try checkError();
+    try checkError();
+    try checkErrorDecode();
+    try t.expect(!errorPending());
 }

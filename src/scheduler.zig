@@ -5798,7 +5798,34 @@ fn publishSpeculativeBlock(sch: *Scheduler, slot: *Slot, gen: *Generator, tokens
     std.debug.assert(slot.completion_tokens == gen.completion_tokens);
 }
 
+/// Every single-slot decode tick funnels through here, so a decode-time MLX
+/// failure is attributed to the slot whose forward raised it.
+///
+/// Without this, `mlx.checkError` was consumed only by the prefill chunk loop
+/// (#353 follow-up): a decode forward that failed left the slot sampling from
+/// buffers Metal never wrote, the request FINISHED 200 with whatever those
+/// bytes decoded to, and the latch sat there until the next request's first
+/// prefill chunk turned it into that innocent request's 503. Two wrong
+/// answers from one failure.
+///
+/// The inner error is preserved unless the latch has something to say — a
+/// latched MLX message is the root cause and the Zig error above it is the
+/// symptom. `checkErrorDecode` clears the latch either way, so nothing leaks
+/// into the next tick or the next request.
 fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
+    var inner_err: ?anyerror = null;
+    runSingleDecodeTickInner(sch, slot) catch |e| {
+        inner_err = e;
+    };
+    mlx.checkErrorDecode() catch |mlx_err| {
+        log.err("[scheduler] decode aborted: MLX failure mid-generation ({s}) — failing this request, the server keeps serving\n", .{@errorName(mlx_err)});
+        slot.markError(@errorName(mlx_err));
+        return;
+    };
+    if (inner_err) |e| return e;
+}
+
+fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
     // ds4-backed slot: drive the engine's session forward by one token. No
     // PLD / drafter / batched paths apply — ds4 has its own internal MTP
     // (see TODO: wire `evalSpeculative` when temp=0 and engine.hasMtp()).
@@ -6188,7 +6215,24 @@ test "every server scheduler path forwards resolved thinking to the DFlash gate"
 /// in one kernel pass, sample per-slot, push the OLD next_token_id (= the
 /// token we just committed to cache via the forward), and load the new
 /// sampled id back into next_token_id.
+/// Batched sibling of the single-slot checkpoint. A batched group shares ONE
+/// forward, so a failure in it belongs to every slot in the group — there is
+/// no honest way to blame one of them, and letting the others keep emitting
+/// from the same failed buffers is the bug this exists to prevent.
 fn runBatchedDecodeTick(sch: *Scheduler, active: []*Slot) !void {
+    var inner_err: ?anyerror = null;
+    runBatchedDecodeTickInner(sch, active) catch |e| {
+        inner_err = e;
+    };
+    mlx.checkErrorDecode() catch |mlx_err| {
+        log.err("[scheduler] batched decode aborted: MLX failure ({s}) — failing all {d} slots in the group\n", .{ @errorName(mlx_err), active.len });
+        for (active) |s| s.markError(@errorName(mlx_err));
+        return;
+    };
+    if (inner_err) |e| return e;
+}
+
+fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     const N = active.len;
     if (N == 0) return;
     const allocator = sch.allocator;

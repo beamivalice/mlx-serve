@@ -64,5 +64,70 @@ CODE3=$(req "Say goodbye.")
 [ "$CODE3" = "200" ] && ok "third request answered 200" || bad "third request status $CODE3"
 
 kill $SRV 2>/dev/null; wait $SRV 2>/dev/null
+
+# ── the DECODE checkpoint ────────────────────────────────────────────────────
+# Same invariant one phase later. Before this, a decode-time MLX failure was
+# never consumed: the request finished 200 emitting from buffers Metal never
+# wrote, and the latch became the NEXT request's 503.
+echo "[4] an MLX error during DECODE fails that request, not the next one"
+LOG2=$(mktemp -t mlxerr2).log
+MLX_SERVE_MLX_FAULT_STEP=2 ./zig-out/bin/mlx-serve serve --model "$MODEL" \
+  --host 127.0.0.1 --port "$PORT" --log-level info > "$LOG2" 2>&1 &
+SRV=$!
+trap 'kill $SRV 2>/dev/null' EXIT
+for _ in $(seq 1 120); do curl -sf -m 2 "$BASE/health" >/dev/null 2>&1 && break; sleep 1; done
+CODE4=$(req "Write one sentence about the sea.")
+case "$CODE4" in
+  503|500) ok "decode-time MLX error answered $CODE4" ;;
+  000|"")  bad "no HTTP response — the server died during decode" ;;
+  200)     bad "decode-time MLX error was SWALLOWED: request answered 200 (the defect)" ;;
+  *)       bad "unexpected status $CODE4: $(head -c 200 /tmp/mlxerr_body.json)" ;;
+esac
+kill -0 $SRV 2>/dev/null || bad "server process is gone after the decode fault"
+CODE5=$(req "Say hello.")
+if [ "$CODE5" = "200" ] && grep -q '"content"' /tmp/mlxerr_body.json; then
+  ok "the request after a decode fault answered 200 with content"
+else
+  bad "post-decode-fault request status $CODE5: $(head -c 200 /tmp/mlxerr_body.json)"
+fi
+
+# ── every guard reads the CLAMPED max_tokens ─────────────────────────────────
+# A long prompt with NO max_tokens field: the omitted value is the
+# `omittedMaxTokensDefault` sentinel (maxInt(u32)/4), and a guard that bills a
+# reservation from the RAW value refuses every prompt past 32k tokens with a
+# 400 that names an impossible number of megabytes.
+echo "[5] a long prompt with NO max_tokens field is admitted"
+# Needs a prompt past KVCache.RESERVE_MIN_TOKENS (32k) that still fits the
+# model's context, so a small-context checkpoint skips this arm rather than
+# reporting a context-overflow 400 as if it were the reservation bug.
+CTX=$(curl -s -m 10 "$BASE/v1/models" | python3 -c "import json,sys; d=json.load(sys.stdin); print(max([m.get('context_length',0) for m in d.get('data',[])] or [0]))" 2>/dev/null || echo 0)
+if [ "${CTX:-0}" -lt 65536 ]; then
+  echo "  SKIP: model context $CTX < 65536 — no room for a 45k-token prompt"
+else
+LONG=$(python3 -c "print(('The quick brown fox jumps over the lazy dog. ' * 9000)[:180000])")
+CODE6=$(python3 - "$BASE" "$LONG" <<'PY2'
+import json,sys,urllib.request,urllib.error
+base,long_text=sys.argv[1:3]
+body={"model":"mlx-serve","messages":[{"role":"user","content":long_text+"\n\nReply with one word."}],
+      "temperature":0,"stream":False}   # NO max_tokens field on purpose
+req=urllib.request.Request(base+"/v1/chat/completions",data=json.dumps(body).encode(),
+                           headers={"content-type":"application/json"})
+try:
+    with urllib.request.urlopen(req,timeout=1800) as r:
+        json.load(r); print("200")
+except urllib.error.HTTPError as e:
+    open("/tmp/mlxerr_body.json","w").write(e.read().decode("utf-8","replace")); print(e.code)
+except Exception as e:
+    open("/tmp/mlxerr_body.json","w").write(f"{type(e).__name__}: {e}"); print("000")
+PY2
+)
+if [ "$CODE6" = "200" ]; then
+  ok "omitted max_tokens on a long prompt answered 200"
+else
+  bad "omitted max_tokens refused with $CODE6: $(head -c 240 /tmp/mlxerr_body.json)"
+fi
+fi
+
+kill $SRV 2>/dev/null; wait $SRV 2>/dev/null
 echo "---- $PASS passed, $FAIL failed ----"
 [ "$FAIL" -eq 0 ]

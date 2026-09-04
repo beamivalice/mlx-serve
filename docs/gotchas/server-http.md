@@ -1775,3 +1775,55 @@ accumulated. Pricing a transient you can delete is the wrong trade.
 **Bar.** The unit tests pin the terms and the single-grow invariant; the live
 bar is a 64k-step ladder 384k → 512k on a 128 GB box: every rung either
 completes or answers a 503, and the process is still serving at the end.
+
+### Three defects the #353 branch shipped with (audit, 2026-09-05)
+
+**1. The guard billed the UNCLAMPED `max_tokens`.** All four text surfaces ran
+
+    if (!try checkAttentionMemory(… max_tokens …)) return;
+    const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
+
+in that order — harmless while the guard ignored `max_tokens`, fatal the
+moment it started billing a reservation from it. An omitted `max_tokens` is
+`omittedMaxTokensDefault` = `maxInt(u32)/4` = 1,073,741,823, which on
+qwen4_exp at 8-bit is ~26 TB of KV: **every prompt past
+`RESERVE_MIN_TOKENS` with no `max_tokens` field would have been refused 400**
+— the overwhelmingly common shape for an agent client. The 512k ladder rung
+missed it because the runner sets `max_tokens: 16`.
+
+Fixed at BOTH ends, because a reservation is a number two subsystems must
+agree on and neither may trust its caller for it: the four surfaces clamp
+first and hand the guard `effective_max_tokens` (scan-pinned, including that
+a clamp precedes each guard within 900 bytes), and `KVCache.reservedTokens`
+takes the context and bounds the headroom by `ctx - seq` itself. `ctx == 0`
+means "unknown" and imposes no clamp.
+
+**2. The evict-to-admit probe billed a different request than the guard
+admitted.** `prefillFitsNow` hardcoded `kv_override = null` and
+`unchunked_prefill = false` while `checkAttentionMemory` passed the request's
+own `kv_quant_override` and `visionPrefillUnchunked(...)`. A `kv_quant: 4`
+request therefore priced its cache at fp16 on the inference thread —
+over-billing ~2.4x, evicting a hot cache that did not need to go, and able to
+refuse by name a request the connection thread had already admitted. One
+estimator means one set of INPUTS too: the hook now carries the scheme and the
+chunking, the scheduler reads them off the slot (`slot.cache.config`,
+`slot.vision_embeddings`), and both are scan-pinned.
+
+**3. A decode-time MLX failure was never consumed.** `mlx.checkError` lived
+only in the prefill chunk loop. A decode forward that failed left the slot
+sampling from buffers Metal never wrote — the request finished **200** with
+whatever those bytes decoded to — and the latch waited for the NEXT request's
+first prefill chunk, which answered 503 for a failure that was not its own:
+two wrong answers from one error. `runSingleDecodeTick` and
+`runBatchedDecodeTick` are now thin wrappers that run the tick and then
+consume the latch (`mlx.checkErrorDecode`), attributing the failure to that
+slot — or, for a batched group, to every slot in it, since they share the one
+forward and there is no honest way to blame one. A latched MLX message is the
+root cause and any Zig error above it is the symptom, so the latch wins;
+either way it is cleared before the next tick.
+
+**Bar.** `MLX_SERVE_MLX_FAULT_STEP=<n>` is the decode sibling of
+`MLX_SERVE_MLX_FAULT_CHUNK`, with its own counter (a decode-step test must not
+have its count eaten by the prefill's chunks); `tests/test_mlx_error_recovery.sh`
+arms it, asserts the faulting request fails and the next succeeds, and sends
+one long prompt with **no** `max_tokens` field — the class defect 1 belongs to.
