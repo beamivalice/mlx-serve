@@ -110,9 +110,16 @@ pub const Table = struct {
     first_use_logged: bool = false,
     /// `folded` at the last store (persistence writes only when it moved).
     stored_at: u32 = 0,
-    /// Cells restored from disk at load (diagnostics).
+    /// WIDTH cells restored from disk at load (diagnostics). The serial row
+    /// is counted separately and deliberately: "how many cells does the
+    /// width planner have" is a different question from "does this bucket
+    /// know what a plain token costs", and one number cannot answer both.
     restored: u32 = 0,
+    /// Serial cells restored from disk at load (diagnostics).
+    restored_serial: u32 = 0,
 
+    /// Folded WIDTH cells. Never counts the serial row — every caller of
+    /// this asks about the width grid.
     pub fn foldedCells(self: *const Table) u32 {
         var n: u32 = 0;
         for (self.cells) |row| {
@@ -120,6 +127,12 @@ pub const Table = struct {
                 if (c.n > 0) n += 1;
             }
         }
+        return n;
+    }
+
+    /// Folded serial cells (buckets that have measured a plain token).
+    pub fn foldedSerialCells(self: *const Table) u32 {
+        var n: u32 = 0;
         for (self.serial) |c| {
             if (c.n > 0) n += 1;
         }
@@ -652,6 +665,7 @@ pub fn parse(text: []const u8) ?Table {
     t.seq = RESEED_GAP + 1;
     t.serial_seq = RESEED_GAP + 1;
     t.restored = t.foldedCells();
+    t.restored_serial = t.foldedSerialCells();
     return t;
 }
 
@@ -876,6 +890,7 @@ test "round_cost: persistence round-trips folded cells, marks them stale, reject
     const text = try serialize(&buf, &t);
     const back = parse(text) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(u32, 2), back.restored);
+    try testing.expectEqual(@as(u32, 0), back.restored_serial); // no serial row in this table
     try testing.expectApproxEqAbs(50.0, back.measuredMs(4, 0).?, 1e-3);
     try testing.expectApproxEqAbs(4.5, back.measuredTok(4, 0).?, 1e-3);
     try testing.expectEqual(@as(u32, 1), back.cells[5][4].n);
@@ -919,7 +934,14 @@ test "round_cost: the serial row folds, trusts at MIN_SAMPLES and round-trips be
     const text = try serialize(&buf, &t);
     try testing.expect(std.mem.indexOf(u8, text, "\ns 0 16.") != null);
     const back = parse(text) orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(u32, 2), back.restored); // one width cell + one serial cell
+    // The two counts are SEPARATE: `restored` is what the width planner got
+    // back, `restored_serial` what the adaptive switch got back. A single
+    // number would have made "1 width cell" and "1 serial cell" indistinguishable
+    // from "2 width cells" in the one place either is ever read (the boot log).
+    try testing.expectEqual(@as(u32, 1), back.restored);
+    try testing.expectEqual(@as(u32, 1), back.restored_serial);
+    try testing.expectEqual(@as(u32, 1), back.foldedCells());
+    try testing.expectEqual(@as(u32, 1), back.foldedSerialCells());
     try testing.expectApproxEqAbs(16.0, back.serialMsPerTok(0).?, 1e-3);
     try testing.expectApproxEqAbs(50.0, back.measuredMs(4, 0).?, 1e-3);
     // A restored table re-probes at most once per boot: the flag is runtime.

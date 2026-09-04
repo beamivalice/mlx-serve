@@ -3447,7 +3447,9 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         xfm_ptr.round_cost_key_len = @intCast(rc_key.len);
         if (round_cost_mod.loadCached(sch.allocator, sch.io, rc_key)) |t| {
             xfm_ptr.round_cost = t;
-            log.info("[spec-cost] round-cost table restored ({d} cells)\n", .{t.restored});
+            // Two counts, never one: the width grid and the serial row are
+            // restored independently and answer different questions.
+            log.info("[spec-cost] round-cost table restored ({d} width cells, {d} serial cells)\n", .{ t.restored, t.restored_serial });
         }
     }
 
