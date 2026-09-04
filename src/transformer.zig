@@ -14337,27 +14337,57 @@ pub const Transformer = struct {
         };
         if (!all_vis or nb <= block_topk) vis3 = try self.qsaBlockVisibility(offset, seq_len, nb, ratio);
 
+        try self.qsa_consts.ensure(self.s, nb, ratio);
+        return qsaSelectMaskOps(self.s, scores, vis3, self.qsa_consts.tie_bias, offset, seq_len, kv, nb, ratio, block_topk, batch);
+    }
+
+    /// Block selection -> dense `[B,1,S,kv]` QSA mask, as pure ops.
+    ///
+    /// `vis3` may be NULL-ctx, which is the caller's claim that every block is
+    /// complete for this chunk's first row (`qsaAllBlocksVisible`). Under that
+    /// claim the visibility sheet is all-true, so every op that consumes it is
+    /// an identity and is skipped. Every consumer in here must therefore
+    /// handle the null handle itself — passing it to an mlx-c op raises
+    /// "expected a non-empty mlx_array" and kills the process.
+    ///
+    /// Split out of `qsaMaskFromQk` so the all-visible claim is testable
+    /// without a Transformer, a cache or a checkpoint.
+    fn qsaSelectMaskOps(
+        s: mlx.mlx_stream,
+        scores: mlx.mlx_array,
+        vis3: mlx.mlx_array,
+        tie_bias: mlx.mlx_array,
+        offset: c_int,
+        seq_len: c_int,
+        kv: c_int,
+        nb: c_int,
+        ratio: c_int,
+        block_topk: c_int,
+        batch: c_int,
+    ) !mlx.mlx_array {
+        const strides3 = [_]c_int{ 1, 1, 1 };
         var blk_sel = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(blk_sel);
         if (nb <= block_topk) {
+            // This arm IS the sheet, so the caller always builds it.
             try mlx.check(mlx.mlx_array_set(&blk_sel, vis3));
         } else {
-            const part = try self.qsaTopBlocks(scores, vis3, nb, ratio, block_topk);
+            const part = try qsaTopBlocksOps(s, scores, vis3, tie_bias, nb, block_topk);
             defer _ = mlx.mlx_array_free(part);
             var top_idx = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(top_idx);
-            try mlx.check(mlx.mlx_slice(&top_idx, part, &[_]c_int{ 0, 0, nb - block_topk }, 3, &[_]c_int{ batch, seq_len, nb }, 3, &strides3, 3, self.s));
+            try mlx.check(mlx.mlx_slice(&top_idx, part, &[_]c_int{ 0, 0, nb - block_topk }, 3, &[_]c_int{ batch, seq_len, nb }, 3, &strides3, 3, s));
             var falses = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(falses);
-            try mlx.check(mlx.mlx_zeros(&falses, &[_]c_int{ batch, seq_len, nb }, 3, .bool_, self.s));
+            try mlx.check(mlx.mlx_zeros(&falses, &[_]c_int{ batch, seq_len, nb }, 3, .bool_, s));
             const true_v = mlx.mlx_array_new_bool(true);
             defer _ = mlx.mlx_array_free(true_v);
             var picked = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(picked);
-            try mlx.check(mlx.mlx_put_along_axis(&picked, falses, top_idx, true_v, -1, self.s));
-            try mlx.check(mlx.mlx_logical_and(&blk_sel, picked, vis3, self.s));
+            try mlx.check(mlx.mlx_put_along_axis(&picked, falses, top_idx, true_v, -1, s));
+            try mlx.check(mlx.mlx_logical_and(&blk_sel, picked, vis3, s));
         }
-        return qsaMaskFromBlockSel(self.s, blk_sel, offset, seq_len, kv, nb, ratio, batch);
+        return qsaMaskFromBlockSel(s, blk_sel, offset, seq_len, kv, nb, ratio, batch);
     }
 
     /// Block visibility [1,S,nb]: block blk is complete for the query at
@@ -14387,11 +14417,6 @@ pub const Transformer = struct {
     /// A null-ctx `vis3` means the caller proved every block visible
     /// (`qsaAllBlocksVisible`): `where(all-true, biased, -inf)` is `biased`,
     /// so the mask op is skipped and argpartition reads the same values.
-    fn qsaTopBlocks(self: *Transformer, scores: mlx.mlx_array, vis3: mlx.mlx_array, nb: c_int, ratio: c_int, block_topk: c_int) !mlx.mlx_array {
-        try self.qsa_consts.ensure(self.s, nb, ratio);
-        return qsaTopBlocksOps(self.s, scores, vis3, self.qsa_consts.tie_bias, nb, block_topk);
-    }
-
     /// One row-chunk of the prefill/decode block selection: the top-`kb`
     /// visible blocks per row, ascending, INT_MAX past the row's count.
     ///
@@ -43343,6 +43368,175 @@ test "qsa pooled rope: one cos/sin build per forward, not one per full-attention
     try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(m.sin, direct.sin, s));
     for (0..11) |_| _ = try t.qsaPooledCosSin(&ctx, rope_dims, base + step, step, n, .bfloat16);
     try testing.expectEqual(@as(usize, 4), t.qsa_pooled_rope.builds);
+}
+
+// ── The QSA all-visible identity skip at the engagement boundary ──
+
+/// The visibility sheet `qsaBlockVisibility` builds, without a Transformer:
+/// vis[r, b] = (b*ratio + ratio - 1) <= offset + r.
+fn qsaVisSheetForTest(s: mlx.mlx_stream, offset: c_int, seq_len: c_int, nb: c_int, ratio: c_int) !mlx.mlx_array {
+    var blk_end = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(blk_end);
+    try mlx.check(mlx.mlx_arange(&blk_end, @floatFromInt(ratio - 1), @floatFromInt(nb * ratio), @floatFromInt(ratio), .int32, s));
+    var blk_end2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(blk_end2);
+    try mlx.check(mlx.mlx_reshape(&blk_end2, blk_end, &[_]c_int{ 1, nb }, 2, s));
+    var pos = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(pos);
+    try mlx.check(mlx.mlx_arange(&pos, @floatFromInt(offset), @floatFromInt(offset + seq_len), 1.0, .int32, s));
+    var pos2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(pos2);
+    try mlx.check(mlx.mlx_reshape(&pos2, pos, &[_]c_int{ seq_len, 1 }, 2, s));
+    var vis = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(vis);
+    try mlx.check(mlx.mlx_less_equal(&vis, blk_end2, pos2, s));
+    var vis3 = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_expand_dims(&vis3, vis, 0, s));
+    return vis3;
+}
+
+/// Random f32 score sheet. The QSA indexer scores are f32 (the reference's own
+/// dtype), so the fixture is f32 and not the bf16 the attention helpers make.
+fn qsaRandScoresF32(rnd: std.Random, shape: []const c_int) !mlx.mlx_array {
+    var n: usize = 1;
+    for (shape) |d| n *= @intCast(d);
+    const data = try std.testing.allocator.alloc(f32, n);
+    defer std.testing.allocator.free(data);
+    // relu output: many exact zeros, which is what makes the tie bias load-bearing.
+    for (data) |*x| {
+        const v = rnd.float(f32) - 0.35;
+        x.* = if (v > 0) v else 0.0;
+    }
+    return mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .float32);
+}
+
+/// `b * 1e-7`, the index-descending tie bias `QsaBlockConsts` caches.
+fn qsaTieBiasForTest(s: mlx.mlx_stream, nb: c_int) !mlx.mlx_array {
+    var idx = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(idx);
+    try mlx.check(mlx.mlx_arange(&idx, 0.0, @floatFromInt(nb), 1.0, .float32, s));
+    const scale = mlx.mlx_array_new_float(1.0e-7);
+    defer _ = mlx.mlx_array_free(scale);
+    var bias = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_multiply(&bias, idx, scale, s));
+    return bias;
+}
+
+fn qsaArraysAllEqual(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !bool {
+    var eq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eq);
+    try mlx.check(mlx.mlx_equal(&eq, a, b, s));
+    var all = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(all);
+    try mlx.check(mlx.mlx_all(&all, eq, false, s));
+    try mlx.check(mlx.mlx_array_eval(all));
+    var out: bool = false;
+    try mlx.check(mlx.mlx_array_item_bool(&out, all));
+    return out;
+}
+
+test "qsa mask: the all-visible skip must not hand a NULL sheet to an mlx op (kv just past the budget)" {
+    // The class, not the instance. `qsaAllBlocksVisible` lets the caller pass a
+    // null-ctx `vis3` meaning "every block is complete for this chunk's first
+    // row", and every consumer of the sheet must then skip its own op. One did
+    // not: `mlx_logical_and(&blk_sel, picked, vis3)` in the nb > block_topk
+    // arm passed the null handle straight to mlx-c, which raised
+    //   expected a non-empty mlx_array at mlx/c/ops.cpp:1866   (mlx_logical_and)
+    // and killed the process mid-request.
+    //
+    // Why it hid: the skip needs BOTH `offset >= nb*ratio - 1` (all blocks
+    // complete) AND `nb > block_topk` (a selection actually happens). The
+    // second needs kv > budget = 2048; the first, at decode width, is exactly
+    // `kv % ratio == 0`. So nothing below 2048 can reach it and, above 2048,
+    // it fires on every 4th generated token — which is why a 2068-token
+    // prompt died a few tokens into generation while every short rung passed.
+    //
+    // Bar: wherever the predicate claims all-visible, (a) the real sheet must
+    // in fact be all-true, and (b) the null-sheet arm must produce the SAME
+    // mask as passing that all-true sheet explicitly. Elsewhere the real-sheet
+    // arm must simply run. Hermetic: no Transformer, no cache, no checkpoint.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const ratio: c_int = 4;
+    const batch: c_int = 1;
+    var prng = std.Random.DefaultPrng.init(0x2068_B0DE);
+    const rnd = prng.random();
+
+    var checked_skip: usize = 0;
+    for ([_]c_int{ 2049, 2068, 2100, 4100 }) |kv| {
+        const nb = @divTrunc(kv + ratio - 1, ratio);
+        for ([_]c_int{ 1, 31, 1024 }) |seq_len| {
+            if (seq_len > kv) continue;
+            const offset = kv - seq_len;
+            // nb <= block_topk (no selection), and nb just ABOVE the budget by
+            // 1..8 — the window the shipped budget/4 = 512 lands in at these kv.
+            var topks = std.ArrayList(c_int){};
+            defer topks.deinit(std.testing.allocator);
+            try topks.append(std.testing.allocator, nb);
+            try topks.append(std.testing.allocator, nb + 4);
+            for (1..9) |d| try topks.append(std.testing.allocator, nb - @as(c_int, @intCast(d)));
+            try topks.append(std.testing.allocator, 512); // the production value
+
+            for (topks.items) |block_topk| {
+                if (block_topk <= 0) continue;
+                const scores = try qsaRandScoresF32(rnd, &[_]c_int{ batch, seq_len, nb });
+                defer _ = mlx.mlx_array_free(scores);
+                const tie = try qsaTieBiasForTest(s, nb);
+                defer _ = mlx.mlx_array_free(tie);
+                const sheet = try qsaVisSheetForTest(s, offset, seq_len, nb, ratio);
+                defer _ = mlx.mlx_array_free(sheet);
+
+                const ref = try Transformer.qsaSelectMaskOps(s, scores, sheet, tie, offset, seq_len, kv, nb, ratio, block_topk, batch);
+                defer _ = mlx.mlx_array_free(ref);
+                try mlx.check(mlx.mlx_array_eval(ref));
+
+                if (!qsaAllBlocksVisible(offset, nb, ratio)) continue;
+                // (a) the predicate's own claim.
+                var ones = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(ones);
+                try mlx.check(mlx.mlx_ones(&ones, &[_]c_int{ 1, seq_len, nb }, 3, .bool_, s));
+                try std.testing.expect(try qsaArraysAllEqual(sheet, ones, s));
+                // (b) the skip is an identity. RED before the fix: this call
+                // raises "expected a non-empty mlx_array" for block_topk < nb.
+                const null_vis = mlx.mlx_array{ .ctx = null };
+                const got = try Transformer.qsaSelectMaskOps(s, scores, null_vis, tie, offset, seq_len, kv, nb, ratio, block_topk, batch);
+                defer _ = mlx.mlx_array_free(got);
+                try std.testing.expect(try qsaArraysAllEqual(got, ref, s));
+                checked_skip += 1;
+            }
+        }
+    }
+    // The test is worthless if it never reached the skip: pin that it did.
+    std.debug.print("[qsa-boundary] all-visible skip exercised in {d} cases\n", .{checked_skip});
+    try std.testing.expect(checked_skip >= 8);
+}
+
+test "qsa boundary: the all-visible skip is reachable only past the budget, and then every ratio-th token" {
+    // Pure arithmetic, no GPU — this is the reachability argument the test
+    // above depends on, written down so it cannot rot silently.
+    const ratio: c_int = 4;
+    const block_topk: c_int = 512; // budget 2048 / ratio
+    // Decode width: offset = kv - 1, nb = ceil(kv / ratio).
+    var hits: usize = 0;
+    var kv: c_int = 2040;
+    while (kv <= 2080) : (kv += 1) {
+        const nb = @divTrunc(kv + ratio - 1, ratio);
+        const vis = qsaAllBlocksVisible(kv - 1, nb, ratio);
+        const selects = nb > block_topk;
+        if (vis and selects) {
+            hits += 1;
+            try std.testing.expectEqual(@as(c_int, 0), @rem(kv, ratio));
+            try std.testing.expect(kv > block_topk * ratio);
+        }
+    }
+    // 2052, 2056, ... 2080 — every ratio-th token once past 2048.
+    try std.testing.expect(hits >= 7);
+    // Nothing at or below the budget can reach it, at ANY width.
+    var kv2: c_int = 1;
+    while (kv2 <= block_topk * ratio) : (kv2 += 1) {
+        const nb = @divTrunc(kv2 + ratio - 1, ratio);
+        try std.testing.expect(!(nb > block_topk));
+    }
 }
 
 test "qsa visibility: decode width is ALWAYS all-visible; a prefill chunk's FIRST row decides" {
