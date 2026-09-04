@@ -1,5 +1,13 @@
 # Changelog
 
+## v26.9.2 (unreleased)
+
+### Fixes
+
+- A long hybrid-model session could suddenly re-prefill its entire prompt from scratch (nine minutes at 390k tokens) with nothing in the log. A cache entry committed after restoring an earlier entry never inherited that entry's restore points, so once the original was evicted nothing usable remained; such entries now inherit them, and a miss that had a matching prompt is always logged.
+
+---
+
 ## v26.9.1 (unreleased)
 
 ### Highlights
