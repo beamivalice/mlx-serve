@@ -17955,32 +17955,32 @@ pub const Transformer = struct {
             // verify widths (and a declined gather) run under the bool mask.
             const ratio: c_int = @intCast(self.config.indexer_compress_ratio);
             var gathered: ?mlx.mlx_array = null;
-            // ONE predicate decides the floor. `qsaAttnMinS()` used to be read
-            // only INSIDE `qsaSparseAttn`, while this dispatch carried its own
-            // `seq_len >= 2` literal — so `MLX_SERVE_QSA_ATTN_MIN_S=1` moved
-            // the callee's gate and the caller never called it. The lever was
-            // inert and an S=1 A/B measured the decode gather against itself
-            // (identical op counts, zero engaged lines, 0.4% apart).
+            // Three arms, three INDEPENDENT widths. `fused_min_s` is the
+            // fused kernel's OWN floor and must gate nothing else: gating the
+            // whole block on it made `MLX_SERVE_QSA_ATTN_MIN_S=6` drop S=2..5
+            // past the union gather onto the dense [S, kv] mask — a lever
+            // meant to NARROW the fused kernel silently widened the slowest
+            // arm instead. A per-arm floor is a property of that arm.
+            const qsa_ok = ctx.qsa_blocks.ctx != null and ctx.qsa_mask.ctx == null and !qwen4Standin().attn_sdpa;
             const fused_min_s = qsaAttnMinS();
-            if (seq_len == 1 and seq_len < fused_min_s and ctx.qsa_blocks.ctx != null and ctx.qsa_mask.ctx == null and !qwen4Standin().attn_sdpa) {
+            if (qsa_ok and seq_len >= fused_min_s and seq_len < FUSED256_MIN_Q_LEN) {
+                // First choice: ONE fused dispatch per layer. Each row indexes
+                // its OWN selection + tail and reads the packed triples
+                // in-kernel — no union, no mask, no slab.
+                gathered = try qsaSparseAttn(self.s, q_rope, &kv_view, ctx.qsa_blocks, ratio, attn_scale);
+            }
+            if (gathered == null and qsa_ok and seq_len == 1) {
                 // Decode width: subset triples (or dense rows) → subset
-                // dequant → dense SDPA over K'<<kv. Declines cleanly to the
-                // mask arm below.
+                // dequant → dense SDPA over K'<<kv. Declines to the mask arm.
                 gathered = try qsaDecodeGatherAttn(self.s, q_rope, &kv_view, ctx.qsa_blocks, ratio, attn_scale);
             }
-            if (gathered == null and seq_len >= fused_min_s and seq_len < FUSED256_MIN_Q_LEN and
-                ctx.qsa_blocks.ctx != null and ctx.qsa_mask.ctx == null and !qwen4Standin().attn_sdpa)
-            {
-                // Verify width, first choice: ONE fused dispatch per layer.
-                // Each row indexes its OWN selection + tail and reads the
-                // packed triples in-kernel — no union, no mask, no slab.
-                gathered = try qsaSparseAttn(self.s, q_rope, &kv_view, ctx.qsa_blocks, ratio, attn_scale);
-                if (gathered == null) {
-                    // Fallback: the union of the block's rows' selections +
-                    // the union tail — subset dequant on a quantized cache,
-                    // never the whole stored range. Declines to the mask arm.
-                    gathered = try qsaVerifyGatherAttn(self.s, q_rope, &kv_view, ctx.qsa_blocks, ratio, attn_scale);
-                }
+            if (gathered == null and qsa_ok and seq_len >= 2 and seq_len < FUSED256_MIN_Q_LEN) {
+                // Verify widths, unconditionally 2..15: the union of the
+                // block's rows' selections + the union tail — subset dequant
+                // on a quantized cache, never the whole stored range. This is
+                // the fused kernel's fallback AND the arm that serves every
+                // width the fused kernel declines, for any reason.
+                gathered = try qsaVerifyGatherAttn(self.s, q_rope, &kv_view, ctx.qsa_blocks, ratio, attn_scale);
             }
             // The prefill kernel has no q_len floor of its own; a verify-width
             // selection must never fall into it (it walks the WHOLE cache).
@@ -39588,10 +39588,55 @@ test "qsa sparse attn: NSPLIT is one MEASURED constant, and the width floor bind
     // decode-gather arm steps aside exactly when the fused kernel claims S=1.
     const src = @embedFile("transformer.zig");
     const disp = std.mem.indexOf(u8, src, "gathered = try qsaSparse" ++ "Attn(").?;
-    const head = src[disp -| 1400 .. disp];
+    const head = src[disp -| 900 .. disp];
+    // The fused arm reads the lever...
     try std.testing.expect(std.mem.indexOf(u8, head, "seq_len >= fused_" ++ "min_s") != null);
-    try std.testing.expect(std.mem.indexOf(u8, head, "seq_len < fused_" ++ "min_s") != null);
-    try std.testing.expect(std.mem.indexOf(u8, head, "seq_len >= 2 and") == null);
+    // ...and the arm BELOW it does not. A floor that gates a neighbouring arm
+    // is how MIN_S=6 dropped S=2..5 onto the dense mask.
+    const vg = std.mem.indexOf(u8, src, "gathered = try qsaVerify" ++ "GatherAttn(").?;
+    const vhead = src[vg -| 700 .. vg];
+    try std.testing.expect(std.mem.indexOf(u8, vhead, "seq_len >= 2 and") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vhead, "fused_" ++ "min_s") == null);
+    const dg = std.mem.indexOf(u8, src, "gathered = try qsaDecode" ++ "GatherAttn(").?;
+    const dhead = src[dg -| 500 .. dg];
+    try std.testing.expect(std.mem.indexOf(u8, dhead, "fused_" ++ "min_s") == null);
+}
+
+test "qsa dispatch: each arm's width floor is its own (MIN_S never moves the union gather)" {
+    // M11. `MLX_SERVE_QSA_ATTN_MIN_S` narrows the FUSED kernel. It must not
+    // decide what serves the widths the fused kernel gives up: with MIN_S=6,
+    // S=2..5 belong to `qsaVerifyGatherAttn`, not to the dense [S, kv] mask.
+    //
+    // Modelled as the dispatch's own predicates so it is hermetic — the three
+    // arms are pure functions of (seq_len, fused_min_s) once `qsa_ok` holds.
+    const Arm = enum { fused, decode_gather, union_gather, dense_mask };
+    const pick = struct {
+        fn f(seq_len: c_int, min_s: c_int) Arm {
+            if (seq_len >= min_s and seq_len < FUSED256_MIN_Q_LEN) return .fused;
+            if (seq_len == 1) return .decode_gather;
+            if (seq_len >= 2 and seq_len < FUSED256_MIN_Q_LEN) return .union_gather;
+            return .dense_mask;
+        }
+    }.f;
+
+    // Shipped default: decode gathers, 2..15 fused, prefill falls through.
+    try std.testing.expectEqual(Arm.decode_gather, pick(1, QSA_ATTN_MIN_S_DEFAULT));
+    for ([_]c_int{ 2, 3, 6, 15 }) |sq| try std.testing.expectEqual(Arm.fused, pick(sq, QSA_ATTN_MIN_S_DEFAULT));
+    try std.testing.expectEqual(Arm.dense_mask, pick(FUSED256_MIN_Q_LEN, QSA_ATTN_MIN_S_DEFAULT));
+
+    // MIN_S=6 narrows the fused kernel and NOTHING else. This is the bug:
+    // S=2..5 must land on the union gather, never on the dense mask.
+    try std.testing.expectEqual(Arm.decode_gather, pick(1, 6));
+    for ([_]c_int{ 2, 3, 4, 5 }) |sq| try std.testing.expectEqual(Arm.union_gather, pick(sq, 6));
+    for ([_]c_int{ 6, 15 }) |sq| try std.testing.expectEqual(Arm.fused, pick(sq, 6));
+
+    // MIN_S=1 hands S=1 to the fused kernel; the decode gather is its fallback.
+    try std.testing.expectEqual(Arm.fused, pick(1, 1));
+
+    // Disabling the fused kernel entirely leaves every width served as before.
+    const off = FUSED256_MIN_Q_LEN;
+    try std.testing.expectEqual(Arm.decode_gather, pick(1, off));
+    for ([_]c_int{ 2, 3, 6, 15 }) |sq| try std.testing.expectEqual(Arm.union_gather, pick(sq, off));
 }
 
 test "qsa sparse attn: gqa tile reuse is invariant — one kv head serving 12 q heads equals 12 serving one each" {
