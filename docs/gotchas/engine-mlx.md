@@ -4663,3 +4663,68 @@ Rules that came out of it:
 - **A float tie-break bias is only a tie-break where it exceeds the ulp at the values it is added to.** Either derive it from the operand's magnitude, or do not encode ordering in float arithmetic at all — order on a monotone integer key, which is what the kernel does.
 - **A parity test whose reference is the incumbent can only find disagreements, not decide them.** Both arms here are measured against `qsaExactTopHost` (score desc, index asc). The incumbent is held to the same bar, and only on the small-magnitude grid where its bias actually resolves — the regime split IS the finding.
 - **"Arbitrary" is not "reliably wrong".** A first attempt to assert the chain picks the higher index was flaky; what is deterministic is the CAUSE (4 vs 2048 distinct biased values, pure f32) and the kernel's own agreement with the reference.
+
+## A QSA arm that engages at kv=2049 must be tested at kv=2049 (2026-09-04, qwen4_exp)
+
+The short-context ladder's bundle arm died on its very first request. The log
+ends mid-prefill:
+
+    prompt=2068 tokens, max_gen=200, ctx=400000
+    [qsa] sparse attention engaged: kv=2068 blocks=517 top-512 (budget 2048, ratio 4)
+    [qsa-fused] engaged: msv_attn_p256 mask arm qL=31 kL=2068
+    MLX error: expected a non-empty mlx_array at mlx/c/ops.cpp:1866
+
+and then the process is gone. The same prompt on the pre-bundle baseline prints
+the same two QSA lines and keeps going.
+
+`ops.cpp:1866` is `mlx_logical_and`, and "non-empty" is mlx-c's phrasing for a
+handle whose `ctx` is null. The empty operand is `vis3`, the block-visibility
+sheet.
+
+The sheet is optional BY DESIGN. `qsaAllBlocksVisible(offset, nb, ratio)` is the
+claim that every block is already complete for this chunk's first row; under it
+`where(all-true, biased, -inf)` is `biased`, the INT_MAX remap is a no-op, and
+`picked AND all-true` is `picked`. So the caller passes a null-ctx `vis3` and
+each consumer skips its own op. `qsaTopBlocksOps` honours that contract with an
+explicit `if (vis3.ctx == null)` and a comment describing it. The
+block-selection AND did not — it handed the null straight to mlx-c.
+
+The interesting part is not the missing branch, it is why nothing caught it.
+The skip needs BOTH halves of a conjunction:
+
+  * `nb > block_topk` — a selection actually happens, which needs kv > budget
+    (2048 tokens with the shipped budget/ratio = 512/4);
+  * `offset >= nb*ratio - 1` — all blocks complete, which at decode width
+    reduces to `kv % ratio == 0`.
+
+So nothing at or below 2048 tokens can reach it at ANY width, and past 2048 it
+fires on every 4th generated token. Every short test rung sat under the budget.
+Every long rung was thousands of tokens past the boundary before anyone looked,
+and its first engagement had already happened at a kv that satisfied neither
+half at the same moment. The bug lived exactly in the band the test matrix
+stepped over: kv barely past the budget, nb barely above 512.
+
+Three things generalise.
+
+**An identity skip is a contract, and a contract with one unhandled arm is a
+crash.** The commit that introduced the skip changed three consumers and
+documented two of them. The right shape is a seam that OWNS the null handle —
+`qsaSelectMaskOps` now takes `vis3` as a parameter whose null case is part of
+its signature's meaning — rather than a null threaded through inline code where
+each new consumer has to remember.
+
+**A gate with a conjunction has a band, and the band is where you test.** "kv >
+2048" and "kv % 4 == 0" each looked individually harmless. The regression test
+walks kv in {2049, 2068, 2100, 4100} against block_topk in {nb, nb+4,
+nb-1..nb-8, 512} precisely because the failure needs the two to coincide, and it
+asserts it actually REACHED the skip (>= 8 cases) — a boundary test that never
+reaches the boundary is worse than no test, because it reports green.
+
+**mlx-c's default error handler aborts.** mlx-serve installs no
+`mlx_set_error_handler`, so a recoverable argument error did not become a 500 on
+one request: it took the process down and every queued request with it. The repo
+already learned this for weights ("a missing tensor is a load ERROR, never
+`unreachable`"). The mlx-c error path is the same lesson in a different
+subsystem, and it is why this bug read as "the server crashed" rather than "one
+request failed".
+
