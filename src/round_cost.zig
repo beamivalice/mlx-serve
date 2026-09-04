@@ -61,6 +61,10 @@ pub const MIN_WIDTHS: u32 = 1;
 /// cell on the M4 base 9B, activated the table on {w2, w4} and anchored it
 /// at 2 — the plan then read w3 as a bargain and lost 6.6%).
 pub const MIN_SAMPLES: u32 = 3;
+/// Serial probes a bucket may attempt per process before it gives up. An
+/// attempt is bounded (`MTP_ADAPTIVE_PROBE_TOKENS` serial ticks), so this
+/// caps the whole cost of teaching one bucket.
+pub const MAX_SERIAL_PROBES: u8 = 3;
 /// A width whose FIRST sample already reads this much worse per token than
 /// a trusted reference is settled as worse: the plan only needs "not
 /// better", and every further trial block of it is a 3-4% hit on the
@@ -97,12 +101,21 @@ pub const Table = struct {
     /// request that never armed MTP, one whose speculation turned itself
     /// off, and the bounded serial probe.
     serial: [N_BUCKETS]Cell = @splat(.{}),
-    /// One bounded serial probe per (model, bucket) per PROCESS: a bucket
-    /// whose serial cell is untrusted cannot be decided at all, and without
-    /// this a workload that never decodes serially there would never learn
-    /// one. Runtime only — never serialized, so a restored table re-probes
-    /// at most once per boot per bucket.
-    serial_probe_done: [N_BUCKETS]bool = @splat(false),
+    /// Bounded serial probes ATTEMPTED per bucket this process. A bucket
+    /// whose serial cell is untrusted cannot be decided at all, and without a
+    /// probe a workload that never decodes serially there would never learn
+    /// one.
+    ///
+    /// A count, not a flag: the flag was set at ARMING, so a probe that was
+    /// interrupted before folding `MIN_SAMPLES` — the request ended, the
+    /// server got busy and the ticks were dropped as contended, a stop
+    /// sequence landed — burned the bucket's only chance and left it
+    /// permanently undecidable. Up to `MAX_SERIAL_PROBES` attempts, which
+    /// bounds the cost at that many short serial blocks per bucket per
+    /// process while letting a broken attempt be retried.
+    ///
+    /// Runtime only — never serialized, so a restored table re-probes.
+    serial_probes: [N_BUCKETS]u8 = @splat(0),
     /// Samples OFFERED (accepted or not): the width grid's reseed clock.
     seq: u32 = 0,
     /// The serial row's OWN reseed clock. It cannot share `seq`: a serial
@@ -978,7 +991,7 @@ test "round_cost: the serial row folds, trusts at MIN_SAMPLES and round-trips be
     try testing.expectApproxEqAbs(16.0, back.serialMsPerTok(0).?, 1e-3);
     try testing.expectApproxEqAbs(50.0, back.measuredMs(4, 0).?, 1e-3);
     // A restored table re-probes at most once per boot: the flag is runtime.
-    try testing.expect(!back.serial_probe_done[0]);
+    try testing.expectEqual(@as(u8, 0), back.serial_probes[0]);
 }
 
 test "round_cost: the serial row and the width grid keep SEPARATE reseed clocks" {

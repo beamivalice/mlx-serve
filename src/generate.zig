@@ -7775,6 +7775,9 @@ pub const Generator = struct {
     }
 
     /// Arm a bounded serial probe, returning the bucket it will measure.
+    /// ONE bucket parameter (H6): the flag used to key on `bucketFor` while
+    /// the "already measured?" check keyed on the decision bucket, so a probe
+    /// could be spent on a bucket the decision never reads.
     /// A bucket with no measured serial token cannot be decided at all, and
     /// a workload that only ever speculates there would never teach it one.
     /// The flag is CONSUMED here, at arming, so the probe fires at most once
@@ -7785,18 +7788,23 @@ pub const Generator = struct {
     /// on and what the next decision will read once it is active.
     pub fn mtpSerialProbeArm(
         t: *round_cost.Table,
-        kv_len: u32,
-        decision_bucket: usize,
+        bucket: usize,
         solo: bool,
         idle: bool,
         may_resume: bool,
     ) ?usize {
         if (!solo or !idle or !may_resume) return null;
-        if (t.serialMsPerTok(decision_bucket) != null) return null;
-        const own = round_cost.bucketFor(kv_len);
-        if (t.serial_probe_done[own]) return null;
-        t.serial_probe_done[own] = true;
-        return own;
+        if (bucket >= round_cost.N_BUCKETS) return null;
+        // Already taught: nothing to probe for.
+        if (t.serialMsPerTok(bucket) != null) return null;
+        // Bounded RETRIES, not a one-shot flag. The flag was consumed at
+        // arming, so a probe interrupted before it folded MIN_SAMPLES — the
+        // request ended, the ticks were dropped as contended, a stop sequence
+        // landed — burned the bucket's only chance and left it permanently
+        // undecidable. The cell being trusted is what ends the retries, above.
+        if (t.serial_probes[bucket] >= round_cost.MAX_SERIAL_PROBES) return null;
+        t.serial_probes[bucket] += 1;
+        return bucket;
     }
 
     /// The standing choice and the streak behind it. Pure — no MLX, no
@@ -8019,7 +8027,7 @@ pub const Generator = struct {
             }
             // Nothing to decide with: teach the bucket a serial token, once.
             const idle = self.mtp_serial_left == 0 and self.mtp_serial_exit == .none;
-            if (mtpSerialProbeArm(t, kv_len, b, self.spec_cost_solo, idle, self.mtpAdaptiveHeadMayResume())) |own| {
+            if (mtpSerialProbeArm(t, b, self.spec_cost_solo, idle, self.mtpAdaptiveHeadMayResume())) |own| {
                 self.mtp_serial_left = MTP_ADAPTIVE_PROBE_TOKENS;
                 log.info(
                     "  [mtp] adaptive: bucket {s} has no serial cell -> probing {d} serial tokens\n",
@@ -14164,41 +14172,45 @@ test "MtpAdaptive: serial is sticky except for ONE re-decision per bucket crossi
     try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, a.serialTick(3));
 }
 
-test "mtpSerialProbeArm: at most one probe per bucket, and none once the cell is trusted" {
+test "mtpSerialProbeArm: bounded RETRIES per bucket, and none once the cell is trusted (M15)" {
     const G = Generator;
     var t = round_cost.Table{};
-    // 20k sits in bucket 4; the plan reads bucket 4 too.
-    const kv: u32 = 20_000;
-    const b = round_cost.bucketFor(kv);
-    try testing.expectEqual(b, G.mtpSerialProbeArm(&t, kv, b, true, true, true).?);
-    // Every later ask — this request's next round, and every other request —
-    // gets nothing: the flag was consumed at arming.
-    var fired: u32 = 1;
+    const b = round_cost.bucketFor(20_000);
+
+    // A probe may be retried: an attempt that never folded MIN_SAMPLES (the
+    // request ended, its ticks were dropped as contended) must not burn the
+    // bucket's only chance the way the arming flag used to.
+    var fired: u32 = 0;
     var i: u32 = 0;
     while (i < 50) : (i += 1) {
-        if (G.mtpSerialProbeArm(&t, kv, b, true, true, true) != null) fired += 1;
+        if (G.mtpSerialProbeArm(&t, b, true, true, true) != null) fired += 1;
     }
-    try testing.expectEqual(@as(u32, 1), fired);
+    try testing.expectEqual(@as(u32, round_cost.MAX_SERIAL_PROBES), fired);
+    try testing.expect(round_cost.MAX_SERIAL_PROBES > 1); // else it is the old flag
+
+    // What ENDS the retries is the cell becoming trusted, not the attempts.
+    var u = round_cost.Table{};
+    const kv: u32 = 20_000;
+    try testing.expect(G.mtpSerialProbeArm(&u, b, true, true, true) != null);
+    var k: u32 = 0;
+    while (k < round_cost.MIN_SAMPLES) : (k += 1) _ = u.observeSerial(kv, 16.0, true, false);
+    try testing.expect(u.serialMsPerTok(b) != null);
+    try testing.expect(G.mtpSerialProbeArm(&u, b, true, true, true) == null);
 
     // Another bucket is its own decision.
-    var u = round_cost.Table{};
-    try testing.expect(G.mtpSerialProbeArm(&u, 1000, round_cost.bucketFor(1000), true, true, true) != null);
-    try testing.expect(G.mtpSerialProbeArm(&u, kv, b, true, true, true) != null);
-
-    // Refusals: contended, mid-block, and an M-RoPE turn (a head-history gap
-    // there is a wrong answer, not a slow one) — none of them consume it.
     var v = round_cost.Table{};
-    try testing.expect(G.mtpSerialProbeArm(&v, kv, b, false, true, true) == null);
-    try testing.expect(G.mtpSerialProbeArm(&v, kv, b, true, false, true) == null);
-    try testing.expect(G.mtpSerialProbeArm(&v, kv, b, true, true, false) == null);
-    try testing.expect(G.mtpSerialProbeArm(&v, kv, b, true, true, true) != null);
+    try testing.expect(G.mtpSerialProbeArm(&v, round_cost.bucketFor(1000), true, true, true) != null);
+    try testing.expect(G.mtpSerialProbeArm(&v, b, true, true, true) != null);
 
-    // A trusted cell needs no probe at all.
+    // Refusals: contended, mid-block, an M-RoPE turn, and a bucket that is
+    // not a bucket.
     var w = round_cost.Table{};
-    var n: u32 = 0;
-    while (n < round_cost.MIN_SAMPLES) : (n += 1) _ = w.observeSerial(kv, 15.0, true, false);
-    try testing.expect(w.serialMsPerTok(b) != null);
-    try testing.expect(G.mtpSerialProbeArm(&w, kv, b, true, true, true) == null);
+    try testing.expect(G.mtpSerialProbeArm(&w, b, false, true, true) == null);
+    try testing.expect(G.mtpSerialProbeArm(&w, b, true, false, true) == null);
+    try testing.expect(G.mtpSerialProbeArm(&w, b, true, true, false) == null);
+    try testing.expect(G.mtpSerialProbeArm(&w, round_cost.N_BUCKETS, true, true, true) == null);
+    // None of those consumed an attempt.
+    try testing.expectEqual(@as(u8, 0), w.serial_probes[b]);
 }
 
 test "mtpAdaptiveSerialEnabledFromEnv: the mechanism is on unless the lever says 0" {
@@ -14259,7 +14271,7 @@ test "the adaptive decision is read after the EV plan, before the width trial, a
     // tokens teaching a bucket that is never allowed to decide.
     const gate_at = std.mem.lastIndexOf(u8, src[0..decide_at], "mtpAdaptiveKv" ++ "Eligible(kv_len") orelse
         return error.MissingKvFloor;
-    const probe_at = std.mem.indexOfPos(u8, src, decide_at, "mtpSerialProbe" ++ "Arm(t, kv_len") orelse
+    const probe_at = std.mem.indexOfPos(u8, src, decide_at, "mtpSerialProbe" ++ "Arm(t, b,") orelse
         return error.MissingProbeArm;
     try testing.expect(gate_at < decide_at);
     try testing.expect(gate_at < probe_at);
