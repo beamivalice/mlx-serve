@@ -163,6 +163,31 @@ const Entry = struct {
     mtp_bytes: u64 = 0,
 };
 
+/// What a spec-snap adoption may do, decided BEFORE any mlx call so the whole
+/// policy is unit-testable: `.kv_only`/`.head` carry the length to clamp to.
+pub const SpecAdopt = union(enum) {
+    /// Nothing to adopt: no payload, the snap starts past what the trunk
+    /// reused, or it ends before it (a gap right below the generation point
+    /// is worse than a blind start).
+    skip,
+    /// A KV-only spec cache (dflash context, sidecar MTP head).
+    kv_only: usize,
+    /// The qwen4_exp in-checkpoint head: KV + QSA aux together.
+    head: usize,
+    /// A head target met a payload with no QSA half — a pre-v5 disk sidecar
+    /// or an entry committed before head persistence. Head-only miss.
+    decline_head_no_history,
+};
+
+pub fn specAdoptPlan(base_pos: usize, snap_step: usize, matched: usize, has_head_target: bool, has_head_aux: bool) SpecAdopt {
+    if (base_pos > matched) return .skip;
+    const want = matched - base_pos;
+    if (want > snap_step) return .skip;
+    if (!has_head_target) return .{ .kv_only = want };
+    if (!has_head_aux) return .decline_head_no_history;
+    return .{ .head = want };
+}
+
 /// A committed speculative-side cache: the snapshot plus the absolute trunk
 /// position its index 0 represents (nonzero when the committing request was
 /// itself a cache hit). Shared by the DFlash assistant context and the MTP
@@ -170,18 +195,42 @@ const Entry = struct {
 pub const DflashSnap = struct {
     snapshot: KVCacheSnapshot,
     base_pos: usize,
+    /// qwen4_exp MTP head ONLY: the head's QSA aux entry (raw index-key
+    /// history + pooled block bank + ratio) and the absolute position of its
+    /// key row 0. The head's KV is meaningless without it — `qsaMaskFromQk`
+    /// errors `QsaHistoryGap` the moment the key history and the cache
+    /// position disagree — so a snap that has one and not the other is
+    /// DECLINED, never half-adopted. Null for the dflash context and the
+    /// sidecar MTP head, whose state really is KV-only.
+    head_aux: ?transformer_mod.SSMCacheEntrySnapshot = null,
+    head_pos_base: c_int = 0,
 
     pub fn deinit(self: *DflashSnap) void {
         self.snapshot.deinit();
+        if (self.head_aux) |*a| transformer_mod.ssmSnapshotDeinit(a);
+        self.head_aux = null;
     }
 };
 
-/// What `commitWithState` reads to build a `DflashSnap`.
-pub const DflashCommit = struct { cache: *const KVCache, base_pos: usize };
+/// What `commitWithState` reads to build a `DflashSnap`. `head` is set only
+/// by the qwen4_exp MTP head (see `DflashSnap.head_aux`).
+pub const DflashCommit = struct {
+    cache: *const KVCache,
+    base_pos: usize,
+    head: ?*const SSMCacheEntry = null,
+    head_pos_base: c_int = 0,
+};
 
 /// Where `lookupAndRestore` puts a restored assistant context. `base_pos` is
-/// written on every path so the caller can build `DflashCtx` from it.
-pub const DflashTarget = struct { cache: *KVCache, base_pos: *usize };
+/// written on every path so the caller can build `DflashCtx` from it. `head`
+/// is the qwen4_exp Transformer owning the in-checkpoint MTP head: present
+/// iff `cache` is that head's own KV, and the adoption then goes through
+/// `qwen4MtpAdopt` so both halves land or neither does.
+pub const DflashTarget = struct {
+    cache: *KVCache,
+    base_pos: *usize,
+    head: ?*transformer_mod.Transformer = null,
+};
 
 /// What `evictLruToAdmit` gave up, and whether it was enough.
 pub const EvictionReport = struct {
@@ -294,9 +343,27 @@ pub const HotPrefixCache = struct {
     fn restoreSpecSnap(snap_opt: ?*const DflashSnap, target: ?DflashTarget, matched: usize, s: mlx.mlx_stream, what: []const u8) ?usize {
         const t = target orelse return null;
         const snap = snap_opt orelse return null;
-        if (snap.base_pos > matched) return null;
-        const want = matched - snap.base_pos;
-        if (want > snap.snapshot.step) return null;
+        const want = switch (specAdoptPlan(snap.base_pos, snap.snapshot.step, matched, t.head != null, snap.head_aux != null)) {
+            .skip => return null,
+            .decline_head_no_history => {
+                log.info("  [qwen4] MTP head restore declined (snapshot carries no QSA history) — head starts blind\n", .{});
+                return null;
+            },
+            .kv_only, .head => |w| w,
+        };
+        // qwen4_exp in-checkpoint head: KV + QSA aux adopt together or not at
+        // all, and the trim is the head's own (it slices the key history and
+        // the pooled bank alongside the KV).
+        if (t.head) |xfm| {
+            const aux = &snap.head_aux.?;
+            xfm.qwen4MtpAdopt(&snap.snapshot, aux, snap.head_pos_base, want) catch |err| {
+                log.warn("  [qwen4] MTP head restore declined ({s}) — head starts blind\n", .{@errorName(err)});
+                return null;
+            };
+            t.base_pos.* = snap.base_pos;
+            log.info("  [qwen4] MTP head restored ({d} tokens from base {d})\n", .{ want, snap.base_pos });
+            return snap.base_pos;
+        }
         t.cache.restore(&snap.snapshot) catch |err| {
             log.warn("  [hot-cache] {s} restore failed: {s} — starts blind\n", .{ what, @errorName(err) });
             return null;
@@ -334,8 +401,15 @@ pub const HotPrefixCache = struct {
         const t = target orelse return null;
         const loaded = d.loadSpecSnap(idx, which, t.cache.entries.len, t.cache.config) orelse return null;
         // restore() refcount-shares the arrays into the target, so the
-        // transient snapshot is freed right after.
-        var snap = DflashSnap{ .snapshot = loaded.snap, .base_pos = loaded.base };
+        // transient snapshot is freed right after. A pre-v5 sidecar carries no
+        // head half, so a qwen4 head target declines it (head-only miss —
+        // the trunk restore above is untouched).
+        var snap = DflashSnap{
+            .snapshot = loaded.snap,
+            .base_pos = loaded.base,
+            .head_aux = loaded.head_aux,
+            .head_pos_base = loaded.head_pos_base,
+        };
         defer snap.deinit();
         return restoreSpecSnap(&snap, target, matched, s, switch (which) {
             .dflash => "dflash context",
@@ -437,6 +511,24 @@ pub const HotPrefixCache = struct {
                 total += @as(u64, mlx.mlx_array_size(e.keys_biases)) * @as(u64, mlx.mlx_array_itemsize(e.keys_biases));
                 total += @as(u64, mlx.mlx_array_size(e.values_scales)) * @as(u64, mlx.mlx_array_itemsize(e.values_scales));
                 total += @as(u64, mlx.mlx_array_size(e.values_biases)) * @as(u64, mlx.mlx_array_itemsize(e.values_biases));
+            }
+        }
+        return total;
+    }
+
+    /// Resident bytes of a speculative-side snap: the KV plus (qwen4_exp) the
+    /// head's QSA aux half. The aux is real resident state — a 62.7k-token
+    /// index-key history is tens of MB — so a budget that only counted the KV
+    /// would under-bill the entry it evicts against.
+    fn specSnapBytes(snap: *const DflashSnap) u64 {
+        var total = snapshotBytes(&snap.snapshot);
+        if (snap.head_aux) |a| {
+            // Only the two the head actually owns: its `conv_state` and
+            // `ssm_state` are empty handles (the head's one layer is a
+            // full-attention layer, so there is no recurrence), and an empty
+            // handle's `size` is not a byte count.
+            inline for (.{ a.aux_state, a.qsa_pooled }) |arr| {
+                if (arr.ctx != null) total += @as(u64, mlx.mlx_array_size(arr)) * @as(u64, mlx.mlx_array_itemsize(arr));
             }
         }
         return total;
@@ -920,8 +1012,14 @@ pub const HotPrefixCache = struct {
         var new_mtp_bytes: u64 = 0;
         if (mtp) |m2| {
             if (m2.cache.snapshot()) |snap| {
-                new_mtp = .{ .snapshot = snap, .base_pos = m2.base_pos };
-                new_mtp_bytes = snapshotBytes(&new_mtp.?.snapshot);
+                new_mtp = .{
+                    .snapshot = snap,
+                    .base_pos = m2.base_pos,
+                    // qwen4_exp: the QSA half. Refcount-shared like the KV.
+                    .head_aux = if (m2.head) |h| transformer_mod.ssmSnapshot(h) else null,
+                    .head_pos_base = m2.head_pos_base,
+                };
+                new_mtp_bytes = specSnapBytes(&new_mtp.?);
             } else |err| {
                 log.warn("  [hot-cache] mtp history snapshot failed: {s}\n", .{@errorName(err)});
             }
@@ -1264,6 +1362,9 @@ pub const HotPrefixCache = struct {
             .step = mm.snapshot.step,
             .config = mm.snapshot.config,
             .base_pos = mm.base_pos,
+            // qwen4_exp: the head's QSA half rides the SAME sidecar (v5).
+            .head_aux = if (mm.head_aux) |*a| a else null,
+            .head_pos_base = mm.head_pos_base,
         } else null;
         const complete = d.appendCommitWithSpec(
             newest.snapshot.entries,
@@ -3376,4 +3477,65 @@ test "evictLruToAdmit: oldest first, never the entry THIS request restored, and 
     try testing.expect(rest.accounted_bytes > 0);
     try testing.expect(rest.bytes * HotPrefixCache.SHARED_RETURN_DIVISOR < rest.accounted_bytes);
     try testing.expect(rest.shared_stop);
+}
+
+test "spec adopt: a qwen4 head target declines a payload with no QSA half; KV-only targets are unaffected" {
+    // The qwen4_exp in-checkpoint head's KV is meaningless without the raw
+    // index-key history it was built beside — `qsaMaskFromQk` errors
+    // `QsaHistoryGap` the moment the two disagree — so the two halves adopt
+    // together or not at all. Everything else (dflash context, the sidecar
+    // MTP head) is genuinely KV-only and keeps the old rule verbatim.
+    // Clamp arithmetic first, shared by both:
+    const Tag = std.meta.Tag(SpecAdopt);
+    const Plan = struct {
+        fn tag(p: SpecAdopt) Tag {
+            return std.meta.activeTag(p);
+        }
+        fn len(p: SpecAdopt) usize {
+            return switch (p) {
+                .kv_only, .head => |w| w,
+                else => std.math.maxInt(usize),
+            };
+        }
+    };
+    try testing.expectEqual(Tag.kv_only, Plan.tag(specAdoptPlan(10, 40, 31, false, false)));
+    try testing.expectEqual(@as(usize, 21), Plan.len(specAdoptPlan(10, 40, 31, false, false)));
+    try testing.expectEqual(Tag.skip, Plan.tag(specAdoptPlan(40, 40, 31, false, false))); // starts past the reuse
+    try testing.expectEqual(Tag.skip, Plan.tag(specAdoptPlan(0, 20, 31, false, false))); // ends short of it
+    try testing.expectEqual(@as(usize, 31), Plan.len(specAdoptPlan(0, 31, 31, false, false))); // exact
+
+    // Head target: same arithmetic, plus the aux requirement.
+    try testing.expectEqual(Tag.head, Plan.tag(specAdoptPlan(10, 40, 31, true, true)));
+    try testing.expectEqual(@as(usize, 21), Plan.len(specAdoptPlan(10, 40, 31, true, true)));
+    try testing.expectEqual(Tag.decline_head_no_history, Plan.tag(specAdoptPlan(10, 40, 31, true, false)));
+    // A payload the trunk cannot use is skipped BEFORE the aux question —
+    // "declined, no history" must name a real head miss, not a length miss.
+    try testing.expectEqual(Tag.skip, Plan.tag(specAdoptPlan(40, 40, 31, true, false)));
+    try testing.expectEqual(Tag.skip, Plan.tag(specAdoptPlan(0, 20, 31, true, false)));
+}
+
+test "spec snap bytes: the qwen4 head's QSA half is billed into the entry" {
+    // A 62.7k-token index-key history is tens of MB of resident state. A
+    // budget that counted only the head's KV would evict against a number
+    // that is not the entry's size.
+    const s = mlx.gpuStream();
+    var kv = try KVCache.init(testing.allocator, 1);
+    defer kv.deinit();
+    try testFillCache(&kv, s, 1, 16);
+    var snap = DflashSnap{ .snapshot = try kv.snapshot(), .base_pos = 0 };
+    defer snap.deinit();
+    const kv_only = HotPrefixCache.specSnapBytes(&snap);
+    try testing.expect(kv_only > 0);
+
+    var entry: SSMCacheEntry = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = true };
+    defer transformer_mod.ssmFreeQsaState(&entry);
+    defer _ = mlx.mlx_array_free(entry.conv_state);
+    defer _ = mlx.mlx_array_free(entry.ssm_state);
+    const shape = [_]c_int{ 1, 16, 128 };
+    entry.aux_state = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_zeros(&entry.aux_state, &shape, 3, .bfloat16, s));
+    entry.qsa_ratio = 4;
+    snap.head_aux = transformer_mod.ssmSnapshot(&entry);
+    const with_head = HotPrefixCache.specSnapBytes(&snap);
+    try testing.expectEqual(kv_only + 16 * 128 * 2, with_head);
 }

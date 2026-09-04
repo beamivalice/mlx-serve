@@ -5026,3 +5026,74 @@ The guard lesson is separate and more general: the first version of
 ONE fresh-state request, and that check passed on the very boots where eleven
 short-context switches were happening. A bucket that only matures over many
 requests cannot be probed with one. The assertion is now a 12-request burst.
+## A spec cache that is not KV-only persists both halves or neither (qwen4 MTP head)
+
+The prefix cache has carried speculative-side state since the DFlash context:
+a restore forwards no trunk layers, so anything built out of trunk hiddens is
+unrecoverable on a hit and has to ride the entry. `Entry.dflash` and
+`Entry.mtp` did exactly that, through one `DflashSnap` of a `KVCache`.
+
+The qwen4_exp in-checkpoint head does not fit that shape. Its per-request
+state is its own KV *plus* a QSA index-key history, a pooled block bank, a
+`qsa_ratio`, a row count and a `pos_base` — all on `Qwen4Mtp`, not in the
+cache. `MtpCacheRef.kv()` returned null for that arm with an honest comment
+("a KV-only restore would leave stale rows under a fresh aux state"), which
+made the whole machinery skip it: `scheduler`'s `mtp_kv` was null, so
+`restoreMtp` never ran and no commit ever happened, and `makeCache` ran
+`qwen4MtpReset` at the top of every request. Every prefix-cache hit therefore
+drafted from an EMPTY head sitting at a 62.7k-token cursor.
+
+The measurement (root_adapt2, 62.7k prose prompt, auto MTP,
+`--prefix-cache-entries 4 --prefix-cache-mem 4GB`, two boots):
+
+| turn | matched | m_avg | acc | tok/s |
+|---|---|---|---|---|
+| long1 (cold prefill) | 0 | 2.94 / 3.97 | 1.59 / 1.66 | 54.1 / 50.5 |
+| long2 (same prompt, hit) | 62724 | 1.00 | 0.59 / 0.50 | 52.2 / 54.0 |
+| serial control | 62724 | — | — | 51.1 / 50.2 |
+
+Per-index acceptance told the same story more sharply: cold
+0.81/0.54/0.45/0.36 against restored 0.69/0.40/0.00/0.00. The planner then did
+exactly its job — it priced a round it could not win and collapsed to
+`m_lo = 1` — so the symptom presented as "auto MTP trails serial at long
+context" rather than as a cache bug. Nothing in the logs said the head had no
+history, because nothing was ever asked to say so.
+
+Rebuilding the head on a restore is not available: row r of its history is
+(pre-mixer stream at r, token r+1), and the pre-mixer stream comes from the
+trunk forward the restore exists to skip. So the state is persisted. It is
+cheap — one layer, `Hk = 2`, hd 256, ≈ 1024 elements/token, ~64 MB at 62.7k
+and ~383 MB at 374k — and `SSMCacheEntrySnapshot` already carried
+`aux_state`/`qsa_pooled`/`qsa_ratio`/`ple_prev` for the trunk's own checkpoints.
+
+Three rules came out of it.
+
+**The two halves are one object.** `qsaAppendKeys` trusts the key history as
+the authority for the position it appends at, and `qsaMaskFromQk` raises
+`QsaHistoryGap` the moment the history and the cache position disagree — so a
+KV restore under a blank aux state does not degrade, it fails on the first
+turn past the budget. `specAdoptPlan` therefore decides BEFORE any mlx call,
+and `qwen4MtpAdopt` is the one entry point: restore the KV, replace the aux,
+set `seq_offset`/`pos_base`, trim both with the head's own truncate, and reset
+the whole head on any failure. A payload with one half and not the other is
+`decline_head_no_history` — a head-only miss that leaves the trunk restore
+untouched, and says so in the log.
+
+**A length miss is not a history miss.** The clamp arithmetic runs first, so
+"declined, no QSA history" names a real pre-v5 payload and never a snap that
+simply ended short of the cursor. That ordering is what the hermetic test
+pins.
+
+**The aux is resident bytes.** `specSnapBytes` bills it into `kv_bytes`, or
+the byte budget evicts against a number that is not the entry's size — the
+same class as the trimmed-candidate accounting in #330.
+
+The SSD tier carries the head in the same `spec.safetensors` (keys
+`{prefix}h.aux` / `{prefix}h.pooled`, scalars in the meta record, manifest
+v5). A v4 entry stays a perfectly good KV-only snap; only the head declines
+it. And the history is written whole rather than sliced, so the writer checks
+that it is exactly `step` rows and drops the head half if it is not — a
+persisted history of the wrong length is worse than none.
+
+`MLX_SERVE_MTP_HEAD_PERSIST=0` restores the old reset-every-request
+behaviour, for the A/B and for a fast retreat.

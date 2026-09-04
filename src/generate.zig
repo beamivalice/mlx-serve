@@ -383,6 +383,26 @@ pub const MtpHeadRef = union(enum) {
     }
 };
 
+/// `MLX_SERVE_MTP_HEAD_PERSIST=0` restores the pre-persistence behaviour for
+/// the qwen4_exp in-checkpoint head: its committed history is neither
+/// snapshotted into a prefix-cache entry nor restored from one, so every
+/// reused prefix drafts from an empty head (`qwen4MtpReset`). Read once.
+var mtp_head_persist_env: ?bool = null;
+/// PURE arm of the switch: absent (and, deliberately, empty) is ON — only a
+/// literal "0" turns persistence off, so a harness that exports the variable
+/// with no value cannot silently disable it.
+pub fn mtpHeadPersistFromEnv(raw: ?[]const u8) bool {
+    const v = raw orelse return true;
+    return !std.mem.eql(u8, v, "0");
+}
+pub fn mtpHeadPersistEnabled() bool {
+    if (mtp_head_persist_env) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_MTP_HEAD_PERSIST");
+    const on = mtpHeadPersistFromEnv(if (raw) |r| std.mem.sliceTo(r, 0) else null);
+    mtp_head_persist_env = on;
+    return on;
+}
+
 /// The head's committed-history cache.
 pub const MtpCacheRef = union(enum) {
     qwen: KVCache,
@@ -396,14 +416,28 @@ pub const MtpCacheRef = union(enum) {
     }
 
     /// The underlying KVCache — what the prefix cache's spec-snap machinery
-    /// snapshots and restores. Null when the head's state is NOT KV-only:
-    /// the qwen4 head also owns QSA key history + pooled blocks + its own
-    /// row count, so a KV-only restore would leave stale rows under a fresh
-    /// aux state — it is neither committed nor restored.
+    /// snapshots and restores. The qwen4 head's state is NOT KV-only (it also
+    /// owns the QSA key history + pooled blocks + its own row count), so its
+    /// KV alone is never enough: a caller that takes this pointer for that arm
+    /// MUST also carry `head()`, and the snap machinery declines an adoption
+    /// that has one without the other. Null when head persistence is off
+    /// (`MLX_SERVE_MTP_HEAD_PERSIST=0`), which restores the old behaviour of
+    /// neither committing nor restoring the qwen4 head.
     pub fn kv(self: *MtpCacheRef) ?*KVCache {
         return switch (self.*) {
             .qwen => |*c| c,
-            .qwen4 => null,
+            .qwen4 => |t| if (mtpHeadPersistEnabled()) &t.qwen4_mtp.?.cache else null,
+        };
+    }
+
+    /// The Transformer owning the in-checkpoint head, for the arms that need
+    /// the non-KV half (QSA aux entry, `seq_offset`, `pos_base`). Null on the
+    /// sidecar arm and whenever `kv()` is null, so the two always travel
+    /// together.
+    pub fn head(self: *MtpCacheRef) ?*Transformer {
+        return switch (self.*) {
+            .qwen => null,
+            .qwen4 => |t| if (mtpHeadPersistEnabled()) t else null,
         };
     }
 
@@ -14652,4 +14686,17 @@ test "mtpSerialCaptureReady: the capture step's entry invariant is a RUNTIME che
         return error.MissingGiveUp;
     const give_end = std.mem.indexOfPos(u8, src, give_at, "\n    }\n") orelse src.len;
     try testing.expect(std.mem.indexOf(u8, src[give_at..give_end], "mtp_serial_giveup_" ++ "logged") != null);
+}
+
+test "MTP head persistence kill switch: only a literal 0 turns it off" {
+    // `MLX_SERVE_MTP_HEAD_PERSIST=0` restores the pre-persistence behaviour
+    // for the qwen4_exp in-checkpoint head — `kv()`/`head()` return null, so
+    // its committed history is neither snapshotted nor restored and every
+    // reused prefix starts from `qwen4MtpReset`. Absent OR empty is ON: a
+    // harness that exports the variable bare must not silently disable a
+    // default-on path (the `QWEN4_PROFILE_FWD=0` class).
+    try testing.expect(mtpHeadPersistFromEnv(null));
+    try testing.expect(mtpHeadPersistFromEnv(""));
+    try testing.expect(mtpHeadPersistFromEnv("1"));
+    try testing.expect(!mtpHeadPersistFromEnv("0"));
 }

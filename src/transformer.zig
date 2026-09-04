@@ -14838,6 +14838,41 @@ pub const Transformer = struct {
         m.seq_offset = len;
     }
 
+    /// Adopt a committed head history from the prefix cache: the head's own
+    /// KV plus the QSA aux entry it is only valid WITH, then trim both to
+    /// `want` rows. Both halves move together — `qwen4MtpTruncate` slices the
+    /// aux history and the pooled bank alongside the KV, and `qsaMaskFromQk`
+    /// errors (`QsaHistoryGap`) the moment the two disagree — so this is the
+    /// ONE entry point for a restore and it never leaves the head half-built:
+    /// any failure resets it back to blank.
+    pub fn qwen4MtpAdopt(
+        self: *Transformer,
+        kv_snap: *const KVCacheSnapshot,
+        aux: *const SSMCacheEntrySnapshot,
+        pos_base: c_int,
+        want: usize,
+    ) !void {
+        const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
+        // The raw index-key history is the authority every new key is
+        // appended against, so a history that is not EXACTLY as long as the
+        // KV it came with is not adoptable at any length.
+        if (aux.aux_state.ctx == null) return error.MtpHeadNoQsaHistory;
+        const aux_shape = mlx.getShape(aux.aux_state);
+        if (aux_shape.len != 3 or aux_shape[1] != @as(c_int, @intCast(kv_snap.step))) return error.MtpHeadQsaHistoryGap;
+        errdefer self.qwen4MtpReset() catch {};
+        try m.cache.restore(kv_snap);
+        // `ssmRestore` REPLACES the aux state (it frees the whole QSA triple
+        // first), so a stale history from the previous request cannot survive.
+        try ssmRestore(&m.entry, aux);
+        m.seq_offset = kv_snap.step;
+        m.pos_base = pos_base;
+        // Unconditional clamp, the trunk restore's rule: a snapshot's buffer
+        // can be longer than the matched prefix and a head row past it drafts
+        // from a position the trunk does not have.
+        try self.qwen4MtpTruncate(want);
+        if (m.seq_offset != want) return error.MtpHeadTrimGap;
+    }
+
     /// `mrope_ctx` (image turns): the head's rows sit at ABSOLUTE positions
     /// `pos_base + seq_offset ..`, so its attention + QSA indexer read the
     /// slot's 3-D table there (prompt rows spanning the image) and the

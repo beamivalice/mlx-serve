@@ -123,6 +123,22 @@ pub const SpecMeta = struct {
     /// count declines (KVCache.restore asserts equal lengths).
     layers: u32,
     quant: kv_quant.KVQuantConfig,
+    /// v5, qwen4_exp MTP head only: the head's QSA aux half lives in the same
+    /// sidecar (`{prefix}h.aux` / `{prefix}h.pooled`). Null on every pre-v5
+    /// manifest and for every KV-only spec cache, and a null here is a
+    /// head-only MISS at restore — the trunk entry is unaffected.
+    head: ?SpecHeadMeta = null,
+};
+
+/// v5 head half of a `SpecMeta`. The tensors themselves are in the sidecar;
+/// these are the scalars the head's position bookkeeping needs.
+pub const SpecHeadMeta = struct {
+    /// Absolute position of the head's key row 0 (`Qwen4Mtp.pos_base`).
+    pos_base: i32,
+    /// `SSMCacheEntry.qsa_ratio` at commit.
+    ratio: i32,
+    /// Was a pooled block bank persisted beside the raw key history?
+    pooled: bool,
 };
 
 /// What `appendCommitWithSpec` reads to persist one spec snapshot — the same
@@ -132,6 +148,11 @@ pub const SpecCommit = struct {
     step: usize,
     config: kv_quant.KVQuantConfig,
     base_pos: usize,
+    /// qwen4_exp MTP head: the QSA aux half, persisted alongside the KV so a
+    /// disk hit adopts the head under the same all-or-nothing rule the RAM
+    /// tier uses.
+    head_aux: ?*const transformer_mod.SSMCacheEntrySnapshot = null,
+    head_pos_base: c_int = 0,
 };
 
 pub const SpecKind = enum { dflash, mtp };
@@ -893,7 +914,14 @@ pub const DiskTier = struct {
     /// committed state.
     fn specWorkPending(e: *const IndexEntry, dflash: ?SpecCommit, mtp: ?SpecCommit) bool {
         return (dflash != null and e.spec_dflash == null) or
-            (mtp != null and e.spec_mtp == null);
+            (mtp != null and e.spec_mtp == null) or
+            // v5 upgrade: an entry persisted by an older binary (or by a
+            // commit that had no head) carries a KV-only MTP snap. A commit
+            // that DOES bring the head's QSA half is new work — without this
+            // the head would never reach an entry that already exists, and
+            // every disk hit on it would decline forever.
+            (mtp != null and mtp.?.head_aux != null and
+                (e.spec_mtp == null or e.spec_mtp.?.head == null));
     }
 
     /// Write (or delete) the entry's ONE spec sidecar from this commit's
@@ -934,12 +962,40 @@ pub const DiskTier = struct {
                 try self.insertSpecSlice(map, prefix, li, "vb", entry.values_biases, limit, s);
             }
         }
+        // v5 head half: the QSA raw-key history and pooled block bank go in
+        // WHOLE (they are already exactly `limit` rows / their block count —
+        // the commit trimmed the head before snapshotting).
+        var head: ?SpecHeadMeta = null;
+        if (sc.head_aux) |a| {
+            // The key history is the AUTHORITY the KV position is checked
+            // against (`qsaMaskFromQk` → QsaHistoryGap), so a history that is
+            // not exactly `limit` rows is not persistable: drop the head half
+            // and keep the KV, which the loader then declines.
+            const rows_ok = a.aux_state.ctx != null and mlx.getShape(a.aux_state).len == 3 and
+                mlx.getShape(a.aux_state)[1] == @as(c_int, @intCast(limit));
+            if (rows_ok) {
+                try self.insertSpecArray(map, prefix, "h.aux", a.aux_state);
+                if (a.qsa_pooled.ctx != null) try self.insertSpecArray(map, prefix, "h.pooled", a.qsa_pooled);
+                head = .{
+                    .pos_base = sc.head_pos_base,
+                    .ratio = a.qsa_ratio,
+                    .pooled = a.qsa_pooled.ctx != null,
+                };
+            }
+        }
         return .{
             .base = sc.base_pos,
             .step = limit,
             .layers = @intCast(sc.entries.len),
             .quant = sc.config,
+            .head = head,
         };
+    }
+
+    fn insertSpecArray(self: *DiskTier, map: mlx.mlx_map_string_to_array, prefix: []const u8, kind: []const u8, arr: mlx.mlx_array) !void {
+        const key = try std.fmt.allocPrint(self.allocator, "{s}{s}\x00", .{ prefix, kind });
+        defer self.allocator.free(key);
+        try mlx.check(mlx.mlx_map_string_to_array_insert(map, @ptrCast(key.ptr), arr));
     }
 
     fn insertSpecSlice(self: *DiskTier, map: mlx.mlx_map_string_to_array, prefix: []const u8, layer: usize, kind: []const u8, buf: mlx.mlx_array, limit: u32, s: mlx.mlx_stream) !void {
@@ -969,7 +1025,13 @@ pub const DiskTier = struct {
         which: SpecKind,
         expected_layers: usize,
         target_config: kv_quant.KVQuantConfig,
-    ) ?struct { snap: transformer_mod.KVCacheSnapshot, base: usize } {
+    ) ?struct {
+        snap: transformer_mod.KVCacheSnapshot,
+        base: usize,
+        /// v5 qwen4_exp head half; null on every other entry (see SpecMeta).
+        head_aux: ?transformer_mod.SSMCacheEntrySnapshot = null,
+        head_pos_base: c_int = 0,
+    } {
         const e = &self.entries.items[idx];
         const meta = (switch (which) {
             .dflash => e.spec_dflash,
@@ -1081,7 +1143,52 @@ pub const DiskTier = struct {
                 };
             }
         }
-        return .{ .snap = snap, .base = meta.base };
+        // v5 head half. Best-effort like everything else on this path: a
+        // pre-v5 sidecar (or a salvage-dropped one) simply returns none and
+        // the qwen4 head then declines the adoption — the trunk restore that
+        // already happened is untouched.
+        var head_aux: ?transformer_mod.SSMCacheEntrySnapshot = null;
+        var head_pos_base: c_int = 0;
+        if (meta.head) |hm| head: {
+            const aux = getSpecArray(tensor_map, self.allocator, prefix, "h.aux") orelse break :head;
+            var snap_aux: transformer_mod.SSMCacheEntrySnapshot = .{
+                .conv_state = mlx.mlx_array_new(),
+                .ssm_state = mlx.mlx_array_new(),
+                .initialized = true,
+                .aux_state = aux,
+                .qsa_ratio = hm.ratio,
+            };
+            if (hm.pooled) {
+                snap_aux.qsa_pooled = getSpecArray(tensor_map, self.allocator, prefix, "h.pooled") orelse {
+                    transformer_mod.ssmSnapshotDeinit(&snap_aux);
+                    break :head;
+                };
+            }
+            const vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(vec);
+            _ = mlx.mlx_vector_array_append_value(vec, snap_aux.aux_state);
+            if (snap_aux.qsa_pooled.ctx != null) _ = mlx.mlx_vector_array_append_value(vec, snap_aux.qsa_pooled);
+            mlx.check(mlx.mlx_eval(vec)) catch {
+                transformer_mod.ssmSnapshotDeinit(&snap_aux);
+                break :head;
+            };
+            head_aux = snap_aux;
+            head_pos_base = hm.pos_base;
+        }
+        return .{ .snap = snap, .base = meta.base, .head_aux = head_aux, .head_pos_base = head_pos_base };
+    }
+
+    /// One optional non-layer tensor out of the loaded sidecar map. Returns
+    /// the +1 handle `_get` hands over, or null when the key is absent.
+    fn getSpecArray(map: mlx.mlx_map_string_to_array, allocator: std.mem.Allocator, prefix: []const u8, kind: []const u8) ?mlx.mlx_array {
+        const key = std.fmt.allocPrint(allocator, "{s}{s}\x00", .{ prefix, kind }) catch return null;
+        defer allocator.free(key);
+        var arr = mlx.mlx_array_new();
+        if (mlx.mlx_map_string_to_array_get(&arr, map, @ptrCast(key.ptr)) != 0) {
+            _ = mlx.mlx_array_free(arr);
+            return null;
+        }
+        return arr;
     }
 
     fn writeChunkFile(
@@ -1420,7 +1527,7 @@ pub const DiskTier = struct {
             var wb: [1024]u8 = undefined;
             var fw = f.writer(self.io, &wb);
             try fw.interface.print(
-                "{{\"v\":4,\"kv_len\":{d},\"tokens\":{d},\"has_tools\":{},\"scheme\":\"{s}\",\"bits\":{d},\"group_size\":{d},\"chunk_tokens\":{d},\"bytes\":{d},\"chunk_bytes\":[",
+                "{{\"v\":5,\"kv_len\":{d},\"tokens\":{d},\"has_tools\":{},\"scheme\":\"{s}\",\"bits\":{d},\"group_size\":{d},\"chunk_tokens\":{d},\"bytes\":{d},\"chunk_bytes\":[",
                 .{
                     e.kv_len,
                     e.tokens.len,
@@ -1527,11 +1634,13 @@ pub const DiskTier = struct {
 
         const version = jsonU64(obj, "v") orelse return null;
         // v2 = pure-attention (no ssm field); v3 adds SSM checkpoints; v4
-        // adds optional spec snapshots (dflash context / MTP history). All
-        // restore — a lower-version entry just carries none of the newer
-        // optional state, so an upgrade doesn't nuke existing disk caches.
-        // Older layouts are dropped, not migrated.
-        if (version != 2 and version != 3 and version != 4) return null;
+        // adds optional spec snapshots (dflash context / MTP history); v5
+        // adds the qwen4_exp MTP head's QSA half beside its KV. All restore —
+        // a lower-version entry just carries none of the newer optional
+        // state, so an upgrade doesn't nuke existing disk caches (a v4 spec
+        // sidecar is still a valid KV-only snap; only the qwen4 head declines
+        // it). Older layouts are dropped, not migrated.
+        if (version < 2 or version > 5) return null;
         var kv_len = jsonU64(obj, "kv_len") orelse return null;
         const n_tokens = jsonU64(obj, "tokens") orelse return null;
         const chunk_tokens = jsonU64(obj, "chunk_tokens") orelse return null;
@@ -1796,9 +1905,13 @@ fn jsonU64(obj: std.json.ObjectMap, key: []const u8) ?u64 {
 }
 
 fn writeSpecMetaJson(w: *std.Io.Writer, name: []const u8, sm: SpecMeta) !void {
-    try w.print(",\"{s}\":{{\"base\":{d},\"step\":{d},\"layers\":{d},\"scheme\":\"{s}\",\"bits\":{d},\"group_size\":{d}}}", .{
+    try w.print(",\"{s}\":{{\"base\":{d},\"step\":{d},\"layers\":{d},\"scheme\":\"{s}\",\"bits\":{d},\"group_size\":{d}", .{
         name, sm.base, sm.step, sm.layers, @tagName(sm.quant.scheme), sm.quant.bits, sm.quant.group_size,
     });
+    if (sm.head) |h| try w.print(",\"head\":{{\"pos_base\":{d},\"ratio\":{d},\"pooled\":{s}}}", .{
+        h.pos_base, h.ratio, if (h.pooled) "true" else "false",
+    });
+    try w.print("}}", .{});
 }
 
 fn parseSpecMeta(obj: std.json.ObjectMap, key: []const u8) ?SpecMeta {
@@ -1824,7 +1937,20 @@ fn parseSpecMeta(obj: std.json.ObjectMap, key: []const u8) ?SpecMeta {
         },
         else => return null,
     };
-    return .{ .base = base, .step = @intCast(step), .layers = @intCast(layers), .quant = quant };
+    // v5 head half; absent on every earlier manifest (head-only miss).
+    var head: ?SpecHeadMeta = null;
+    if (o.get("head")) |hv| head_blk: {
+        if (hv != .object) break :head_blk;
+        const ho = hv.object;
+        const pb = ho.get("pos_base") orelse break :head_blk;
+        if (pb != .integer) break :head_blk;
+        const ratio = jsonU64(ho, "ratio") orelse break :head_blk;
+        if (ratio == 0) break :head_blk;
+        const pooled_v = ho.get("pooled") orelse break :head_blk;
+        if (pooled_v != .bool) break :head_blk;
+        head = .{ .pos_base = @intCast(pb.integer), .ratio = @intCast(ratio), .pooled = pooled_v.bool };
+    }
+    return .{ .base = base, .step = @intCast(step), .layers = @intCast(layers), .quant = quant, .head = head };
 }
 
 // ── Tests ──
@@ -2312,6 +2438,16 @@ fn makeArange(s: mlx.mlx_stream, shape: []const c_int, base: f64) mlx.mlx_array 
     return out;
 }
 
+/// A test tensor of `shape` filled with `v` (f32). Owned by the caller.
+fn filledArray(shape: []const c_int, v: f32, s: mlx.mlx_stream) !mlx.mlx_array {
+    const scalar = mlx.mlx_array_new_float(v);
+    defer _ = mlx.mlx_array_free(scalar);
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_full(&out, shape.ptr, shape.len, scalar, .float32, s));
+    return out;
+}
+
 fn ssmArrVal(arr: mlx.mlx_array, idx: usize, s: mlx.mlx_stream) f32 {
     var f = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(f);
@@ -2753,7 +2889,7 @@ test "DiskTier: v4 spec snapshots round-trip; geometry mismatches decline; v3 re
         defer rewritten.deinit(testing.allocator);
         try rewritten.appendSlice(testing.allocator, content[0..spec_at]);
         try rewritten.append(testing.allocator, '}');
-        _ = std.mem.replace(u8, rewritten.items, "\"v\":4", "\"v\":3", rewritten.items);
+        _ = std.mem.replace(u8, rewritten.items, "\"v\":5", "\"v\":3", rewritten.items);
         const f = try std.Io.Dir.createFileAbsolute(io, meta_path, .{});
         defer f.close(io);
         var wb: [4096]u8 = undefined;
@@ -2840,4 +2976,138 @@ test "modelFingerprint: rolls with --config-overrides" {
     const fp_ws = try modelFingerprint(testing.allocator, io, dir_a);
     defer testing.allocator.free(fp_ws);
     try testing.expect(!std.mem.eql(u8, fp_over, fp_ws));
+}
+
+test "spec meta json: the v5 head half round-trips and a v4 record parses without one" {
+    // The qwen4_exp MTP head's QSA half rides the SAME spec sidecar, so its
+    // scalars ride the SAME meta record. A pre-v5 manifest simply has no
+    // "head" object — which is a head-only MISS at restore, never a dropped
+    // entry: the KV half of that record is still a valid KV-only snap.
+    var buf: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    const sm: SpecMeta = .{
+        .base = 62_000,
+        .step = 700,
+        .layers = 1,
+        .quant = kv_quant.KVQuantConfig.dense,
+        .head = .{ .pos_base = 1, .ratio = 4, .pooled = true },
+    };
+    try writeSpecMetaJson(&w, "mtp", sm);
+    // The helper emits a leading comma (it is written inside an object).
+    const rec = try std.fmt.allocPrint(testing.allocator, "{{\"bytes\":1{s}}}", .{w.buffered()});
+    defer testing.allocator.free(rec);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, rec, .{});
+    defer parsed.deinit();
+    const back = parseSpecMeta(parsed.value.object, "mtp") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(sm.base, back.base);
+    try testing.expectEqual(sm.step, back.step);
+    const h = back.head orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(i32, 1), h.pos_base);
+    try testing.expectEqual(@as(i32, 4), h.ratio);
+    try testing.expect(h.pooled);
+
+    // A v4-shaped record (no "head") parses, with the head half absent.
+    const v4 = "{\"mtp\":{\"base\":5,\"step\":9,\"layers\":1,\"scheme\":\"off\",\"bits\":0,\"group_size\":0}}";
+    var p4 = try std.json.parseFromSlice(std.json.Value, testing.allocator, v4, .{});
+    defer p4.deinit();
+    const old = parseSpecMeta(p4.value.object, "mtp") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u64, 5), old.base);
+    try testing.expectEqual(@as(?SpecHeadMeta, null), old.head);
+}
+
+test "DiskTier: the qwen4 MTP head's QSA half round-trips exactly; a head-less sidecar declines the head only" {
+    // The head's KV is meaningless without the raw index-key history it was
+    // built beside, so the sidecar carries both — and a pre-v5 sidecar (or
+    // one written by a commit that had no head) comes back KV-only, which is
+    // a head-only miss: the caller declines the adoption and drafts blind,
+    // while the trunk entry keeps working.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-head", 0, 128);
+    defer tier.deinit();
+
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 600, 8, 0.0, .float32);
+    var mtp = try KVCache.init(testing.allocator, 1);
+    defer mtp.deinit();
+    try fillCache(&mtp, s, 1, 600, 8, 9.5, .float32);
+
+    // The QSA half: a [1, 600, 8] key history and its [1, 150, 8] pooled bank
+    // (ratio 4). Distinct values so a swapped tensor cannot false-pass.
+    var aux_src: SSMCacheEntry = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = true };
+    defer {
+        _ = mlx.mlx_array_free(aux_src.conv_state);
+        _ = mlx.mlx_array_free(aux_src.ssm_state);
+        transformer_mod.ssmFreeQsaState(&aux_src);
+    }
+    aux_src.aux_state = try filledArray(&[_]c_int{ 1, 600, 8 }, 4.25, s);
+    aux_src.qsa_pooled = try filledArray(&[_]c_int{ 1, 150, 8 }, -1.75, s);
+    aux_src.qsa_ratio = 4;
+    var head_snap = transformer_mod.ssmSnapshot(&aux_src);
+    defer transformer_mod.ssmSnapshotDeinit(&head_snap);
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 11);
+    _ = try tier.appendCommitWithSpec(
+        cache.entries,
+        cache.step,
+        cache.config,
+        &tokens,
+        false,
+        null,
+        null,
+        .{
+            .entries = mtp.entries,
+            .step = mtp.step,
+            .config = mtp.config,
+            .base_pos = 0,
+            .head_aux = &head_snap,
+            .head_pos_base = 1,
+        },
+        s,
+    );
+
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-head", 0, 128);
+    defer tier2.deinit();
+    const m = tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
+    var loaded = tier2.loadSpecSnap(m.idx, .mtp, 1, kv_quant.KVQuantConfig.dense) orelse
+        return error.TestExpectedSpecSnap;
+    defer loaded.snap.deinit();
+    try testing.expectEqual(@as(usize, 600), loaded.snap.step);
+    var back = loaded.head_aux orelse return error.TestExpectedHeadSnap;
+    defer transformer_mod.ssmSnapshotDeinit(&back);
+    try testing.expectEqual(@as(c_int, 1), loaded.head_pos_base);
+    try testing.expectEqual(@as(c_int, 4), back.qsa_ratio);
+    try testing.expectEqual(@as(c_int, 600), mlx.getShape(back.aux_state)[1]);
+    try testing.expectEqual(@as(c_int, 150), mlx.getShape(back.qsa_pooled)[1]);
+    try testing.expectEqual(@as(f32, 4.25), ssmArrVal(back.aux_state, 0, s));
+    try testing.expectEqual(@as(f32, -1.75), ssmArrVal(back.qsa_pooled, 0, s));
+
+    // Second entry, MTP history but NO head: the KV half loads, the head
+    // half is absent — exactly what a pre-v5 sidecar looks like.
+    var tokens_b: [600]u32 = undefined;
+    for (&tokens_b, 0..) |*t, i| t.* = @intCast(i + 700_000);
+    _ = try tier2.appendCommitWithSpec(
+        cache.entries,
+        cache.step,
+        cache.config,
+        &tokens_b,
+        false,
+        null,
+        null,
+        .{ .entries = mtp.entries, .step = mtp.step, .config = mtp.config, .base_pos = 0 },
+        s,
+    );
+    const mb = tier2.bestMatch(&tokens_b, false, kv_quant.KVQuantConfig.dense).?;
+    var kv_only = tier2.loadSpecSnap(mb.idx, .mtp, 1, kv_quant.KVQuantConfig.dense) orelse
+        return error.TestExpectedSpecSnap;
+    defer kv_only.snap.deinit();
+    try testing.expectEqual(@as(usize, 600), kv_only.snap.step);
+    try testing.expect(kv_only.head_aux == null);
 }

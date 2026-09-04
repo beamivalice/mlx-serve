@@ -4616,7 +4616,15 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
             log.warn("[hot-cache] mtp history trim failed: {s} — not committed\n", .{@errorName(err)});
             break :blk null;
         };
-        break :blk .{ .cache = mc.kv() orelse break :blk null, .base_pos = gen_ptr.mtp_position_base };
+        // The qwen4_exp in-checkpoint head also commits its QSA half — its KV
+        // alone is not a restorable history (`MtpCacheRef.head`).
+        const head = mc.head();
+        break :blk .{
+            .cache = mc.kv() orelse break :blk null,
+            .base_pos = gen_ptr.mtp_position_base,
+            .head = if (head) |t| &t.qwen4_mtp.?.entry else null,
+            .head_pos_base = if (head) |t| t.qwen4_mtp.?.pos_base else 0,
+        };
     };
     hc.commitWithMediaState(&slot.cache, total_tokens, slot.has_tools, slot.vision_key, slot.media_start, ssm_cps_opt, dflash_commit, mtp_commit) catch |err| {
         // Ownership of the checkpoints transferred to the cache regardless of
@@ -5353,6 +5361,10 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             errdefer if (mtp_target) |*mc| mc.deinit();
             var mtp_base: usize = 0;
             const mtp_kv: ?*KVCache = if (mtp_target) |*mc| mc.kv() else null;
+            // qwen4_exp: the head's QSA half travels with its KV, so the
+            // target names the Transformer too and the adoption is
+            // all-or-nothing inside `restoreSpecSnap`.
+            const mtp_head: ?*Transformer = if (mtp_target) |*mc| mc.head() else null;
             const lookup = hc.lookupAndRestoreWithMedia(
                 &slot.cache,
                 &slot.moe_seq_offset,
@@ -5363,7 +5375,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 slot.vision_key,
                 slot.media_start,
                 if (dfl_target) |*dc| .{ .cache = &dc.cache, .base_pos = &dfl_base } else null,
-                if (mtp_kv) |k| .{ .cache = k, .base_pos = &mtp_base } else null,
+                if (mtp_kv) |k| .{ .cache = k, .base_pos = &mtp_base, .head = mtp_head } else null,
             ) catch |err| blk: {
                 log.warn("[hot-cache] lookup failed: {s} — proceeding with cold prefill\n", .{@errorName(err)});
                 break :blk prefix_cache_mod.LookupResult{ .matched = 0, .full_match = false };
