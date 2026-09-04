@@ -1360,6 +1360,21 @@ pub const Generator = struct {
     /// - `per_draft_pct` (drafter only) = accepts / (attempts × (block_size-1)),
     ///   the per-draft acceptance probability comparable to vLLM's reported
     ///   "62% acceptance rate" metric.
+    /// Which QSA arm served this request's attention (qwen4_exp only; no-op
+    /// elsewhere). The engaged/declined meters are one-shots for the whole
+    /// PROCESS, so they cannot say what ran on THIS request at THIS context
+    /// length — a gather that quietly hands every call back to the dense mask
+    /// (a full kv8 dequant per layer per forward) otherwise reads like a
+    /// healthy run. Emitted next to `[spec-stats]`; resets the tally.
+    pub fn logQsaArms(self: *Generator) void {
+        const c = self.xfm.qsaArmsTake() orelse return;
+        const arm = c.majority() orelse return;
+        log.info(
+            "  [qsa-arms] qsa={s} calls={d} mask={d} decode={d} verify={d} prefill={d}\n",
+            .{ @tagName(arm), c.total(), c.mask, c.decode, c.verify, c.prefill },
+        );
+    }
+
     pub fn logSpecStats(self: *const Generator) void {
         var table_buf: [256]u8 = undefined;
         var hist_buf: [256]u8 = undefined;
@@ -8438,6 +8453,7 @@ fn finishDrafterResult(
         });
     }
     gen.logSpecStats();
+    gen.logQsaArms();
     const strip_leading = tok.tok_type == .sentencepiece_bpe;
     const text = try tok.decode(allocator, output_ids.items, strip_leading);
     const token_ids = try output_ids.toOwnedSlice(allocator);
@@ -8543,6 +8559,7 @@ pub fn generateMtp(
         });
     }
     gen.logSpecStats();
+    gen.logQsaArms();
     const strip_leading = tok.tok_type == .sentencepiece_bpe;
     const text = try tok.decode(allocator, output_ids.items, strip_leading);
     const token_ids = try output_ids.toOwnedSlice(allocator);
@@ -8593,6 +8610,7 @@ fn finishPldResult(
         });
     }
     gen.logSpecStats();
+    gen.logQsaArms();
     const strip_leading = tok.tok_type == .sentencepiece_bpe;
     const text = try tok.decode(allocator, output_ids.items, strip_leading);
     const token_ids = try output_ids.toOwnedSlice(allocator);

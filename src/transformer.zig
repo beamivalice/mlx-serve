@@ -2914,8 +2914,6 @@ fn getAttnQsa256Kernel() !mlx.mlx_fast_metal_kernel {
     return kernel;
 }
 
-var qsa_gather_logged = false;
-
 /// Block-gathered QSA attention (qwen4_exp prefill): `blocks` is the
 /// [B, S, KB] int32 selection, each row ascending with INT_MAX past its
 /// count; `ratio` tokens per block. Same envelope as the p256 kernel (hd
@@ -2974,14 +2972,152 @@ pub fn gatherQsa256(
     if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
-    if (!qsa_gather_logged) {
-        qsa_gather_logged = true;
-        log.info("[qsa-gather] engaged: msv_attn_qsa256 qL={d} kL={d} blocks={d} bk={d} (MLX_SERVE_QSA_GATHER=0 restores the dense mask arm)\n", .{ qs[2], ks[2], bs[2], bk });
+    if (qsa_engaged_bits.take(qsaEngagedBit(.prefill_gather, qs[2]))) {
+        log.info("[qsa-gather] engaged: msv_attn_qsa256 S={d} kv={d} blocks={d} bk={d} (MLX_SERVE_QSA_GATHER=0 restores the dense mask arm)\n", .{ qs[2], ks[2], bs[2], bk });
     }
     return out;
 }
 
-var qsa_decode_gather_logged = false;
+// ── QSA arm meters ──
+//
+// A single process-global `engaged` bool is not a meter: it fires on the
+// first request of a session and then says nothing about the width or the
+// context length that is actually slow, and a DECLINE says nothing at all —
+// so a gather that silently hands every 62k decode step back to the dense
+// mask (a full kv8 dequant per layer per step) reads exactly like a healthy
+// run. These three pieces make the arm that ran observable: one-shot bits
+// per (arm, width bucket) for engagement, one-shot bits per reason for
+// declines, and a per-request tally.
+
+/// One-shot gate keyed by a small bit index. `take` returns true the FIRST
+/// time each bit is asked for.
+pub const OneShotBits = struct {
+    seen: u32 = 0,
+
+    pub fn take(self: *OneShotBits, bit: u5) bool {
+        const m: u32 = @as(u32, 1) << bit;
+        if (self.seen & m != 0) return false;
+        self.seen |= m;
+        return true;
+    }
+    pub fn reset(self: *OneShotBits) void {
+        self.seen = 0;
+    }
+};
+
+/// Which arm served one qwen4_exp full-attention call.
+pub const QsaArm = enum(u2) { mask = 0, decode_gather = 1, verify_gather = 2, prefill_gather = 3 };
+
+/// Query-width bucket: decode (1), verify (2 .. FUSED256_MIN_Q_LEN-1),
+/// prefill (>= FUSED256_MIN_Q_LEN). The meters are one-shot PER BUCKET so a
+/// decode-width engagement at 16k cannot vouch for a verify-width call at
+/// 62k — which is exactly the confusion a single global bool created.
+pub fn qsaWidthBucket(seq_len: c_int) u2 {
+    if (seq_len <= 1) return 0;
+    if (seq_len < FUSED256_MIN_Q_LEN) return 1;
+    return 2;
+}
+
+/// Why a gather arm handed the call back to the dense mask.
+pub const QsaDeclineReason = enum(u5) {
+    disabled,
+    width,
+    geometry,
+    dtype,
+    kv_floor,
+    no_win,
+    quant_layout,
+    gather_shape,
+
+    pub fn text(self: QsaDeclineReason) []const u8 {
+        return switch (self) {
+            .disabled => "kill switch",
+            .width => "query width not this arm's",
+            .geometry => "geometry",
+            .dtype => "dtype",
+            .kv_floor => "kv below the arm's floor",
+            .no_win => "no sparsity win (gathered rows >= kv)",
+            .quant_layout => "quant triple layout",
+            .gather_shape => "gathered slab shape",
+        };
+    }
+};
+
+/// Decline reporter threaded through one gather call: `no(reason)` logs at
+/// most once per (arm, reason) for the process and hands the caller the
+/// decline. `s`/`kv` are filled in as soon as the guards learn them (-1 =
+/// not yet known at that guard).
+pub const QsaDecline = struct {
+    bits: *OneShotBits,
+    arm: []const u8,
+    s: c_int = -1,
+    kv: c_int = -1,
+
+    pub fn no(self: *QsaDecline, r: QsaDeclineReason) ?mlx.mlx_array {
+        if (self.bits.take(@intFromEnum(r))) {
+            log.info(
+                "[{s}] declined: {s} (S={d} kv={d}) — the dense [S, kv] mask arm serves this call\n",
+                .{ self.arm, r.text(), self.s, self.kv },
+            );
+        }
+        return null;
+    }
+};
+
+/// Per-request tally of which arm served each full-attention call. Three
+/// increments per attention layer; read and reset where the request's
+/// `[mtp-trace]` line is emitted.
+pub const QsaArmCounts = struct {
+    mask: u32 = 0,
+    decode: u32 = 0,
+    verify: u32 = 0,
+    prefill: u32 = 0,
+
+    pub fn note(self: *QsaArmCounts, arm: QsaArm) void {
+        switch (arm) {
+            .mask => self.mask +|= 1,
+            .decode_gather => self.decode +|= 1,
+            .verify_gather => self.verify +|= 1,
+            .prefill_gather => self.prefill +|= 1,
+        }
+    }
+    pub fn total(self: QsaArmCounts) u32 {
+        return self.mask +| self.decode +| self.verify +| self.prefill;
+    }
+    /// The arm that served the most calls; null when nothing was counted.
+    /// Ties break toward the CHEAPEST arm that could have run so a tie never
+    /// reads as "the mask arm is fine".
+    pub fn majority(self: QsaArmCounts) ?QsaArm {
+        if (self.total() == 0) return null;
+        var best: QsaArm = .mask;
+        var best_n: u32 = self.mask;
+        if (self.decode >= best_n) {
+            best = .decode_gather;
+            best_n = self.decode;
+        }
+        if (self.verify >= best_n) {
+            best = .verify_gather;
+            best_n = self.verify;
+        }
+        if (self.prefill >= best_n) {
+            best = .prefill_gather;
+            best_n = self.prefill;
+        }
+        return best;
+    }
+    pub fn reset(self: *QsaArmCounts) void {
+        self.* = .{};
+    }
+};
+
+/// Engagement meters, one-shot per (arm, width bucket): bit = arm*4 + bucket.
+var qsa_engaged_bits: OneShotBits = .{};
+var qsa_decode_decline_bits: OneShotBits = .{};
+var qsa_verify_decline_bits: OneShotBits = .{};
+
+fn qsaEngagedBit(arm: QsaArm, seq_len: c_int) u5 {
+    return @as(u5, @intFromEnum(arm)) * 4 + @as(u5, qsaWidthBucket(seq_len));
+}
 
 /// take_axis + materialized copy: quantized kernels (dequantize included)
 /// misread the strided view take hands back, so the gather-then-dequantize
@@ -3018,40 +3154,44 @@ pub fn qsaDecodeGatherAttn(
     ratio: c_int,
     attn_scale: f32,
 ) !?mlx.mlx_array {
-    if (!qsaDecodeGatherEnabled()) return null;
-    if (mlx.mlx_array_ndim(q_rope) != 4 or mlx.mlx_array_ndim(blocks) != 3) return null;
+    var dq = QsaDecline{ .bits = &qsa_decode_decline_bits, .arm = "qsa-decode-gather" };
+    if (!qsaDecodeGatherEnabled()) return dq.no(.disabled);
+    if (mlx.mlx_array_ndim(q_rope) != 4 or mlx.mlx_array_ndim(blocks) != 3) return dq.no(.geometry);
     const qs = mlx.getShape(q_rope);
-    if (qs[0] != 1 or qs[2] != 1) return null;
-    if (mlx.mlx_array_dtype(q_rope) != .bfloat16) return null;
-    if (mlx.mlx_array_dtype(blocks) != .int32) return null;
+    dq.s = qs[2];
+    if (qs[0] != 1) return dq.no(.geometry);
+    if (qs[2] != 1) return dq.no(.width);
+    if (mlx.mlx_array_dtype(q_rope) != .bfloat16) return dq.no(.dtype);
+    if (mlx.mlx_array_dtype(blocks) != .int32) return dq.no(.dtype);
     const bs = mlx.getShape(blocks);
-    if (bs[0] != 1 or bs[1] != 1) return null;
+    if (bs[0] != 1 or bs[1] != 1) return dq.no(.geometry);
     const kb: c_int = bs[2];
-    if (kb <= 0 or ratio <= 0) return null;
+    if (kb <= 0 or ratio <= 0) return dq.no(.geometry);
     const h_q: c_int = qs[1];
     const head_dim: c_int = qs[3];
-    if (h_q <= 0 or head_dim <= 0) return null;
+    if (h_q <= 0 or head_dim <= 0) return dq.no(.geometry);
 
     // Cache geometry off the dense K (present in every scheme; shapes are
     // known without executing the lazy dequant graph).
-    if (kv_view.k.ctx == null or kv_view.v.ctx == null) return null;
+    if (kv_view.k.ctx == null or kv_view.v.ctx == null) return dq.no(.geometry);
     const ks = mlx.getShape(kv_view.k);
-    if (ks.len != 4 or ks[0] != 1) return null;
+    if (ks.len != 4 or ks[0] != 1) return dq.no(.geometry);
     const h_kv: c_int = ks[1];
     const kv: c_int = ks[2];
-    if (h_kv <= 0 or kv <= 0 or @rem(h_q, h_kv) != 0) return null;
-    if (ks[3] != head_dim) return null;
+    dq.kv = kv;
+    if (h_kv <= 0 or kv <= 0 or @rem(h_q, h_kv) != 0) return dq.no(.geometry);
+    if (ks[3] != head_dim) return dq.no(.geometry);
     const vs = mlx.getShape(kv_view.v);
-    if (vs.len != 4 or vs[0] != 1 or vs[1] != h_kv or vs[2] != kv or vs[3] != head_dim) return null;
+    if (vs.len != 4 or vs[0] != 1 or vs[1] != h_kv or vs[2] != kv or vs[3] != head_dim) return dq.no(.geometry);
 
     const nb: c_int = @divTrunc(kv, ratio);
     const tail_start: c_int = nb * ratio;
     const tail_len: c_int = kv - tail_start;
-    if (tail_len < 0) return null;
+    if (tail_len < 0) return dq.no(.geometry);
     const sel_len: c_int = kb * ratio;
     const gathered_len: c_int = sel_len + tail_len;
     // No sparsity win (or degenerate): keep the mask arm.
-    if (gathered_len <= 0 or gathered_len >= kv) return null;
+    if (gathered_len <= 0 or gathered_len >= kv) return dq.no(.no_win);
 
     // Token ids: selected blocks' ratio tokens each (sentinel → 0, masked
     // below) then the incomplete tail. Reachable decode rows have no
@@ -3148,11 +3288,11 @@ pub fn qsaDecodeGatherAttn(
     if (kv_view.has_quant_triple and (kv_view.bits == 4 or kv_view.bits == 8)) {
         const kq = kv_view.k_triple_q;
         const vq = kv_view.v_triple_q;
-        if (kq.ctx == null or vq.ctx == null) return null;
+        if (kq.ctx == null or vq.ctx == null) return dq.no(.quant_layout);
         const kqs = mlx.getShape(kq);
         const vqs = mlx.getShape(vq);
         if (kqs.len != 4 or vqs.len != 4 or kqs[0] != 1 or vqs[0] != 1 or
-            kqs[1] != h_kv or vqs[1] != h_kv or kqs[2] != kv or vqs[2] != kv) return null;
+            kqs[1] != h_kv or vqs[1] != h_kv or kqs[2] != kv or vqs[2] != kv) return dq.no(.quant_layout);
         // Contiguous copies: dequantize misreads the strided take views.
         const gkq = try takeContig(s, kq, idx_u32, 2);
         defer _ = mlx.mlx_array_free(gkq);
@@ -3167,7 +3307,7 @@ pub fn qsaDecodeGatherAttn(
         const gvb = try takeContig(s, kv_view.v_triple_biases, idx_u32, 2);
         defer _ = mlx.mlx_array_free(gvb);
         const gs: u32 = kv_view.group_size;
-        if (gs == 0) return null;
+        if (gs == 0) return dq.no(.quant_layout);
         const gkd = try kv_quant.dequantizeAffine(s, gkq, gks, gkb, gs, kv_view.bits);
         defer _ = mlx.mlx_array_free(gkd);
         const gvd = try kv_quant.dequantizeAffine(s, gvq, gvs, gvb, gs, kv_view.bits);
@@ -3175,23 +3315,22 @@ pub fn qsaDecodeGatherAttn(
         try mlx.check(mlx.mlx_array_set(&gk, gkd));
         try mlx.check(mlx.mlx_array_set(&gv, gvd));
     } else {
-        if (kv_view.k.ctx == null or kv_view.v.ctx == null) return null;
+        if (kv_view.k.ctx == null or kv_view.v.ctx == null) return dq.no(.geometry);
         try mlx.check(mlx.mlx_take_axis(&gk, kv_view.k, idx_u32, 2, s));
         try mlx.check(mlx.mlx_take_axis(&gv, kv_view.v, idx_u32, 2, s));
     }
-    if (mlx.mlx_array_dtype(gk) != mlx.mlx_array_dtype(q_rope)) return null;
+    if (mlx.mlx_array_dtype(gk) != mlx.mlx_array_dtype(q_rope)) return dq.no(.dtype);
     const gks2 = mlx.getShape(gk);
     const gvs2 = mlx.getShape(gv);
     if (gks2.len != 4 or gvs2.len != 4 or gks2[0] != 1 or gvs2[0] != 1 or
         gks2[1] != h_kv or gvs2[1] != h_kv or gks2[2] != gathered_len or gvs2[2] != gathered_len or
-        gks2[3] != head_dim or gvs2[3] != head_dim) return null;
+        gks2[3] != head_dim or gvs2[3] != head_dim) return dq.no(.gather_shape);
 
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out, q_rope, gk, gv, attn_scale, "array", add4, .{ .ctx = null }, false, s));
-    if (!qsa_decode_gather_logged) {
-        qsa_decode_gather_logged = true;
-        log.info("[qsa-decode-gather] engaged: S=1 K'={d} (MLX_SERVE_QSA_DECODE_GATHER=0 restores the dense mask arm)\n", .{gathered_len});
+    if (qsa_engaged_bits.take(qsaEngagedBit(.decode_gather, qs[2]))) {
+        log.info("[qsa-decode-gather] engaged (S={d} kv={d} rows={d}) (MLX_SERVE_QSA_DECODE_GATHER=0 restores the dense mask arm)\n", .{ qs[2], kv, gathered_len });
     }
     return out;
 }
@@ -3387,8 +3526,6 @@ pub fn qsaVerifyPlanHost(
     return .{ .rows = rows, .mask = mask };
 }
 
-var qsa_verify_gather_logged = false;
-
 /// Verify-width QSA gather (2 <= S < FUSED256_MIN_Q_LEN, sorted `blocks`):
 /// gather the fixed-size union of the S rows' selections + the union tail
 /// (see `QsaVerifyGeom`), dequantizing ONLY those rows on a quantized cache,
@@ -3411,32 +3548,35 @@ pub fn qsaVerifyGatherAttn(
     ratio: c_int,
     attn_scale: f32,
 ) !?mlx.mlx_array {
-    if (!qsaVerifyGatherEnabled()) return null;
-    if (mlx.mlx_array_ndim(q_rope) != 4 or mlx.mlx_array_ndim(blocks) != 3) return null;
-    if (mlx.mlx_array_dtype(q_rope) != .bfloat16 or mlx.mlx_array_dtype(blocks) != .int32) return null;
+    var dq = QsaDecline{ .bits = &qsa_verify_decline_bits, .arm = "qsa-verify-gather" };
+    if (!qsaVerifyGatherEnabled()) return dq.no(.disabled);
+    if (mlx.mlx_array_ndim(q_rope) != 4 or mlx.mlx_array_ndim(blocks) != 3) return dq.no(.geometry);
+    if (mlx.mlx_array_dtype(q_rope) != .bfloat16 or mlx.mlx_array_dtype(blocks) != .int32) return dq.no(.dtype);
     const qs = mlx.getShape(q_rope);
-    if (qs[0] != 1) return null;
+    if (qs[0] != 1) return dq.no(.geometry);
     const seq_len: c_int = qs[2];
+    dq.s = seq_len;
     const head_dim: c_int = qs[3];
     const h_q: c_int = qs[1];
-    if (h_q <= 0 or head_dim <= 0) return null;
+    if (h_q <= 0 or head_dim <= 0) return dq.no(.geometry);
     const bs = mlx.getShape(blocks);
-    if (bs[0] != 1 or bs[1] != seq_len or bs[2] <= 0) return null;
+    if (bs[0] != 1 or bs[1] != seq_len or bs[2] <= 0) return dq.no(.geometry);
     const kb: c_int = bs[2];
 
-    if (kv_view.k.ctx == null or kv_view.v.ctx == null) return null;
+    if (kv_view.k.ctx == null or kv_view.v.ctx == null) return dq.no(.geometry);
     const ks = mlx.getShape(kv_view.k);
-    if (ks.len != 4 or ks[0] != 1) return null;
+    if (ks.len != 4 or ks[0] != 1) return dq.no(.geometry);
     const h_kv: c_int = ks[1];
     const kv: c_int = ks[2];
-    if (h_kv <= 0 or kv <= 0 or @rem(h_q, h_kv) != 0) return null;
-    if (ks[3] != head_dim) return null;
+    dq.kv = kv;
+    if (h_kv <= 0 or kv <= 0 or @rem(h_q, h_kv) != 0) return dq.no(.geometry);
+    if (ks[3] != head_dim) return dq.no(.geometry);
     const vs = mlx.getShape(kv_view.v);
-    if (vs.len != 4 or vs[0] != 1 or vs[1] != h_kv or vs[2] != kv or vs[3] != head_dim) return null;
-    if (kv <= qsaVerifyGatherMinKv()) return null;
+    if (vs.len != 4 or vs[0] != 1 or vs[1] != h_kv or vs[2] != kv or vs[3] != head_dim) return dq.no(.geometry);
+    if (kv <= qsaVerifyGatherMinKv()) return dq.no(.kv_floor);
 
-    const geom = QsaVerifyGeom.compute(seq_len, kv, ratio, kb) orelse return null;
-    if (geom.k_blocks <= 0 or geom.rows <= 0 or geom.rows >= kv) return null;
+    const geom = QsaVerifyGeom.compute(seq_len, kv, ratio, kb) orelse return dq.no(.width);
+    if (geom.k_blocks <= 0 or geom.rows <= 0 or geom.rows >= kv) return dq.no(.no_win);
     const offset: c_int = kv - seq_len;
     const nb = geom.nb;
     const sel_w: c_int = nb + 2; // [.. nb-1] real, `nb` = the always-false
@@ -3603,13 +3743,13 @@ pub fn qsaVerifyGatherAttn(
     if (kv_view.has_quant_triple and (kv_view.bits == 4 or kv_view.bits == 8)) {
         const kq = kv_view.k_triple_q;
         const vq = kv_view.v_triple_q;
-        if (kq.ctx == null or vq.ctx == null) return null;
+        if (kq.ctx == null or vq.ctx == null) return dq.no(.quant_layout);
         const kqs = mlx.getShape(kq);
         const vqs = mlx.getShape(vq);
         if (kqs.len != 4 or vqs.len != 4 or kqs[0] != 1 or vqs[0] != 1 or
-            kqs[1] != h_kv or vqs[1] != h_kv or kqs[2] != kv or vqs[2] != kv) return null;
+            kqs[1] != h_kv or vqs[1] != h_kv or kqs[2] != kv or vqs[2] != kv) return dq.no(.quant_layout);
         const gs: u32 = kv_view.group_size;
-        if (gs == 0) return null;
+        if (gs == 0) return dq.no(.quant_layout);
         // Contiguous copies: dequantize misreads the strided take views.
         const gkq = try takeContig(s, kq, tok_u32, 2);
         defer _ = mlx.mlx_array_free(gkq);
@@ -3633,12 +3773,12 @@ pub fn qsaVerifyGatherAttn(
         try mlx.check(mlx.mlx_take_axis(&gk, kv_view.k, tok_u32, 2, s));
         try mlx.check(mlx.mlx_take_axis(&gv, kv_view.v, tok_u32, 2, s));
     }
-    if (mlx.mlx_array_dtype(gk) != .bfloat16 or mlx.mlx_array_dtype(gv) != .bfloat16) return null;
+    if (mlx.mlx_array_dtype(gk) != .bfloat16 or mlx.mlx_array_dtype(gv) != .bfloat16) return dq.no(.dtype);
     const gks2 = mlx.getShape(gk);
     const gvs2 = mlx.getShape(gv);
     if (gks2.len != 4 or gvs2.len != 4 or gks2[0] != 1 or gvs2[0] != 1 or
         gks2[1] != h_kv or gvs2[1] != h_kv or gks2[2] != geom.rows or gvs2[2] != geom.rows or
-        gks2[3] != head_dim or gvs2[3] != head_dim) return null;
+        gks2[3] != head_dim or gvs2[3] != head_dim) return dq.no(.gather_shape);
 
     // hd 256 + an ARRAY mask has no fused arm in MLX: the same row-group
     // split the dense mask arm uses, now over [R] instead of [kv].
@@ -3650,8 +3790,7 @@ pub fn qsaVerifyGatherAttn(
     } else {
         try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out, q_rope, gk, gv, attn_scale, "array", add4, .{ .ctx = null }, false, s));
     }
-    if (!qsa_verify_gather_logged) {
-        qsa_verify_gather_logged = true;
+    if (qsa_engaged_bits.take(qsaEngagedBit(.verify_gather, seq_len))) {
         log.info("[qsa-verify-gather] engaged (S={d} kv={d} rows={d}) (MLX_SERVE_QSA_VERIFY_GATHER=0 restores the dense mask arm)\n", .{ seq_len, kv, geom.rows });
     }
     return out;
@@ -7685,6 +7824,11 @@ pub const Transformer = struct {
     /// the oracle test): the shipped checkpoint is bf16 end to end, the f32
     /// fixture is the tighter bar for the MATH.
     qwen4_stream_f32: bool = false,
+    /// Which QSA arm served each full-attention call of the CURRENT request.
+    /// One increment per attention layer; read + reset where the request's
+    /// `[mtp-trace]` line is emitted (`qsaArmsTake`). A one-shot "engaged"
+    /// meter fires once per session and cannot say what ran at 62k — this can.
+    qsa_arms: QsaArmCounts = .{},
     qwen4_mixer: ?HcWeights = null,
     /// qwen4_exp MTP head (one hyper-connected QSA+MoE layer over the trunk's
     /// pre-mixer stream + next-token embedding). Loaded when the pack carries
@@ -13482,6 +13626,16 @@ pub const Transformer = struct {
         return merged;
     }
 
+    /// Read and clear the request's QSA arm tally. Returns null when nothing
+    /// was counted (not a QSA arch, or below the sparse budget) so a caller
+    /// never prints a meaningless `qsa=mask 0/0`.
+    pub fn qsaArmsTake(self: *Transformer) ?QsaArmCounts {
+        const c = self.qsa_arms;
+        self.qsa_arms.reset();
+        if (c.total() == 0) return null;
+        return c;
+    }
+
     /// Full-attention layer with the QSA mask threaded through
     /// `gatedFullAttnWith` (q-gate, QK norm, partial RoPE, KV cache all shared).
     fn qwen4AttnWith(self: *Transformer, ctx: *ForwardCtx, x: mlx.mlx_array, fa: *const FullAttnWeights, entry: *SSMCacheEntry, layer: u32, cache_len: c_int, pos_base: c_int, batch: c_int, seq_len: c_int, is_prefill: bool) !mlx.mlx_array {
@@ -15992,9 +16146,18 @@ pub const Transformer = struct {
                 };
             }
             if (gathered) |g| {
+                self.qsa_arms.note(switch (qsaWidthBucket(seq_len)) {
+                    0 => .decode_gather,
+                    1 => .verify_gather,
+                    else => .prefill_gather,
+                });
                 _ = mlx.mlx_array_free(attn_out);
                 attn_out = g;
             } else {
+                // The dense [S, kv] mask arm reads `full_k`/`full_v` — on a
+                // quantized cache that is what EVALUATES the whole-range
+                // dequant graph `updateAffine` built, per layer per forward.
+                self.qsa_arms.note(.mask);
                 if (ctx.qsa_mask.ctx == null) ctx.qsa_mask = try qsaMaskFromBlocks(self.s, ctx.qsa_blocks, mlx.getShape(full_k)[2], ratio);
                 if (qwen4Standin().attn_sdpa) {
                     _ = mlx.mlx_array_free(attn_out);
@@ -37046,6 +37209,66 @@ test "qsa verify gather plan: gathered rows carry exactly the dense [S, kv] mask
                 }
             }
         }
+    }
+}
+
+test "qsa arm meters: one-shot bits, width buckets, and the per-request tally" {
+    // The meters exist because a process-global `engaged` bool cannot answer
+    // "which arm served THIS request at THIS context length". Each property
+    // it needs is pinned here: a bit fires once, decode/verify/prefill get
+    // SEPARATE engagement bits (so a 16k decode engagement cannot vouch for a
+    // 62k verify call), and an empty tally reports nothing rather than a
+    // misleading `qsa=mask`.
+    var bits: OneShotBits = .{};
+    try std.testing.expect(bits.take(3));
+    try std.testing.expect(!bits.take(3));
+    try std.testing.expect(bits.take(4));
+    try std.testing.expect(!bits.take(4));
+    bits.reset();
+    try std.testing.expect(bits.take(3));
+
+    try std.testing.expectEqual(@as(u2, 0), qsaWidthBucket(1));
+    try std.testing.expectEqual(@as(u2, 1), qsaWidthBucket(2));
+    try std.testing.expectEqual(@as(u2, 1), qsaWidthBucket(FUSED256_MIN_Q_LEN - 1));
+    try std.testing.expectEqual(@as(u2, 2), qsaWidthBucket(FUSED256_MIN_Q_LEN));
+    try std.testing.expectEqual(@as(u2, 2), qsaWidthBucket(4096));
+
+    // Every (arm, bucket) pair owns a distinct bit — a collision would let one
+    // arm's engagement silence another's.
+    var seen = std.AutoHashMap(u5, void).init(std.testing.allocator);
+    defer seen.deinit();
+    for ([_]QsaArm{ .mask, .decode_gather, .verify_gather, .prefill_gather }) |arm| {
+        for ([_]c_int{ 1, 5, 64 }) |s| {
+            const bit = qsaEngagedBit(arm, s);
+            try std.testing.expect(!seen.contains(bit));
+            try seen.put(bit, {});
+        }
+    }
+
+    var counts: QsaArmCounts = .{};
+    try std.testing.expect(counts.majority() == null);
+    try std.testing.expectEqual(@as(u32, 0), counts.total());
+    counts.note(.mask);
+    counts.note(.mask);
+    counts.note(.decode_gather);
+    try std.testing.expectEqual(@as(u32, 3), counts.total());
+    try std.testing.expectEqual(QsaArm.mask, counts.majority().?);
+    counts.note(.decode_gather);
+    // Tie breaks toward the gather: a tie must never read as "the mask is fine".
+    try std.testing.expectEqual(QsaArm.decode_gather, counts.majority().?);
+    counts.reset();
+    try std.testing.expectEqual(@as(u32, 0), counts.total());
+
+    // Every reason carries distinct, non-empty text (the log's whole value).
+    var texts = std.StringHashMap(void).init(std.testing.allocator);
+    defer texts.deinit();
+    inline for (@typeInfo(QsaDeclineReason).@"enum".field_values) |v| {
+        const t = (@as(QsaDeclineReason, @enumFromInt(v))).text();
+        try std.testing.expect(t.len > 0);
+        try std.testing.expect(!texts.contains(t));
+        try texts.put(t, {});
+        // Reasons index OneShotBits directly — they must fit its 32 bits.
+        try std.testing.expect(v < 32);
     }
 }
 
