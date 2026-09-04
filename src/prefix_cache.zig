@@ -363,10 +363,7 @@ pub const HotPrefixCache = struct {
             ssm.conv_state = mlx.mlx_array_new();
             ssm.ssm_state = mlx.mlx_array_new();
             ssm.initialized = false;
-            if (ssm.aux_state.ctx != null) _ = mlx.mlx_array_free(ssm.aux_state);
-            if (ssm.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(ssm.qsa_pooled);
-            ssm.aux_state = .{ .ctx = null };
-            ssm.qsa_pooled = .{ .ctx = null };
+            transformer_mod.ssmFreeQsaState(ssm);
             ssm.ple_prev_valid = false;
         }
     }

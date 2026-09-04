@@ -539,8 +539,7 @@ pub const Slot = struct {
             for (entries) |*e| {
                 _ = mlx.mlx_array_free(e.conv_state);
                 _ = mlx.mlx_array_free(e.ssm_state);
-                if (e.aux_state.ctx != null) _ = mlx.mlx_array_free(e.aux_state);
-                if (e.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(e.qsa_pooled);
+                transformer_mod.ssmFreeQsaState(e);
             }
             allocator.free(entries);
         };
@@ -683,8 +682,7 @@ pub const Slot = struct {
             for (entries) |*e| {
                 _ = mlx.mlx_array_free(e.conv_state);
                 _ = mlx.mlx_array_free(e.ssm_state);
-                if (e.aux_state.ctx != null) _ = mlx.mlx_array_free(e.aux_state);
-                if (e.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(e.qsa_pooled);
+                transformer_mod.ssmFreeQsaState(e);
             }
             self.allocator.free(entries);
         }
