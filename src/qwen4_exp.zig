@@ -292,9 +292,28 @@ pub const NgramTable = struct {
     /// `[ids.len / n_heads][n_heads * dim]` row-major.
     pub fn gather(self: *const NgramTable, row_ids: []const i64, out: []f32) void {
         const need: usize = self.wcols * 4 + self.scols * 4;
-        // Decode/verify widths only: a 4096-row prefill chunk is 65k rows,
-        // mostly page-cache hits, and 1024 wake rounds cost more than they save.
-        if (self.pool) |p| if (self.fd >= 0 and need <= PrefetchPool.ROW_BUF and row_ids.len <= PrefetchPool.MAX_ROWS) {
+        // The pool served DECODE widths only, on the assumption that a
+        // 4096-row prefill chunk is "mostly page-cache hits" so 1024 wake
+        // rounds cost more than they save. Measured 2026-09-04 on the 374k
+        // ladder (M5 Max, 128 GB, chunk 4096, QWEN4_PROFILE_FWD=all), the
+        // assumption does not hold once MLX active climbs toward the ceiling:
+        // this gather -- a pure host read, no MLX and no sync inside the timer
+        // -- went 67.7 -> 267.9 ms per 1000 prompt tokens between kv 24k and
+        // kv 355k, 31% of the whole prefill slowdown, while gathering the same
+        // rows per token at both ends. The weights evict the 32 GB mapping and
+        // the serial faults land on the compressor (per-process `pagein` stays
+        // 0; `vm_stat` shows the decompressions), which is exactly the
+        // serialize-on-the-VM-map-lock case the pool exists to fan out.
+        //
+        // The batching loop below ALREADY walks in MAX_ROWS groups, so a
+        // prefill gather needs no new scratch and no change to the pool's
+        // contract: `bufs` stays [MAX_ROWS][ROW_BUF] and `run` still fans
+        // 3*rows preads over the 48 workers. Only the length gate moves.
+        // Read path, so the output is byte-identical either way; the win (or
+        // the wake-round loss at small kv) is timing only.
+        // QWEN4_PLE_PREFETCH_PREFILL=0 restores the decode-only gate.
+        const wide_ok = row_ids.len <= PrefetchPool.MAX_ROWS or plePrefillPrefetchEnabled();
+        if (self.pool) |p| if (self.fd >= 0 and need <= PrefetchPool.ROW_BUF and wide_ok) {
             const wl: usize = self.wcols * 4;
             const sl: usize = self.scols * 2;
             var start: usize = 0;
@@ -344,6 +363,10 @@ const PrefetchPool = struct {
     bufs: [MAX_ROWS][ROW_BUF]u8 = undefined,
     pending: std.atomic.Value(u32) = .init(0),
     failed: std.atomic.Value(u32) = .init(0),
+    /// Fan-out rounds issued. Diagnostics, and the ENGAGEMENT counter the
+    /// prefill test reads -- a pooled gather and a serial one produce the same
+    /// bytes, so equality alone cannot prove which path ran.
+    runs: std.atomic.Value(u64) = .init(0),
     threads: [N]std.Thread = undefined,
 
     fn create() !*PrefetchPool {
@@ -378,6 +401,7 @@ const PrefetchPool = struct {
 
     /// Fan the `3 * rows.len` preads over the workers; rows land in `bufs`.
     fn run(self: *PrefetchPool, table: *const NgramTable, rows: []const i64) bool {
+        _ = self.runs.fetchAdd(1, .monotonic);
         const io = std.Io.Threaded.global_single_threaded.io();
         self.mu.lockUncancelable(io);
         self.table = table;
@@ -420,6 +444,25 @@ fn plePrefetchEnabled() bool {
     };
     if (S.v) |v| return v;
     const raw = std.c.getenv("QWEN4_PLE_PREFETCH");
+    const v = raw == null or raw.?[0] != '0';
+    S.v = v;
+    return v;
+}
+
+/// Test seam for the prefill gate below (the env is read once per process).
+pub var ple_prefill_prefetch_override: ?bool = null;
+
+/// Whether a gather WIDER than one pool batch may use the pool at all. Default
+/// on; `QWEN4_PLE_PREFETCH_PREFILL=0` restores the decode-only gate. Separate
+/// from `QWEN4_PLE_PREFETCH`, which still turns the pool off entirely -- a pool
+/// that was never created cannot serve either width.
+fn plePrefillPrefetchEnabled() bool {
+    if (ple_prefill_prefetch_override) |v| return v;
+    const S = struct {
+        var v: ?bool = null;
+    };
+    if (S.v) |v| return v;
+    const raw = std.c.getenv("QWEN4_PLE_PREFETCH_PREFILL");
     const v = raw == null or raw.?[0] != '0';
     S.v = v;
     return v;
@@ -549,6 +592,84 @@ pub const Qwen4State = struct {
         self.table.close();
     }
 };
+
+test "ngram prefill gather: 4096 rows through the pool equal the direct mmap read" {
+    // 4-bit, group 32, dim 32 -> wcols 4 u32 (16 B), scols 1 (2 B scale + 2 B
+    // bias). 4096 rows, so a prefill-width gather is 64 pool batches and the
+    // old `row_ids.len <= MAX_ROWS` gate rejected it outright.
+    const ROWS: usize = 4096;
+    const HDR: usize = 512;
+    const W: usize = ROWS * 16;
+    const SB: usize = ROWS * 2;
+    const buf = try testing.allocator.alloc(u8, 8 + HDR + W + 2 * SB);
+    defer testing.allocator.free(buf);
+    const header = "{\"__metadata__\":{\"bits\":\"4\",\"group_size\":\"32\"}," ++
+        "\"weight\":{\"dtype\":\"U32\",\"shape\":[4096,4],\"data_offsets\":[0,65536]}," ++
+        "\"scales\":{\"dtype\":\"BF16\",\"shape\":[4096,1],\"data_offsets\":[65536,73728]}," ++
+        "\"biases\":{\"dtype\":\"BF16\",\"shape\":[4096,1],\"data_offsets\":[73728,81920]}}";
+    std.mem.writeInt(u64, buf[0..8], HDR, .little);
+    @memset(buf[8 .. 8 + HDR], ' ');
+    @memcpy(buf[8..][0..header.len], header);
+    // Every row distinct: a constant fill would let a wrong-row gather pass.
+    for (buf[8 + HDR ..], 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
+
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try td.dir.writeFile(io, .{ .sub_path = "ngram_table.bin", .data = buf });
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try td.dir.realPath(io, &pbuf);
+    var full: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&full, "{s}/ngram_table.bin", .{pbuf[0..root_len]});
+
+    warm_override = false; // the warm thread would race the fd for no benefit
+    defer warm_override = null;
+    var t = try NgramTable.open(path);
+    defer t.close();
+    // A box that cannot spawn the 48 workers has no pooled path to compare.
+    const pool = t.pool orelse return error.SkipZigTest;
+    try testing.expectEqual(@as(u32, 32), t.dim);
+
+    // Non-sequential ids: a serial mmap walk and a fanned-out pread set must
+    // agree on ORDER as well as content.
+    const ids = try testing.allocator.alloc(i64, ROWS);
+    defer testing.allocator.free(ids);
+    for (ids, 0..) |*r, i| r.* = @intCast((i *% 1237) % ROWS);
+    const ref = try testing.allocator.alloc(f32, ROWS * t.dim);
+    defer testing.allocator.free(ref);
+    const got = try testing.allocator.alloc(f32, ROWS * t.dim);
+    defer testing.allocator.free(got);
+
+    // Kill switch: decode-only gate, so a 4096-row gather takes the serial
+    // mmap path and issues NO pool round.
+    ple_prefill_prefetch_override = false;
+    defer ple_prefill_prefetch_override = null;
+    const before = pool.runs.load(.monotonic);
+    t.gather(ids, ref);
+    try testing.expectEqual(before, pool.runs.load(.monotonic));
+
+    // Default: the same gather rides the pool in MAX_ROWS batches.
+    ple_prefill_prefetch_override = true;
+    t.gather(ids, got);
+    try testing.expectEqual(before + ROWS / PrefetchPool.MAX_ROWS, pool.runs.load(.monotonic));
+
+    // Read path: byte-identical, not merely close.
+    try testing.expectEqualSlices(f32, ref, got);
+
+    // A decode-width gather is unaffected by the new gate in either position.
+    const dec = ids[0..16];
+    const d_ref = try testing.allocator.alloc(f32, dec.len * t.dim);
+    defer testing.allocator.free(d_ref);
+    const d_got = try testing.allocator.alloc(f32, dec.len * t.dim);
+    defer testing.allocator.free(d_got);
+    ple_prefill_prefetch_override = false;
+    const dec_before = pool.runs.load(.monotonic);
+    t.gather(dec, d_ref);
+    try testing.expectEqual(dec_before + 1, pool.runs.load(.monotonic)); // still pooled
+    ple_prefill_prefetch_override = true;
+    t.gather(dec, d_got);
+    try testing.expectEqualSlices(f32, d_ref, d_got);
+}
 
 test "ngram table warm: touches the whole file in the background; close() joins mid-warm" {
     // The 4-bit fixture from the nibble-layout test, written to a real file
