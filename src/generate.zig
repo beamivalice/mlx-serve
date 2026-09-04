@@ -350,12 +350,6 @@ pub const MtpHeadRef = union(enum) {
     }
 };
 
-comptime {
-    // `Qwen4Mtp.ev_seed_accept` is sized by transformer.zig, which cannot
-    // import mtp.zig (mtp imports transformer). This file sees both.
-    std.debug.assert(transformer_mod.MTP_EV_SEED_DEPTH == mtp_mod.MAX_DEPTH);
-}
-
 /// The head's committed-history cache.
 pub const MtpCacheRef = union(enum) {
     qwen: KVCache,

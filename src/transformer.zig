@@ -5428,12 +5428,6 @@ const PleWeights = struct {
 ///   x = fc_hidden(rms_{4H}(stream)) per stream + fc_embedding(rms_H(embed))
 ///   → one full-attention decoder layer (own hc/QSA/MoE) → mixer → lm_head.
 /// Keeps its own KV cache (index `num_hidden_layers`) + indexer key history.
-///
-/// Width of the cross-request EV seed below. It must equal `mtp.MAX_DEPTH`,
-/// but transformer.zig cannot import mtp.zig (mtp imports transformer), so
-/// generate.zig — which sees both — asserts they agree at comptime.
-pub const MTP_EV_SEED_DEPTH: u32 = 8;
-
 pub const Qwen4Mtp = struct {
     layer: MoeLayerWeights,
     pre_norm_emb: mlx.mlx_array,
@@ -5462,7 +5456,7 @@ pub const Qwen4Mtp = struct {
     /// lives on the head, so it dies with the head and can never reach
     /// another model. `qwen4MtpReset` deliberately does not clear it — a
     /// reset starts a new REQUEST, which is precisely who should inherit it.
-    ev_seed_accept: ?[MTP_EV_SEED_DEPTH]f32 = null,
+    ev_seed_accept: ?[mtp_mod.MAX_DEPTH]f32 = null,
     ev_seed_m_lo: u32 = 1,
     /// Draft rerank (`mtp.rerankSelect`): a low-bit copy of the TRUNK lm_head
     /// that shortlists 32 candidates, which the real head then re-scores.
@@ -41065,4 +41059,22 @@ test "ssm checkpoint carries the qwen4_exp aux state (key history, pooled keys, 
     _ = mlx.mlx_array_free(src_e[0].aux_state);
     src_e[0].aux_state = .{ .ctx = null };
     try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(dst[0].aux_state, cp.layers[0].aux_state, s));
+}
+
+test "the qwen4 EV seed width is mtp.MAX_DEPTH itself, not a mirrored constant" {
+    // The mirrored seed-width constant existed because "transformer.zig
+    // cannot import mtp.zig" — which stopped being true when the draft-rerank
+    // scheme put `const mtp_mod = @import("mtp.zig")` at the top of this file.
+    // A mirror plus a comptime assert in a THIRD file is what a direct
+    // reference is for, and the doc comment claiming the import is impossible
+    // reads as a spec (rule: "a contract COMMENT is read as a spec").
+    //
+    // The needle is split so this test is not its own counter-example.
+    const needle = "MTP_EV_SEED" ++ "_DEPTH";
+    try testing.expect(std.mem.indexOf(u8, @embedFile("transformer.zig"), needle) == null);
+    try testing.expect(std.mem.indexOf(u8, @embedFile("generate.zig"), needle) == null);
+    // The width reads through the import the retired comment said could not exist.
+    const source = @embedFile("transformer.zig");
+    try testing.expect(std.mem.indexOf(u8, source, "ev_seed_accept: ?[mtp_mod.MAX_DEPTH]f32") != null);
+    try testing.expect(std.mem.indexOf(u8, source, "const mtp_mod = @import(\"mtp.zig\");") != null);
 }
