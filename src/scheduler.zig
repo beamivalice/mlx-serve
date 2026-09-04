@@ -1222,6 +1222,18 @@ pub const Scheduler = struct {
     /// current model's cache (or null when the cache isn't applicable for
     /// the model, e.g. hybrid SSM archs).
     hot_prefix_cache: ?*prefix_cache_mod.HotPrefixCache,
+    /// Resident hot-cache bytes, PUBLISHED for the connection thread.
+    ///
+    /// `hot_prefix_cache` itself is inference-thread state: the pointer is
+    /// nulled and the cache freed on every model switch/unload, so a
+    /// connection thread that dereferenced it to ask `residentBytes()` was one
+    /// unlucky interleaving away from reading freed memory (found auditing
+    /// #353 — the admission guard's `evictable` term did exactly that). The
+    /// inference thread republishes this after every commit and eviction; the
+    /// guard reads the number and never the pointer. Stale by at most one
+    /// entry, which is what a HINT is allowed to be — the eviction decision
+    /// that matters is re-asked on the inference thread against live memory.
+    resident_hot_cache_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     max_concurrent: u32,
     /// Phase A7 test hook: when true, `runDecodeTick` forces the batched
@@ -1532,6 +1544,7 @@ pub const Scheduler = struct {
         self.drafter = null;
         self.dflash = null;
         self.hot_prefix_cache = null;
+        self.resident_hot_cache_bytes.store(0, .monotonic);
         if (self.load_error_name) |n| self.allocator.free(n);
 
         self.allocator.destroy(self);
@@ -2544,6 +2557,7 @@ fn doLoadDs4OnInferenceThread(sch: *Scheduler, params: anytype) !void {
     sch.drafter = null;
     sch.dflash = null;
     sch.hot_prefix_cache = null;
+    publishHotCacheResidency(sch);
 }
 
 /// llama.cpp load on the inference thread. Mirrors `doLoadDs4OnInferenceThread`:
@@ -2620,6 +2634,7 @@ fn doLoadLlamaOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     sch.drafter = null;
     sch.dflash = null;
     sch.hot_prefix_cache = null;
+    publishHotCacheResidency(sch);
 }
 
 /// The post-load residency bill the eviction gate reserves, in bytes.
@@ -2757,6 +2772,7 @@ fn doLoadGenOnInferenceThread(sch: *Scheduler, params: anytype, modality: gen_mo
     sch.drafter = null;
     sch.dflash = null;
     sch.hot_prefix_cache = null;
+    publishHotCacheResidency(sch);
 }
 
 /// Sum of `*.safetensors` bytes in `model_dir` — the MLX weight footprint used
@@ -3874,6 +3890,15 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     sch.drafter = drafter_ptr;
     sch.dflash = dflash_ptr;
     if (entry.prefix_cache) |*hc| sch.hot_prefix_cache = hc;
+    publishHotCacheResidency(sch);
+}
+
+/// Republish the hot cache's residency for the connection thread's admission
+/// guard. Called from the inference thread after anything that changes it —
+/// a commit, an eviction, an invalidation, a model switch. One relaxed store.
+pub fn publishHotCacheResidency(sch: *Scheduler) void {
+    const bytes: u64 = if (sch.hot_prefix_cache) |hc| hc.residentBytes() else 0;
+    sch.resident_hot_cache_bytes.store(bytes, .monotonic);
 }
 
 /// Caller holds `queue_mu`. Shared with the wait condition below.
@@ -4490,6 +4515,7 @@ fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
         sch.drafter = null;
         sch.dflash = null;
         sch.hot_prefix_cache = null;
+        publishHotCacheResidency(sch);
     }
     sch.registry.mutex.lockUncancelable(sch.io);
     sch.registry.accountEvictedLocked(bytes);
@@ -4529,7 +4555,11 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
         // pad-only guard: `was_pad_only` starts true and only flips on the
         // first pushed token, so a slot that never pushed one is not
         // pad-POISONED, it is merely empty.
-        return commitCancelledPrefillSlot(slot, hc);
+        commitCancelledPrefillSlot(slot, hc);
+        // Republish for the connection thread's admission guard: a cancelled
+        // prefill still commits, so residency moved.
+        publishHotCacheResidency(sch);
+        return;
     };
     const n_gen = gen_ptr.generated_ids.items.len;
     if (n_gen > 0 and slot.was_pad_only) return;
@@ -4594,6 +4624,7 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
         // here too was a double free, with a different allocator).
         log.warn("[hot-cache] commit failed: {s}\n", .{@errorName(err)});
     };
+    publishHotCacheResidency(sch);
 }
 
 /// Logical committed length for a cancelled-prefill commit: the tokens
@@ -5412,6 +5443,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                     hc.evictLruToAdmit(slot.full_prompt.len, &probe, Probe.call, true)
                 else
                     prefix_cache_mod.EvictionReport{ .admitted = false };
+                publishHotCacheResidency(sch);
                 if (!report.admitted) {
                     // Nothing left to give back. Refuse by NAME — the memory
                     // class, so the client gets a 503 that says so rather

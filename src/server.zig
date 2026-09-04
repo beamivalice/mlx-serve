@@ -3443,8 +3443,15 @@ pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: us
     _ = mlx.mlx_get_active_memory(&active_mem);
     const total_limit: u64 = currentGpuMemoryCeiling(active_mem);
     const available = if (total_limit > active_mem) total_limit - active_mem else 0;
+    // PUBLISHED number, never the pointer: `hot_prefix_cache` is
+    // inference-thread state — nulled and freed on every model switch — so
+    // dereferencing it from a connection thread to ask `residentBytes()` was a
+    // use-after-free waiting for the wrong interleaving. The inference thread
+    // republishes this after every commit, eviction and switch; it is stale by
+    // at most one entry, which is all a HINT has to be (the decision that
+    // matters is re-asked there, against live memory).
     const evictable: u64 = if (global_scheduler) |sch|
-        (if (sch.hot_prefix_cache) |hc| hc.residentBytes() else 0)
+        sch.resident_hot_cache_bytes.load(.monotonic)
     else
         0;
     return .{ .needed = needed, .available = available, .evictable = evictable };
@@ -18308,8 +18315,11 @@ test "checkAttentionMemory does not bill resident hot-cache buffers twice" {
     try t.expect(std.mem.indexOf(u8, body, "hot_" ++ "restore") == null);
     try t.expect(std.mem.indexOf(u8, body, "mlx_get_active_memory(&active_mem)") != null);
     // The hot cache appears exactly ONCE and only as `evictable` — a hint for
-    // the admit-after-eviction arm, never added to `needed`.
-    try t.expect(std.mem.indexOf(u8, body, "residentBytes()") != null);
+    // the admit-after-eviction arm, never added to `needed` — and it is read
+    // as the PUBLISHED atomic, never by dereferencing the inference thread's
+    // `hot_prefix_cache` pointer from a connection thread.
+    try t.expect(std.mem.indexOf(u8, body, "resident_hot_cache_bytes.load(.monotonic)") != null);
+    try t.expect(std.mem.indexOf(u8, body, "hot_prefix_cache") == null);
     try t.expect(std.mem.indexOf(u8, body, "needed = needed +") == null);
 }
 
@@ -19269,4 +19279,25 @@ test "the QSA history is billed at BOTH copies: the live one and the checkpoint 
     dense.num_hidden_layers = 32;
     dense.num_attention_heads = 32;
     try t.expectEqual(@as(u64, 0), statePerTokenBilled(&dense));
+}
+
+test "the admission guard reads a PUBLISHED hot-cache residency, never the inference thread's pointer" {
+    // `Scheduler.hot_prefix_cache` is inference-thread state: it is nulled and
+    // the cache freed on a model switch or unload (four sites), so a
+    // connection thread that dereferenced it to ask `residentBytes()` — which
+    // the #353 admission guard did — was one interleaving away from reading
+    // freed memory. Class guard: the pointer is never read outside the
+    // scheduler, and every site that changes residency republishes.
+    const t = std.testing;
+    const src = @embedFile("server.zig");
+    try t.expectEqual(@as(usize, 0), std.mem.count(u8, src, "sch.hot_prefix" ++ "_cache"));
+
+    const sched = @embedFile("scheduler.zig");
+    // Every assignment of the pointer is followed by a republish. Counted, so
+    // a fifth null site cannot be added without one.
+    const sets = std.mem.count(u8, sched, "hot_prefix_cache = null;");
+    try t.expect(sets >= 4);
+    const publishes = std.mem.count(u8, sched, "publishHotCache" ++ "Residency(");
+    // the fn itself + every set/clear + both commits + the admission eviction
+    try t.expect(publishes >= sets + 3);
 }
