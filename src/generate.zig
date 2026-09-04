@@ -50,6 +50,25 @@ pub var prefill_trace_force: bool = false;
 /// tok/s); at 32K it was a wash. Qwen's stock head drafts from deep history.
 pub var mtp_history_window_override: usize = 0;
 
+/// `--max-mtp-ctx N`: MTP stays OFF past N context tokens (0 = unlimited).
+/// Same set-once-at-CLI-parse contract as `mtp_history_window_override` — a
+/// machine-wide dispatch limit, so ONE value serves both readers: the HTTP
+/// admission gate (`server.admitMtpForCtx`, applied once per request after
+/// the prompt is tokenized) and the per-round check at the top of `nextMtp`
+/// (prompt + generated, so a long generation switches to serial mid-flight
+/// through the existing `spec_disabled_runtime` fallback). The predicate and
+/// its inclusive boundary live in `mtp.mtpCtxWithinLimit`.
+pub var max_mtp_ctx: u32 = 0;
+
+/// Why a request left speculative decoding for the rest of its generation.
+pub const SpecDisableReason = enum {
+    none,
+    /// Realized draft acceptance did not pay for the verify overhead.
+    acceptance,
+    /// Context crossed `--max-mtp-ctx` mid-generation.
+    max_ctx,
+};
+
 /// Effective MTP history window for a prefill forwarding `prefix_len`
 /// positions: 0 (capture everything) unless windowing is on AND the tail is
 /// past the threshold — short/medium prompts keep byte-identical behavior.
@@ -1178,6 +1197,11 @@ pub const Generator = struct {
     // per-step verify overhead. The flag is sticky for the rest of the
     // generation; we never re-enable speculation within a single request.
     spec_disabled_runtime: bool = false,
+    /// WHY `spec_disabled_runtime` was set, for `[spec-stats]`. A reader
+    /// cannot tell "acceptance did not pay" from "the operator's context
+    /// ceiling" out of a bare `runtime_disabled=true`, and those two call for
+    /// opposite follow-ups.
+    spec_disable_reason: SpecDisableReason = .none,
     /// Yield-gate counters: enabled-mode `nextPld` steps and drafted tokens
     /// accepted since the last (re-)enable. Reset on mid-request re-enable so
     /// a fresh workload region (e.g. file echo after a novel preamble) gets a
@@ -1407,7 +1431,7 @@ pub const Generator = struct {
             else
                 0.0;
             log.info(
-                "  [spec-stats] mode=mtp attempts={d} accepts={d} avg_per_round={d:.2} per_draft_pct={d:.1}% depth={d} drafted={d} ext_rounds={d} runtime_disabled={s} sync_ms={d:.2} round_ms={d:.2} two_ms_tok={d:.2} one_ms_tok={d:.2} verdict_round={d} trials={d} width_trials={d} table={s}:{s} table_drops=t{d}/c{d}/b{d}\n",
+                "  [spec-stats] mode=mtp attempts={d} accepts={d} avg_per_round={d:.2} per_draft_pct={d:.1}% depth={d} drafted={d} ext_rounds={d} runtime_disabled={s} reason={s} sync_ms={d:.2} round_ms={d:.2} two_ms_tok={d:.2} one_ms_tok={d:.2} verdict_round={d} trials={d} width_trials={d} table={s}:{s} table_drops=t{d}/c{d}/b{d}\n",
                 .{
                     self.mtp_attempted,
                     self.mtp_accepted_tokens,
@@ -1417,6 +1441,7 @@ pub const Generator = struct {
                     self.mtp_drafted_tokens,
                     self.mtp_ext_rounds,
                     if (self.spec_disabled_runtime) "true" else "false",
+                    @tagName(self.spec_disable_reason),
                     self.mtp_ev_sync_ms,
                     self.mtp_ev_round_ms,
                     if (self.mtp_regime.two_tok > 0) self.mtp_regime.two_ms / self.mtp_regime.two_tok else 0.0,
@@ -5011,6 +5036,25 @@ pub const Generator = struct {
         // grammar constraint or logprobs (compiled-out asserts before).
         if (specDecodeUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
 
+        // `--max-mtp-ctx`: checked at the TOP of the round, before any
+        // drafting, against prompt + generated (`mtpKvLen` — what the next
+        // verify forward would read). A request admitted under the ceiling
+        // can generate its way past it, and past it every round costs more
+        // than the serial steps it replaces. Sticky for the rest of the
+        // generation (context only grows) and routed through the SAME
+        // `spec_disabled_runtime` fallback the acceptance gate uses, so the
+        // pre-draft is freed and the hand-off contract is the tested one.
+        if (!self.spec_disabled_runtime and
+            !mtp_mod.mtpCtxWithinLimit(max_mtp_ctx, self.mtpKvLen()))
+        {
+            log.info(
+                "  mtp=off (ctx {d} > --max-mtp-ctx {d})\n",
+                .{ self.mtpKvLen(), max_mtp_ctx },
+            );
+            self.spec_disabled_runtime = true;
+            self.spec_disable_reason = .max_ctx;
+        }
+
         // Runtime acceptance gate: same hand-off contract as the drafter
         // (`next()`'s transition shim seeds pending_logits).
         if (self.spec_disabled_runtime) {
@@ -5838,6 +5882,7 @@ pub const Generator = struct {
                 .{ rate, MTP_DISABLE_BELOW },
             );
             self.spec_disabled_runtime = true;
+            self.spec_disable_reason = .acceptance;
             return;
         }
         log.debug("  [mtp-depth] {d} -> {d} (windowed per-draft rate {d:.2})\n", .{ self.mtp_depth_current, next_depth, rate });
@@ -7380,6 +7425,7 @@ pub const Generator = struct {
                 .{ rate, MTP_DISABLE_BELOW },
             );
             self.spec_disabled_runtime = true;
+            self.spec_disable_reason = .acceptance;
         }
     }
 
@@ -13017,5 +13063,38 @@ test "every request-finalize seam that logs [spec-stats] also logs [qsa-arms]" {
             i = at + spec_call.len;
         }
         try std.testing.expect(seams > 0);
+    }
+}
+
+test "nextMtp consults the --max-mtp-ctx ceiling at round entry, before drafting" {
+    const src = @embedFile("generate.zig");
+
+    // The check lives INSIDE nextMtp and ahead of its `spec_disabled_runtime`
+    // short-circuit, so a crossing lands on the tested AR-fallback hand-off
+    // (which frees `mtp_pre_draft`) instead of a second, parallel bail-out.
+    const fn_at = std.mem.indexOf(u8, src, "pub fn next" ++ "Mtp(self: *Generator") orelse
+        return error.NextMtpMissing;
+    const needle = "mtpCtx" ++ "WithinLimit(max_mtp_ctx, self.mtpKvLen())";
+    const check_at = std.mem.indexOfPos(u8, src, fn_at, needle) orelse
+        return error.CeilingCheckMissing;
+    const bail_at = std.mem.indexOfPos(u8, src, fn_at, "if (self.spec_disabled" ++ "_runtime) {") orelse
+        return error.RuntimeBailMissing;
+    try testing.expect(check_at < bail_at);
+
+    // It disables through the EXISTING runtime path and names its reason, so
+    // `[spec-stats]` can tell an operator ceiling from a bad acceptance rate.
+    const window = src[check_at..bail_at];
+    try testing.expect(std.mem.indexOf(u8, window, "spec_disabled" ++ "_runtime = true") != null);
+    try testing.expect(std.mem.indexOf(u8, window, "spec_disable" ++ "_reason = .max_ctx") != null);
+
+    // The reason rides the [spec-stats] mtp line.
+    try testing.expect(std.mem.indexOf(u8, src, "runtime_disabled={s} reason={s}") != null);
+
+    // MTP only: the ceiling must not appear in the PLD / drafter / DFlash
+    // round entries (they have their own economics and their own gates).
+    for ([_][]const u8{ "fn next" ++ "Pld(", "fn next" ++ "Drafter(", "fn next" ++ "Dflash(" }) |name| {
+        const at = std.mem.indexOf(u8, src, name) orelse continue;
+        const end = @min(src.len, at + 4096);
+        try testing.expect(std.mem.indexOf(u8, src[at..end], "max_mtp_ctx") == null);
     }
 }

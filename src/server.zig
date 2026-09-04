@@ -4,6 +4,7 @@ const transformer_mod = @import("transformer.zig");
 const kv_quant_mod = @import("kv_quant.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
+const mtp_mod = @import("mtp.zig");
 const drafter_mod = @import("drafter.zig");
 const chat_mod = @import("chat.zig");
 const model_mod = @import("model.zig");
@@ -536,6 +537,27 @@ fn dsv4DraftStages(lm: *LoadedModel) bool {
 /// default/dispatch layers were correct (the per-surface wiring class).
 fn mtpCapable(lm: *LoadedModel) bool {
     return lm.mtp != null or dsv4DraftStages(lm);
+}
+
+/// `--max-mtp-ctx` admission: MTP is refused for a request whose prompt is
+/// past the operator's context ceiling. The ONE place this runs, called on
+/// every request surface once the prompt is tokenized (the count is not known
+/// where `enable_mtp` is parsed, and the ceiling is about TOKENS) and before
+/// the value reaches either dispatch. That placement also makes it apply to
+/// stream and non-stream alike from a single site per surface.
+///
+/// The ceiling is a MACHINE limit, not a request preference, so it outranks an
+/// explicit `enable_mtp:true` in the body — hence a gate on the resolved value
+/// rather than another conjunct in `defaultEnableMtp`, which only answers for
+/// requests that OMITTED the field.
+///
+/// MTP only: PLD, the Gemma drafter and DFlash/DSpark are untouched.
+fn admitMtpForCtx(enable_mtp: bool, prompt_tokens: usize) bool {
+    if (!enable_mtp) return false;
+    const max = generate_mod.max_mtp_ctx;
+    if (mtp_mod.mtpCtxWithinLimit(max, prompt_tokens)) return true;
+    log.info("  mtp=off (ctx {d} > --max-mtp-ctx {d})\n", .{ prompt_tokens, max });
+    return false;
 }
 
 /// parseJsonFloat variant that distinguishes "omitted / wrong type" (null)
@@ -1384,6 +1406,9 @@ pub fn serve(
     }
     if (server_config.default_force_mtp) {
         log.info("MTP: forced ON for MoE targets (--mtp; default for new requests)\n", .{});
+    }
+    if (generate_mod.max_mtp_ctx != 0) {
+        log.info("MTP context ceiling: {d} tokens (--max-mtp-ctx; requests past it decode serially)\n", .{generate_mod.max_mtp_ctx});
     }
     log.info("\nServer listening on http://{s}:{d}\n", .{ host, port });
     if (g_api_key != null) {
@@ -5573,6 +5598,7 @@ fn handleChatCompletions(
     }
     const prompt_ids = prompt_ids_raw;
     defer allocator.free(prompt_ids);
+    enable_mtp = admitMtpForCtx(enable_mtp, prompt_ids.len);
 
     // Qwen3-VL interleaved M-RoPE: compute the position-id table from the final
     // (image-pad-expanded) prompt + the image grids. Ownership transfers to the
@@ -5861,6 +5887,7 @@ fn handleCompletions(
         break :blk out;
     } else try tok.encode(allocator, prompt_text.?);
     defer allocator.free(prompt_ids);
+    enable_mtp = admitMtpForCtx(enable_mtp, prompt_ids.len);
 
     // Enforce context size limit
     const effective_ctx = getEffectiveContextLength(config);
@@ -11966,6 +11993,7 @@ fn handleAnthropicMessages(
     }
     const prompt_ids = prompt_ids_raw;
     defer allocator.free(prompt_ids);
+    enable_mtp = admitMtpForCtx(enable_mtp, prompt_ids.len);
 
     // Adaptive spec-decode gate (Anthropic path; mirrors chat-completions).
     if ((enable_pld and !pld_explicit_in_json) or (enable_drafter and !drafter_explicit_in_json)) {
@@ -13773,6 +13801,7 @@ fn handleResponses(
     else
         defaultEnableMtp(lm.mtp != null, config.isMoe(), server_config.default_force_mtp, dsv4DraftStages(lm), nativeMeasuredMoeHead(lm));
     if (enable_mtp_resp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp_resp = false;
+    enable_mtp_resp = admitMtpForCtx(enable_mtp_resp, prompt_ids.len);
 
     // Adaptive spec-decode gate (Responses path; mirrors chat-completions and
     // Anthropic). Score the full prompt's 3-gram repetition; novel content
@@ -18662,4 +18691,55 @@ test "the memory guard's vision billing routes through visionPrefillUnchunked at
         at = i + 1;
     }
     try std.testing.expectEqual(@as(usize, 3), n);
+}
+
+test "admitMtpForCtx: the --max-mtp-ctx ceiling outranks the request's own flag" {
+    const saved = generate_mod.max_mtp_ctx;
+    defer generate_mod.max_mtp_ctx = saved;
+
+    // Unlimited (the default): the gate is a pass-through in both directions.
+    generate_mod.max_mtp_ctx = 0;
+    try std.testing.expect(admitMtpForCtx(true, 1_000_000));
+    try std.testing.expect(!admitMtpForCtx(false, 1));
+
+    // Inclusive at the ceiling, off at the first token past it. `true` here is
+    // the resolved value — an explicit `enable_mtp:true` in the body reaches
+    // the gate exactly like the default does, and loses.
+    generate_mod.max_mtp_ctx = 4096;
+    try std.testing.expect(admitMtpForCtx(true, 4096));
+    try std.testing.expect(!admitMtpForCtx(true, 4097));
+
+    // It never turns MTP ON for a request that had it off for another reason
+    // (logprobs, no head loaded, ...).
+    try std.testing.expect(!admitMtpForCtx(false, 1));
+}
+
+test "every request surface runs the --max-mtp-ctx admission gate" {
+    // Class guard (the per-surface wiring class): four surfaces resolve
+    // `enable_mtp`, and a surface that skipped the ceiling would serve MTP at
+    // any context while every other layer looked correct. Needles split so
+    // this test's own text cannot satisfy the count.
+    const src = @embedFile("server.zig");
+    const call = "admitMtpFor" ++ "Ctx(enable_mtp";
+    var sites: usize = 0;
+    var idx: usize = 0;
+    while (std.mem.indexOfPos(u8, src, idx, call)) |at| {
+        sites += 1;
+        idx = at + call.len;
+    }
+    // chat/completions, completions, messages, responses (`enable_mtp_resp`
+    // shares the prefix) — plus nothing else, since the helper takes the
+    // RESOLVED value and each surface resolves it once.
+    try std.testing.expect(sites >= 4);
+
+    // The gate reads the ONE value the CLI sets; a second source of truth for
+    // the ceiling is the bug this pins.
+    try std.testing.expect(std.mem.indexOf(u8, src, "generate_mod.max_mtp" ++ "_ctx;") != null);
+
+    // `--max-mtp-ctx` must be in main.zig's match list or the arg loop eats it
+    // silently (`cli.classifyUnparsedArg` only classifies what falls through).
+    const main_src = @embedFile("main.zig");
+    try std.testing.expect(std.mem.indexOf(u8, main_src, "\"--max-mtp" ++ "-ctx\"") != null);
+    // ... and in --help, which is the flag list users read.
+    try std.testing.expect(std.mem.indexOf(u8, main_src, "--max-mtp" ++ "-ctx <n>") != null);
 }

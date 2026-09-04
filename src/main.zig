@@ -198,6 +198,17 @@ fn printUsage(io: std.Io) void {
         \\                        otherwise 6; MLX_SERVE_MTP_ADAPTIVE=0
         \\                        reverts to the fixed windowed controller,
         \\                        cap 3). Pass an explicit <n> to hard-cap.
+        \\  --max-mtp-ctx <n>   Keep MTP speculative decoding OFF past <n>
+        \\                        context tokens (default: 0 = no ceiling).
+        \\                        A verify row is BYTES, so on a long-context
+        \\                        trunk a round can cost more than the serial
+        \\                        steps it replaces. A request whose prompt is
+        \\                        past <n> decodes serially, and one that
+        \\                        GENERATES past it switches mid-flight. The
+        \\                        bound is inclusive (<n> itself still drafts)
+        \\                        and it outranks `enable_mtp:true` in the
+        \\                        request body. MTP only — PLD, the drafter
+        \\                        and DFlash/DSpark are unaffected.
         \\  --mtp-history-window <n>
         \\                      MTP prefill-history window: prompts forwarding
         \\                        more than 16384 tokens only build head history
@@ -685,6 +696,12 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--mtp-depth") and i + 1 < args.len) {
             i += 1;
             mtp_depth = @min(mtp_mod.MAX_DEPTH, @max(1, try std.fmt.parseInt(u32, args[i], 10)));
+        } else if (std.mem.eql(u8, args[i], "--max-mtp-ctx") and i + 1 < args.len) {
+            i += 1;
+            // Set-once module override (same contract as
+            // --mtp-history-window): ONE value read by the HTTP admission
+            // gate and by nextMtp's per-round check. 0 = unlimited.
+            generate_mod.max_mtp_ctx = try std.fmt.parseInt(u32, args[i], 10);
         } else if (std.mem.eql(u8, args[i], "--mtp-history-window") and i + 1 < args.len) {
             i += 1;
             // 0 = full history; otherwise the last-N-token window applied
