@@ -6911,6 +6911,42 @@ pub const PlePending = struct {
     capture: bool,
 };
 
+/// The QSA pooled-block RoPE tables for ONE forward.
+///
+/// Every full-attention layer ropes the blocks THIS forward completed, at the
+/// same block-start positions (`pos_base + ratio*b`), the same count, the same
+/// dtype — so cos/sin, and on the scalar arm the inv_freq spectrum behind
+/// them, are a property of the forward, not of the layer. qwen4_exp rebuilt
+/// them 12 times per forward, ~18 dispatches each.
+///
+/// The key carries `gen` (bumped by every forward entry) and the `ForwardCtx`
+/// pointer as well as (base, step, n, dtype, arm), because the M-RoPE arm
+/// also reads the ctx's position table — which is NOT derivable from the
+/// scalars. A stale table can therefore never be served: a new forward, a new
+/// ctx, or any moved position rebuilds.
+const QsaPooledRope = struct {
+    gen: u64 = 0,
+    ctx: ?*const ForwardCtx = null,
+    base: c_int = 0,
+    step: c_int = 0,
+    n: c_int = 0,
+    dtype: mlx.mlx_dtype = .float32,
+    mrope: bool = false,
+    cos: mlx.mlx_array = .{ .ctx = null },
+    sin: mlx.mlx_array = .{ .ctx = null },
+    /// Rebuild counter — the only externally visible difference between a
+    /// cache hit and a rebuild.
+    builds: usize = 0,
+
+    fn deinit(self: *QsaPooledRope) void {
+        if (self.cos.ctx != null) _ = mlx.mlx_array_free(self.cos);
+        if (self.sin.ctx != null) _ = mlx.mlx_array_free(self.sin);
+        self.cos = .{ .ctx = null };
+        self.sin = .{ .ctx = null };
+        self.ctx = null;
+    }
+};
+
 /// Does every complete block visible-check pass for EVERY query row of a call
 /// that starts at cache position `offset`?
 ///
@@ -7985,6 +8021,13 @@ pub const Transformer = struct {
     /// nb-keyed QSA block constants, built once per (nb, ratio) instead of
     /// once per full-attention layer. See `QsaBlockConsts`.
     qsa_consts: QsaBlockConsts = .{},
+    /// QSA pooled-block cos/sin, built once per forward instead of once per
+    /// full-attention layer. See `QsaPooledRope`.
+    qsa_pooled_rope: QsaPooledRope = .{},
+    /// Bumped by every forward entry that can reach QSA. Part of the
+    /// `qsa_pooled_rope` key, so a per-forward table never outlives its
+    /// forward.
+    fwd_gen: u64 = 0,
     /// qwen4_exp MTP head (one hyper-connected QSA+MoE layer over the trunk's
     /// pre-mixer stream + next-token embedding). Loaded when the pack carries
     /// `mtp.*`; served by `qwen4MtpForward`. Not yet wired into spec decode.
@@ -9453,6 +9496,7 @@ pub const Transformer = struct {
         if (self.yarn_inv_freq) |f| self.allocator.free(f);
         if (self.suppress_mask) |m| _ = mlx.mlx_array_free(m);
         self.qsa_consts.deinit();
+        self.qsa_pooled_rope.deinit();
         self.yarn_mscale_cast.deinit();
         if (self.prompt_cache) |*pc| pc.deinit();
         self.cache.deinit();
@@ -12419,6 +12463,7 @@ pub const Transformer = struct {
         ctxs: []const *ForwardCtx,
         rope_offsets: []const u32,
     ) ![]mlx.mlx_array {
+        self.fwd_gen +%= 1; // per-forward QSA scratch key
         const N: c_int = @intCast(next_tokens.len);
         std.debug.assert(next_tokens.len == ctxs.len);
         std.debug.assert(next_tokens.len == rope_offsets.len);
@@ -13199,9 +13244,13 @@ pub const Transformer = struct {
 
     var qsa_engaged_logged: bool = false;
 
-    /// Partial neox RoPE of `x [B,1,N,hd]` at positions `base + step*i`
-    /// (i < n): explicit cos/sin, for position ladders fast_rope can't express.
-    fn ropeAtPositions(self: *Transformer, x: mlx.mlx_array, rope_dims: c_int, theta: f32, base: f32, step: f32, n: c_int) !mlx.mlx_array {
+    /// The `[half]` f32 inverse-frequency spectrum this trunk ropes with:
+    /// the load-time YaRN host table when the config scales, else
+    /// `theta^(-2j/rope_dims)` built in-graph. Caller OWNS the result.
+    ///
+    /// A constant of (rope_dims, theta, yarnActive) — nothing about the
+    /// positions or the layer enters it.
+    fn ropeInvFreq(self: *Transformer, rope_dims: c_int, theta: f32) !mlx.mlx_array {
         const half = @divExact(rope_dims, 2);
         // YaRN: the load-time host spectrum (f64 → the tensor dtype), the SAME
         // table attention and the M-RoPE tables rotate with. Deriving inv_freq
@@ -13213,7 +13262,7 @@ pub const Transformer = struct {
             defer self.allocator.free(f32s);
             for (yf, 0..) |v, i| f32s[i] = @floatCast(v);
             const shape = [_]c_int{@intCast(yf.len)};
-            return self.ropeAtFreqs(x, rope_dims, mlx.mlx_array_new_data(f32s.ptr, &shape, 1, .float32), base, step, n);
+            return mlx.mlx_array_new_data(f32s.ptr, &shape, 1, .float32);
         }
         var j = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(j);
@@ -13226,14 +13275,30 @@ pub const Transformer = struct {
         try mlx.check(mlx.mlx_multiply(&jl, j, neg, self.s));
         var inv_freq = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_exp(&inv_freq, jl, self.s)); // [half]
-        return self.ropeAtFreqs(x, rope_dims, inv_freq, base, step, n); // takes ownership
+        return inv_freq;
+    }
+
+    /// Partial neox RoPE of `x [B,1,N,hd]` at positions `base + step*i`
+    /// (i < n): explicit cos/sin, for position ladders fast_rope can't express.
+    fn ropeAtPositions(self: *Transformer, x: mlx.mlx_array, rope_dims: c_int, theta: f32, base: f32, step: f32, n: c_int) !mlx.mlx_array {
+        return self.ropeAtFreqs(x, rope_dims, try self.ropeInvFreq(rope_dims, theta), base, step, n); // takes ownership
     }
 
     /// The shared tail of `ropeAtPositions`: rotate `x` at positions
     /// `base + step*i` using the given inv_freq array (`[half]`, f32).
     fn ropeAtFreqs(self: *Transformer, x: mlx.mlx_array, rope_dims: c_int, inv_freq: mlx.mlx_array, base: f32, step: f32, n: c_int) !mlx.mlx_array {
-        const half = @divExact(rope_dims, 2);
+        const cs = try self.ropeCosSinFromFreqs(rope_dims, inv_freq, base, step, n, mlx.mlx_array_dtype(x));
+        defer _ = mlx.mlx_array_free(cs.cos);
+        defer _ = mlx.mlx_array_free(cs.sin);
+        return self.ropeApplyCosSin(x, rope_dims, cs.cos, cs.sin);
+    }
+
+    /// The BUILD half of `ropeAtFreqs`: cos/sin `[n, rope_dims]` in `dt` for
+    /// positions `base + step*i`, carrying the YaRN mscale when the config
+    /// scales. `inv_freq` is TAKEN (freed here).
+    fn ropeCosSinFromFreqs(self: *Transformer, rope_dims: c_int, inv_freq: mlx.mlx_array, base: f32, step: f32, n: c_int, dt: mlx.mlx_dtype) !MropeCosSin {
         defer _ = mlx.mlx_array_free(inv_freq);
+        std.debug.assert(mlx.getShape(inv_freq)[0] == @divExact(rope_dims, 2));
         var pos = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(pos);
         try mlx.check(mlx.mlx_arange(&pos, base, base + step * @as(f32, @floatFromInt(n)) - step * 0.5, step, .float32, self.s)); // [n]
@@ -13255,12 +13320,11 @@ pub const Transformer = struct {
         var sin_f = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(sin_f);
         try mlx.check(mlx.mlx_sin(&sin_f, emb, self.s));
-        const dt = mlx.mlx_array_dtype(x);
         var cosv = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(cosv);
+        errdefer _ = mlx.mlx_array_free(cosv);
         try mlx.check(mlx.mlx_astype(&cosv, cos_f, dt, self.s));
         var sinv = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(sinv);
+        errdefer _ = mlx.mlx_array_free(sinv);
         try mlx.check(mlx.mlx_astype(&sinv, sin_f, dt, self.s));
         if (self.yarnActive()) {
             const ms = try scalarOf(self.config.yarn_attention_factor, dt, self.s);
@@ -13274,6 +13338,14 @@ pub const Transformer = struct {
             _ = mlx.mlx_array_free(sinv);
             sinv = sin_s;
         }
+        return .{ .cos = cosv, .sin = sinv };
+    }
+
+    /// The APPLY half of `ropeAtFreqs`: rotate the first `rope_dims` dims of
+    /// `x [B,H,N,hd]` with cos/sin `[N, rope_dims]` (BORROWED — the caller
+    /// owns them), passing the tail through.
+    fn ropeApplyCosSin(self: *Transformer, x: mlx.mlx_array, rope_dims: c_int, cosv: mlx.mlx_array, sinv: mlx.mlx_array) !mlx.mlx_array {
+        const half = @divExact(rope_dims, 2);
         const sh = mlx.getShape(x);
         const strides = [_]c_int{ 1, 1, 1, 1 };
         var xr = mlx.mlx_array_new();
@@ -13312,6 +13384,34 @@ pub const Transformer = struct {
         var out = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_concatenate_axis(&out, ovec, -1, self.s));
         return out;
+    }
+
+    /// The pooled-block cos/sin for this forward, built on first ask and
+    /// reused by the remaining full-attention layers. BORROWED handles: valid
+    /// until the next ask with a different key (mlx ops retain their inputs,
+    /// so a graph already built on them stays valid). See `QsaPooledRope`.
+    fn qsaPooledCosSin(self: *Transformer, ctx: *ForwardCtx, rope_dims: c_int, base: c_int, step: c_int, n: c_int, dt: mlx.mlx_dtype) !MropeCosSin {
+        const is_mrope = ctx.mrope_pos != null;
+        const c = &self.qsa_pooled_rope;
+        if (c.cos.ctx != null and c.gen == self.fwd_gen and c.ctx == ctx and
+            c.base == base and c.step == step and c.n == n and
+            c.dtype == dt and c.mrope == is_mrope) return .{ .cos = c.cos, .sin = c.sin };
+        c.deinit();
+        const cs = if (is_mrope)
+            try self.mropeCosSinAt(mropeContext(ctx), @intCast(base), @intCast(step), @intCast(n), dt)
+        else
+            try self.ropeCosSinFromFreqs(rope_dims, try self.ropeInvFreq(rope_dims, self.config.rope_theta), @floatFromInt(base), @floatFromInt(step), n, dt);
+        c.cos = cs.cos;
+        c.sin = cs.sin;
+        c.gen = self.fwd_gen;
+        c.ctx = ctx;
+        c.base = base;
+        c.step = step;
+        c.n = n;
+        c.dtype = dt;
+        c.mrope = is_mrope;
+        c.builds += 1;
+        return cs;
     }
 
     /// QSA: append this chunk's raw index keys to the layer's history and,
@@ -13517,12 +13617,14 @@ pub const Transformer = struct {
             var pn4 = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(pn4);
             try mlx.check(mlx.mlx_expand_dims(&pn4, pn, 1, self.s)); // [B,1,n_new,hd]
-            const new_rope = if (ctx.mrope_pos != null) blk: {
-                const cs = try self.mropeCosSinAt(mropeContext(ctx), @intCast(pos_base + nb_cached * ratio), @intCast(ratio), @intCast(n_new), mlx.mlx_array_dtype(pn4));
-                defer _ = mlx.mlx_array_free(cs.cos);
-                defer _ = mlx.mlx_array_free(cs.sin);
-                break :blk try self.applyMrope(pn4, cs.cos, cs.sin, rope_dims);
-            } else try self.ropeAtPositions(pn4, rope_dims, cfg.rope_theta, @floatFromInt(pos_base + nb_cached * ratio), @floatFromInt(ratio), n_new);
+            // cos/sin at the block-START positions this forward completed:
+            // identical across every full-attention layer, so built once
+            // (`qsaPooledCosSin`) and BORROWED here.
+            const cs = try self.qsaPooledCosSin(ctx, rope_dims, pos_base + nb_cached * ratio, ratio, n_new, mlx.mlx_array_dtype(pn4));
+            const new_rope = if (ctx.mrope_pos != null)
+                try self.applyMrope(pn4, cs.cos, cs.sin, rope_dims)
+            else
+                try self.ropeApplyCosSin(pn4, rope_dims, cs.cos, cs.sin);
             defer _ = mlx.mlx_array_free(new_rope);
             var new3 = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(new3);
@@ -13961,6 +14063,7 @@ pub const Transformer = struct {
     /// slot's 3-D table there (prompt rows spanning the image) and the
     /// scalar `offset + delta` past it — the same two arms as the trunk.
     pub fn qwen4MtpForward(self: *Transformer, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, pos_offset: c_int, mrope_ctx: ?mrope.PositionContext, project: Qwen4MtpProject) !Qwen4MtpOut {
+        self.fwd_gen +%= 1; // per-forward QSA scratch key
         const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
         const cfg = &self.config;
         const hc: c_int = @intCast(cfg.hc_count);
@@ -14146,6 +14249,7 @@ pub const Transformer = struct {
     /// through per-stream scalar gates; the n-gram PLE adds to the streams
     /// before its layer; the final mixer replaces model.norm.
     fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
+        self.fwd_gen +%= 1; // per-forward QSA scratch key
         const ml = self.moe_layers.?;
         const cfg = &self.config;
         const offset = ctx.moe_seq_offset.*;
@@ -14298,6 +14402,7 @@ pub const Transformer = struct {
     }
 
     fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
+        self.fwd_gen +%= 1; // per-forward QSA scratch key
         const ml = self.moe_layers.?;
         const offset = ctx.moe_seq_offset.*;
         const cfg = &self.config;
@@ -42316,6 +42421,90 @@ test "the qwen4 EV seed width is mtp.MAX_DEPTH itself, not a mirrored constant" 
     const source = @embedFile("transformer.zig");
     try testing.expect(std.mem.indexOf(u8, source, "ev_seed_accept: ?[mtp_mod.MAX_DEPTH]f32") != null);
     try testing.expect(std.mem.indexOf(u8, source, "const mtp_mod = @import(\"mtp.zig\");") != null);
+}
+
+test "qsa pooled rope: one cos/sin build per forward, not one per full-attention layer" {
+    // Every full-attention layer ropes the blocks THIS forward completed at
+    // the same block-start positions with the same width — the tables (and
+    // the inv_freq spectrum behind them) are a property of the forward, not
+    // of the layer. `builds` is the meter; the parity assertions are the bar.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+
+    var t: Transformer = undefined;
+    t.s = s;
+    t.allocator = testing.allocator;
+    t.config = .{};
+    t.config.head_dim = 256;
+    t.config.partial_rotary_factor = 0.5;
+    t.config.rope_theta = 10_000_000.0;
+    t.config.mrope_section = .{ 11, 11, 10 };
+    t.rope_freqs_yarn = null;
+    t.yarn_inv_freq = null;
+    t.fwd_gen = 0;
+    t.qsa_pooled_rope = .{};
+    defer t.qsa_pooled_rope.deinit();
+
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    var seq_off: usize = 0;
+    var ctx: ForwardCtx = .{ .cache = &cache, .moe_seq_offset = &seq_off, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
+
+    const rope_dims: c_int = 128;
+    const base: c_int = 96;
+    const step: c_int = 4; // = indexer_compress_ratio
+    const n: c_int = 5;
+
+    // Twelve full-attention layers of ONE forward: one build, same handles.
+    const cs = try t.qsaPooledCosSin(&ctx, rope_dims, base, step, n, .bfloat16);
+    try testing.expectEqual(@as(usize, 1), t.qsa_pooled_rope.builds);
+    for (0..11) |_| {
+        const again = try t.qsaPooledCosSin(&ctx, rope_dims, base, step, n, .bfloat16);
+        try testing.expect(again.cos.ctx == cs.cos.ctx and again.sin.ctx == cs.sin.ctx);
+    }
+    try testing.expectEqual(@as(usize, 1), t.qsa_pooled_rope.builds);
+
+    // Hoisted == per-layer: applying the cached tables must equal the
+    // unhoisted `ropeAtPositions` byte for byte.
+    var data: [@as(usize, @intCast(n)) * 128]f32 = undefined;
+    for (&data, 0..) |*d, i| d.* = @floatFromInt((i % 37) + 1);
+    const xshape = [_]c_int{ 1, 1, n, 128 };
+    const xf = mlx.mlx_array_new_data(&data, &xshape, 4, .float32);
+    defer _ = mlx.mlx_array_free(xf);
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_astype(&x, xf, .bfloat16, s));
+    const hoisted = try t.ropeApplyCosSin(x, rope_dims, cs.cos, cs.sin);
+    defer _ = mlx.mlx_array_free(hoisted);
+    const per_layer = try t.ropeAtPositions(x, rope_dims, t.config.rope_theta, @floatFromInt(base), @floatFromInt(step), n);
+    defer _ = mlx.mlx_array_free(per_layer);
+    try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(hoisted, per_layer, s));
+
+    // A NEW forward rebuilds — the M-RoPE arm's position table is not in the
+    // key, so a cache that outlived its forward could serve a stale table.
+    t.fwd_gen += 1;
+    _ = try t.qsaPooledCosSin(&ctx, rope_dims, base, step, n, .bfloat16);
+    try testing.expectEqual(@as(usize, 2), t.qsa_pooled_rope.builds);
+    // ...and so does a moved block-start position.
+    _ = try t.qsaPooledCosSin(&ctx, rope_dims, base + step, step, n, .bfloat16);
+    try testing.expectEqual(@as(usize, 3), t.qsa_pooled_rope.builds);
+
+    // The M-RoPE arm is a DIFFERENT table at the same (base, step, n): the
+    // key carries the arm, so one is never served for the other.
+    const pos = try testing.allocator.alloc(i32, 3 * 256);
+    defer testing.allocator.free(pos);
+    for (pos, 0..) |*p, i| p.* = @intCast(i % 256);
+    ctx.mrope_pos = pos;
+    ctx.mrope_total = 256;
+    const m = try t.qsaPooledCosSin(&ctx, rope_dims, base + step, step, n, .bfloat16);
+    try testing.expectEqual(@as(usize, 4), t.qsa_pooled_rope.builds);
+    const direct = try t.mropeCosSinAt(.{ .pos = pos, .total = 256, .delta = 0 }, @intCast(base + step), @intCast(step), @intCast(n), .bfloat16);
+    defer _ = mlx.mlx_array_free(direct.cos);
+    defer _ = mlx.mlx_array_free(direct.sin);
+    try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(m.cos, direct.cos, s));
+    try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(m.sin, direct.sin, s));
+    for (0..11) |_| _ = try t.qsaPooledCosSin(&ctx, rope_dims, base + step, step, n, .bfloat16);
+    try testing.expectEqual(@as(usize, 4), t.qsa_pooled_rope.builds);
 }
 
 test "qsa visibility: decode width is ALWAYS all-visible; a prefill chunk's FIRST row decides" {
