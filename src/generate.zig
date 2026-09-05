@@ -1753,10 +1753,12 @@ pub const Generator = struct {
         /// Chunked prefill aligns chunk ends to stride positions so each
         /// snapshot reflects a coherent state.
         ssm_checkpoint_stride: u32 = 0,
-        /// Cap on the number of checkpoints retained. The first stride-aligned
-        /// position is always captured; if more would land than `ssm_checkpoint_max`,
-        /// the oldest checkpoints are dropped to keep the latest run of
-        /// positions. 0 = unlimited (rely on the hot-cache byte budget to bound).
+        /// Cap on the number of checkpoints retained. Past the cap the list is
+        /// thinned span-preservingly (`transformer.ssmCheckpointDropIndex`):
+        /// the lowest and the newest positions always survive, so the
+        /// survivors still span the WHOLE prompt and an oversized commit has
+        /// an affordable trim point. 0 = unlimited (rely on the hot-cache byte
+        /// budget to bound).
         ssm_checkpoint_max: u32 = 16,
         /// Phase 1: absolute position of the FIRST token in `prompt_ids`.
         /// On a cold prefill this is 0. On the warm path (where the
@@ -2368,17 +2370,19 @@ pub const Generator = struct {
                 if (want_ssm_cp and ssm_cp_stride > 0 and abs_end_for_cp2 % ssm_cp_stride == 0) {
                     const cp = try captureSsmCheckpoint(allocator, ctx.ssm_entries.?, abs_end_for_cp2, xfm.s);
                     try ssm_checkpoints.append(allocator, cp);
-                    // Keep the buffer bounded — drop the oldest if we've
-                    // accumulated more than the configured max. Front-removal
-                    // is O(n) but `n` is tiny (≤ ssm_checkpoint_max). We keep
-                    // the latest positions because they're closer to the
-                    // end-of-prompt, which is where most multi-turn warm
-                    // requests match.
+                    // Keep the buffer bounded — thin the INTERIOR, never the
+                    // oldest (#330 follow-up). Drop-oldest survivors cover
+                    // only the last `max * stride` tokens, so a 383k prefill's
+                    // lowest checkpoint lands past the hot-cache budget and
+                    // the commit has no affordable trim point at all. Removal
+                    // is O(n) but `n` is tiny (≤ ssm_checkpoint_max).
                     if (options.ssm_checkpoint_max > 0 and
                         ssm_checkpoints.items.len > options.ssm_checkpoint_max)
                     {
-                        var oldest = ssm_checkpoints.orderedRemove(0);
-                        oldest.deinit(allocator);
+                        var dropped = ssm_checkpoints.orderedRemove(
+                            transformer_mod.ssmCheckpointDropIndex(ssm_checkpoints.items),
+                        );
+                        dropped.deinit(allocator);
                     }
                 }
 
@@ -2446,8 +2450,11 @@ pub const Generator = struct {
                     if (options.ssm_checkpoint_max > 0 and
                         ssm_checkpoints.items.len > options.ssm_checkpoint_max)
                     {
-                        var oldest = ssm_checkpoints.orderedRemove(0);
-                        oldest.deinit(allocator);
+                        // Same span-preserving thin as the stride capture.
+                        var dropped = ssm_checkpoints.orderedRemove(
+                            transformer_mod.ssmCheckpointDropIndex(ssm_checkpoints.items),
+                        );
+                        dropped.deinit(allocator);
                     }
                 }
                 // One copy of the QSA key history on the latest snap. Stride

@@ -7344,6 +7344,61 @@ pub fn ssmCheckpointBytes(cp: *const SSMCheckpoint) u64 {
     return total;
 }
 
+/// The checkpoint index to DROP when a retention list is over its cap: the
+/// interior position whose removal widens the coverage gap least. Index 0 (a
+/// prompt that diverges early restores only there) and the last (where warm
+/// turns match) are always kept; under three there is no interior, so the
+/// oldest goes — also the cheapest to redo. ONE selection for every retention
+/// site (prefill capture, hot-cache merge/shed, disk retention) so drop-oldest
+/// cannot creep back in on one of them: end-anchored survivors cover only the
+/// last `max * stride` tokens, and a long entry then has no affordable trim
+/// point at all (#330 follow-up).
+pub fn spanPreservingDropIndex(
+    comptime T: type,
+    items: []const T,
+    comptime posOf: fn (*const T) usize,
+) usize {
+    if (items.len < 3) return 0;
+    var best_at: usize = 1;
+    var best_span: usize = std.math.maxInt(usize);
+    var k: usize = 1;
+    while (k + 1 < items.len) : (k += 1) {
+        const span = posOf(&items[k + 1]) -| posOf(&items[k - 1]);
+        if (span < best_span) {
+            best_span = span;
+            best_at = k;
+        }
+    }
+    return best_at;
+}
+
+fn checkpointPosOf(cp: *const SSMCheckpoint) usize {
+    return cp.pos;
+}
+
+fn u32PosOf(p: *const u32) usize {
+    return p.*;
+}
+
+fn usizePosOf(p: *const usize) usize {
+    return p.*;
+}
+
+/// `spanPreservingDropIndex` over a checkpoint list.
+pub fn ssmCheckpointDropIndex(cps: []const SSMCheckpoint) usize {
+    return spanPreservingDropIndex(SSMCheckpoint, cps, checkpointPosOf);
+}
+
+/// `spanPreservingDropIndex` over a bare ascending position list (the disk
+/// tier's persisted positions, and the hot cache's shed simulation).
+pub fn positionDropIndex(positions: []const u32) usize {
+    return spanPreservingDropIndex(u32, positions, u32PosOf);
+}
+
+pub fn positionDropIndexUsize(positions: []const usize) usize {
+    return spanPreservingDropIndex(usize, positions, usizePosOf);
+}
+
 /// QSA indexer key history lives on full-attention layers: `aux_state` is
 /// `[B, kv, idx_hd]` and there is no conv recurrence (`conv_state` null or
 /// an empty handle). PLE's dilated-conv window is `aux_state` on a GDN
@@ -46386,4 +46441,40 @@ test "a reserved KV cache grows ONCE: no old+new buffer coexists during a long p
         KVCache.nextCapacityPolicy(1024, 2048, KVCache.kvGrowLinear()),
         small.nextCapacityReserved(1024, 2048),
     );
+}
+
+test "ssm retention: the span-preserving thin keeps both ends and spreads the survivors" {
+    // #330 follow-up. Drop-oldest retention leaves survivors covering only
+    // the last `max * stride` tokens of a long prefill: at max 16 and stride
+    // 4096 a 383k prefill's LOWEST surviving checkpoint sits at ~319k, which
+    // already prices past the hot-cache budget — so the oversized commit has
+    // no affordable trim point and flat-declines. Thinning the interior keeps
+    // the same COUNT spread over the whole prompt.
+    const t = std.testing;
+    var positions: [94]usize = undefined;
+    for (&positions, 0..) |*p, i| p.* = (i + 1) * 4096;
+    var n: usize = positions.len;
+    while (n > 16) {
+        const drop = positionDropIndexUsize(positions[0..n]);
+        // Never the lowest, never the newest.
+        try t.expect(drop != 0);
+        try t.expect(drop + 1 != n);
+        var k = drop;
+        while (k + 1 < n) : (k += 1) positions[k] = positions[k + 1];
+        n -= 1;
+    }
+    try t.expectEqual(@as(usize, 16), n);
+    try t.expectEqual(@as(usize, 4096), positions[0]);
+    try t.expectEqual(@as(usize, 94 * 4096), positions[n - 1]);
+    // Roughly even: no surviving gap wider than twice the ideal spacing.
+    const ideal = (positions[n - 1] - positions[0]) / (n - 1);
+    var i: usize = 1;
+    while (i < n) : (i += 1) try t.expect(positions[i] - positions[i - 1] <= 2 * ideal);
+    // Under three there is no interior — the oldest goes.
+    try t.expectEqual(@as(usize, 0), positionDropIndexUsize(positions[0..2]));
+    try t.expectEqual(@as(usize, 0), positionDropIndexUsize(positions[0..1]));
+    // The closest pair of NEIGHBOURS decides: dropping index 2 widens the gap
+    // to 1000, dropping index 1 would widen it to 1010.
+    const clustered = [_]u32{ 0, 1000, 1010, 2000 };
+    try t.expectEqual(@as(usize, 2), positionDropIndex(&clustered));
 }

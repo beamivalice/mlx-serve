@@ -70,6 +70,26 @@ pub fn missKind(candidates: usize, best_raw: usize) MissKind {
     return .no_checkpoint;
 }
 
+/// Why an oversized commit retained NOTHING. Three different outcomes used to
+/// print one identical `skipped oversized entry` line — the budget arithmetic
+/// declining, the trimmed KV copy failing, and the trimmed checkpoint list's
+/// `dupe` failing — so a live decline said nothing about which one happened
+/// (and the two failures swallowed their error). Pure so the wording is
+/// unit-testable.
+pub const TrimDecline = enum {
+    no_restorable_prefix,
+    snapshot_copy_failed,
+    checkpoint_list_copy_failed,
+
+    pub fn reason(self: TrimDecline) []const u8 {
+        return switch (self) {
+            .no_restorable_prefix => "no restorable prefix fits the budget",
+            .snapshot_copy_failed => "every trimmed KV copy failed",
+            .checkpoint_list_copy_failed => "the trimmed checkpoint list copy failed",
+        };
+    }
+};
+
 /// Result of a cache lookup. Tells the caller how many tokens of `prompt_ids`
 /// are already in the live cache after a successful restore — the caller
 /// then prefills only the trailing diverged tokens (`prompt_ids[matched..]`).
@@ -612,36 +632,110 @@ pub const HotPrefixCache = struct {
         return total;
     }
 
+    /// Stack bound for the shed simulation. A committed checkpoint list is
+    /// capped by `ssm_checkpoint_max` (32 by default), so this never binds in
+    /// practice; a longer list falls back to billing every lower checkpoint,
+    /// which only ever prices a SHORTER trim point, never a longer one.
+    const SHED_SIM_MAX: usize = 128;
+
+    /// Bytes the checkpoints at or below a candidate trim point cost AFTER the
+    /// commit path's span-preserving shed to `allowance`; null when even the
+    /// last survivor is over. Billing every lower checkpoint instead (the #330
+    /// answer) prices a trim point the entry never has to pay for —
+    /// `shedCheckpointsToFit` thins the interior the moment the entry lands
+    /// over the cap. `positions` is ascending, `bytes` parallel to it.
+    fn shedSurvivorBytes(positions: []const usize, bytes: []const u64, allowance: u64) ?u64 {
+        var total: u64 = 0;
+        for (bytes) |b| total += b;
+        if (total <= allowance) return total;
+        if (positions.len > SHED_SIM_MAX) return null;
+        var pos_buf: [SHED_SIM_MAX]usize = undefined;
+        var byte_buf: [SHED_SIM_MAX]u64 = undefined;
+        @memcpy(pos_buf[0..positions.len], positions);
+        @memcpy(byte_buf[0..bytes.len], bytes);
+        var n = positions.len;
+        while (total > allowance and n > 1) {
+            const drop = transformer_mod.positionDropIndexUsize(pos_buf[0..n]);
+            total -= byte_buf[drop];
+            var k = drop;
+            while (k + 1 < n) : (k += 1) {
+                pos_buf[k] = pos_buf[k + 1];
+                byte_buf[k] = byte_buf[k + 1];
+            }
+            n -= 1;
+        }
+        return if (total <= allowance) total else null;
+    }
+
+    /// The hybrid arm of `trimLenForBudget` as pure arithmetic over positions
+    /// and per-checkpoint bytes, so the live 383k shape is testable without
+    /// materializing 8 GB of state.
+    fn trimLenForBudgetPure(
+        budget: u64,
+        limit: usize,
+        row_bytes: u64,
+        positions: []const usize,
+        cp_bytes: []const u64,
+    ) ?usize {
+        var k = positions.len;
+        while (k > 0) {
+            k -= 1;
+            const p = positions[k];
+            if (p > limit) continue;
+            // Ascending positions: everything below here is under the floor
+            // too.
+            if (p < MIN_CANCELLED_COMMIT_TOKENS) return null;
+            const rows = @as(u64, p) * row_bytes;
+            if (rows > budget) continue;
+            if (shedSurvivorBytes(positions[0 .. k + 1], cp_bytes[0 .. k + 1], budget - rows) != null) return p;
+        }
+        return null;
+    }
+
+    /// Defensive arm for a checkpoint list past `SHED_SIM_MAX`: the pre-shed
+    /// bill (every lower checkpoint). Unreachable while the retention cap
+    /// holds.
+    fn trimLenBillingAllLower(budget: u64, limit: usize, row_bytes: u64, list: []const SSMCheckpoint) ?usize {
+        var k = list.len;
+        while (k > 0) {
+            k -= 1;
+            const p = list[k].pos;
+            if (p > limit) continue;
+            if (p < MIN_CANCELLED_COMMIT_TOKENS) return null;
+            var cps_cost: u64 = 0;
+            for (list[0 .. k + 1]) |*cp| cps_cost += ssmCheckpointBytes(cp);
+            if (@as(u64, p) * row_bytes + cps_cost <= budget) return p;
+        }
+        return null;
+    }
+
     /// Issue #330: the longest retainable prefix length under `budget`, or
     /// null when nothing at or above the commit floor fits. With checkpoints
     /// (hybrid entry) the trim point must be a RESTORABLE position — a
-    /// checkpoint's own `pos` — and its cost includes every checkpoint it
-    /// keeps; a KV-only hybrid prefix restores as a cold miss while occupying
-    /// an LRU slot, so `budget / row_bytes` is not an answer there. Plain
-    /// attention restores at any length, so the budget simply prices tokens.
-    /// `limit` caps the answer (tokens.len, or the media boundary — trimming
-    /// INTO placeholder rows is not a shape we want to reason about).
+    /// checkpoint's own `pos` — and its cost includes the checkpoints that
+    /// SURVIVE the commit's span-preserving shed, not every lower one; a
+    /// KV-only hybrid prefix restores as a cold miss while occupying an LRU
+    /// slot, so `budget / row_bytes` is not an answer there. Plain attention
+    /// restores at any length, so the budget simply prices tokens. `limit`
+    /// caps the answer (tokens.len, or the media boundary — trimming INTO
+    /// placeholder rows is not a shape we want to reason about).
     fn trimLenForBudget(
         budget: u64,
         limit: usize,
         row_bytes: u64,
         cps: ?[]const SSMCheckpoint,
     ) ?usize {
-        if (cps != null and cps.?.len > 0) {
-            const list = cps.?;
-            var k = list.len;
-            while (k > 0) {
-                k -= 1;
-                const p = list[k].pos;
-                if (p > limit) continue;
-                // Ascending positions: everything below here is under the
-                // floor too.
-                if (p < MIN_CANCELLED_COMMIT_TOKENS) return null;
-                var cps_cost: u64 = 0;
-                for (list[0 .. k + 1]) |*cp| cps_cost += ssmCheckpointBytes(cp);
-                if (@as(u64, p) * row_bytes + cps_cost <= budget) return p;
+        if (cps) |list| {
+            if (list.len > 0) {
+                if (list.len > SHED_SIM_MAX) return trimLenBillingAllLower(budget, limit, row_bytes, list);
+                var pos_buf: [SHED_SIM_MAX]usize = undefined;
+                var byte_buf: [SHED_SIM_MAX]u64 = undefined;
+                for (list, 0..) |*cp, i| {
+                    pos_buf[i] = cp.pos;
+                    byte_buf[i] = ssmCheckpointBytes(cp);
+                }
+                return trimLenForBudgetPure(budget, limit, row_bytes, pos_buf[0..list.len], byte_buf[0..list.len]);
             }
-            return null;
         }
         if (row_bytes == 0) return null;
         const fit: usize = @intCast(budget / row_bytes);
@@ -1110,8 +1204,10 @@ pub const HotPrefixCache = struct {
         // fits instead; decline only when nothing above the floor does.
         if (self.max_kv_bytes > 0 and new_bytes > self.max_kv_bytes) {
             var trimmed_ok = false;
-            trim_blk: {
-                const limit = if (eff_media_start) |ms| @min(tokens.len, ms) else tokens.len;
+            var decline: TrimDecline = .no_restorable_prefix;
+            var decline_err: ?anyerror = null;
+            var limit = if (eff_media_start) |ms| @min(tokens.len, ms) else tokens.len;
+            trim_blk: while (true) {
                 const tl = trimLenForBudget(self.max_kv_bytes, limit, snapshotRowBytes(&new_snap), eff_cps) orelse break :trim_blk;
                 // One-shot: when the resident covered entry already retains
                 // the trim target, keep it and drop the candidate — the
@@ -1136,7 +1232,17 @@ pub const HotPrefixCache = struct {
                         return;
                     }
                 }
-                const trimmed = new_snap.trimmedCopy(tl, mlx.gpuStream()) catch break :trim_blk;
+                const trimmed = new_snap.trimmedCopy(tl, mlx.gpuStream()) catch |err| {
+                    // A copy that failed at THIS width is not a verdict on
+                    // the entry: retry at the next-lower checkpoint before
+                    // declining. The old arm swallowed the error entirely.
+                    decline = .snapshot_copy_failed;
+                    decline_err = err;
+                    log.warn("  [hot-cache] trimmed copy to {d} tokens failed: {s}; retrying at the next-lower checkpoint\n", .{ tl, @errorName(err) });
+                    if (tl == 0) break :trim_blk;
+                    limit = tl - 1;
+                    continue;
+                };
                 new_snap.deinit();
                 new_snap = trimmed;
                 // Spec payloads describe the FULL-length state; a trimmed
@@ -1161,7 +1267,15 @@ pub const HotPrefixCache = struct {
                         if (kept > 0 and checkpointHasQsaHistory(&cps[cps.len - 1])) {
                             sliceQsaHistoryOntoCheckpoint(&cps[kept - 1], &cps[cps.len - 1], cps[kept - 1].pos, mlx.gpuStream()) catch {};
                         }
-                        const shrunk = self.allocator.dupe(SSMCheckpoint, cps[0..kept]) catch break :trim_blk;
+                        const shrunk = self.allocator.dupe(SSMCheckpoint, cps[0..kept]) catch |err| {
+                            // `new_snap` is already the trimmed copy and the
+                            // spec payloads are gone; the decline below frees
+                            // exactly that, so nothing leaks — but the work
+                            // is thrown away, which is worth its own line.
+                            decline = .checkpoint_list_copy_failed;
+                            decline_err = err;
+                            break :trim_blk;
+                        };
                         for (cps[kept..]) |*cp| cp.deinit(self.allocator);
                         self.allocator.free(cps);
                         eff_cps = shrunk;
@@ -1184,6 +1298,7 @@ pub const HotPrefixCache = struct {
                     @as(f64, @floatFromInt(self.max_kv_bytes)) / (1024.0 * 1024.0),
                 });
                 trimmed_ok = true;
+                break;
             }
             if (!trimmed_ok) {
                 var discarded_snap = new_snap;
@@ -1194,10 +1309,15 @@ pub const HotPrefixCache = struct {
                     for (cps) |*cp| cp.deinit(self.allocator);
                     self.allocator.free(cps);
                 }
-                log.info("  [hot-cache] skipped oversized entry ({d} tokens, {d:.2} MB > {d:.2} MB budget)\n", .{
+                const err_sep: []const u8 = if (decline_err != null) ": " else "";
+                const err_name: []const u8 = if (decline_err) |e| @errorName(e) else "";
+                log.info("  [hot-cache] skipped oversized entry ({d} tokens, {d:.2} MB > {d:.2} MB budget): {s}{s}{s}\n", .{
                     tokens.len,
                     @as(f64, @floatFromInt(new_bytes)) / (1024.0 * 1024.0),
                     @as(f64, @floatFromInt(self.max_kv_bytes)) / (1024.0 * 1024.0),
+                    decline.reason(),
+                    err_sep,
+                    err_name,
                 });
                 return;
             }
@@ -1391,6 +1511,10 @@ pub const HotPrefixCache = struct {
             return err;
         };
         self.current_kv_bytes += new_bytes;
+        // The trim above prices a prefix against the checkpoints that SURVIVE
+        // a shed, so the shed has to actually run here too — the replace path
+        // already ends with one. No-op while the cache is under its cap.
+        if (self.max_kv_bytes > 0) self.shedCheckpointsToFit();
         if (self.disk != null) self.disk_dirty = true;
         self.logResident();
     }
@@ -1641,7 +1765,10 @@ pub const HotPrefixCache = struct {
     /// drop whichever checkpoint sits between the closest pair of neighbours,
     /// i.e. the one whose removal widens the coverage gap least. Same count,
     /// spread over the whole prompt, LESS memory. `n` is at most
-    /// `ssm_checkpoint_max`, so the quadratic scan is trivial.
+    /// `ssm_checkpoint_max`, so the quadratic scan is trivial. The selection
+    /// is `transformer.ssmCheckpointDropIndex` — ONE policy shared with the
+    /// prefill capture, the byte-budget shed and the disk tier, so no site can
+    /// drift back to drop-oldest.
     fn mergeCheckpointLists(
         self: *HotPrefixCache,
         old: []SSMCheckpoint,
@@ -1693,19 +1820,7 @@ pub const HotPrefixCache = struct {
         {
             // Under three there is no interior to thin; honour the cap by
             // dropping the oldest, which is also the cheapest to redo.
-            const drop = if (merged.items.len < 3) 0 else blk2: {
-                var best_at: usize = 1;
-                var best_span: usize = std.math.maxInt(usize);
-                var k: usize = 1;
-                while (k + 1 < merged.items.len) : (k += 1) {
-                    const span = merged.items[k + 1].pos - merged.items[k - 1].pos;
-                    if (span < best_span) {
-                        best_span = span;
-                        best_at = k;
-                    }
-                }
-                break :blk2 best_at;
-            };
+            const drop = transformer_mod.ssmCheckpointDropIndex(merged.items);
             var dropped = merged.orderedRemove(drop);
             dropped.deinit(self.allocator);
         }
@@ -1817,20 +1932,11 @@ pub const HotPrefixCache = struct {
         var n = cps.len;
         var shed: usize = 0;
         while (n > 1 and self.current_kv_bytes > self.max_kv_bytes) {
-            const drop = if (n < 3) 0 else blk: {
-                var best_at: usize = 1;
-                var best_span: usize = std.math.maxInt(usize);
-                var k: usize = 1;
-                while (k + 1 < n) : (k += 1) {
-                    const span = cps[k + 1].pos - cps[k - 1].pos;
-                    if (span < best_span) {
-                        best_span = span;
-                        best_at = k;
-                    }
-                }
-                break :blk best_at;
-            };
+            const drop = transformer_mod.ssmCheckpointDropIndex(cps[0..n]);
             const freed = ssmCheckpointBytes(&cps[drop]);
+            // Defensive: the shared selection never picks the last (that is
+            // where warm turns match), so this arm is a no-op guard against a
+            // future policy that would.
             if (drop + 1 == n and drop > 0 and checkpointHasQsaHistory(&cps[drop])) {
                 sliceQsaHistoryOntoCheckpoint(&cps[drop - 1], &cps[drop], cps[drop - 1].pos, mlx.gpuStream()) catch {};
             }
@@ -4318,4 +4424,173 @@ test "EntryDigest: the published snapshot answers the reclaimable question witho
     // The digest agrees with the direct, cache-side answer.
     try testing.expectEqual(hc.reclaimableBytesFor(&tokens_a), credit_a);
     try testing.expectEqual(hc.reclaimableBytesFor(&tokens_c), both);
+test "prefix cache: the trim bill prices only the checkpoints a shed would keep" {
+    // `shedCheckpointsToFit` thins the interior the moment an entry lands over
+    // the cap, so billing EVERY lower checkpoint at a candidate trim point
+    // (the #330 answer) prices memory the entry never has to hold.
+    const positions = [_]usize{ 100, 200, 300, 400, 500 };
+    const bytes = [_]u64{ 10, 10, 10, 10, 10 };
+    // Everything fits: no shed, full bill.
+    try testing.expectEqual(@as(?u64, 50), HotPrefixCache.shedSurvivorBytes(&positions, &bytes, 50));
+    // Sheds down to the two ends.
+    try testing.expectEqual(@as(?u64, 20), HotPrefixCache.shedSurvivorBytes(&positions, &bytes, 25));
+    // ... and to the single trim-point checkpoint.
+    try testing.expectEqual(@as(?u64, 10), HotPrefixCache.shedSurvivorBytes(&positions, &bytes, 15));
+    // One checkpoint is the floor: under that there is nothing to retain.
+    try testing.expectEqual(@as(?u64, null), HotPrefixCache.shedSurvivorBytes(&positions, &bytes, 5));
+}
+
+test "prefix cache: a 383k oversized hybrid entry trims instead of flat-declining" {
+    // The live #330 follow-up shape: qwen4_exp, 4096-token SSM checkpoint
+    // stride, a 383,069-token entry at 13,056 bytes per KV row, ~26 MB per
+    // checkpoint, a 3,873.54 MB hot-cache budget. It committed as
+    //   [hot-cache] skipped oversized entry (383069 tokens, 8757.79 MB > 3873.54 MB budget)
+    // although #330 promises a TRIM.
+    const row_bytes: u64 = 13_056;
+    const per_cp: u64 = 26 * 1024 * 1024;
+    const budget: u64 = 3873 * 1024 * 1024;
+    const tokens: usize = 383_069;
+
+    // 93 stride captures plus the end-of-prompt snap.
+    var all_pos: [94]usize = undefined;
+    for (all_pos[0..93], 0..) |*p, i| p.* = (i + 1) * 4096;
+    all_pos[93] = 383_039;
+    var bytes: [94]u64 = undefined;
+    for (&bytes) |*b| b.* = per_cp;
+
+    // (a) Drop-oldest retention: the survivors are the highest 16, so the
+    // LOWEST of them already prices past the budget on KV rows alone and
+    // nothing at all fits — the flat decline.
+    {
+        const end_anchored = all_pos[78..94];
+        try testing.expect(@as(u64, end_anchored[0]) * row_bytes > budget);
+        try testing.expectEqual(
+            @as(?usize, null),
+            HotPrefixCache.trimLenForBudgetPure(budget, tokens, row_bytes, end_anchored, bytes[0..16]),
+        );
+    }
+
+    // (b) Span-preserving retention: the same 16 survivors spread over the
+    // whole prompt, so a long prefix is affordable.
+    var pos: [94]usize = all_pos;
+    var n: usize = pos.len;
+    while (n > 16) {
+        const drop = transformer_mod.positionDropIndexUsize(pos[0..n]);
+        var k = drop;
+        while (k + 1 < n) : (k += 1) pos[k] = pos[k + 1];
+        n -= 1;
+    }
+    try testing.expectEqual(@as(usize, 4096), pos[0]);
+    try testing.expectEqual(@as(usize, 383_039), pos[n - 1]);
+    const tl = HotPrefixCache.trimLenForBudgetPure(budget, tokens, row_bytes, pos[0..n], bytes[0..n]) orelse
+        return error.NoTrimPoint;
+    // 126,976 = 31 x 4096 is the arithmetic in the write-up; the thinned list
+    // affords considerably more.
+    try testing.expect(tl >= 126_976);
+    // The answer is a RESTORABLE position, and it fits once the shed runs.
+    try testing.expect(std.mem.indexOfScalar(usize, pos[0..n], tl) != null);
+    var kept: usize = 0;
+    while (kept < n and pos[kept] <= tl) kept += 1;
+    const survivors = HotPrefixCache.shedSurvivorBytes(
+        pos[0..kept],
+        bytes[0..kept],
+        budget - @as(u64, tl) * row_bytes,
+    ) orelse return error.ShedDoesNotFit;
+    try testing.expect(@as(u64, tl) * row_bytes + survivors <= budget);
+
+    // (c) The bill itself is load-bearing, not just the retention: pricing
+    // EVERY lower checkpoint (the #330 answer) at the same candidate point
+    // buys a strictly SHORTER prefix, because the commit sheds those
+    // checkpoints the moment the entry lands over the cap.
+    var all_lower: ?usize = null;
+    var k = n;
+    while (k > 0) {
+        k -= 1;
+        const p = pos[k];
+        if (p < MIN_CANCELLED_COMMIT_TOKENS) break;
+        if (@as(u64, p) * row_bytes + @as(u64, k + 1) * per_cp <= budget) {
+            all_lower = p;
+            break;
+        }
+    }
+    try testing.expect(all_lower != null);
+    try testing.expect(tl > all_lower.?);
+}
+
+test "prefix cache: a failed trimmed copy retries at the next-lower checkpoint" {
+    // A `trimmedCopy` failure at one width is not a verdict on the entry —
+    // the old arm swallowed the error and declined the whole commit.
+    const positions = [_]usize{ 4096, 8192, 12288 };
+    const bytes = [_]u64{ 1024, 1024, 1024 };
+    const budget: u64 = 60_000;
+    const tl = HotPrefixCache.trimLenForBudgetPure(budget, 100_000, 4, &positions, &bytes) orelse
+        return error.NoTrimPoint;
+    try testing.expectEqual(@as(usize, 12288), tl);
+    // The retry's limit is `tl - 1`, which lands on the next-lower checkpoint.
+    try testing.expectEqual(
+        @as(?usize, 8192),
+        HotPrefixCache.trimLenForBudgetPure(budget, tl - 1, 4, &positions, &bytes),
+    );
+    // Below the commit floor there is nothing left to retry.
+    try testing.expectEqual(
+        @as(?usize, null),
+        HotPrefixCache.trimLenForBudgetPure(budget, 255, 4, &positions, &bytes),
+    );
+    const source = @embedFile("prefix_cache.zig");
+    const at = std.mem.indexOf(u8, source, "new_snap.trimmedCopy(tl, mlx.gpuStream()) catch") orelse
+        return error.MissingTrimCopy;
+    const arm = source[at..@min(source.len, at + 800)];
+    try testing.expect(std.mem.indexOf(u8, arm, "limit = tl - 1") != null);
+    try testing.expect(std.mem.indexOf(u8, arm, "@errorName(err)") != null);
+}
+
+test "prefix cache: an oversized commit names WHICH outcome declined it" {
+    // Three outcomes printed the SAME `skipped oversized entry` line, and the
+    // two failures swallowed their error.
+    const a = TrimDecline.no_restorable_prefix.reason();
+    const b = TrimDecline.snapshot_copy_failed.reason();
+    const c = TrimDecline.checkpoint_list_copy_failed.reason();
+    try testing.expect(a.len > 0 and b.len > 0 and c.len > 0);
+    try testing.expect(!std.mem.eql(u8, a, b));
+    try testing.expect(!std.mem.eql(u8, a, c));
+    try testing.expect(!std.mem.eql(u8, b, c));
+
+    const source = @embedFile("prefix_cache.zig");
+    const at = std.mem.indexOf(u8, source, "skipped oversized entry ({d} tokens") orelse
+        return error.MissingSkipLine;
+    const line = source[at..@min(source.len, at + 400)];
+    try testing.expect(std.mem.indexOf(u8, line, "decline.reason()") != null);
+    try testing.expect(std.mem.indexOf(u8, line, "err_name") != null);
+    // Both failure arms set a distinct decline AND keep the error.
+    try testing.expect(std.mem.indexOf(u8, source, "decline = .snapshot_copy_failed;") != null);
+    try testing.expect(std.mem.indexOf(u8, source, "decline = .checkpoint_list_copy_failed;") != null);
+}
+
+test "prefix cache: every ssm checkpoint retention site thins span-preserving" {
+    // Class guard. Three sites bound a checkpoint list — the prefill capture
+    // (generate.zig, twice), the hot cache's merge + byte-budget shed, and the
+    // disk tier's persisted positions. Drop-oldest on ANY of them end-anchors
+    // the survivors, and #330's trim then has nothing affordable to land on.
+    const gen = @embedFile("generate.zig");
+    try testing.expect(std.mem.indexOf(u8, gen, "ssm_checkpoints.orderedRemove(0)") == null);
+    var seen: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, gen, i, "transformer_mod.ssmCheckpointDropIndex(ssm_checkpoints.items)")) |at| {
+        seen += 1;
+        i = at + 1;
+    }
+    try testing.expectEqual(@as(usize, 2), seen);
+
+    // Scan the two hot-cache sites INSIDE their own functions — a bare
+    // file-wide search would match this test's own text.
+    const self_src = @embedFile("prefix_cache.zig");
+    for ([_][]const u8{ "fn mergeCheckpointLists(", "fn shedCheckpointsToFit(" }) |sig| {
+        const at = std.mem.indexOf(u8, self_src, sig) orelse return error.MissingRetentionSite;
+        const body = self_src[at..@min(self_src.len, at + 2400)];
+        try testing.expect(std.mem.indexOf(u8, body, "transformer_mod.ssmCheckpointDropIndex(") != null);
+    }
+
+    const disk = @embedFile("kv_disk_cache.zig");
+    try testing.expect(std.mem.indexOf(u8, disk, "transformer_mod.positionDropIndex(set.items)") != null);
+    try testing.expect(std.mem.indexOf(u8, disk, "std.mem.copyForwards(u32, set.items") == null);
 }

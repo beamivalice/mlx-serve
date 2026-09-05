@@ -71,9 +71,10 @@ pub const DEFAULT_CHUNK_TOKENS: u32 = 1024;
 
 /// Max persisted SSM checkpoint positions per entry. Every turn adds an
 /// end-of-prompt checkpoint (~400 MB each on Qwen3.6-27B); unbounded, one
-/// long session would accumulate GBs in a single entry. Thinning drops the
-/// LOWEST positions first (mirrors the RAM capture's front-drop) — the
-/// newest positions are where multi-turn warm requests match.
+/// long session would accumulate GBs in a single entry. Thinning is
+/// span-preserving (`transformer.positionDropIndex`, the RAM tier's policy):
+/// the lowest AND the newest position always survive, so a restore that
+/// diverges early still finds a checkpoint below its match.
 pub const SSM_DISK_MAX_PER_ENTRY: usize = 8;
 
 /// SSD-first per-flush READBACK bound (mechanism 2). Bounds only the
@@ -1579,8 +1580,8 @@ pub const DiskTier = struct {
     }
 
     /// The set of checkpoint positions that SHOULD be on disk after this
-    /// flush: the highest `SSM_DISK_MAX_PER_ENTRY` of (already-persisted ∪
-    /// newly-eligible). Eligible = a RAM checkpoint at a position within the
+    /// flush: `SSM_DISK_MAX_PER_ENTRY` of (already-persisted ∪
+    /// newly-eligible), thinned span-preservingly (both ends kept). Eligible = a RAM checkpoint at a position within the
     /// KV now on disk (a hybrid restore needs KV covering [0, cp_pos)).
     /// Sorted ascending; caller frees.
     fn ssmTargetPositions(self: *DiskTier, old_positions: []const u32, cps: []const transformer_mod.SSMCheckpoint, kv_len: u32) ![]u32 {
@@ -1593,10 +1594,8 @@ pub const DiskTier = struct {
             if (std.mem.indexOfScalar(u32, set.items, p) == null) try set.append(self.allocator, p);
         }
         std.mem.sort(u32, set.items, {}, std.sort.asc(u32));
-        if (set.items.len > SSM_DISK_MAX_PER_ENTRY) {
-            const drop = set.items.len - SSM_DISK_MAX_PER_ENTRY;
-            std.mem.copyForwards(u32, set.items[0 .. set.items.len - drop], set.items[drop..]);
-            set.shrinkRetainingCapacity(set.items.len - drop);
+        while (set.items.len > SSM_DISK_MAX_PER_ENTRY) {
+            _ = set.orderedRemove(transformer_mod.positionDropIndex(set.items));
         }
         return set.toOwnedSlice(self.allocator);
     }
@@ -3061,11 +3060,13 @@ test "DiskTier: hybrid entry round-trips SSM checkpoints (Phase 3)" {
     try testing.expectError(error.DiskCacheNoCheckpoint, tier2.restoreIntoHybrid(&cache3, &dst2, 0, 200, s));
 }
 
-test "DiskTier: SSM retention keeps the newest positions, drops the oldest" {
+test "DiskTier: SSM retention thins the interior, keeping both ends" {
     // Every turn adds an end-of-prompt checkpoint; unbounded, one entry grows
     // without limit. Retention keeps at most SSM_DISK_MAX_PER_ENTRY, thinning
-    // from the FRONT (lowest positions first — the newest are where warm
-    // requests match).
+    // the INTERIOR (#330 follow-up — front-thinning end-anchors the survivors,
+    // so a restore that diverges early finds no checkpoint below its match and
+    // pays a full cold prefill). Updated from "keeps the newest, drops the
+    // oldest": the policy itself changed, and it is now the RAM tier's.
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -3093,17 +3094,19 @@ test "DiskTier: SSM retention keeps the newest positions, drops the oldest" {
 
     _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
 
-    // Exactly MAX positions on disk; the LOWEST (100) dropped, newest kept.
+    // Exactly MAX positions on disk; BOTH ends kept, an interior one dropped.
     const e = &tier.entries.items[0];
     try testing.expectEqual(@as(usize, SSM_DISK_MAX_PER_ENTRY), e.ssm_positions.len);
-    try testing.expectEqual(@as(u32, 200), e.ssm_positions[0]);
+    try testing.expectEqual(@as(u32, 100), e.ssm_positions[0]);
     try testing.expectEqual(@as(u32, @intCast(N * 100)), e.ssm_positions[e.ssm_positions.len - 1]);
+    // Evenly spaced: the first interior position goes.
+    try testing.expect(std.mem.indexOfScalar(u32, e.ssm_positions, 200) == null);
     // The dropped position's file is gone.
-    const dropped = try std.fmt.allocPrint(testing.allocator, "{s}/fp-retain/e1/s0000100.safetensors", .{base});
+    const dropped = try std.fmt.allocPrint(testing.allocator, "{s}/fp-retain/e1/s0000200.safetensors", .{base});
     defer testing.allocator.free(dropped);
     try testing.expect(statFile(io, dropped) == null);
-    // A kept position's file exists.
-    const kept = try std.fmt.allocPrint(testing.allocator, "{s}/fp-retain/e1/s0000200.safetensors", .{base});
+    // The lowest position — the one front-thinning used to drop — is kept.
+    const kept = try std.fmt.allocPrint(testing.allocator, "{s}/fp-retain/e1/s0000100.safetensors", .{base});
     defer testing.allocator.free(kept);
     try testing.expect(statFile(io, kept) != null);
 }
