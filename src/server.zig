@@ -3260,22 +3260,34 @@ pub fn ssdFirstPrefixCacheMem(
 /// the answer comes back as a placeholder: 1024 tokens ≈ 26 MB of "session" on
 /// the box that found this (clamp live check #6, the 870-token boot).
 ///
-/// `cache_reserve` is the ONE argument the two arms differ in, and it is the
-/// reason this is shared rather than duplicated:
+/// `cache_reserve` is `CTX_SIZING_CACHE_RESERVE` on BOTH arms, and it is the
+/// same constant `computeMemoryContext` sizes against. That is not a
+/// coincidence to be tidied up later — it is the invariant:
 ///
-///   * SSD-first passes **0**. Its resident entry IS the live KV, so the cache
-///     genuinely reserves nothing beyond the session, the context that falls
-///     out is the one the machine will actually serve, and there is no
-///     fixpoint. Not a convenience — the honest number.
-///   * RAM-first has no such out (its cache is memory in ADDITION to the live
-///     KV) and passes a CONSTANT. It must never pass the ask, nor anything
-///     derived from it: context is the primary claimant and the cache is the
-///     residual, the same order rule the prefill chunk already follows. An ask
-///     that can shrink the context is an ask that shrinks the bill computed
-///     against it — #6 again, one level in.
+///   * The number this returns is the session the hot-cache budget floor is
+///     built for. The number `pinAutoContext` freezes right afterwards is the
+///     session the server ADVERTISES, and an agent CLI reads it once and
+///     budgets against it for the whole session. If the two reserves differ,
+///     the load-time bill and the pinned context are two different answers to
+///     "how big is one session", and the floor is sized for a session the box
+///     will never be asked to serve.
+///   * The reserve must never be the ask, nor anything derived from it —
+///     neither `--prefix-cache-mem` nor the budget resolved from it. Context is
+///     the primary claimant and the cache is the residual, the same order rule
+///     the prefill chunk follows. Reading the ask is live check #6 (60GB ask ->
+///     an 870-token advertised context); reading the RESOLVED budget is audit
+///     S6, the same bug one level in, as a one-step loop.
+///
+/// SSD-first used to pass 0 here, on the ground that its resident entry IS the
+/// live KV and so costs nothing beyond the session. True of the RESIDENT entry
+/// and false of the mode's IDLE allowance, which is RAM in addition to it — and
+/// the sizer reserved the constant either way, so the SSD arm billed a session
+/// several percent larger than the one it then advertised. One constant, both
+/// arms, both sides.
 ///
 /// Runs `autoContextFrom` — the SAME helper `autoContextFor` runs — rather than
-/// re-spelling the margin, so it cannot depend on the accessor it works around.
+/// re-spelling the margin, so it cannot depend on the accessor it works around
+/// and cannot drift from it either.
 pub fn resolvedContextForLoad(
     explicit_ctx: u32,
     pinned_ctx: u32,
@@ -3302,15 +3314,19 @@ pub fn resolvedContextForLoad(
 
 /// The SSD-first call site. Takes the ceiling rather than reading it: the
 /// budget is a property of the MACHINE, not of how busy the box happened to be
-/// at load, and the caller passes the STATIC ceiling for both arms. Passes
-/// `cache_reserve = 0` for the reason given above.
+/// at load, and the caller passes the STATIC ceiling for both arms.
+///
+/// Passes `CTX_SIZING_CACHE_RESERVE`, the same constant the RAM arm and
+/// `computeMemoryContext` pass. The session this bills is the session
+/// `pinAutoContext` advertises a moment later; a reserve of its own here made
+/// them two numbers.
 fn ssdFirstSessionTokensNow(config: *const model_mod.ModelConfig, kv_bits: u64, ceiling: u64, active_mem: u64, chunk: u32) u32 {
     return resolvedContextForLoad(
         server_config.max_context_size,
         config.pinned_context,
         ceiling,
         active_mem,
-        0,
+        CTX_SIZING_CACHE_RESERVE,
         prefillTransientReserve(config, kv_bits, chunk),
         kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config),
         config.contextCap(),

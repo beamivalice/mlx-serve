@@ -2382,8 +2382,70 @@ only after it; under `--log-level warn` the call returns before it can even
 consume the post-load token, which must not be spent on a line that was never
 going to be written.
 
+### The billed session and the advertised session were two numbers (2026-09-05)
+
+Found by the SSD-first owner while folding these branches together, and it is
+the same family as audit S6 one level out.
+
+On an SSD-first boot the load-time bill and the pinned context are supposed to
+be one session:
+
+- `ssdFirstSessionTokensNow` bills the session the budget FLOOR is built for
+  (`ssdFirstPrefixCacheMem` floors the budget at one entry at the working
+  context), and it passed `cache_reserve = 0` — the reasoning being that the
+  resident entry IS the live KV, so the cache reserves nothing beyond the
+  session.
+- `pinAutoContext` -> `computeMemoryContext` then sized the ADVERTISED context
+  against `CTX_SIZING_CACHE_RESERVE`.
+
+Same box, same instant, two reserves, two sessions. An agent CLI reads the
+smaller number out of `/v1/models` ONCE and budgets against it for the whole
+session, while the cache floor holds RAM for the larger one. It survived review
+because neither number looks wrong on its own: both are real contexts, a few
+percent apart, and the wrongness is only visible when you ask which one "one
+session" means.
+
+The `= 0` argument is true of the RESIDENT entry and false of the mode's IDLE
+allowance, which is RAM in addition to it. But the honest idle allowance is
+`--prefix-cache-mem`, i.e. the ASK — and reading the ask is live check #6 (a
+60GB ask collapsed the advertised context to 870 tokens), while reading the
+budget resolved from it is audit S6, the same bug as a one-step loop. Context is
+the primary claimant and the cache is the residual. So the reserve is the
+CONSTANT on both arms and on both sides, and the constant is the server's own
+`--prefix-cache-mem` default, so a default boot is unchanged.
+
+The relation, stated exactly, is now one expression in one helper
+(`autoContextFrom`) that both sides run:
+
+```
+advertised = autoContextFrom(
+    safeContextForBudget(ceiling, active,
+                         CTX_SIZING_CACHE_RESERVE + transient,
+                         per_tok, 0),
+    ctx_cap)
+```
+
+The 85% memory margin lives INSIDE it and the checkpoint cap is applied AFTER
+the margin, un-margined — get that order wrong and the two sides differ by
+exactly the margin, which is how the S6 test read at the fold (it compared the
+raw memory context against the clamp's margined answer).
+
+Explicit `--ctx-size` boots are untouched: the operator's number is the
+resolver's FIRST early return and `pinAutoContext` returns it before any sizing
+runs. Pinned as INVARIANCE in the reserve rather than against a recorded
+constant, because that is the property the change has to preserve.
+
 ### Rules this produced
 
+- The load-time session bill and the advertised context are ONE number. They are
+  computed in different functions at different times, so they must read one
+  reserve and one margin helper, or they are two answers to "how big is one
+  session" and the cache floor is sized for a session nobody can request.
+- A per-arm reserve is a per-arm SESSION. If an arm has a reason to reserve
+  differently, the sizer needs the same reason — otherwise the arm is billing a
+  machine the server does not advertise.
+- A margin and a cap that are applied in a fixed ORDER belong in one helper. Two
+  sites spelling "85% then cap" agree until one of them is edited.
 - A width chosen from free memory is asked TWICE around an eviction pass, and the
   second reading is credited only the bytes the ALLOCATOR returned — never
   `reclaimable`, never `accounted_bytes`. The clamp to the max is the assertion
