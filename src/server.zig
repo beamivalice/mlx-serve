@@ -3178,20 +3178,25 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
         const kv_bits: u64 = defaultKvBits();
         // The hot-cache ASK is the a93e2c0 term, read only on the ungated arm
         // (`prefillChunkCap`); the gated arm ignores it by construction.
+        // Through the accessor, never the global: at pin time nothing has
+        // published a clamped budget yet so this IS the raw ask (a93e2c0's
+        // `prefix_cache_mem_bytes`), and if a later model pins after a publish
+        // the accessor is the one that knows the switch retired it.
+        const hot_cache_ask = resolvedPrefixCacheMem();
         config.pinned_prefill_chunk = billedPrefillChunk(
             config,
             kv_bits,
             currentGpuMemoryCeiling(active_mem),
             active_mem,
             sizerCtxKvBytes(config, kv_bits),
-            prefix_cache_mem_bytes,
+            hot_cache_ask,
             explicitPrefillChunk(),
         );
         // The ctx bar narrows the rung on the GATED arch only, so say when it
         // is the binding one — a chunk pinned at 512 by a large `--ctx-size`
         // is otherwise indistinguishable from a small box (audit S9).
         if (ctxBarEnabled() and config.longCtxGated() and explicitPrefillChunk() == 0) {
-            const share_only = resolvePrefillChunk(config, kv_bits, currentGpuMemoryCeiling(active_mem), active_mem, 0, prefix_cache_mem_bytes);
+            const share_only = resolvePrefillChunk(config, kv_bits, currentGpuMemoryCeiling(active_mem), active_mem, 0, hot_cache_ask);
             if (share_only > config.pinned_prefill_chunk) {
                 log.info("[prefill] chunk {d} (ctx bar: the --ctx-size KV bill; share-only would allow {d}; MLX_SERVE_PREFILL_CHUNK_CTX_BAR=0 restores)\n", .{ config.pinned_prefill_chunk, share_only });
             }
@@ -3619,8 +3624,15 @@ test "clampedPrefixCacheMem: the budget never exceeds what the weights leave und
 /// and `qsaMaskBytes`) are non-zero. The absolute rung it lands on depends on
 /// the checkpoint's own reserve ladder; every assertion below is an INVARIANT
 /// over that ladder, never a hardcoded width.
+///
+/// It DECLARES `qwen4_exp` (a test config is a checkpoint CLAIM): only that
+/// arch parses the indexer fields this fixture sets, and every #363 mechanism
+/// is gated on `ModelConfig.longCtxGated()`, so a fixture that left the
+/// default `model_type` would silently measure the a93e2c0 arm while claiming
+/// to pin the new one.
 fn longCtxTestConfig() model_mod.ModelConfig {
     var cfg = model_mod.ModelConfig{};
+    cfg.model_type = "qwen4_exp";
     cfg.num_hidden_layers = 40;
     cfg.num_attention_heads = 24;
     cfg.num_key_value_heads = 2;

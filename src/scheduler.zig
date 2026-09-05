@@ -7428,7 +7428,10 @@ test "the batched group takes its kv length from the ONE accessor, never cache.s
     // ...and the arch gate is the ONE predicate, in this ONE function. A
     // second site with its own conjunct is how the two drift.
     try testing.expect(std.mem.indexOf(u8, of_body, "c.longCtx" ++ "Gated()") != null);
-    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "longCtx" ++ "Gated()"));
+    // ...and no site in this file hand-rolls the arch instead of asking the
+    // predicate: a second spelling is a second predicate, and the two drift.
+    const impl = src[0 .. std.mem.indexOf(u8, src, "\ntest \"") orelse src.len];
+    try testing.expectEqual(@as(usize, 0), std.mem.count(u8, impl, "\"qwen4" ++ "_exp\""));
 }
 
 test "modelBatchable permits pure-attention" {
