@@ -8366,12 +8366,28 @@ pub const Generator = struct {
     /// controllers are independent and are now gated independently;
     /// `MLX_SERVE_MTP_FORCE_DEPTH` still bypasses both, because that mode
     /// never plans.
+    /// S22. Every A/B behind the adaptive serial switch — the round-cost
+    /// numbers, the margin, the confirm count, the probe budget — was measured
+    /// on qwen4_exp, whose verify row is BYTES and whose depth-2 round costs
+    /// 2.05 serial forwards. A sidecar pack (qwen3.5/3.6/3.8) has a different
+    /// verify surface entirely, so `model_has_mtp` let every such model past
+    /// 8192 KV spend up to MAX_SERIAL_PROBES x MTP_ADAPTIVE_PROBE_TOKENS
+    /// serial tokens per bucket probing, and switch speculation off on a
+    /// calibration that was never taken on it. The head KIND is the arch:
+    /// `.qwen4` is the in-checkpoint head, `.qwen` is every sidecar.
+    /// Widening this is a MEASUREMENT, not a flag flip.
+    fn mtpAdaptiveArchEligible(self: *const Generator) bool {
+        const head = self.mtp orelse return false;
+        return head == .qwen4;
+    }
+
     fn mtpAdaptiveSerialStep(self: *Generator, m_lo: u32, kv_len: u32) bool {
         // Adaptive serial: the EV plan answers "which width"; this answers
         // "is a round worth running at all". Read AFTER the plan (m_lo is
         // the width it prices) and BEFORE the width trial — a trial measures
         // a width for a request that is about to leave speculation.
         if (mtpAdaptiveSerialEnabled() and mtpCostTableEnabled() and
+            self.mtpAdaptiveArchEligible() and
             mtpAdaptiveKvEligible(kv_len, mtpAdaptiveMinKv()))
         {
             const t = &self.xfm.round_cost;
