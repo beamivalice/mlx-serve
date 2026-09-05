@@ -2516,5 +2516,13 @@ PREVIOUS turn's reservation with it, and the grow guard (`offset + new_len >
 bufferCapacity`) then simply does not fire. That was true by construction and
 untested, which is the same as untrue — `KVCache.kv_cap_buf_grows` now counts
 the moments a second copy exists, and the guard asserts zero across a restore
-whose donor capacity suffices, with a negative arm (a reservation past the
-donor's capacity) proving the counter can see a copy at all.
+whose donor capacity suffices.
+
+Writing that guard turned up something stronger than the claim it was meant to
+pin: a reservation is NOT retroactive. `reserve()` raises the capacity of a grow
+that HAPPENS; it does not provoke one. So a restored slot that merely reserves
+more than the donor holds still allocates nothing — the copy is deferred until
+the data actually needs the room, and on a warm turn it usually never does. The
+negative arm therefore cannot be "reserve more than the donor" (that also
+counts zero, which is why the first version of the test failed); it has to be a
+write that genuinely runs past the donor's capacity.

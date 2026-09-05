@@ -3951,8 +3951,10 @@ test "SSD-first companion: a restore adopts the entry's buffer when its capacity
     try testFillCache(&slot, s, 1, 8); // the diverged tail
     try testing.expectEqual(@as(usize, 0), Grows.* - g1);
 
-    // Negative arm — the bar can SEE a copy: a reservation past the donor's
-    // capacity does grow, so the assertion above is not vacuous.
+    // A reservation is NOT retroactive: it raises the capacity of a grow that
+    // happens, it does not provoke one. So a restored slot that merely RESERVES
+    // more than the donor holds still allocates nothing — the copy is deferred
+    // until the data actually needs the room.
     var slot2 = try KVCache.init(testing.allocator, 1);
     defer slot2.deinit();
     var moe_off2: usize = 0;
@@ -3960,7 +3962,13 @@ test "SSD-first companion: a restore adopts the entry's buffer when its capacity
     slot2.reserve(65536);
     const g2 = Grows.*;
     try testFillCache(&slot2, s, 1, 8);
-    try testing.expectEqual(@as(usize, 1), Grows.* - g2);
+    try testing.expectEqual(@as(usize, 0), Grows.* - g2);
+
+    // Negative arm — the bar can SEE a copy, so the zeros above are not
+    // vacuous: writing PAST the donor's capacity does grow, exactly once.
+    const g3 = Grows.*;
+    try testFillCache(&slot2, s, 1, 4096);
+    try testing.expect(Grows.* - g3 >= 1);
 }
 
 test "SSD-first: an idle entry spills to disk and leaves RAM; the active session stays" {
@@ -4011,7 +4019,9 @@ test "SSD-first: an idle entry spills to disk and leaves RAM; the active session
         defer back.deinit();
         var moe_off: usize = 0;
         const res = try hc.lookupAndRestore(&back, &moe_off, null, s, &tokens_a, false, 0, null, null);
-        try testing.expectEqual(@as(usize, 600), res.matched);
+        // A restore always leaves the last token to forward, so a full-prefix
+        // hit on a 600-token record lands at 599.
+        try testing.expectEqual(@as(usize, 599), res.matched);
     }
 
     // Arm B: every other arch keeps both entries resident.

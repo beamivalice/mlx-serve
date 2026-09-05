@@ -2254,7 +2254,7 @@ pub fn sweepBase(
             };
             const bytes = dirBytes(io, e_abs);
             total += bytes;
-            victims.append(allocator, .{ .path = e_abs, .bytes = bytes, .mtime = st.mtime }) catch {
+            victims.append(allocator, .{ .path = e_abs, .bytes = bytes, .mtime = st.mtime.nanoseconds }) catch {
                 allocator.free(e_abs);
             };
         }
@@ -3890,13 +3890,16 @@ test "DiskTier: the root-wide sweep drops strays and never touches the live tier
     }
     try tmp.dir.createDirPath(io, "fp-stray/e9");
     try tmp.dir.writeFile(io, .{ .sub_path = "fp-stray/e9/c000000.safetensors", .data = "orphan" });
-    // The live tier's own root, mid-write-through: chunks, no index.
-    try tmp.dir.createDirPath(io, "fp-live/e1");
-    try tmp.dir.writeFile(io, .{ .sub_path = "fp-live/e1/c000000.safetensors", .data = "inflight" });
-
     var live = try DiskTier.init(testing.allocator, io, base, "fp-live", 0, 128);
     defer live.deinit();
     live.ssd_first = true;
+    // The live tier's own root, mid-write-through: chunks, no index yet. Staged
+    // AFTER init on purpose — at init the tier's own `scan` drops an
+    // index-less entry, and that is right: a startup leftover really is
+    // unrestorable. The sweep is the one that must not confuse the two, since
+    // it runs while the tier is LIVE.
+    try tmp.dir.createDirPath(io, "fp-live/e1");
+    try tmp.dir.writeFile(io, .{ .sub_path = "fp-live/e1/c000000.safetensors", .data = "inflight" });
     // A budget large enough that no LRU eviction fires — strays only.
     live.max_bytes = 1 << 40;
     sweepBase(testing.allocator, io, base, live.root, live.max_bytes);
