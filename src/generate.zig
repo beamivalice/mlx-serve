@@ -1560,7 +1560,7 @@ pub const Generator = struct {
     pub fn logSpecStats(self: *const Generator) void {
         var table_buf: [256]u8 = undefined;
         var hist_buf: [256]u8 = undefined;
-        const table_bucket = round_cost.bucketFor(self.mtpKvLen());
+        const table_bucket = self.xfm.round_cost.bucketOf(self.mtpKvLen());
         if (self.dspark_enabled and self.dspark_attempted > 0) {
             const avg_per_round: f64 = @as(f64, @floatFromInt(self.dspark_accepted_tokens)) /
                 @as(f64, @floatFromInt(self.dspark_attempted));
@@ -5534,8 +5534,29 @@ pub const Generator = struct {
     /// is, and it must keep feeding the cell. Known gap: a request that opted
     /// out of a SIDECAR head has neither `self.mtp` nor `xfm.qwen4_mtp`, so it
     /// does not fold — conservative, and never wrong.
+    /// S22 / L27. Model-level twin of `mtpAdaptiveArchEligible`: is the
+    /// adaptive switch's whole calibration valid for THIS checkpoint?
+    ///
+    /// `serialCellWanted` runs on requests that never armed a head, so it
+    /// cannot ask `self.mtp` — it asks the MODEL. `model_has_mtp` alone was
+    /// too wide: every sidecar pack (qwen3.5/3.6/3.8) past 8192 KV read a
+    /// stopwatch on every decode token, folded a cell into a row nothing on
+    /// that arch will ever read, and rewrote the persisted table at the end
+    /// of every request for it. The head KIND is the arch, and only the
+    /// in-checkpoint qwen4 head was measured. Widening this is a MEASUREMENT.
+    pub fn mtpAdaptiveModelEligible(model_has_mtp: bool, module_head_loaded: bool) bool {
+        return model_has_mtp and module_head_loaded;
+    }
+
+    fn mtpAdaptiveModelOk(self: *const Generator) bool {
+        return mtpAdaptiveModelEligible(self.model_has_mtp, self.xfm.qwen4_mtp != null);
+    }
+
     pub fn serialCellWanted(self: *const Generator) bool {
         if (!mtpAdaptiveSerialEnabled() or !mtpCostTableEnabled()) return false;
+        // The ARCH gate first: on a sidecar pack nothing reads the serial
+        // row, so folding one is pure cost and a persisted write per request.
+        if (!self.mtpAdaptiveModelOk()) return false;
         // NOT `xfm.qwen4_mtp != null`: the in-checkpoint head's weights load
         // with the TRUNK, so they are present even under `--no-mtp`, and a
         // `--no-mtp` boot folded a serial cell on every decoded token and
@@ -6917,7 +6938,9 @@ pub const Generator = struct {
         // only ever ADDS time). Unlike the table's cells this is not per
         // width: the vote it feeds asks whether the whole speculation is
         // worth running, so every non-trial round counts, extension included.
-        if (post_warmup and self.spec_cost_solo) self.mtp_price.observe(wall, tok, width_trial);
+        // Gated with its ONE consumer (`mtpAdaptiveVoteFor`, arch-scoped):
+        // on a sidecar pack this window is written and never read.
+        if (post_warmup and self.spec_cost_solo and self.mtpAdaptiveModelOk()) self.mtp_price.observe(wall, tok, width_trial);
         self.specObserveRound(m, wall, tok, ev_planned and !two_chunk, shape_changed);
     }
 
@@ -8031,12 +8054,17 @@ pub const Generator = struct {
     /// called it a crossing and re-entered — then the next round switched
     /// again. An oscillation, and not a cheap one: every lap pays the drain
     /// plus the capture forward of the exit ramp.
-    pub fn mtpAdaptiveBucketOf(read: ?usize, kv_len: u32) usize {
-        return read orelse round_cost.bucketFor(kv_len);
+    /// The fallback is the TABLE's grid (`Table.bucketOf`), never the free
+    /// `bucketFor`: the two disagree past 32k the moment a table is on the
+    /// legacy layout, and this is the same class of bug the paragraph above
+    /// describes — two sites resolving one bucket differently.
+    pub fn mtpAdaptiveBucketOf(read: ?usize, kv_len: u32, layout: round_cost.Layout) usize {
+        return read orelse round_cost.bucketForLayout(kv_len, layout);
     }
 
     fn mtpAdaptiveBucket(self: *const Generator, kv_len: u32) usize {
-        return mtpAdaptiveBucketOf(self.xfm.round_cost.bucketToRead(kv_len), kv_len);
+        const t = &self.xfm.round_cost;
+        return mtpAdaptiveBucketOf(t.bucketToRead(kv_len), kv_len, t.layout);
     }
 
     /// Must the realized price window be dropped? It prices ONE arm in ONE
@@ -8724,7 +8752,7 @@ pub const Generator = struct {
     /// any shape, else a periodic m_lo+1 on single-chunk plans. Null =
     /// nothing to try.
     pub fn mtpWidthTrialTarget(t: *const round_cost.Table, kv_len: u32, plan: MtpRoundPlan, cap: u32, base_settled: bool) ?u32 {
-        const b = t.bucketToRead(kv_len) orelse round_cost.bucketFor(kv_len);
+        const b = t.bucketToRead(kv_len) orelse t.bucketOf(kv_len);
         // A single-chunk plan feeds its own base every round; only a
         // two-chunk plan (extensions and syncs never feed) owes a trial of
         // it — and only once the base has stopped climbing, or the first EV
@@ -14811,28 +14839,28 @@ test "mtpAdaptiveBucketOf: the decision and the re-entry resolve ONE bucket (H6 
     const own = round_cost.bucketFor(kv);
 
     // No measured neighbour: both sites land on the request's own bucket.
-    try testing.expectEqual(own, G.mtpAdaptiveBucketOf(null, kv));
+    try testing.expectEqual(own, G.mtpAdaptiveBucketOf(null, kv, .long));
     // A measured NEIGHBOUR is what the prices came from, so it is the bucket
     // the switch speaks in — at BOTH sites.
-    try testing.expectEqual(@as(usize, own + 1), G.mtpAdaptiveBucketOf(own + 1, kv));
-    try testing.expect(G.mtpAdaptiveBucketOf(own + 1, kv) != round_cost.bucketFor(kv));
+    try testing.expectEqual(@as(usize, own + 1), G.mtpAdaptiveBucketOf(own + 1, kv, .long));
+    try testing.expect(G.mtpAdaptiveBucketOf(own + 1, kv, .long) != round_cost.bucketFor(kv));
 
     // The oscillation the mismatch produced: a switch decided in the read
     // bucket, followed by a serial tick that resolved the bucket the OTHER
     // way, reads as a crossing and re-enters immediately — then the next
     // round switches again, each lap paying the drain + capture ramp.
     var osc = G.MtpAdaptive{};
-    _ = osc.round(0, G.mtpAdaptiveBucketOf(own + 1, kv), .serial, 1);
+    _ = osc.round(0, G.mtpAdaptiveBucketOf(own + 1, kv, .long), .serial, 1);
     try testing.expectEqual(G.MtpAdaptiveArm.serial, osc.arm);
     try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, osc.serialTick(round_cost.bucketFor(kv), 0));
 
     // With one resolver the switch is sticky, which is the contract.
     var ok = G.MtpAdaptive{};
-    const b = G.mtpAdaptiveBucketOf(own + 1, kv);
+    const b = G.mtpAdaptiveBucketOf(own + 1, kv, .long);
     _ = ok.round(0, b, .serial, 1);
     var i: u32 = 0;
     while (i < 50) : (i += 1) {
-        try testing.expectEqual(G.MtpAdaptiveAction.none, ok.serialTick(G.mtpAdaptiveBucketOf(own + 1, kv), 0));
+        try testing.expectEqual(G.MtpAdaptiveAction.none, ok.serialTick(G.mtpAdaptiveBucketOf(own + 1, kv, .long), 0));
     }
     try testing.expectEqual(G.MtpAdaptiveArm.serial, ok.arm);
 }
@@ -15525,4 +15553,106 @@ test "scan: the prefill chunk loop's post-eval order is a contract (B0b + S17)" 
     // is what the write-through then persists — so the check precedes it too.
     const cp = std.mem.indexOfPos(u8, src, clear, "captureSsm" ++ "Checkpoint(").?;
     try std.testing.expect(check < cp);
+}
+
+test "L27 characterization: a sidecar (legacy-layout) boot plans EXACTLY as a93e2c0 did" {
+    // The regression this pins: on a qwen3_5 trunk with a MTP SIDECAR (the
+    // 27B pack), a PR that bumped the round-cost store version made every
+    // boot COLD. `MtpCostSource.fromTable()` is the ONE term deciding
+    // whether the EV plan prices extension from measurements or from the
+    // fitted prior, and the prior's extension valve is deliberately
+    // always-open — it exists to observe `a[m_lo]`, which no other round
+    // can. Cold therefore means EVERY round is a two-chunk round: measured
+    // in the field at 37 of 40 extension rounds at 77 ms against a warm
+    // table's 1 of 52 at 51 ms, same acceptance, -25% decode.
+    //
+    // Every expectation below was RECORDED by running the a93e2c0 planner on
+    // these exact inputs (scratch worktree at a93e2c0, probe over
+    // `mtpEvPlanSrc` / `MtpCostSource.init`), never derived from this tree.
+    const G = Generator;
+    const a = [_]f32{ 0.85, 0.78, 0.70, 0.60, 0.50, 0.42, 0.35, 0.30 };
+    const kv: u32 = 8192; // one 27B rung; ~3.0-3.5 tok/round at m_lo 2-3
+    const costs = G.MTP_EV_DEFAULT_COSTS;
+    const cap: u32 = 6;
+
+    // The bucket an 8k request reads is 3 on BOTH grids — the split is a
+    // long-context change — so the scenario isolates the FORMAT, not the
+    // edges.
+    const legacy_empty = round_cost.Table{ .layout = .legacy };
+    try testing.expectEqual(@as(usize, 3), legacy_empty.bucketOf(kv));
+    try testing.expectEqual(@as(usize, 3), round_cost.bucketFor(kv));
+
+    // ── the warm table, restored from the file 26.9.1 wrote ──
+    const rc1_body = "rc1\n2 3 44.0000 2.7000 3\n3 3 88.0000 3.0500 3\n4 3 140.0000 3.2000 3\n";
+    const warm = round_cost.parse(rc1_body, .legacy) orelse return error.TestUnexpectedResult;
+    const warm_src = G.MtpCostSource.init(costs, kv, &warm);
+    try testing.expect(warm_src.fromTable());
+
+    // a93e2c0, warm: a MEASURED marginal the position cannot repay even at
+    // full confidence closes the valve. Every round is SINGLE-chunk.
+    var prev: u32 = 1;
+    for (0..8) |_| {
+        const p = G.mtpEvPlanSrc(&a, cap, warm_src, prev + 1);
+        try testing.expectEqual(@as(u32, 2), p.m_lo);
+        try testing.expectEqual(@as(u32, 2), p.m_hi); // no extension
+        try testing.expectEqual(@as(f32, 0.0), p.tau_ln);
+        prev = p.m_lo;
+    }
+
+    // ── the same request on a COLD table: the flip, and why the bump cost
+    // 25%. Recorded from a93e2c0 too, so this arm is not a claim about the
+    // fix — it is the shape both trees produce when the file is missing.
+    const cold_src = G.MtpCostSource.init(costs, kv, null);
+    try testing.expect(!cold_src.fromTable());
+    const cold0 = G.mtpEvPlanSrc(&a, cap, cold_src, 2);
+    try testing.expectEqual(@as(u32, 2), cold0.m_lo);
+    try testing.expectEqual(@as(u32, 4), cold0.m_hi);
+    try testing.expectApproxEqAbs(@as(f32, -0.444614), cold0.tau_ln, 1e-5);
+    prev = cold0.m_lo;
+    for (0..7) |_| {
+        const p = G.mtpEvPlanSrc(&a, cap, cold_src, prev + 1);
+        try testing.expectEqual(@as(u32, 3), p.m_lo);
+        try testing.expectEqual(@as(u32, 4), p.m_hi); // two-chunk, every round
+        try testing.expectApproxEqAbs(@as(f32, -0.477666), p.tau_ln, 1e-5);
+        prev = p.m_lo;
+    }
+
+    // ── a warm table whose cells make ONE extension position pay: the plan
+    // extends by exactly one, and stops. (a93e2c0 literals.)
+    var shallow = round_cost.Table{ .layout = .legacy };
+    for (0..round_cost.MIN_SAMPLES) |_| {
+        _ = shallow.observe(2, kv, 44.0, 2.70, true, false);
+        _ = shallow.observe(3, kv, 51.0, 3.20, true, false);
+        _ = shallow.observe(4, kv, 62.0, 3.50, true, false);
+    }
+    const shallow_src = G.MtpCostSource.init(costs, kv, &shallow);
+    prev = 1;
+    for (0..8) |_| {
+        const p = G.mtpEvPlanSrc(&a, cap, shallow_src, prev + 1);
+        try testing.expectEqual(@as(u32, 2), p.m_lo);
+        try testing.expectEqual(@as(u32, 3), p.m_hi);
+        try testing.expectApproxEqAbs(@as(f32, -0.488353), p.tau_ln, 1e-5);
+        prev = p.m_lo;
+    }
+
+    // The width trial reads the SAME bucket through the table's own grid,
+    // and owes the same width a93e2c0 owed (recorded: 3).
+    try testing.expectEqual(
+        @as(?u32, 3),
+        G.mtpWidthTrialTarget(&warm, kv, .{ .m_lo = 2, .m_hi = 2, .tau_ln = 0 }, cap, true),
+    );
+}
+
+test "mtpAdaptiveModelEligible: the serial row and its price window are the module head's, not every MTP model's (L27)" {
+    const G = Generator;
+    // A sidecar pack HAS an MTP head, so `model_has_mtp` alone let every
+    // qwen3.5/3.6/3.8 boot past 8192 KV read a stopwatch per decode token,
+    // fold a cell nothing on that arch reads, and rewrite the persisted
+    // table at the end of every request for it.
+    try testing.expect(!G.mtpAdaptiveModelEligible(true, false));
+    try testing.expect(G.mtpAdaptiveModelEligible(true, true));
+    // `--no-mtp` on the calibrated arch still declines: the in-checkpoint
+    // head's weights load with the trunk, so presence alone is not consent.
+    try testing.expect(!G.mtpAdaptiveModelEligible(false, true));
+    try testing.expect(!G.mtpAdaptiveModelEligible(false, false));
 }

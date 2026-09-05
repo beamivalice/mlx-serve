@@ -3690,9 +3690,16 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         const os_build = transformer_mod.macosProductVersion(&os_buf) orelse "";
         // The measured round-cost table rides the same identity: restored
         // here, written at the end of any request that folded new samples.
-        const rc_key = round_cost_mod.cacheKey(&xfm_ptr.round_cost_key_buf, ane_mod.chipBrand(), params.model_dir, quant, os_build);
+        // L27. The bucket grid AND the store version are the ARCH's. Only
+        // qwen4_exp gets the long-context split and the serial row; every
+        // other arch keeps the six-bucket `rc1` table 26.9.1 wrote, so an
+        // upgrading user boots WARM and the EV plan keeps pricing extension
+        // from measurements instead of the always-open prior valve.
+        const rc_layout: round_cost_mod.Layout = if (params.config.isQwen4()) .long else .legacy;
+        xfm_ptr.round_cost.layout = rc_layout;
+        const rc_key = round_cost_mod.cacheKey(&xfm_ptr.round_cost_key_buf, ane_mod.chipBrand(), params.model_dir, quant, os_build, rc_layout);
         xfm_ptr.round_cost_key_len = @intCast(rc_key.len);
-        if (round_cost_mod.loadCached(sch.allocator, sch.io, rc_key)) |t| {
+        if (round_cost_mod.loadCached(sch.allocator, sch.io, rc_key, rc_layout)) |t| {
             xfm_ptr.round_cost = t;
             // Two counts, never one: the width grid and the serial row are
             // restored independently and answer different questions.

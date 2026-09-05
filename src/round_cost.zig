@@ -40,6 +40,39 @@ pub const BUCKET_NAMES = [N_BUCKETS][]const u8{
     "32-64k",  "64-128k", "128-256k", "256k+",
 };
 
+/// Which bucket grid a table speaks. The split above, the serial row and the
+/// adaptive switch that reads it were all MEASURED on qwen4_exp; every other
+/// arch keeps the six-bucket grid every release through 26.9.1 wrote, so a
+/// sidecar-MTP pack (qwen3.5/3.6/3.8) reads its OWN persisted table and plans
+/// from exactly the cells it planned from before.
+///
+/// This is not decoration. `MtpCostSource.fromTable()` is the single term
+/// that decides whether the EV plan prices extension from measurements or
+/// from the fitted prior, and the prior's extension valve is deliberately
+/// always-open (it exists to observe `a[m_lo]`, which no other round can).
+/// Bumping the store version therefore does not merely cost one re-explore:
+/// until the new file matures, EVERY round is a two-chunk round. On the 27B
+/// at 8k that measured 37 of 40 extension rounds at 77 ms against a warm
+/// table's 1 of 52 at 51 ms — a 25% decode loss with acceptance unchanged.
+/// A layout that keeps its old version keeps its old file, and with it the
+/// old plan.
+pub const Layout = enum {
+    /// Six buckets, top one unbounded at 32k. Store version 1, no serial row.
+    legacy,
+    /// Nine buckets (64k/128k/256k edges) + the serial row. Store version 3.
+    long,
+};
+
+/// Buckets the layout actually uses. Cells past it are never written and
+/// never active, so every scan over `N_BUCKETS` reads the same as a scan
+/// over this — the array dimension stays the long layout's.
+pub fn nBuckets(layout: Layout) usize {
+    return switch (layout) {
+        .legacy => 6,
+        .long => N_BUCKETS,
+    };
+}
+
 /// EMA weight. MIN is wrong here (thermal soak makes the early rounds the
 /// fast ones); an EMA tracks the live machine.
 pub const BETA: f32 = 0.10;
@@ -72,11 +105,22 @@ pub const MAX_SERIAL_PROBES: u8 = 3;
 /// sample 1 and never moved; at 3-samples-to-trust that cost -7.1%).
 pub const CLEARLY_WORSE: f32 = 0.20;
 
-pub fn bucketFor(kv_len: u32) usize {
-    for (BUCKET_EDGES, 0..) |edge, i| {
+/// The bucket `kv_len` falls in, under `layout`. The legacy grid stops at
+/// the 32768 edge and folds everything above into its last bucket — bit for
+/// bit what `bucketFor` did through 26.9.1.
+pub fn bucketForLayout(kv_len: u32, layout: Layout) usize {
+    const edges = nBuckets(layout) - 1;
+    for (BUCKET_EDGES[0..edges], 0..) |edge, i| {
         if (kv_len < edge) return i;
     }
-    return N_BUCKETS - 1;
+    return edges;
+}
+
+/// The long layout's grid. Kept as the free function because that is what
+/// the qwen4-only call sites and the tests want; anything reading a TABLE
+/// must go through `Table.bucketOf`, which honours the table's own layout.
+pub fn bucketFor(kv_len: u32) usize {
+    return bucketForLayout(kv_len, .long);
 }
 
 pub const Cell = struct {
@@ -95,6 +139,11 @@ pub const Cell = struct {
 pub const Verdict = enum { folded, reseeded, contended, transition, bad_sample, out_of_range };
 
 pub const Table = struct {
+    /// Which bucket grid (and which store version) this table speaks. Set
+    /// once at load from the ARCH, never from a request. The default is the
+    /// legacy grid: a table that nobody told is a table on the arch the
+    /// split was not measured on.
+    layout: Layout = .legacy,
     cells: [MAX_WIDTH + 1][N_BUCKETS]Cell = @splat(@splat(.{})),
     /// Measured ms per PLAIN serial decode token, per bucket (`tok` is 1 per
     /// sample, so `msPerTok` and `ms` agree). Fed by solo serial ticks — a
@@ -192,7 +241,7 @@ pub const Table = struct {
             return .transition;
         }
         self.folded += 1;
-        return foldInto(&self.cells[width][bucketFor(kv_len)], ms, tokens, self.seq);
+        return foldInto(&self.cells[width][self.bucketOf(kv_len)], ms, tokens, self.seq);
     }
 
     /// Feed one realized PLAIN serial decode token into `serial[bucket]`.
@@ -215,7 +264,7 @@ pub const Table = struct {
             return .transition;
         }
         self.serial_folded += 1;
-        return foldInto(&self.serial[bucketFor(kv_len)], ms, 1.0, self.serial_seq);
+        return foldInto(&self.serial[self.bucketOf(kv_len)], ms, 1.0, self.serial_seq);
     }
 
     fn foldInto(cell: *Cell, ms: f32, tokens: f32, clock: u32) Verdict {
@@ -242,6 +291,14 @@ pub const Table = struct {
     pub fn serialMsPerTok(self: *const Table, bucket: usize) ?f32 {
         if (bucket >= N_BUCKETS or self.serial[bucket].n < MIN_SAMPLES) return null;
         return self.serial[bucket].msPerTok();
+    }
+
+    /// THE bucket resolver for anything holding a table: the layout is the
+    /// table's, never the caller's guess. A free `bucketFor` beside a table
+    /// with the legacy grid is how a 40k request came to read a bucket the
+    /// table never writes.
+    pub fn bucketOf(self: *const Table, kv_len: u32) usize {
+        return bucketForLayout(kv_len, self.layout);
     }
 
     fn trusted(self: *const Table, width: u32, bucket: usize) bool {
@@ -300,7 +357,7 @@ pub const Table = struct {
     /// bucket, the prior applies. A bucket boundary crossed mid-generation
     /// must not snap the plan back to the prior.
     pub fn bucketToRead(self: *const Table, kv_len: u32) ?usize {
-        const own = bucketFor(kv_len);
+        const own = self.bucketOf(kv_len);
         if (self.active(own)) return own;
         var d: usize = 1;
         while (d < N_BUCKETS) : (d += 1) {
@@ -557,7 +614,7 @@ pub const WidthChooser = struct {
 
     /// The width this round runs. `round_idx` = rounds so far (post-warmup).
     pub fn choose(self: *WidthChooser, t: *const Table, kv_len: u32, round_idx: u32) Decision {
-        const bucket = t.bucketToRead(kv_len) orelse bucketFor(kv_len);
+        const bucket = t.bucketToRead(kv_len) orelse t.bucketOf(kv_len);
         // Standing choice: the best measured-or-widest+1 candidate, with
         // hysteresis against the current width — and never while the
         // current width is itself unmeasured (a measured w0 from an earlier
@@ -641,6 +698,19 @@ pub const WidthChooser = struct {
 /// cost of the bump is one re-explore per (chip, model, quant, OS build).
 pub const STORE_VERSION: u32 = 3;
 
+/// The store version a layout writes and reads. The legacy grid keeps `rc1`
+/// — the format 26.9.1 shipped — so a user upgrading onto a sidecar pack
+/// finds the file they already have and boots WARM. `rc2` is nobody's: it
+/// was written by a build whose bucket indices were the legacy ones but
+/// whose body carried a serial row, and reading one as either layout would
+/// mis-assign a row.
+pub fn storeVersion(layout: Layout) u32 {
+    return switch (layout) {
+        .legacy => 1,
+        .long => 3,
+    };
+}
+
 /// Samples folded into EITHER row. The persistence trigger reads this, so a
 /// boot that only ever learned serial cells still writes them, while the two
 /// counters stay separate for reporting.
@@ -655,29 +725,37 @@ pub fn persistEnabled() bool {
 
 /// Same identity rule as the spec-cost probe's key: every field the cost
 /// depends on, hashed, so one machine's cliff is never served to another.
-pub fn cacheKey(buf: []u8, chip: []const u8, model_dir: []const u8, quant: []const u8, os_build: []const u8) []const u8 {
+pub fn cacheKey(buf: []u8, chip: []const u8, model_dir: []const u8, quant: []const u8, os_build: []const u8, layout: Layout) []const u8 {
     var h = std.hash.Fnv1a_64.init();
     for ([_][]const u8{ chip, model_dir, quant, os_build }) |part| {
         h.update(part);
         h.update("\x00");
     }
-    return std.fmt.bufPrint(buf, "rc{d}-{x:0>16}", .{ STORE_VERSION, h.final() }) catch buf[0..0];
+    // The HASH is layout-blind on purpose: only the version prefix moves, so
+    // a legacy table lands on the very file a 26.9.1 boot wrote for the same
+    // (chip, model, quant, OS build).
+    return std.fmt.bufPrint(buf, "rc{d}-{x:0>16}", .{ storeVersion(layout), h.final() }) catch buf[0..0];
 }
 
 /// `rc3\n`, then one `width bucket ms tok n` line per folded width cell and
 /// one `s bucket ms tok n` line per folded serial cell.
 pub fn serialize(buf: []u8, t: *const Table) ![]const u8 {
     var w = std.Io.Writer.fixed(buf);
-    try w.print("rc{d}\n", .{STORE_VERSION});
+    try w.print("rc{d}\n", .{storeVersion(t.layout)});
     for (t.cells, 0..) |row, wi| {
         for (row, 0..) |c, b| {
             if (c.n == 0) continue;
             try w.print("{d} {d} {d:.4} {d:.4} {d}\n", .{ wi, b, c.ms, c.tok, c.n });
         }
     }
-    for (t.serial, 0..) |c, b| {
-        if (c.n == 0) continue;
-        try w.print("s {d} {d:.4} {d:.4} {d}\n", .{ b, c.ms, c.tok, c.n });
+    // The serial row is v3-only. A legacy table never folds one (the switch
+    // that reads it is arch-gated), and writing an `s` line into an rc1 file
+    // would hand an older build a cell for width `s`.
+    if (t.layout == .long) {
+        for (t.serial, 0..) |c, b| {
+            if (c.n == 0) continue;
+            try w.print("s {d} {d:.4} {d:.4} {d}\n", .{ b, c.ms, c.tok, c.n });
+        }
     }
     return w.buffered();
 }
@@ -685,13 +763,13 @@ pub fn serialize(buf: []u8, t: *const Table) ![]const u8 {
 /// Null on any version or shape mismatch. Restored cells keep their sample
 /// counts (trust) but are marked STALE, so the first live sample of each
 /// blends at RESEED_WEIGHT — another boot is another thermal/OS state.
-pub fn parse(text: []const u8) ?Table {
+pub fn parse(text: []const u8, layout: Layout) ?Table {
     var lines = std.mem.splitScalar(u8, text, '\n');
     const head = lines.next() orelse return null;
     var hb: [16]u8 = undefined;
-    const want = std.fmt.bufPrint(&hb, "rc{d}", .{STORE_VERSION}) catch return null;
+    const want = std.fmt.bufPrint(&hb, "rc{d}", .{storeVersion(layout)}) catch return null;
     if (!std.mem.eql(u8, std.mem.trim(u8, head, " \r"), want)) return null;
-    var t = Table{};
+    var t = Table{ .layout = layout };
     while (lines.next()) |line| {
         const l = std.mem.trim(u8, line, " \r");
         if (l.len == 0) continue;
@@ -703,7 +781,10 @@ pub fn parse(text: []const u8) ?Table {
         const ms = std.fmt.parseFloat(f32, f.next() orelse return null) catch return null;
         const tok = std.fmt.parseFloat(f32, f.next() orelse return null) catch return null;
         const n = std.fmt.parseInt(u32, f.next() orelse return null, 10) catch return null;
-        if (wi > MAX_WIDTH or b >= N_BUCKETS or n == 0) return null;
+        // Range is the LAYOUT's, not the array's: an rc1 file can only carry
+        // buckets 0..5, and a body claiming otherwise is not an rc1 file.
+        if (wi > MAX_WIDTH or b >= nBuckets(layout) or n == 0) return null;
+        if (is_serial and layout != .long) return null;
         if (!std.math.isFinite(ms) or ms <= 0 or !(tok > 0)) return null;
         const cell = Cell{ .ms = ms, .tok = tok, .n = n, .last_seen = 0 };
         if (is_serial) t.serial[b] = cell else t.cells[wi][b] = cell;
@@ -723,7 +804,7 @@ fn cachePath(buf: []u8, key: []const u8) ?[]const u8 {
     return std.fmt.bufPrint(buf, "{s}/.mlx-serve/round-cost/{s}.txt", .{ homeDir(), key }) catch null;
 }
 
-pub fn loadCached(allocator: std.mem.Allocator, io: std.Io, key: []const u8) ?Table {
+pub fn loadCached(allocator: std.mem.Allocator, io: std.Io, key: []const u8, layout: Layout) ?Table {
     if (!persistEnabled() or key.len == 0) return null;
     var path_buf: [512]u8 = undefined;
     const path = cachePath(&path_buf, key) orelse return null;
@@ -733,7 +814,7 @@ pub fn loadCached(allocator: std.mem.Allocator, io: std.Io, key: []const u8) ?Ta
     var rs = f.reader(io, &rb);
     const text = rs.interface.allocRemaining(allocator, .limited(16384)) catch return null;
     defer allocator.free(text);
-    return parse(text);
+    return parse(text, layout);
 }
 
 /// Best-effort: a machine that cannot write re-explores next boot.
@@ -942,12 +1023,12 @@ test "round_cost: WidthChooser picks serial when the block loses, and comes back
 }
 
 test "round_cost: persistence round-trips folded cells, marks them stale, rejects other versions" {
-    var t = Table{};
+    var t = Table{ .layout = .long };
     feed(&t, 4, 1000, 50.0, 4.5);
     _ = t.observe(5, 20000, 80.0, 5.0, true, false);
     var buf: [1024]u8 = undefined;
     const text = try serialize(&buf, &t);
-    const back = parse(text) orelse return error.TestUnexpectedResult;
+    const back = parse(text, .long) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(u32, 2), back.restored);
     try testing.expectEqual(@as(u32, 0), back.restored_serial); // no serial row in this table
     try testing.expectApproxEqAbs(50.0, back.measuredMs(4, 0).?, 1e-3);
@@ -957,17 +1038,26 @@ test "round_cost: persistence round-trips folded cells, marks them stale, reject
     var live = back;
     try testing.expectEqual(Verdict.reseeded, live.observe(4, 1000, 70.0, 4.5, true, false));
     try testing.expectApproxEqAbs(60.0, live.measuredMs(4, 0).?, 1e-3);
-    try testing.expect(parse("rc0\n4 0 50 4 3\n") == null);
-    try testing.expect(parse("rc1\n4 0 50 4 3\n") == null); // the pre-serial format is a quiet miss
-    // v2 is a quiet miss too: its bucket INDICES mean other contexts now, so
-    // reading one would hand the new 32-64k cell an EMA measured up to 1M.
-    try testing.expect(parse("rc2\n4 5 50 4 3\n") == null);
-    try testing.expect(parse("rc3\n99 0 50 4 3\n") == null);
-    try testing.expect(parse("") == null);
+    try testing.expect(parse("rc0\n4 0 50 4 3\n", .long) == null);
+    try testing.expect(parse("rc1\n4 0 50 4 3\n", .long) == null); // the pre-serial format is a quiet miss ON THE LONG LAYOUT
+    // v2 is a quiet miss on BOTH layouts: its bucket INDICES are the legacy
+    // ones but its body can carry a serial row, so neither reader can trust it.
+    try testing.expect(parse("rc2\n4 5 50 4 3\n", .long) == null);
+    try testing.expect(parse("rc2\n4 5 50 4 3\n", .legacy) == null);
+    try testing.expect(parse("rc3\n99 0 50 4 3\n", .long) == null);
+    try testing.expect(parse("", .long) == null);
     var kb: [64]u8 = undefined;
-    // The version rides the KEY as well as the body, so a v3 build does not
-    // even open the v2 file — the persisted-table key semantics are unchanged.
-    try testing.expect(std.mem.startsWith(u8, cacheKey(&kb, "M4", "/m", "q4g64", "26.4"), "rc3-"));
+    // The version rides the KEY as well as the body, and the two layouts are
+    // two files: `rc3-<h>` for qwen4_exp, `rc1-<h>` — the very file 26.9.1
+    // wrote — for everything else. Same HASH, so a legacy boot finds it.
+    try testing.expect(std.mem.startsWith(u8, cacheKey(&kb, "M4", "/m", "q4g64", "26.4", .long), "rc3-"));
+    var kb2: [64]u8 = undefined;
+    const legacy_key = cacheKey(&kb2, "M4", "/m", "q4g64", "26.4", .legacy);
+    try testing.expect(std.mem.startsWith(u8, legacy_key, "rc1-"));
+    try testing.expectEqualStrings(
+        cacheKey(&kb, "M4", "/m", "q4g64", "26.4", .long)[4..],
+        legacy_key[4..],
+    );
 }
 
 test "round_cost: the serial row keeps its OWN fold and drop counters (M19)" {
@@ -1007,7 +1097,7 @@ test "round_cost: the serial row keeps its OWN fold and drop counters (M19)" {
 }
 
 test "round_cost: the serial row folds, trusts at MIN_SAMPLES and round-trips beside the widths" {
-    var t = Table{};
+    var t = Table{ .layout = .long };
     try testing.expect(t.serialMsPerTok(0) == null);
     // Same drop rules as a round sample; none of them touch the width grid.
     try testing.expectEqual(Verdict.contended, t.observeSerial(1000, 15.0, false, false));
@@ -1033,7 +1123,7 @@ test "round_cost: the serial row folds, trusts at MIN_SAMPLES and round-trips be
     var buf: [1024]u8 = undefined;
     const text = try serialize(&buf, &t);
     try testing.expect(std.mem.indexOf(u8, text, "\ns 0 16.") != null);
-    const back = parse(text) orelse return error.TestUnexpectedResult;
+    const back = parse(text, .long) orelse return error.TestUnexpectedResult;
     // The two counts are SEPARATE: `restored` is what the width planner got
     // back, `restored_serial` what the adaptive switch got back. A single
     // number would have made "1 width cell" and "1 serial cell" indistinguishable
@@ -1084,4 +1174,71 @@ test "round_cost: a clearly worse first sample settles a width" {
     feed(&u, 4, 1000, 70.0, 5.0);
     _ = u.observe(5, 1000, 86.0, 6.0, true, false); // 14.3 vs 14.0: noise, keep trialling
     try testing.expect(!u.clearlyWorse(5, 4, 0));
+}
+
+test "round_cost: the legacy layout is a93e2c0's grid, writes rc1 and reads the file 26.9.1 wrote (L27)" {
+    // The six-bucket grid, bucket for bucket. These literals are a93e2c0's
+    // `BUCKET_EDGES` — the grid every release through 26.9.1 wrote — and
+    // they are what a sidecar-MTP pack must keep reading, because the store
+    // version rides the FILE NAME: a bump is a cold table, a cold table is
+    // `fromTable() == false`, and the prior's extension valve is always open.
+    try testing.expectEqual(@as(usize, 0), bucketForLayout(0, .legacy));
+    try testing.expectEqual(@as(usize, 0), bucketForLayout(2047, .legacy));
+    try testing.expectEqual(@as(usize, 1), bucketForLayout(2048, .legacy));
+    try testing.expectEqual(@as(usize, 2), bucketForLayout(4096, .legacy));
+    try testing.expectEqual(@as(usize, 3), bucketForLayout(8192, .legacy));
+    try testing.expectEqual(@as(usize, 4), bucketForLayout(16384, .legacy));
+    try testing.expectEqual(@as(usize, 5), bucketForLayout(32768, .legacy));
+    // The top bucket is UNBOUNDED again on the legacy grid — 62.7k and 374k
+    // share a cell, exactly as they did before the split.
+    try testing.expectEqual(@as(usize, 5), bucketForLayout(65536, .legacy));
+    try testing.expectEqual(@as(usize, 5), bucketForLayout(1_000_000, .legacy));
+    try testing.expectEqual(bucketForLayout(62_755, .legacy), bucketForLayout(374_000, .legacy));
+    // …and the long grid still splits them. Below 32k the two agree, which
+    // is why an 8k request reads the same cell either way.
+    try testing.expect(bucketForLayout(62_755, .long) != bucketForLayout(374_000, .long));
+    var kv: u32 = 0;
+    while (kv < 32768) : (kv += 337) {
+        try testing.expectEqual(bucketForLayout(kv, .long), bucketForLayout(kv, .legacy));
+    }
+    try testing.expectEqual(@as(usize, 6), nBuckets(.legacy));
+    try testing.expectEqual(N_BUCKETS, nBuckets(.long));
+
+    // A table's own resolver honours its layout; the free `bucketFor` is the
+    // LONG grid and must never be used against a legacy table.
+    const legacy = Table{ .layout = .legacy };
+    try testing.expectEqual(@as(usize, 5), legacy.bucketOf(400_000));
+    try testing.expectEqual(@as(usize, 8), bucketFor(400_000));
+
+    // The file 26.9.1 wrote, byte for byte, loads with its cells intact.
+    const rc1_body = "rc1\n2 3 44.0000 2.7000 3\n3 3 88.0000 3.0500 3\n4 3 140.0000 3.2000 3\n";
+    const back = parse(rc1_body, .legacy) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(Layout.legacy, back.layout);
+    try testing.expectEqual(@as(u32, 3), back.restored);
+    try testing.expectEqual(@as(u32, 0), back.restored_serial);
+    try testing.expectApproxEqAbs(44.0, back.measuredMs(2, 3).?, 1e-3);
+    try testing.expectApproxEqAbs(3.05, back.measuredTok(3, 3).?, 1e-3);
+    try testing.expectApproxEqAbs(140.0, back.measuredMs(4, 3).?, 1e-3);
+    try testing.expect(back.active(3));
+    // …and the long reader refuses it rather than mis-assigning its buckets.
+    try testing.expect(parse(rc1_body, .long) == null);
+
+    // A legacy table writes rc1 and never an `s` line: the serial row is the
+    // adaptive switch's, the switch is arch-gated, and an `s` line in an rc1
+    // file would read as width `s` to an older build.
+    var t = Table{ .layout = .legacy };
+    for (0..MIN_SAMPLES) |_| _ = t.observe(2, 8192, 44.0, 2.7, true, false);
+    // Even if something did fold one, it never reaches the file.
+    for (0..MIN_SAMPLES) |_| _ = t.observeSerial(8192, 16.0, true, false);
+    var buf: [1024]u8 = undefined;
+    const text = try serialize(&buf, &t);
+    try testing.expect(std.mem.startsWith(u8, text, "rc1\n"));
+    try testing.expect(std.mem.indexOf(u8, text, "\ns ") == null);
+    const rt = parse(text, .legacy) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u32, 1), rt.restored);
+    try testing.expectEqual(@as(u32, 0), rt.restored_serial);
+    // A body claiming a bucket the legacy grid cannot produce is not an rc1
+    // file, and neither is one carrying a serial row.
+    try testing.expect(parse("rc1\n2 6 44.0 2.7 3\n", .legacy) == null);
+    try testing.expect(parse("rc1\ns 3 16.0 1.0 3\n", .legacy) == null);
 }
