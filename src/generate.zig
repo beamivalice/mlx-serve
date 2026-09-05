@@ -12056,6 +12056,41 @@ test "every ladder rung the adaptive width can take divides the checkpoint strid
     }
 }
 
+/// The source of ONE named declaration: from `decl` to the `}` that closes it
+/// at the declaration's OWN indentation. zig fmt puts that closer alone on its
+/// line, so it is the one brace that cannot also appear inside the body, a
+/// string literal or a comment.
+///
+/// Every ORDERING scan in this file resolves its needles inside this window.
+/// `indexOfPos` over the whole embedded file searches FORWARD from a
+/// production offset, so deleting the very line a scan pins lets the needle
+/// fall through to the TEST'S OWN literal further down the file — the
+/// assertion then holds on a full revert (the B0c class). A window that stops
+/// above the tests cannot do that, whether or not the individual needle
+/// happens to be `++`-split.
+fn productionDeclSource(src: []const u8, decl: []const u8) ?[]const u8 {
+    const start = std.mem.indexOf(u8, src, decl) orelse return null;
+    var indent: usize = 0;
+    while (indent < decl.len and decl[indent] == ' ') indent += 1;
+    var closer_buf: [40]u8 = undefined;
+    if (indent + 3 > closer_buf.len) return null;
+    closer_buf[0] = '\n';
+    @memset(closer_buf[1 .. 1 + indent], ' ');
+    closer_buf[1 + indent] = '}';
+    closer_buf[2 + indent] = '\n';
+    const closer = closer_buf[0 .. indent + 3];
+    const end = std.mem.indexOfPos(u8, src, start, closer) orelse return null;
+    return src[start .. end + closer.len];
+}
+
+/// True when `window` holds no test block at all — the property that makes an
+/// ordering scan resolved inside it red on a revert. `generate.zig` has test
+/// blocks ABOVE some implementations, so "ends before the first test" is not
+/// the question; "contains no test" is.
+fn windowHasNoTestBlock(window: []const u8) bool {
+    return std.mem.indexOf(u8, window, "\n" ++ "test \"") == null;
+}
+
 test "a widen is committed only after the interleave tick, a step-down before it" {
     // S17. Attribution and safety want opposite orderings: the probe must run
     // BEFORE the tick so a co-tenant's decode is not read as this prefill's
@@ -12063,22 +12098,35 @@ test "a widen is committed only after the interleave tick, a step-down before it
     // memory the tick allocated and the probe never saw — and a Metal abort
     // cannot be un-decided. So the growth direction is re-priced after the
     // tick and the safe direction is not. Scan-pinned by index, because the
-    // ordering is the whole fix. Needles split so this test's own source
-    // cannot satisfy them.
+    // ordering is the whole fix.
+    //
+    // BL-6: needles resolve inside `initWithOptions`'s OWN body, never the
+    // whole file. Three of these five (`hk.call(hk.ctx, …`, `cf(widen_ctx.?,`,
+    // `if (next_w < cur_chunk)`) appear verbatim in THIS test's bytes, and
+    // with a whole-file `indexOfPos` a full revert of S17 — delete the
+    // post-tick confirm block, commit the widen pre-tick — left every needle
+    // resolving into this test's own literals below, so all five assertions
+    // survived the revert. Splitting the literals would fix these three; the
+    // window fixes the CLASS, including the next needle somebody adds.
     const t = testing;
     const src = @embedFile("generate.zig");
-    const probe = std.mem.indexOf(u8, src, "hk.call(hk.ctx, ssm_cp_offset + pos, @intCast(cur_chunk)") orelse return error.CallSiteMoved;
-    const tick = std.mem.indexOfPos(u8, src, probe, "options.interleave" ++ "_hook") orelse return error.CallSiteMoved;
-    const confirm = std.mem.indexOfPos(u8, src, probe, "cf(widen_ctx.?,") orelse return error.CallSiteMoved;
+    const impl = productionDeclSource(src, "    pub fn initWithOptions(") orelse return error.CallSiteMoved;
+    // The window is production bytes only — the property the whole fix rests on.
+    try t.expect(windowHasNoTestBlock(impl));
+    try t.expect(impl.len < src.len);
+
+    const probe = std.mem.indexOf(u8, impl, "hk.call(hk.ctx, ssm_cp_offset + pos, @intCast(cur_chunk)") orelse return error.CallSiteMoved;
+    const tick = std.mem.indexOfPos(u8, impl, probe, "options.interleave" ++ "_hook") orelse return error.CallSiteMoved;
+    const confirm = std.mem.indexOfPos(u8, impl, probe, "cf(widen_ctx.?,") orelse return error.CallSiteMoved;
     try t.expect(probe < tick);
     try t.expect(tick < confirm);
 
     // The step-down commits from the pre-tick branch, the widen only from the
     // post-tick one — both through the ONE commit helper.
-    const down = std.mem.indexOfPos(u8, src, probe, "if (next_w < cur_chunk)") orelse return error.CallSiteMoved;
+    const down = std.mem.indexOfPos(u8, impl, probe, "if (next_w < cur_chunk)") orelse return error.CallSiteMoved;
     try t.expect(down < tick);
-    try t.expect(std.mem.indexOfPos(u8, src, down, "commitAdaptive" ++ "Width(") .? < tick);
-    try t.expect(std.mem.indexOfPos(u8, src, confirm, "commitAdaptive" ++ "Width(") != null);
+    try t.expect(std.mem.indexOfPos(u8, impl, down, "commitAdaptive" ++ "Width(").? < tick);
+    try t.expect(std.mem.indexOfPos(u8, impl, confirm, "commitAdaptive" ++ "Width(") != null);
 }
 
 test "commitAdaptiveWidth: the summary follows the running width from both commit sites" {
@@ -12105,27 +12153,34 @@ test "the per-chunk width is probed after the cache clear and before the interle
     // test, so they are scan-pinned. Probing BEFORE the clear reads the
     // chunk's own peak and narrows on memory that is already gone; probing
     // AFTER the interleave tick reads a co-tenant's decode allocations as this
-    // prefill's pressure. Needles split so this test's own source cannot
-    // satisfy them.
+    // prefill's pressure.
+    //
+    // BL-6 sibling: resolved inside `initWithOptions`'s own body. `clear`'s
+    // needle is unsplit and appears verbatim in this test's bytes, so with a
+    // whole-file scan a deleted trace line would re-anchor the ordering on the
+    // test's own literal. The split needles made it fail closed rather than
+    // green, but the window is what makes that structural.
     const t = testing;
     const src = @embedFile("generate.zig");
+    const impl = productionDeclSource(src, "    pub fn initWithOptions(") orelse return error.CallSiteMoved;
+    try t.expect(windowHasNoTestBlock(impl));
     // Anchored on the eval-trace line, not on the clear plus its next line:
     // the g1 loop-order fix (B0b) inserts `try mlx.checkError()` immediately
     // after the clear, and a needle spanning both lines would go red for that
     // rather than for anything this test is about.
-    const clear = std.mem.indexOf(u8, src, "if (trace_enabled) eval_ns +=") orelse return error.CallSiteMoved;
-    const probe = std.mem.indexOfPos(u8, src, clear, "options.chunk_width" ++ "_hook") orelse return error.CallSiteMoved;
-    const tick = std.mem.indexOfPos(u8, src, clear, "options.interleave" ++ "_hook") orelse return error.CallSiteMoved;
+    const clear = std.mem.indexOf(u8, impl, "if (trace_enabled) eval_ns +=") orelse return error.CallSiteMoved;
+    const probe = std.mem.indexOfPos(u8, impl, clear, "options.chunk_width" ++ "_hook") orelse return error.CallSiteMoved;
+    const tick = std.mem.indexOfPos(u8, impl, clear, "options.interleave" ++ "_hook") orelse return error.CallSiteMoved;
     try t.expect(probe < tick);
 
     // The unchunked vision arm forwards the whole prompt: there is no next
     // chunk to size, and the guard bills the real width already.
-    try t.expect(std.mem.indexOf(u8, src, "const adapt_chunked = " ++ "!(has_vision and !vision_chunked);") != null);
+    try t.expect(std.mem.indexOf(u8, impl, "const adapt_chunked = " ++ "!(has_vision and !vision_chunked);") != null);
     // The stride is still coarsened against the LAUNCH width, never the
     // per-request pin and never the per-chunk width.
-    try t.expect(std.mem.indexOf(u8, src, "effectiveSsmCheckpoint" ++ "Stride(@intCast(options.ssm_checkpoint_stride), @max(PREFILL_CHUNK, prefill_chunk_override))") != null);
+    try t.expect(std.mem.indexOf(u8, impl, "effectiveSsmCheckpoint" ++ "Stride(@intCast(options.ssm_checkpoint_stride), @max(PREFILL_CHUNK, prefill_chunk_override))") != null);
     // And the first chunk always runs the width admission billed.
-    try t.expect(std.mem.indexOf(u8, src, "var cur_chunk: usize = " ++ "default_chunk;") != null);
+    try t.expect(std.mem.indexOf(u8, impl, "var cur_chunk: usize = " ++ "default_chunk;") != null);
 }
 
 test "tailMergeMax: the tail a chunk may absorb scales with the width" {
