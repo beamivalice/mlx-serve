@@ -2966,8 +2966,60 @@ One line per transition, and one summary per request that moved:
 [prefill] adaptive: 261 chunks, width 1024..4096, 2 change(s)
 ```
 
+### What the audit caught (2026-09-05, fix round)
+
+Four findings, all of them the same shape: a decision taken at a NEW moment
+kept reading numbers built for an OLD one.
+
+**The bill was a load-time bill (blocker).** `prefillChunkCost` reached
+`prefillTransientReserve`, which prices the QSA score sheet at `kv = chunk`
+because at load there is no KV. Past the indexer budget
+`qsaScoreRowsPerChunk` saturates, so the real sheet is ~its whole budget
+rather than the tiny `fwd x nb` product — ~0.5 GB under-billed per decision at
+the default 256 MB, ~9 GB at `MLX_SERVE_QSA_SCORE_SHEET_MB=4096`. The ratchet
+did not cover it: it blocks widening only AFTER a step-down, so the first
+widen at high `pos` was unguarded. `pos` was reaching
+`adaptivePrefillWidthNow` and being spent on the LOG LINE. Fixed by
+`prefillTransientReserveAtKv`, with `prefillTransientReserve` as its
+`kv = chunk` case so every load-time caller keeps its number. The
+project's own rule was already written down one function away: *one estimator
+means one set of INPUTS too*.
+
+**The log quoted a smaller sibling of the number it compared.** The decision
+was `prefillChunkCost`; the line printed `prefillTransientReserve`. An
+under-bill therefore rendered as a comfortable margin.
+
+**Attribution and safety wanted opposite orderings (S17).** Probing before the
+interleave tick keeps a co-tenant's decode out of this prefill's pressure —
+right for attribution. But a widen decided on pre-tick headroom then forwards
+into memory the tick allocated and the probe never saw. The two directions
+split: a step-down commits from the pre-tick branch, a widen is re-priced
+after the tick (`adaptivePrefillWidenStillFits`) and withdrawn if it no longer
+fits. A step-down never waits — waiting is waiting inside the abort.
+
+**Host bytes are memory too (S11).** The SSD write-through stages a full host
+copy of the chunk behind a ~1 GiB permit, at exactly this boundary, and
+`mlx_get_active_memory` counts device bytes only. On unified memory both come
+out of one pool, so the writer publishes `staged_disk_host_bytes` and
+`prefillHeadroomNow` subtracts it.
+
+**And an old constant became reachable (S18).** `TAIL_MERGE_MAX` is a flat 512
+justified as "~6% at 8192". At `PREFILL_CHUNK_FLOOR` it is +100% of the
+transient the step-down just bought — pre-existing arithmetic that only this
+feature can reach. `tailMergeMax(width)` keeps the original ~6% bound at every
+rung and is a no-op at 4096 and 8192.
+
 ### Rules this produced
 
+- A helper's arguments encode the QUESTION it was written for. Reusing it from
+  a new moment silently answers the old question — thread the new input
+  through and keep the old call as a named special case.
+- When attribution and safety want opposite orderings, do not pick one. Split
+  the decision by direction: the safe direction commits early, the risky one
+  is confirmed late.
+- Host allocations on unified memory are working-set pressure. A probe that
+  reads only the device allocator is optimistic by whatever the host side is
+  holding.
 - Establish which quantity actually moves before you write the controller. A
   plausible mechanism that does not happen is worse than no mechanism: it
   fires for the wrong reason and the reason is invisible.

@@ -55,6 +55,16 @@ pub fn envPrefillChunk() usize {
 /// concurrent prefills cannot share a ratchet. The POLICY that reads it is
 /// `server.adaptivePrefillWidth`; the type lives here because the loop owns
 /// the instance and this module has no server.zig import.
+/// The ONE place a chosen width becomes the running width, so the summary
+/// counters cannot drift from `cur_chunk` (the widen commits from a different
+/// point in the loop than the step-down since S17).
+pub fn commitAdaptiveWidth(cur: *usize, st: *AdaptiveWidthState, w: u32) void {
+    cur.* = w;
+    st.transitions +|= 1;
+    st.width_min = @min(st.width_min, w);
+    st.width_max = @max(st.width_max, w);
+}
+
 pub const AdaptiveWidthState = struct {
     /// Consecutive probes that supported the next rung up.
     supporting: u8 = 0,
@@ -792,6 +802,19 @@ pub fn prefillTokensPerSec(prompt_tokens: u32, cached_tokens: u32, prefill_ns: u
 /// score-budget slack `boundedPrefillChunk` already carries.
 pub const TAIL_MERGE_MAX: usize = 512;
 
+/// PURE: the tail a chunk of `default_chunk` tokens may absorb.
+///
+/// `TAIL_MERGE_MAX` is a flat 512 justified by "at most ~6% at 8192". Once the
+/// width is chosen PER CHUNK that justification stops holding at the bottom of
+/// the ladder: at `PREFILL_CHUNK_FLOOR` the same 512 tokens are +100% of the
+/// transient the step-down just bought, which is the one thing a step-down
+/// exists to prevent. An eighth of the width keeps the original ~6% bound at
+/// every rung and is a no-op at 4096 and 8192, where `TAIL_MERGE_MAX` is
+/// already the smaller of the two.
+pub fn tailMergeMax(default_chunk: usize) usize {
+    return @min(TAIL_MERGE_MAX, @max(default_chunk / 8, 1));
+}
+
 pub fn nextChunkEnd(
     pos: usize,
     prefix_len: usize,
@@ -811,7 +834,7 @@ pub fn nextChunkEnd(
             return next_boundary_abs - ssm_cp_offset;
         }
     }
-    if (end < prefix_len and prefix_len - end < TAIL_MERGE_MAX) {
+    if (end < prefix_len and prefix_len - end < tailMergeMax(default_chunk)) {
         // Absorb a tiny tail instead of paying a full graph build + eval
         // barrier for a few tokens. With checkpointing active this can only
         // extend within a boundary-free span (the boundary case returned
@@ -1909,6 +1932,14 @@ pub const Generator = struct {
     pub const ChunkWidthHook = struct {
         ctx: *anyopaque,
         call: *const fn (ctx: *anyopaque, pos: usize, cur: u32, cap: u32, st: *AdaptiveWidthState) u32,
+        /// Re-price a WIDEN after the interleave tick has allocated for the
+        /// co-tenant slots it hosts. `call` runs BEFORE the tick so a
+        /// co-tenant's decode is not attributed to this prefill's pressure —
+        /// right for attribution, backwards for safety, because a widen
+        /// decided on pre-tick headroom then forwards into memory the probe
+        /// never saw and a Metal abort cannot be un-decided. A step-down needs
+        /// no confirmation: it is the safe direction and waiting costs bytes.
+        confirm: *const fn (ctx: *anyopaque, pos: usize, want: u32) bool,
     };
 
     /// Selects the source slice that `initWithOptions` will dupe into
@@ -2541,25 +2572,46 @@ pub const Generator = struct {
                     wt.call(wt.ctx, pos + ssm_cp_offset, ssm_checkpoints.items);
                 }
                 // The width of the NEXT chunk, re-priced against live memory
-                // at this boundary and nowhere else. Two placements are
-                // load-bearing: AFTER the chunk's `mlx_clear_cache` above, so
-                // the probe reads the steady state the next chunk starts from
-                // rather than this one's peak; and BEFORE the interleave tick
-                // below, so a co-tenant's decode allocations are not counted
-                // as this prefill's pressure. `pos < loop_end` because the
-                // last boundary has no next chunk to size.
+                // at this boundary and nowhere else. The placement is AFTER
+                // the chunk's `mlx_clear_cache` above, so the probe reads the
+                // steady state the next chunk starts from rather than this
+                // one's peak, and BEFORE the interleave tick below, so a
+                // co-tenant's decode is not attributed to this prefill's
+                // pressure. The SSD write-through above stages HOST bytes the
+                // probe cannot see in `mlx_get_active_memory`, so it publishes
+                // them and `prefillHeadroomNow` subtracts them (S11).
+                // Attribution and safety want opposite orderings here, so a
+                // step-down commits from this point and a WIDEN is re-priced
+                // after the tick (S17). `pos < loop_end` because the last
+                // boundary has no next chunk to size.
                 //
                 // The first chunk always runs the width admission billed —
                 // this only ever moves it afterwards, and the admission bill
                 // itself never moves.
+                var pending_widen: u32 = 0;
+                var widen_confirm: ?*const fn (*anyopaque, usize, u32) bool = null;
+                var widen_ctx: ?*anyopaque = null;
                 if (adapt_chunked and pos < loop_end) {
                     if (options.chunk_width_hook) |hk| {
                         const next_w = hk.call(hk.ctx, ssm_cp_offset + pos, @intCast(cur_chunk), cap_adapt, &adapt_state);
                         if (next_w != 0 and next_w != cur_chunk) {
-                            cur_chunk = next_w;
-                            adapt_state.transitions +|= 1;
-                            adapt_state.width_min = @min(adapt_state.width_min, next_w);
-                            adapt_state.width_max = @max(adapt_state.width_max, next_w);
+                            if (next_w < cur_chunk) {
+                                // A step-DOWN is the safe direction and takes
+                                // effect at once: waiting for the tick is
+                                // waiting inside the abort it prevents.
+                                commitAdaptiveWidth(&cur_chunk, &adapt_state, next_w);
+                            } else {
+                                // A WIDEN is held until after the tick (S17).
+                                // The confirm is captured HERE, by value, so
+                                // this stays the loop body's ONE unwrapping
+                                // of the width hook — the g1 loop-order
+                                // contract pins that site BEFORE the tick, and
+                                // a second unwrapping after it would make that
+                                // scan depend on which occurrence it found.
+                                pending_widen = next_w;
+                                widen_confirm = hk.confirm;
+                                widen_ctx = hk.ctx;
+                            }
                         }
                     }
                 }
@@ -2567,6 +2619,19 @@ pub const Generator = struct {
                 // last (the post-prefill decode tick covers that boundary).
                 if (pos < loop_end) {
                     if (options.interleave_hook) |hk| hk.call(hk.ctx);
+                }
+                // The tick just allocated KV and activations for whatever
+                // co-tenant slots it hosted — memory the pre-tick probe could
+                // not see. Re-price the widen against what is left; a refusal
+                // simply keeps the current width.
+                if (pending_widen != 0) {
+                    if (widen_confirm) |cf| {
+                        if (cf(widen_ctx.?, ssm_cp_offset + pos, pending_widen)) {
+                            commitAdaptiveWidth(&cur_chunk, &adapt_state, pending_widen);
+                        } else {
+                            adapt_state.supporting = 0;
+                        }
+                    }
                 }
             }
             // The last chunk's failure has no next iteration to catch it.
@@ -11991,6 +12056,50 @@ test "every ladder rung the adaptive width can take divides the checkpoint strid
     }
 }
 
+test "a widen is committed only after the interleave tick, a step-down before it" {
+    // S17. Attribution and safety want opposite orderings: the probe must run
+    // BEFORE the tick so a co-tenant's decode is not read as this prefill's
+    // pressure, but a WIDEN decided on pre-tick headroom then forwards into
+    // memory the tick allocated and the probe never saw — and a Metal abort
+    // cannot be un-decided. So the growth direction is re-priced after the
+    // tick and the safe direction is not. Scan-pinned by index, because the
+    // ordering is the whole fix. Needles split so this test's own source
+    // cannot satisfy them.
+    const t = testing;
+    const src = @embedFile("generate.zig");
+    const probe = std.mem.indexOf(u8, src, "hk.call(hk.ctx, ssm_cp_offset + pos, @intCast(cur_chunk)") orelse return error.CallSiteMoved;
+    const tick = std.mem.indexOfPos(u8, src, probe, "options.interleave" ++ "_hook") orelse return error.CallSiteMoved;
+    const confirm = std.mem.indexOfPos(u8, src, probe, "cf(widen_ctx.?,") orelse return error.CallSiteMoved;
+    try t.expect(probe < tick);
+    try t.expect(tick < confirm);
+
+    // The step-down commits from the pre-tick branch, the widen only from the
+    // post-tick one — both through the ONE commit helper.
+    const down = std.mem.indexOfPos(u8, src, probe, "if (next_w < cur_chunk)") orelse return error.CallSiteMoved;
+    try t.expect(down < tick);
+    try t.expect(std.mem.indexOfPos(u8, src, down, "commitAdaptive" ++ "Width(") .? < tick);
+    try t.expect(std.mem.indexOfPos(u8, src, confirm, "commitAdaptive" ++ "Width(") != null);
+}
+
+test "commitAdaptiveWidth: the summary follows the running width from both commit sites" {
+    // The widen and the step-down commit from different points in the loop
+    // since S17, so the counters live in ONE function or they drift from
+    // `cur_chunk` the first time somebody edits one branch.
+    const t = testing;
+    var cur: usize = 2048;
+    var st: AdaptiveWidthState = .{ .width_min = 2048, .width_max = 2048 };
+    commitAdaptiveWidth(&cur, &st, 1024);
+    try t.expectEqual(@as(usize, 1024), cur);
+    try t.expectEqual(@as(u32, 1), st.transitions);
+    try t.expectEqual(@as(u32, 1024), st.width_min);
+    try t.expectEqual(@as(u32, 2048), st.width_max);
+    commitAdaptiveWidth(&cur, &st, 4096);
+    try t.expectEqual(@as(usize, 4096), cur);
+    try t.expectEqual(@as(u32, 2), st.transitions);
+    try t.expectEqual(@as(u32, 1024), st.width_min);
+    try t.expectEqual(@as(u32, 4096), st.width_max);
+}
+
 test "the per-chunk width is probed after the cache clear and before the interleave tick" {
     // Both placements are load-bearing and neither is visible from a unit
     // test, so they are scan-pinned. Probing BEFORE the clear reads the
@@ -12000,7 +12109,11 @@ test "the per-chunk width is probed after the cache clear and before the interle
     // satisfy them.
     const t = testing;
     const src = @embedFile("generate.zig");
-    const clear = std.mem.lastIndexOf(u8, src, "_ = mlx.mlx_clear" ++ "_cache();\n                if (trace_enabled) eval_ns") orelse return error.CallSiteMoved;
+    // Anchored on the eval-trace line, not on the clear plus its next line:
+    // the g1 loop-order fix (B0b) inserts `try mlx.checkError()` immediately
+    // after the clear, and a needle spanning both lines would go red for that
+    // rather than for anything this test is about.
+    const clear = std.mem.indexOf(u8, src, "if (trace_enabled) eval_ns +=") orelse return error.CallSiteMoved;
     const probe = std.mem.indexOfPos(u8, src, clear, "options.chunk_width" ++ "_hook") orelse return error.CallSiteMoved;
     const tick = std.mem.indexOfPos(u8, src, clear, "options.interleave" ++ "_hook") orelse return error.CallSiteMoved;
     try t.expect(probe < tick);
@@ -12013,6 +12126,30 @@ test "the per-chunk width is probed after the cache clear and before the interle
     try t.expect(std.mem.indexOf(u8, src, "effectiveSsmCheckpoint" ++ "Stride(@intCast(options.ssm_checkpoint_stride), @max(PREFILL_CHUNK, prefill_chunk_override))") != null);
     // And the first chunk always runs the width admission billed.
     try t.expect(std.mem.indexOf(u8, src, "var cur_chunk: usize = " ++ "default_chunk;") != null);
+}
+
+test "tailMergeMax: the tail a chunk may absorb scales with the width" {
+    // S18. The flat 512 was justified as "~6% at 8192". At the ladder floor —
+    // which the per-chunk width now reaches by design — it is +100% of the
+    // transient the step-down just bought.
+    const t = testing;
+    try t.expectEqual(TAIL_MERGE_MAX, tailMergeMax(8192)); // no-op where it was justified
+    try t.expectEqual(TAIL_MERGE_MAX, tailMergeMax(4096));
+    try t.expectEqual(@as(usize, 256), tailMergeMax(2048));
+    try t.expectEqual(@as(usize, 128), tailMergeMax(1024));
+    try t.expectEqual(@as(usize, 64), tailMergeMax(PREFILL_CHUNK_FLOOR));
+    // Never 0: a 0 merge bound is fine, but a 0 divisor is a trap for the
+    // next caller, and `nextChunkEnd` must stay total.
+    try t.expectEqual(@as(usize, 1), tailMergeMax(1));
+    // The bound it exists to keep: never more than an eighth of the width.
+    for ([_]usize{ 8192, 4096, 2048, 1024, PREFILL_CHUNK_FLOOR }) |w| {
+        try t.expect(tailMergeMax(w) * 8 <= w);
+    }
+
+    // And the loop honours it: a 300-token tail merges at 8192 and does NOT
+    // at the floor, where it would double the chunk.
+    try t.expectEqual(@as(usize, 8492), nextChunkEnd(0, 8492, 8192, false, 0, 0));
+    try t.expectEqual(@as(usize, 512), nextChunkEnd(0, 812, PREFILL_CHUNK_FLOOR, false, 0, 0));
 }
 
 test "nextChunkEnd: a tiny trailing remainder merges into the last chunk" {
