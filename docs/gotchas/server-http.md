@@ -3921,5 +3921,5 @@ A "qwen4_exp long-context" change that touches a shared function is a
 cross-arch change until a predicate says otherwise. The predicate is
 `ModelConfig.longCtxGated()`, it has ONE body, and a site that cannot see a
 ModelConfig mirrors it ONCE into a field at wiring time
-(`HotPrefixCache.span_preserving_cps`, the `qsa_history_required` pattern) and
+(`HotPrefixCache.cp_thin`, the `qsa_history_required` pattern) and
 is scan-pinned to it.

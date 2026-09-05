@@ -964,7 +964,7 @@ pub const ModelConfig = struct {
     /// conjunct is a second predicate, and the two drift (the
     /// `supportsBatchedGdnDecode` story, one file up). Sites that cannot see a
     /// ModelConfig mirror this ONCE into a field at wiring time
-    /// (`HotPrefixCache.span_preserving_cps`, the `qsa_history_required`
+    /// (`HotPrefixCache.cp_thin`, the `qsa_history_required`
     /// pattern) and are scan-pinned to it.
     pub fn longCtxGated(self: *const ModelConfig) bool {
         return self.isQwen4();
