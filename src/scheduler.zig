@@ -5512,6 +5512,10 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             ),
             .mtp_enabled = use_mtp,
             .mtp = if (use_mtp) slot.mtp else null,
+            // The MODEL's head, before this request's opt-out: `slot.mtp` is
+            // the registry's `entry.mtp`, which already ANDs `--no-mtp`. The
+            // serial cell keys on THIS, not on the weights being loaded.
+            .model_has_mtp = slot.mtp != null,
             .mtp_depth = slot.mtp_depth,
             .lookup_prompt = slot.full_prompt,
             .ctx = slot.ctx,

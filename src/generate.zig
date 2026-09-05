@@ -1081,6 +1081,10 @@ pub const Generator = struct {
     // KV cache — OWNED by the Generator (built during prefill, freed in
     // `deinit`).
     mtp: ?MtpHeadRef = null,
+    /// Does the MODEL have a usable MTP head — i.e. did the registry give
+    /// this slot one? `--no-mtp` clears it; a per-REQUEST `enable_mtp:false`
+    /// does not, which is deliberate (see `serialCellWanted`).
+    model_has_mtp: bool = false,
     mtp_cache: ?MtpCacheRef = null,
     /// Absolute target position represented by MTP-cache position 0. Usually
     /// zero; nonzero when the head keeps only a suffix of a restored/long
@@ -1672,6 +1676,11 @@ pub const Generator = struct {
         mtp_enabled: bool = false,
         /// Non-owning pointer to the loaded MTP head.
         mtp: ?MtpHeadRef = null,
+        /// The MODEL's head, before this request's opt-out. `Transformer`
+        /// loads `qwen4_mtp` with the trunk whatever `--no-mtp` says, so the
+        /// weights are the wrong thing to ask; the scheduler passes the
+        /// registry's answer.
+        model_has_mtp: bool = false,
         /// Max tokens drafted per nextMtp round. 0 = auto (`--mtp-depth` not
         /// passed): resolved by `resolveMtpDepthCap` — MTP_ADAPTIVE_NAX_CAP
         /// for the measured M5 target+sidecar profile, otherwise
@@ -2543,6 +2552,7 @@ pub const Generator = struct {
             }
             var gen = Generator{
                 .xfm = xfm,
+                .model_has_mtp = options.model_has_mtp,
                 .ctx = ctx,
                 .tok = tok,
                 .next_token_id = 0,
@@ -2594,6 +2604,7 @@ pub const Generator = struct {
                 0;
             var gen = Generator{
                 .xfm = xfm,
+                .model_has_mtp = options.model_has_mtp,
                 .ctx = ctx,
                 .tok = tok,
                 .next_token_id = @intCast(first_val),
@@ -2670,6 +2681,7 @@ pub const Generator = struct {
             var gen = Generator{
                 .pending_logprob = first_lp,
                 .xfm = xfm,
+                .model_has_mtp = options.model_has_mtp,
                 .ctx = ctx,
                 .tok = tok,
                 .next_token_id = @intCast(first_val),
@@ -2726,6 +2738,7 @@ pub const Generator = struct {
         var gen = Generator{
             .pending_logprob = first_lp,
             .xfm = xfm,
+            .model_has_mtp = options.model_has_mtp,
             .ctx = ctx,
             .tok = tok,
             .next_token_id = @intCast(val),
@@ -5220,7 +5233,16 @@ pub const Generator = struct {
     /// does not fold — conservative, and never wrong.
     pub fn serialCellWanted(self: *const Generator) bool {
         if (!mtpAdaptiveSerialEnabled() or !mtpCostTableEnabled()) return false;
-        if (self.mtp == null and self.xfm.qwen4_mtp == null) return false;
+        // NOT `xfm.qwen4_mtp != null`: the in-checkpoint head's weights load
+        // with the TRUNK, so they are present even under `--no-mtp`, and a
+        // `--no-mtp` boot folded a serial cell on every decoded token and
+        // rewrote the persisted table at the end of every request. The
+        // registry's answer is the model-level one and honours the flag.
+        //
+        // Per-REQUEST `enable_mtp:false` deliberately still folds: a plain
+        // decode on a checkpoint that CAN speculate is the cleanest serial
+        // sample there is, and it is what teaches the cell.
+        if (!self.model_has_mtp) return false;
         return mtpAdaptiveKvEligible(self.mtpKvLen(), mtpAdaptiveMinKv());
     }
 
@@ -14213,6 +14235,24 @@ test "mtpAdaptiveRegimeMoved: a switch either way, or a crossing, drops the pric
     pa = a.arm;
     _ = a.serialTick(6, 0);
     try testing.expect(!G.mtpAdaptiveRegimeMoved(pb, pa, a.bucket, a.arm));
+}
+
+test "serialCellWanted: --no-mtp must not fold a serial cell (the head weights are still loaded)" {
+    const src = @embedFile("generate.zig");
+    const at = std.mem.indexOf(u8, src, "fn serialCell" ++ "Wanted(self: *const Generator)") orelse
+        return error.MissingSerialCellWanted;
+    const end = std.mem.indexOfPos(u8, src, at, "\n    }\n") orelse src.len;
+    const body = src[at..end];
+
+    // `Transformer.qwen4_mtp` is loaded with the TRUNK — `--no-mtp` gates
+    // `entry.mtp`, not the weights — so "the head exists" is not the same
+    // question as "this model may speculate", and using it as the proxy made
+    // a `--no-mtp` boot fold a serial cell per token and persist the table.
+    // The model-level answer is the one the registry already computed.
+    // The CODE form, not the word: the comment above the predicate names the
+    // rejected expression on purpose, and must stay allowed to.
+    try testing.expect(std.mem.indexOf(u8, body, "self.xfm.qwen4_" ++ "mtp") == null);
+    try testing.expect(std.mem.indexOf(u8, body, "self.model_has_" ++ "mtp") != null);
 }
 
 test "mtpAdaptiveKvEligible: short context is below the floor, and the floor is the default" {
