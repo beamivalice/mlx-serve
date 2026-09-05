@@ -112,6 +112,14 @@ pub const LookupResult = struct {
     /// without this every reused prefix drafts against an empty history
     /// (measured on Qwen3.6-27B echo: ~70 → ~38 tok/s on warm repeats).
     mtp_base: ?usize = null,
+    /// Did this restore CHECK OUT its entry (`checkoutEligible`)? True means
+    /// the entry released its own handles and the slot is the sole owner, so
+    /// the first append DONATES in place. False — every other restore — is a
+    /// refcount SHARE, and mlx privatises the whole prefix on that first
+    /// append (`is_donatable()` fails on the entry's second reference). The
+    /// admission bill reads this: only a checked-out prefix is a prefix the
+    /// request will not allocate (audit B-A3).
+    checked_out: bool = false,
 };
 
 const Entry = struct {
@@ -1284,13 +1292,16 @@ pub const HotPrefixCache = struct {
         }
 
         log.info("  [hot-cache] reused {d}/{d} tokens (matched {d}; entry {d}/{d})\n", .{ effective_matched, prompt_ids.len, m.shared, m.idx + 1, self.entries.items.len });
-        const res: LookupResult = .{
+        var res: LookupResult = .{
             .matched = effective_matched,
             .full_match = full_match,
             .dflash_base = restoreDflash(e, dflash_target, effective_matched, s),
             .mtp_base = restoreMtp(e, mtp_target, effective_matched, s),
         };
-        self.checkoutIfEligible(m.idx, m.shared, prompt_ids.len, slot_id);
+        // The bill reads this: a SHARED restore is copied by the first append
+        // (`is_donatable()` fails on the entry's second reference), so only a
+        // checkout makes the restored rows rows nobody allocates (audit B-A3).
+        res.checked_out = self.checkoutIfEligible(m.idx, m.shared, prompt_ids.len, slot_id);
         return res;
     }
 
@@ -1329,7 +1340,12 @@ pub const HotPrefixCache = struct {
     /// RELEASING the entry's own handles. The slot already holds refcount-
     /// shared handles from `restore`, so this drops the buffers' use_count to
     /// one and the slot's first `writeAtOffset` donates instead of copying.
-    fn checkoutIfEligible(self: *HotPrefixCache, idx: usize, shared: usize, prompt_len: usize, slot_id: ?usize) void {
+    ///
+    /// Returns whether the checkout was TAKEN — the one answer the admission
+    /// bill needs, because only a checked-out prefix is one the request will
+    /// not allocate (audit B-A3). The caller never re-derives it from the
+    /// conjuncts above; there is one predicate and this is its only reader.
+    fn checkoutIfEligible(self: *HotPrefixCache, idx: usize, shared: usize, prompt_len: usize, slot_id: ?usize) bool {
         const e = &self.entries.items[idx];
         if (!checkoutEligible(
             self.ssd_first,
@@ -1339,10 +1355,11 @@ pub const HotPrefixCache = struct {
             shared,
             prompt_len,
             slot_id != null,
-        )) return;
+        )) return false;
         e.snapshot.releaseHandles();
         e.checked_out_by = slot_id;
         log.info("  [hot-cache] checked out {d}-token entry to the slot (restore by move; the append donates in place)\n", .{e.tokens.len});
+        return true;
     }
 
     /// End of a slot's life: any entry that slot still holds is DROPPED.

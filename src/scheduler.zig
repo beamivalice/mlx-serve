@@ -304,19 +304,22 @@ pub const SubmitParams = struct {
 /// hosts that never route through the HTTP server, which disables the
 /// evict-to-admit path entirely (behaviour identical to before #353).
 ///
-/// The two trailing `u64`s are the WARM prefix: the rows the hot cache
-/// restored into this slot, and the capacity its buffers already hold. A cold
-/// caller passes `0, 0` and gets exactly the bill it had. Passed as scalars
+/// The three trailing warm arguments are the WARM prefix: the rows the hot
+/// cache restored into this slot, the capacity its buffers already hold, and
+/// whether that restore CHECKED THE ENTRY OUT (`prefix_cache.checkoutEligible`
+/// — the only restore whose rows the request will not allocate; every other
+/// one is refcount-shared and copied by the first append). A cold caller
+/// passes `0, 0, false` and gets exactly the bill it had. Passed as scalars
 /// rather than `server.WarmPrefix` because this module deliberately does not
 /// import server.zig.
-pub var prefill_admission_fits: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64) bool = null;
+pub var prefill_admission_fits: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool) bool = null;
 
 /// Third of the same family: the prefill WIDTH this request should run at,
 /// chosen against live post-eviction memory by the estimator that admits it
 /// (`server.requestPrefillChunkNow`). Null in unit tests and wherever the
 /// HTTP server is not installed, which keeps the model's load-time pin —
 /// exactly the behaviour every arch but qwen4_exp gets anyway.
-pub var prefill_request_chunk: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64) u32 = null;
+pub var prefill_request_chunk: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool) u32 = null;
 
 /// PURE: the prefill width to RUN, given the width the admission bill was
 /// taken at BEFORE the eviction pass (`admitted`) and the width re-asked
@@ -398,7 +401,7 @@ pub var prefill_chunk_widen_ok: ?*const fn (
 /// Twin of the above for the REFUSAL: logs the numbers the estimator
 /// compared, from the module that owns them. A refusal quotes the number it
 /// compared, and the scheduler cannot format a bill it has no estimator for.
-pub var prefill_admission_refused_log: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64) void = null;
+pub var prefill_admission_refused_log: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool) void = null;
 
 /// Invalidate the published hot-cache budget (`server.clearResolvedPrefixCacheMem`).
 /// The budget is PER MODEL but the global holding it is process-wide, so an
@@ -5841,6 +5844,11 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // per-request, so prefix matching would reuse stale features.
     var prefill_tokens: []const u32 = slot.full_prompt;
     var hot_matched: u32 = 0;
+    // Did the restore CHECK OUT its entry (restore by move)? The admission
+    // bill credits a warm prefix only then: every other restore is a refcount
+    // SHARE, whose first `writeAtOffset` privatises the whole prefix, so its
+    // rows really are allocated (audit B-A3).
+    var hot_checked_out: bool = false;
     // The DFlash assistant's context rides the prefix cache: a restore
     // forwards no trunk layers, so without it the assistant starts every
     // reused turn blind and drafts against nothing. Measured on Muse 4-bit,
@@ -5904,6 +5912,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             if (lookup.matched > 0 and lookup.matched <= slot.full_prompt.len) {
                 hot_matched = @intCast(lookup.matched);
                 prefill_tokens = slot.full_prompt[hot_matched..];
+                hot_checked_out = lookup.checked_out;
             }
             if (dfl_target) |*dc| {
                 // Adopt only a context that lines up EXACTLY with the trunk
@@ -5982,10 +5991,16 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 /// entry), and both are what the request will prefill against.
                 warm_matched: u64,
                 warm_capacity: u64,
-                fits: *const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64) bool,
+                /// ...and whether the restore CHECKED THE ENTRY OUT. Without
+                /// it the rows above are refcount-SHARED, the first append
+                /// copies the whole prefix, and crediting them is an
+                /// under-bill on a path that ends in an uncatchable Metal
+                /// abort rather than a 400 (audit B-A3).
+                warm_will_donate: bool,
+                fits: *const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool) bool,
                 fn call(ctx: ?*anyopaque) bool {
                     const self: *@This() = @ptrCast(@alignCast(ctx.?));
-                    return self.fits(self.cfg, self.seq, self.max_tokens, self.kv_cfg, self.unchunked, self.warm_matched, self.warm_capacity);
+                    return self.fits(self.cfg, self.seq, self.max_tokens, self.kv_cfg, self.unchunked, self.warm_matched, self.warm_capacity, self.warm_will_donate);
                 }
             };
             var probe = Probe{
@@ -5998,6 +6013,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 .unchunked = generate_mod.visionPrefillUnchunked(slot.vision_embeddings != null),
                 .warm_matched = hot_matched,
                 .warm_capacity = slot.cache.residentCapacityTokens(),
+                .warm_will_donate = hot_checked_out,
                 .fits = fits_fn,
             };
             if (!Probe.call(&probe)) {
@@ -6008,7 +6024,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 // memory as the probe that just ran, so this IS the admitted
                 // width and not a second opinion (#126).
                 if (prefill_request_chunk) |pick_pre| {
-                    admitted_prefill_chunk = pick_pre(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, probe.unchunked, probe.warm_matched, probe.warm_capacity);
+                    admitted_prefill_chunk = pick_pre(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, probe.unchunked, probe.warm_matched, probe.warm_capacity, probe.warm_will_donate);
                 }
                 // Per-MODEL, off the slot — same rule as `commitSlotIfApplicable`
                 // ("Phase D: per-model prefix cache"). `sch.hot_prefix_cache`
@@ -6046,7 +6062,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                     // A refusal quotes the numbers it COMPARED (the estimator
                     // lives in server.zig, so it does the formatting).
                     if (prefill_admission_refused_log) |report_fn| {
-                        report_fn(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, probe.unchunked, probe.warm_matched, probe.warm_capacity);
+                        report_fn(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, probe.unchunked, probe.warm_matched, probe.warm_capacity, probe.warm_will_donate);
                     }
                     // NOT `error.OutOfMemory`: nothing ran out of anything.
                     // That name is the MLX working-set latch's, and it sends
@@ -6077,6 +6093,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             generate_mod.visionPrefillUnchunked(slot.vision_embeddings != null),
             hot_matched,
             slot.cache.residentCapacityTokens(),
+            hot_checked_out,
         );
         // Audit N5. Without an eviction pass this is the only ask and the
         // request keeps its width; with one it is the SECOND ask, taken
