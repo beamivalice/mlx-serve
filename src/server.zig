@@ -3502,7 +3502,20 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, idl
     // plan on qwen4_exp, so a live ceiling here BYPASSED the reproducibility fix
     // on the only arch the gates are about. The callee takes the ceiling as a
     // parameter and no longer derives one. (audit S1)
-    if (ssdFirstBudgetForLoad(config, requested, staticGpuMemoryCeiling(), active_mem, ssd_ctx_kv, prefillTransientReserve(config, kv_bits, ssd_chunk), idle_out)) |b| return b;
+    // The CLAMP reserve, at the same width `planHotCache` reserves for: the
+    // ladder FLOOR on an arch that re-bills its prefill width per request
+    // (`clampReserveWidth`). This arm short-circuits above the RAM plan on
+    // qwen4_exp, so billing the sizer's rung here meant the floor-reserve fix
+    // never ran on the deployed pack at all — the same shape as the ceiling
+    // bypass audit S1 caught one line up. Two reserves, exactly as on the RAM
+    // arm: the SESSION is billed at the pinned width (`ssdFirstSessionTokensNow`,
+    // twin of `ramFirstContextForLoad`) because that is the width
+    // `computeMemoryContext` advertises against; the BUDGET is billed at the
+    // floor, because the load-time reserve is only a promise to the FIRST
+    // request and every request re-bills its own real width at admission.
+    // (external review item 5)
+    const ssd_clamp_reserve: u64 = prefillTransientReserve(config, kv_bits, clampReserveWidth(config, @intCast(ssd_chunk)));
+    if (ssdFirstBudgetForLoad(config, requested, staticGpuMemoryCeiling(), active_mem, ssd_ctx_kv, ssd_clamp_reserve, idle_out)) |b| return b;
     // Pin first, then hand the pinned width in as the override: the plan must
     // bill the width `generate.effectivePrefillChunk` will resolve to, and the
     // pin is that width (it already folded in an explicit `--prefill-chunk`).
@@ -3789,6 +3802,32 @@ fn countDecls(src: []const u8, header: []const u8) usize {
     return n;
 }
 
+/// The ARGUMENT TEXT of the call whose name starts at `at` — balanced from
+/// the opening paren, so a multi-line call and a nested call are both exact.
+///
+/// The scans that check "this call passes that term" used a fixed-size window
+/// and cut at the first `);`. Both calls this file scans end in `))` or span
+/// several lines, so the window ran 400+ characters PAST the call and the
+/// assertion could be satisfied by unrelated code below it — the same
+/// self-satisfying-scan class as audit B0c, one level out. A scan that cannot
+/// go red is not a scan. (external review item 5)
+fn callArgs(src: []const u8, at: usize) ?[]const u8 {
+    const open = std.mem.indexOfScalarPos(u8, src, at, '(') orelse return null;
+    var depth: usize = 0;
+    var i: usize = open;
+    while (i < src.len) : (i += 1) {
+        switch (src[i]) {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if (depth == 0) return src[open + 1 .. i];
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
 /// One declaration's source window. Thin alias for the ONE extractor,
 /// `generate.productionDeclSource` — the same windows the prefill loop's own
 /// ordering scans read, so the two cannot drift. It generalises what this used
@@ -3880,9 +3919,12 @@ test "free RAM still binds where it can be acted on: request-time admission" {
     const load = declBody(src, "pub fn prefixCacheMemForLoad(") orelse return error.CallSiteMoved;
     for ([_][]const u8{ "ssdFirstBudgetFor" ++ "Load(", "planHot" ++ "Cache(" }) |callee| {
         const at = std.mem.indexOf(u8, load, callee) orelse return error.CallSiteMoved;
-        const args = load[at..@min(load.len, at + 600)];
-        const close = std.mem.indexOf(u8, args, ");") orelse return error.CallSiteMoved;
-        try t.expect(std.mem.indexOf(u8, args[0..close], static_c) != null);
+        // Balanced from the opening paren: the old form cut at the first `);`
+        // in a 600-byte window, and BOTH calls here end in `))` or span
+        // several lines, so it ran ~420 bytes past the call and could be
+        // satisfied by code below it. (external review item 5)
+        const args = callArgs(load, at) orelse return error.CallSiteMoved;
+        try t.expect(std.mem.indexOf(u8, args, static_c) != null);
     }
     // ...and neither callee may re-derive a live ceiling behind the argument.
     for ([_][]const u8{ "fn ssdFirstBudgetForLoad(", "fn ssdFirstSessionTokensNow(", "pub fn planHotCache(" }) |decl| {
@@ -3982,6 +4024,108 @@ test "the clamp bills the context that will be SERVED, not the placeholder" {
     try t.expect(placeholder.ctx_kv < 30 * MiB);
     try t.expect(real.ctx_kv > 18_000 * MiB);
     try t.expect(real.budget > 0);
+}
+
+test "the SSD-first budget bills the FLOOR reserve, at the deployed pack's live numbers" {
+    // External review item 5. `ssdFirstBudgetForLoad` short-circuits ABOVE
+    // `planHotCache`, so `clampReserveWidth` — the fix that made the clamp
+    // monotone in the ceiling by reserving only the ladder FLOOR on an arch
+    // that re-bills its width per request — never executed on qwen4_exp, the
+    // one arch these gates are about. Exactly the shape audit S1 caught for
+    // the ceiling, one argument along.
+    //
+    // Live numbers, the same boot the other clamp tests use (2026-09-05,
+    // wired 120000): the guards' boot lines are
+    //   [hot-cache] budget clamped 10240 -> 9642 MB          (RAM arm)
+    //   [hot-cache] SSD-first budget 34748 MB                (SSD arm)
+    const t = std.testing;
+    var cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const MiB: u64 = 1 << 20;
+    const active: u64 = 69_827 * MiB;
+    const ceiling: u64 = 109_395 * MiB;
+
+    const orig_ctx = server_config.max_context_size;
+    defer server_config.max_context_size = orig_ctx;
+    server_config.max_context_size = 0;
+    cfg.pinned_context = 0;
+    // Both gates pinned, so the environment cannot decide this test's verdict.
+    per_request_chunk_override = true;
+    defer per_request_chunk_override = null;
+    const orig_explicit = generate_mod.prefill_chunk_explicit;
+    defer generate_mod.prefill_chunk_explicit = orig_explicit;
+    generate_mod.prefill_chunk_explicit = false;
+
+    // The PURE chunk resolver — the same one the neighbouring clamp tests use.
+    // `pinPrefillChunk` reads live memory, and a box that happened to resolve
+    // the floor rung would make the floor-vs-pinned comparison below vacuous.
+    const chunk: u32 = @intCast(generate_mod.effectivePrefillChunk(
+        cfg.prefillScoreHeadDim(),
+        cfg.num_attention_heads,
+        0,
+        cfg.has_sliding_window,
+        cfg.isMoe(),
+        cfg.pinned_prefill_chunk,
+    ));
+    // The arch DOES re-bill per request, so the two widths really differ —
+    // otherwise this test would be vacuous.
+    try t.expect(perRequestPrefillChunkEnabled(&cfg));
+    const floor_w = clampReserveWidth(&cfg, chunk);
+    try t.expectEqual(PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1], floor_w);
+    try t.expect(floor_w < chunk);
+
+    const reserve_pinned = prefillTransientReserve(&cfg, kv_bits, chunk);
+    const reserve_floor = prefillTransientReserve(&cfg, kv_bits, floor_w);
+    try t.expect(reserve_floor < reserve_pinned);
+
+    const ctx_kv: u64 = (kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(&cfg)) *|
+        ssdFirstSessionTokensNow(&cfg, kv_bits, ceiling, active, chunk);
+    const ask: u64 = 10 * 1024 * MiB;
+
+    // What the arm bills now, and what it billed before: the idle allowance
+    // is the residual after the reserve, so the whole difference lands there.
+    const now = ssdFirstPrefixCacheMem(ask, ceiling, active, ctx_kv, reserve_floor);
+    const before = ssdFirstPrefixCacheMem(ask, ceiling, active, ctx_kv, reserve_pinned);
+    try t.expect(now >= before);
+
+    // ...and the RAM arm reserves the same floor for the same pack, which is
+    // the point: the two arms differ in their SEMANTICS (residual vs
+    // one-session floor), never in the width they promise the first request.
+    const plan = planHotCache(&cfg, kv_bits, ceiling, active, 1_048_576, sizerCtxKvBytes(&cfg, kv_bits), ask, chunk);
+    try t.expectEqual(floor_w, plan.reserve_chunk);
+    try t.expectEqual(reserve_floor, plan.reserve);
+
+    // The session the floor holds is the one the server advertises — unchanged
+    // by this fix, and asserted here so the two reserves cannot be conflated
+    // by a later tidy-up. `ssdFirstSessionTokensNow` bills the PINNED width
+    // because that is what `computeMemoryContext` sizes against.
+    const advertised = autoContextFrom(
+        safeContextForBudget(ceiling, active, CTX_SIZING_CACHE_RESERVE +| reserve_pinned, kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(&cfg), 0),
+        cfg.contextCap(),
+    );
+    try t.expectEqual(advertised, ssdFirstSessionTokensNow(&cfg, kv_bits, ceiling, active, chunk));
+}
+
+test "the SSD-first budget arm reads the same clamp reserve the RAM plan does" {
+    // Scan half of item 5: a body-scoped assertion cannot see which arm ran,
+    // so the reserve is checked AT THE CALL, on its arguments — the lesson
+    // audit S1 wrote down for the ceiling. Needles split.
+    const t = std.testing;
+    const src = @embedFile("server.zig");
+    const clamp = "clampReserve" ++ "Width(config, ";
+    const load = declBody(src, "pub fn prefixCacheMemForLoad(") orelse return error.CallSiteMoved;
+    // The SSD arm derives its clamp reserve through the shared helper...
+    const at = std.mem.indexOf(u8, load, "ssdFirstBudgetFor" ++ "Load(") orelse return error.CallSiteMoved;
+    const args = callArgs(load, at) orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, args, "ssd_clamp_reserve") != null);
+    // ...and it is the ONLY reserve the arm passes: a second, pinned-width
+    // term beside it would be the bug wearing the fix's name.
+    try t.expect(std.mem.indexOf(u8, args, "prefillTransientReserve(") == null);
+    const decl = std.mem.indexOf(u8, load, "const ssd_clamp_reserve") orelse return error.ReserveMoved;
+    try t.expect(std.mem.indexOf(u8, load[decl..@min(load.len, decl + 200)], clamp) != null);
+    // ...and the RAM arm still reaches it through `planHotCache`.
+    const plan = declBody(src, "pub fn planHotCache(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, plan, clamp) != null);
 }
 
 test "SSD-first is gated on a DISK TIER: with --prefix-cache-disk off, qwen4_exp takes the RAM arm" {
