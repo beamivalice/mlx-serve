@@ -6815,6 +6815,11 @@ fn capBufAppend(s: mlx.mlx_stream, buf: *mlx.mlx_array, view: *mlx.mlx_array, co
                 defer _ = mlx.mlx_array_free(old);
                 try mlx.check(mlx.mlx_slice(&old, buf.*, &start, nd, &stop, nd, &strides, nd, s));
                 var seeded = mlx.mlx_array_new();
+                // Safe unscoped only because this `if` block ENDS with the
+                // transfer to `grown`: on normal exit the errdefer never runs,
+                // and on failure `grown` is still the old handle, so the two
+                // errdefers free two different arrays.
+                errdefer _ = mlx.mlx_array_free(seeded);
                 try mlx.check(mlx.mlx_slice_update(&seeded, grown, old, &start, nd, &stop, nd, &strides, nd, s));
                 _ = mlx.mlx_array_free(grown);
                 grown = seeded;
@@ -6825,10 +6830,20 @@ fn capBufAppend(s: mlx.mlx_stream, buf: *mlx.mlx_array, view: *mlx.mlx_array, co
     }
     start[axis] = count.*;
     stop[axis] = @intCast(plan.new_rows);
-    var updated = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_slice_update(&updated, buf.*, chunk, &start, nd, &stop, nd, &strides, nd, s));
-    _ = mlx.mlx_array_free(buf.*);
-    buf.* = updated;
+    // S22c. The handle leaked if the update failed — live rather than
+    // theoretical now that the error latch returns a Metal OOM instead of
+    // ending the process. The errdefer is BLOCK-scoped on purpose: `updated`
+    // becomes `buf.*` on the last line, and a function-scoped errdefer would
+    // then free the caller's buffer when the `mlx_slice` for `view` below
+    // fails. Normal exit from the block skips it; only a failure inside it,
+    // where `updated` is still ours alone, runs it.
+    {
+        var updated = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(updated);
+        try mlx.check(mlx.mlx_slice_update(&updated, buf.*, chunk, &start, nd, &stop, nd, &strides, nd, s));
+        _ = mlx.mlx_array_free(buf.*);
+        buf.* = updated;
+    }
     count.* = @intCast(plan.new_rows);
 
     start[axis] = 0;
