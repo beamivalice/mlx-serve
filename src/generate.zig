@@ -225,8 +225,11 @@ fn readEnvUsize(name: [:0]const u8, default: usize) usize {
     return std.fmt.parseInt(usize, slice, 10) catch default;
 }
 
-/// Read a finite, strictly positive float from an environment variable,
-/// falling back to `default` when unset, empty, unparseable or non-finite.
+/// Read a finite, NON-NEGATIVE float from an environment variable, falling
+/// back to `default` when unset, empty, unparseable, negative or non-finite.
+/// (The doc used to say "strictly positive" while the code accepted 0; 0 is a
+/// meaningful setting for every current caller — a zero margin, a zero warm —
+/// so the comment was the wrong half.)
 fn readEnvFloat(name: [:0]const u8, default: f32) f32 {
     const raw = std.c.getenv(name.ptr);
     if (raw == null) return default;
@@ -260,6 +263,23 @@ pub const MtpHeadRef = union(enum) {
     /// (`qwen4_mtp`, module-owned ⇒ single-flight); row r of the history is
     /// (pre-mixer stream at position r, token r+1), query position r+1.
     qwen4: *Transformer,
+
+    /// Is this head's decode state MODULE-owned — one instance per MODEL,
+    /// shared by every slot on it — rather than per-request?
+    ///
+    /// The sidecar arm's cache is a `KVCache` this Generator allocated and
+    /// owns; the in-checkpoint arm's is `Qwen4Mtp.cache` on the Transformer,
+    /// which is why `scheduler.slotExclusiveDecode` gives the slot driving it
+    /// the model to itself. That was written as a hand-rolled `head == .qwen4`
+    /// on the scheduler side and re-derived again here for S21 — a list of ONE
+    /// in two places, the exact shape `ownsModuleDecodeState` was factored out
+    /// of. BOTH sides now ask this. A new head arm answers here, once.
+    pub fn moduleOwned(self: MtpHeadRef) bool {
+        return switch (self) {
+            .qwen => false,
+            .qwen4 => true,
+        };
+    }
 
     pub fn makeCache(self: MtpHeadRef, allocator: std.mem.Allocator) !MtpCacheRef {
         return switch (self) {
@@ -1282,6 +1302,16 @@ pub const Generator = struct {
     /// Adaptive serial controller (`MtpAdaptive`): which arm this request is
     /// on, the confirm streak behind it and the KV bucket it was decided in.
     mtp_adaptive: MtpAdaptive = .{},
+    /// S21. This request has RELEASED the module-owned MTP head: it armed the
+    /// sticky serial arm (so no re-entry, no probe, no round can follow) and
+    /// has since reached a serial block boundary with the head detached. From
+    /// that point `scheduler.slotExclusiveDecode` stops claiming the model for
+    /// this slot, so another request may take the head and the rest of this
+    /// one batches like any plain decode.
+    ///
+    /// Per-REQUEST, deliberately: on the Generator, never on `LoadedModel` or
+    /// the Transformer. One slow request must not turn MTP off process-wide.
+    mtp_head_released: bool = false,
     /// This request's realized MTP price (ms per emitted token) over a
     /// trailing window — the second of the two measured prices the switch
     /// requires. Zeroed for every new request, hence empty after a restore.
@@ -2241,8 +2271,19 @@ pub const Generator = struct {
             // us already clamped by the server, but a reservation is a number
             // two subsystems must agree on and neither may trust its caller
             // for it (the omitted-max_tokens sentinel, #353 follow-up).
+            // ABSOLUTE capacity, so it must be billed in ABSOLUTE positions.
+            // `prompt_ids` is the TAIL after a prefix-cache hit, and the cache
+            // already holds `ssm_checkpoint_pos_offset` rows — so on every warm
+            // path the reservation landed BELOW the capacity the cache already
+            // had, `nextCapacityReserved` fell through to the +25% ladder, and
+            // the tail prefill re-grew: exactly the old+new coexistence
+            // transient #353 measured at 7.75 GB @ 458k, silently absent on
+            // the warm long-context path this reservation exists for. The
+            // admission guard already bills the FULL prompt length
+            // (`server.reservedCacheTokens`), so this also stops the two
+            // drifting apart. `total_ctx_for_chunk` is that absolute length.
             const reserved_tokens = transformer_mod.KVCache.reservedTokens(
-                prompt_ids.len,
+                total_ctx_for_chunk,
                 max_tokens,
                 default_chunk,
                 xfm.config.max_position_embeddings,
@@ -2431,6 +2472,28 @@ pub const Generator = struct {
                 }
                 _ = mlx.mlx_clear_cache();
                 if (trace_enabled) eval_ns += prefill_sw.read() - eval_start_ns;
+
+                // THIS chunk's latch, read HERE — before anything persists it,
+                // snapshots it, or yields the thread (B0b). It used to be read
+                // at the top of the NEXT iteration, and three things ran in the
+                // gap, all on KV that Metal had already abandoned (the rule:
+                // Metal at the working-set edge returns ZEROS before it aborts):
+                //
+                //   * `captureSsmCheckpoint` below snapshots the garbage state;
+                //   * `write_through_hook` commits it to the SSD tier as a
+                //     durable, indexed restorable prefix that nothing removes,
+                //     so later requests restore FROM the failure;
+                //   * `interleave_hook` -> `checkErrorDecode` is the same
+                //     `consumeLatch`, so a co-tenant decode ate the latch and
+                //     was blamed for it — after which this prefill saw a clean
+                //     latch at the top of the next iteration and answered 200
+                //     with zeros.
+                //
+                // One failure, two wrong answers: a poisoned disk cache and an
+                // error charged to an innocent request. The checks at the top of
+                // the loop and after it are now redundant for the chunk's own
+                // forward and kept only for what the hooks themselves latch.
+                try mlx.checkError();
 
                 // Phase 1: snapshot SSM state at stride-aligned boundaries.
                 // We snapshot AFTER the eval above so the underlying buffers
@@ -3144,12 +3207,18 @@ pub const Generator = struct {
 
         const step_logits = self.pending_logits;
         self.has_pending_logits = false;
-        const lazy = self.sampleLazy(step_logits);
-        _ = mlx.mlx_array_free(step_logits);
-        try mlx.check(mlx.mlx_array_eval(lazy));
-        var val: i32 = 0;
-        try mlx.check(mlx.mlx_array_item_int32(&val, lazy));
-        _ = mlx.mlx_array_free(lazy);
+        // Same hole as `mtpSerialCaptureTick` (N17) and the site that one was
+        // copied from: with the latch these checks RETURN instead of ending
+        // the process, so the handle needs an owner on the error path.
+        const val: i32 = blk: {
+            const lazy = self.sampleLazy(step_logits);
+            _ = mlx.mlx_array_free(step_logits);
+            defer _ = mlx.mlx_array_free(lazy);
+            try mlx.check(mlx.mlx_array_eval(lazy));
+            var v: i32 = 0;
+            try mlx.check(mlx.mlx_array_item_int32(&v, lazy));
+            break :blk v;
+        };
         self.next_token_id = @intCast(val);
         return .{ .drained = token };
     }
@@ -5540,11 +5609,22 @@ pub const Generator = struct {
         self.advanceStep(1);
         try self.generated_ids.append(allocator, token);
 
-        const lazy = self.sampleLazy(logits);
-        try mlx.check(mlx.mlx_array_eval(lazy));
-        var val: i32 = 0;
-        try mlx.check(mlx.mlx_array_item_int32(&val, lazy));
-        _ = mlx.mlx_array_free(lazy);
+        // N17. Both checks below now RETURN on a Metal working-set abort
+        // instead of ending the process — that is what the error latch is for,
+        // and it is exactly the failure this code path exists to survive — so
+        // the handle needs an owner on the error path. A scoped `defer` rather
+        // than an `errdefer` plus a manual free: this function ends in
+        // `return try mtpSerialOneToken(...)`, and an errdefer paired with an
+        // explicit free would double-free the moment anything after the free
+        // fails.
+        const val: i32 = blk: {
+            const lazy = self.sampleLazy(logits);
+            defer _ = mlx.mlx_array_free(lazy);
+            try mlx.check(mlx.mlx_array_eval(lazy));
+            var v: i32 = 0;
+            try mlx.check(mlx.mlx_array_item_int32(&v, lazy));
+            break :blk v;
+        };
         self.next_token_id = @intCast(val);
 
         // Block over. The next MTP round must not bill the serial block it
@@ -5638,6 +5718,7 @@ pub const Generator = struct {
         // pending_logits).
         if (self.spec_disabled_runtime or self.mtp_serial_left > 0 or self.mtp_serial_exit != .none) {
             try self.mtpDetachHead(allocator, self.mtpSerialMayResume());
+            self.mtpMaybeReleaseModuleHead();
             return try self.mtpSerialTick(allocator);
         }
 
@@ -8078,6 +8159,16 @@ pub const Generator = struct {
         /// position bookkeeping was in sync. The drift cannot shrink by
         /// itself, so this latches for the request.
         reentry_declined: bool = false,
+        /// S21. The switch left MTP on a MODULE-OWNED head, so the arm is
+        /// STICKY: no re-entry, no probe and no round for the rest of this
+        /// request. It is not a stronger opinion about the measurements —
+        /// it is what BUYS the release. While a re-arm was possible the
+        /// slot had to keep the model's one head reserved forever (the
+        /// documented S21 limit); once no round can follow, the head can be
+        /// handed back and the other slots on the model can batch.
+        /// A KV-only sidecar head never sets this: its cache is per-request,
+        /// nothing is reserved, and re-entry stays exactly as it was.
+        sticky_serial: bool = false,
         /// Round index of the last `round()`. `mtpRoundPlan` has TWO call
         /// sites per round (the cross-round pre-draft at the previous
         /// round's tail, and the round entry when there is no pre-draft), so
@@ -8087,6 +8178,11 @@ pub const Generator = struct {
         switches: u32 = 0,
 
         pub fn round(self: *MtpAdaptive, round_idx: u32, bucket: usize, vote: MtpAdaptiveVote, need: u32) MtpAdaptiveAction {
+            // S21. A sticky request has no rounds left to plan — every caller
+            // above is already behind `spec_disabled_runtime` — but the refusal
+            // is stated HERE, in the controller, so the invariant does not
+            // depend on which of the two `mtpRoundPlan` call sites ran.
+            if (self.sticky_serial) return .none;
             if (self.last_round) |r| {
                 if (r == round_idx) return .none;
             }
@@ -8157,7 +8253,19 @@ pub const Generator = struct {
             self.reentry_declined = true;
         }
 
+        /// S21. Make the serial arm permanent for this request. Armed at the
+        /// `to_serial` that moved a MODULE-OWNED head off speculation, so the
+        /// head can be released at the next serial block boundary.
+        pub fn stickSerial(self: *MtpAdaptive) void {
+            self.arm = .serial;
+            self.serial_ticks = 0;
+            self.sticky_serial = true;
+        }
+
         pub fn serialTick(self: *MtpAdaptive, bucket: usize, redecide_tokens: u32) MtpAdaptiveAction {
+            // S21 outranks both re-entry triggers, the bucket CROSSING
+            // included: a released head belongs to whoever took it next.
+            if (self.sticky_serial) return .none;
             if (self.reentry_declined) return .none;
             if (self.arm != .serial) return .none;
             if (self.bucket) |b| {
@@ -8199,9 +8307,13 @@ pub const Generator = struct {
     /// That is the right trade: an off switch that costs literally nothing
     /// beats one that keeps a meter warm for the convenience of an A/B.
     var mtp_adaptive_serial_cache: ?bool = null;
+    /// Default ON; only an exact "0" turns it off. First-BYTE matching read
+    /// "01" and "0.5" as off, and the sibling `mtpHeadPersistFromEnv` two
+    /// screens up already uses exact equality — two kill switches in one file
+    /// should not disagree about what "0" means.
     pub fn mtpAdaptiveSerialEnabledFromEnv(raw: ?[]const u8) bool {
         const value = raw orelse return true;
-        return value.len == 0 or value[0] != '0';
+        return !std.mem.eql(u8, value, "0");
     }
 
     fn mtpAdaptiveSerialEnabled() bool {
@@ -8294,7 +8406,71 @@ pub const Generator = struct {
     /// rather than a slow one. Vision turns therefore never come back, and
     /// never probe.
     fn mtpAdaptiveHeadMayResume(self: *const Generator) bool {
+        // S21 first. This ONE predicate is what the three round-start doors
+        // on the serial side ask — the re-entry gate in `nextMtp`, the
+        // `apply_stash` decision in `mtpSerialMayResume`, and the bounded
+        // serial PROBE's arming (a probe is a serial block that RETURNS to
+        // speculation, so it is a round start like any other). A sticky
+        // request has handed the module head back; none of the three may
+        // reach for it again.
+        if (self.mtp_adaptive.sticky_serial) return false;
         return self.ctx.mrope_pos == null;
+    }
+
+    /// S21. Does a `to_serial` on THIS head make the arm sticky? Only a
+    /// MODULE-OWNED head: the sidecar arm's cache is this request's own, so
+    /// nothing is reserved and nothing is released — its re-entry, its probe
+    /// and its exclusivity are all byte-for-byte what they were.
+    pub fn stickyOnSerialSwitch(head: ?MtpHeadRef) bool {
+        const h = head orelse return false;
+        return h.moduleOwned();
+    }
+
+    /// S21. Does THIS tick newly release the module head? True exactly once
+    /// per request, which is what makes the log line a one-shot and the
+    /// exclusivity drop an edge rather than a level.
+    pub fn stickyReleaseNow(sticky: bool, already_released: bool) bool {
+        return sticky and !already_released;
+    }
+
+    /// S21. Has this request released the module-owned MTP head?
+    /// `scheduler.slotExclusiveDecode` and the prefix-cache commit both ask.
+    pub fn mtpModuleHeadReleased(self: *const Generator) bool {
+        return self.mtp_head_released;
+    }
+
+    /// S21. Armed but not LANDED: the latch is set and the release has not
+    /// run yet. The release lives in `nextMtp`'s serial branch — after the
+    /// head is detached, which is what makes it safe — and the BATCHED tick
+    /// never calls `nextMtp`. A sticky slot becomes batchable the instant it
+    /// sets `spec_disabled_runtime`, so one plain neighbour on the same model
+    /// arriving in the very next tick would carry it into a group and it
+    /// would hold the model's one MTP head to the end of the request: exactly
+    /// the limit this is fixing, now silent instead of documented.
+    /// `scheduler.batchable` therefore keeps the slot out of a group for the
+    /// ONE tick the release needs. Bounded, and only for a request that
+    /// actually took the switch.
+    pub fn mtpReleasePending(self: *const Generator) bool {
+        return self.mtp_adaptive.sticky_serial and !self.mtp_head_released;
+    }
+
+    /// S21. Release the module-owned head, at a serial BLOCK BOUNDARY.
+    ///
+    /// Called from `nextMtp`'s serial branch and nowhere else, AFTER
+    /// `mtpDetachHead` — never from `mtpAdaptiveSerialStep`, where the switch
+    /// is decided. The vote is read while a round is being PLANNED and that
+    /// round still runs (the log line says so); releasing there would hand a
+    /// second slot a head this one is mid-round on. By the time this runs the
+    /// pre-draft is dropped, the deferred history stash is dropped too
+    /// (`mtpSerialMayResume` is false once sticky, so no head forward is
+    /// paid), and this request will not touch the head again.
+    fn mtpMaybeReleaseModuleHead(self: *Generator) void {
+        if (!stickyReleaseNow(self.mtp_adaptive.sticky_serial, self.mtp_head_released)) return;
+        self.mtp_head_released = true;
+        log.info(
+            "  [mtp] sticky-serial: module head released for the rest of the request (kv {d}) — other slots may claim it\n",
+            .{self.mtpKvLen()},
+        );
     }
 
     /// The adaptive serial step: the EV plan answers "which width", this
@@ -8309,12 +8485,33 @@ pub const Generator = struct {
     /// controllers are independent and are now gated independently;
     /// `MLX_SERVE_MTP_FORCE_DEPTH` still bypasses both, because that mode
     /// never plans.
+    /// S22. Every A/B behind the adaptive serial switch — the round-cost
+    /// numbers, the margin, the confirm count, the probe budget — was measured
+    /// on qwen4_exp, whose verify row is BYTES and whose depth-2 round costs
+    /// 2.05 serial forwards. A sidecar pack (qwen3.5/3.6/3.8) has a different
+    /// verify surface entirely, so `model_has_mtp` let every such model past
+    /// 8192 KV spend up to MAX_SERIAL_PROBES x MTP_ADAPTIVE_PROBE_TOKENS
+    /// serial tokens per bucket probing, and switch speculation off on a
+    /// calibration that was never taken on it. The head KIND is the arch:
+    /// `.qwen4` is the in-checkpoint head, `.qwen` is every sidecar.
+    /// Widening this is a MEASUREMENT, not a flag flip.
+    ///
+    /// NOT `MtpHeadRef.moduleOwned()`, which the S21 sticky arm keys on: the
+    /// two agree today because there is one in-checkpoint head, but this asks
+    /// "was the switch calibrated here" and that one asks "is the head shared".
+    /// A module-owned head on an uncalibrated family must answer no here.
+    fn mtpAdaptiveArchEligible(self: *const Generator) bool {
+        const head = self.mtp orelse return false;
+        return head == .qwen4;
+    }
+
     fn mtpAdaptiveSerialStep(self: *Generator, m_lo: u32, kv_len: u32) bool {
         // Adaptive serial: the EV plan answers "which width"; this answers
         // "is a round worth running at all". Read AFTER the plan (m_lo is
         // the width it prices) and BEFORE the width trial — a trial measures
         // a width for a request that is about to leave speculation.
         if (mtpAdaptiveSerialEnabled() and mtpCostTableEnabled() and
+            self.mtpAdaptiveArchEligible() and
             mtpAdaptiveKvEligible(kv_len, mtpAdaptiveMinKv()))
         {
             const t = &self.xfm.round_cost;
@@ -8349,6 +8546,11 @@ pub const Generator = struct {
                 );
                 self.spec_disabled_runtime = true;
                 self.spec_disable_reason = .adaptive;
+                // S21. On a MODULE-OWNED head this switch is one-way. The
+                // latch is what lets `nextMtp`'s serial branch hand the head
+                // back; it is set HERE (with the decision) and consumed there
+                // (at the block boundary), never the other way round.
+                if (stickyOnSerialSwitch(self.mtp)) self.mtp_adaptive.stickSerial();
                 return true;
             }
             // Nothing to decide with: teach the bucket a serial token, once.
@@ -14801,6 +15003,180 @@ test "mtpSerialProbeArm: bounded RETRIES per bucket, and none once the cell is t
     try testing.expectEqual(@as(u8, 0), w.serial_probes[b]);
 }
 
+test "S21: a to_serial on a MODULE-OWNED head is sticky, and the release is a one-shot" {
+    const G = Generator;
+    // The in-checkpoint qwen4_exp head is the module-owned one; the pointer is
+    // never dereferenced, only the tag is read.
+    try testing.expect(G.stickyOnSerialSwitch(MtpHeadRef{ .qwen4 = undefined }));
+
+    var a = G.MtpAdaptive{};
+    try testing.expectEqual(G.MtpAdaptiveAction.to_serial, a.round(0, 3, .serial, 1));
+    a.stickSerial();
+    try testing.expect(a.sticky_serial);
+    try testing.expectEqual(G.MtpAdaptiveArm.serial, a.arm);
+
+    // The two re-entry triggers are both refused. A bucket CROSSING is the
+    // one that always fired before (the periodic re-open is off by default),
+    // so it is the one that proves the latch.
+    try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(4, 0));
+    try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(5, 0));
+    const on = G.MtpAdaptive.REDECIDE_SERIAL_TOKENS_ON;
+    var i: u32 = 0;
+    while (i < on * 2) : (i += 1) {
+        try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(3, on));
+    }
+    // ...and so is a fresh round, whichever way it votes: the controller
+    // refuses before it looks at the vote, so neither call site can re-arm.
+    try testing.expectEqual(G.MtpAdaptiveAction.none, a.round(1, 3, .mtp, 1));
+    try testing.expectEqual(G.MtpAdaptiveAction.none, a.round(2, 4, .serial, 1));
+    try testing.expectEqual(G.MtpAdaptiveArm.serial, a.arm);
+
+    // The release edge fires exactly once — the log line and the exclusivity
+    // drop both key on it. `mtpReleasePending` is its complement: armed and
+    // not yet landed, which is the one tick `scheduler.batchable` holds the
+    // slot out of a group so the release cannot be skipped.
+    try testing.expect(G.stickyReleaseNow(true, false));
+    try testing.expect(!G.stickyReleaseNow(true, true));
+    try testing.expect(!G.stickyReleaseNow(false, false));
+    try testing.expect(!G.stickyReleaseNow(false, true));
+}
+
+test "S21: a KV-only sidecar head keeps its re-arm, and nothing about it changes" {
+    const G = Generator;
+    // A sidecar cache is this request's own KVCache: nothing is reserved on
+    // the model, so there is nothing to release and no reason to give up the
+    // re-entry. No head at all (a request that never armed MTP) likewise.
+    try testing.expect(!G.stickyOnSerialSwitch(MtpHeadRef{ .qwen = undefined }));
+    try testing.expect(!G.stickyOnSerialSwitch(null));
+
+    var b = G.MtpAdaptive{};
+    try testing.expectEqual(G.MtpAdaptiveAction.to_serial, b.round(0, 3, .serial, 1));
+    try testing.expect(!b.sticky_serial);
+    // Byte-for-byte the pre-S21 behaviour: a crossing re-opens.
+    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, b.serialTick(4, 0));
+    try testing.expectEqual(G.MtpAdaptiveArm.undecided, b.arm);
+
+    // And the whole mechanism off (`MLX_SERVE_MTP_ADAPTIVE_SERIAL=0`) means no
+    // vote, so no `to_serial`, so no latch and no release: unchanged by
+    // construction.
+    try testing.expect(!Generator.mtpAdaptiveSerialEnabledFromEnv("0"));
+}
+
+test "S21: every site that can start an MTP round refuses a sticky-serial request" {
+    const src = @embedFile("generate.zig");
+
+    // (i) THE gate. One predicate answers for the re-entry, for the deferred
+    // history stash, and for the bounded serial PROBE (a probe is a serial
+    // block that RETURNS to speculation, i.e. a round start).
+    const may_at = std.mem.indexOf(u8, src, "fn mtpAdaptiveHeadMay" ++ "Resume(self: *const Generator)") orelse
+        return error.MissingMayResume;
+    const sticky_at = std.mem.indexOfPos(u8, src, may_at, "if (self.mtp_adaptive.sticky" ++ "_serial) return false;") orelse
+        return error.MissingStickyGate;
+    const mrope_at = std.mem.indexOfPos(u8, src, may_at, "self.ctx.mrope" ++ "_pos == null") orelse
+        return error.MissingMropeGate;
+    try testing.expect(sticky_at < mrope_at);
+
+    // (ii) re-entry in `nextMtp` — the ONE place that clears the adaptive
+    // disable — reads it.
+    const fn_at = std.mem.indexOf(u8, src, "pub fn next" ++ "Mtp(self: *Generator") orelse
+        return error.MissingNextMtp;
+    const reentry_at = std.mem.indexOfPos(u8, src, fn_at, "self.mtp_adaptive." ++ "serialTick(") orelse
+        return error.MissingReentry;
+    try testing.expect(std.mem.indexOf(u8, src[fn_at..reentry_at], "self.mtpAdaptiveHeadMay" ++ "Resume()") != null);
+
+    // (iii) the probe arm takes the same predicate as its `may_resume`.
+    try testing.expect(std.mem.indexOf(u8, src, "mtpSerialProbe" ++ "Arm(t, b, self.spec_cost_solo, idle, self.mtpAdaptiveHeadMayResume())") != null);
+
+    // (iv) the deferred stash: a sticky request drops it instead of paying a
+    // head forward to keep a head it is handing back.
+    const resume_at = std.mem.indexOf(u8, src, "fn mtpSerialMay" ++ "Resume(self: *const Generator)") orelse
+        return error.MissingSerialMayResume;
+    try testing.expect(std.mem.indexOf(u8, src[resume_at .. resume_at + 400], "self.mtpAdaptiveHeadMay" ++ "Resume()") != null);
+
+    // (v) the round PLANNER and the width trial inside it are reached from
+    // exactly two places: the cross-round pre-draft, which returns on the
+    // runtime disable both BEFORE and AFTER planning, and `nextMtp` below its
+    // serial branch. (Their ordering inside the planner is pinned by "the
+    // adaptive decision is read after the EV plan..." above.)
+    const pre_at = std.mem.indexOf(u8, src, "fn mtpMaybePre" ++ "Draft(self: *Generator") orelse
+        return error.MissingPreDraft;
+    const pre_gate = std.mem.indexOfPos(u8, src, pre_at, "if (self.spec_disabled" ++ "_runtime) return;") orelse
+        return error.MissingPreDraftGate;
+    const pre_plan = std.mem.indexOfPos(u8, src, pre_at, "self.mtpRound" ++ "Plan();") orelse
+        return error.MissingPreDraftPlan;
+    const pre_after = std.mem.indexOfPos(u8, src, pre_plan, "if (self.spec_disabled" ++ "_runtime or self.mtp_serial_left > 0) return;") orelse
+        return error.MissingPreDraftRecheck;
+    try testing.expect(pre_gate < pre_plan);
+    try testing.expect(pre_plan < pre_after);
+
+    // (vi) the serial branch is the FIRST thing past the re-entry gate, so
+    // the round body — the EV seed consume included — is unreachable while
+    // the disable stands. A sticky request never inherits a seed.
+    const serial_at = std.mem.indexOfPos(u8, src, reentry_at, "return try self.mtpSerial" ++ "Tick(allocator);") orelse
+        return error.MissingSerialBranch;
+    const seed_at = std.mem.indexOfPos(u8, src, reentry_at, "head.ev" ++ "Seed()") orelse
+        return error.MissingSeedConsume;
+    try testing.expect(serial_at < seed_at);
+
+    // (vii) the EV seed PUBLISH at deinit is gated on the same disable, so a
+    // request that left speculation never teaches the next one its surface.
+    try testing.expect(std.mem.indexOf(u8, src, "!self.spec_disabled" ++ "_runtime and self.mtp_attempted >= 8") != null);
+
+    // (viii) and the controller itself refuses both entry points, so the
+    // invariant does not rest on any of the call-site orderings above.
+    const ctrl_round = std.mem.indexOf(u8, src, "pub fn round(self: *MtpAdaptive") orelse
+        return error.MissingCtrlRound;
+    try testing.expect(std.mem.indexOf(u8, src[ctrl_round .. ctrl_round + 600], "if (self.sticky" ++ "_serial) return .none;") != null);
+    const ctrl_tick = std.mem.indexOf(u8, src, "pub fn serialTick(self: *MtpAdaptive") orelse
+        return error.MissingCtrlTick;
+    try testing.expect(std.mem.indexOf(u8, src[ctrl_tick .. ctrl_tick + 400], "if (self.sticky" ++ "_serial) return .none;") != null);
+}
+
+test "S21: the head is released at the block boundary, after the detach, and logged once" {
+    const src = @embedFile("generate.zig");
+
+    // ONE call site, and it is the serial branch of `nextMtp` — the pre-commit
+    // block boundary. Releasing where the switch is DECIDED
+    // (`mtpAdaptiveSerialStep`) would hand a second slot a head this request
+    // is mid-round on: the vote is read while a round is being planned and
+    // that round still runs.
+    try testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, src, "self.mtpMaybeReleaseModule" ++ "Head();"),
+    );
+    const detach_at = std.mem.indexOf(u8, src, "try self.mtpDetach" ++ "Head(allocator, self.mtpSerialMayResume());") orelse
+        return error.MissingDetach;
+    const rel_at = std.mem.indexOfPos(u8, src, detach_at, "self.mtpMaybeReleaseModule" ++ "Head();") orelse
+        return error.MissingReleaseCall;
+    const tick_at = std.mem.indexOfPos(u8, src, detach_at, "return try self.mtpSerial" ++ "Tick(allocator);") orelse
+        return error.MissingSerialTick;
+    try testing.expect(detach_at < rel_at);
+    try testing.expect(rel_at < tick_at);
+    const step_at = std.mem.indexOf(u8, src, "fn mtpAdaptiveSerial" ++ "Step(self: *Generator") orelse
+        return error.MissingStepFn;
+    const plan_at = std.mem.indexOfPos(u8, src, step_at, "fn mtpRound" ++ "Plan(self: *Generator)") orelse
+        return error.MissingRoundPlan;
+    try testing.expect(std.mem.indexOf(u8, src[step_at..plan_at], "mtpMaybeReleaseModule" ++ "Head") == null);
+    // The switch's own site arms the LATCH and nothing else.
+    try testing.expect(std.mem.indexOf(u8, src[step_at..plan_at], "self.mtp_adaptive.stick" ++ "Serial()") != null);
+
+    // Inside the release: guard, then the flag, then the log — so the line is
+    // emitted exactly once per request (`stickyReleaseNow` is the one-shot).
+    const fn_at = std.mem.indexOf(u8, src, "fn mtpMaybeReleaseModule" ++ "Head(self: *Generator)") orelse
+        return error.MissingReleaseFn;
+    const guard_at = std.mem.indexOfPos(u8, src, fn_at, "stickyRelease" ++ "Now(self.mtp_adaptive.sticky_serial, self.mtp_head_released)") orelse
+        return error.MissingReleaseGuard;
+    const flag_at = std.mem.indexOfPos(u8, src, fn_at, "self.mtp_head" ++ "_released = true;") orelse
+        return error.MissingReleaseFlag;
+    const log_at = std.mem.indexOfPos(u8, src, fn_at, "[mtp] sticky-serial: module head released") orelse
+        return error.MissingReleaseLog;
+    try testing.expect(guard_at < flag_at);
+    try testing.expect(flag_at < log_at);
+    // The flag is written in exactly one place, and read through one accessor.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "self.mtp_head" ++ "_released = true;"));
+    try testing.expect(std.mem.indexOf(u8, src, "pub fn mtpModuleHead" ++ "Released(self: *const Generator) bool") != null);
+}
+
 test "mtpAdaptiveSerialEnabledFromEnv: the mechanism is on unless the lever says 0" {
     try testing.expect(Generator.mtpAdaptiveSerialEnabledFromEnv(null));
     try testing.expect(Generator.mtpAdaptiveSerialEnabledFromEnv(""));
@@ -14959,4 +15335,57 @@ test "MTP head persistence kill switch: only a literal 0 turns it off" {
     try testing.expect(mtpHeadPersistFromEnv(""));
     try testing.expect(mtpHeadPersistFromEnv("1"));
     try testing.expect(!mtpHeadPersistFromEnv("0"));
+}
+
+test "scan: the prefill chunk loop's post-eval order is a contract (B0b + S17)" {
+    // SHARED CONTRACT with the adaptive-width owner (a8bb30c23939f18f4). The
+    // order after a chunk's forward is, and must stay:
+    //
+    //   eval -> mlx_clear_cache -> checkError -> write_through_hook
+    //        -> chunk_width_hook -> interleaveDecodeTick
+    //
+    // Each edge is load-bearing and they were established for different
+    // reasons, so a change that looks local to one owner can silently undo
+    // the other's:
+    //
+    //   clear   -> check : the chunk's own latch, read before ANYTHING acts
+    //                      on the KV it produced (B0b).
+    //   check   -> wt    : the write-through indexes a DURABLE restorable
+    //                      prefix on the SSD tier. Metal returns ZEROS before
+    //                      it aborts, so persisting first publishes garbage
+    //                      that later requests restore FROM, permanently.
+    //   check   -> tick  : `interleaveDecodeTick` -> `checkErrorDecode` is the
+    //                      same `consumeLatch`. Running it first let a
+    //                      co-tenant decode EAT this prefill's latch and be
+    //                      blamed, after which the failing prefill saw a clean
+    //                      latch and answered 200 with zeros.
+    //   wt      -> width : the width probe sizes the NEXT chunk; the hook
+    //                      above it persists the one just completed.
+    //   width   -> tick  : the probe reads steady-state headroom, so a
+    //                      co-tenant's decode allocations are not charged to
+    //                      this prefill (the adaptive owner's attribution
+    //                      argument, S17).
+    //
+    // Every needle is SPLIT: this scan sits BELOW the impl in this file, and
+    // an unsplit needle matches the test's own literal first and can never go
+    // red — the failure mode the audit found in two other guards.
+    const src = @embedFile("generate.zig");
+    const wt = std.mem.indexOf(u8, src, "write_through" ++ "_hook) |wt|").?;
+    const before = src[0..wt];
+    // `lastIndexOf` anchors on THIS chunk's eval/clear pair, so the check at
+    // the TOP of the loop — which precedes the clear — cannot satisfy it.
+    const clear = std.mem.lastIndexOf(u8, before, "mlx_clear" ++ "_cache();").?;
+    const check = std.mem.lastIndexOf(u8, before, "try mlx.check" ++ "Error();").?;
+    const width = std.mem.indexOfPos(u8, src, wt, "chunk_width" ++ "_hook) |hk|").?;
+    const tick = std.mem.indexOfPos(u8, src, wt, "interleave" ++ "_hook) |hk|").?;
+
+    try std.testing.expect(clear < check);
+    try std.testing.expect(check < wt);
+    try std.testing.expect(wt < width);
+    try std.testing.expect(width < tick);
+
+    // The SSM checkpoint capture is on the same poisoned path — the snapshot
+    // is what the write-through then persists — so the check precedes it too.
+    const cp = std.mem.indexOfPos(u8, src, clear, "captureSsm" ++ "Checkpoint(").?;
+    try std.testing.expect(check < cp);
 }

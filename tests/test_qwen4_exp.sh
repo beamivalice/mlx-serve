@@ -181,6 +181,21 @@ echo "  mtp: $(echo "$tm" | tr '\n' ' ' | cut -c1-60)  plain: $(echo "$tp" | tr 
 check "exactly one more mtp engagement" "$(python3 -c "print($(grep -c 'spec-stats\] mode=mtp' "$LOG") - $nm0)")" "1"
 check "mtp answer == serial (tie-aware)" "$(same_or_tie "$pm" "$tm")" "1"
 check "plain answer == serial (tie-aware)" "$(same_or_tie "$pp" "$tp")" "1"
+# S21. The head is module-owned, so anything that hands it between slots — the
+# sticky-serial release included — risks the head's key history and its cache
+# position disagreeing. `qsaMaskFromQk` raises then, and the request dies. A 200
+# is not the bar: assert the ABSENCE of the gap over the whole run so far.
+check "no QSA history gap anywhere in the run" "$(grep -c 'QsaHistoryGap' "$LOG")" "0"
+# If the adaptive switch fired on this run (it needs kv past its floor and a
+# measured serial cell, so it usually does not), the release is a ONE-SHOT per
+# request and the slot must have kept serving.
+n_rel=$(grep -c 'sticky-serial: module head released' "$LOG")
+if [ "$n_rel" -gt 0 ]; then
+  echo "  sticky-serial releases this run: $n_rel"
+  check "release never repeats within a request" "$(python3 -c "print(1 if $n_rel <= $(grep -c 'adaptive: .* -> serial (from the next round)' "$LOG") else 0)")" "1"
+else
+  echo "  (adaptive serial switch did not fire this run — release path not exercised)"
+fi
 echo "[11] --no-vision boot: tower absent, text works, media 400s by name"
 kill $SPID 2>/dev/null; wait $SPID 2>/dev/null
 LOG11="$LOG.novision"

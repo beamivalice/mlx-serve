@@ -3835,6 +3835,12 @@ pub fn warmQsaEnvCaches() void {
     _ = qsaAttnMinS();
     _ = qsaAttnBk();
     _ = qsaAttnBalanced();
+    // The one QSA env cache with two PROVEN readers on two threads: the
+    // inference thread through `qsaSelectBlocks` -> `qsaScoreRowsPerChunk`,
+    // and the HTTP/admission thread through `server.prefillNeededAtChunk` ->
+    // `qsaMaskBytes` -> `qsaPrefillTransientBytes`. Both `?u64` cache and
+    // `bool` log flag are non-atomic, so first touch had to stop being a race.
+    _ = qsaScoreSheetBudget();
 }
 
 /// `qsaSelectKernelEnabled` consults an override first, so warming it through
@@ -4115,7 +4121,10 @@ pub fn qsaSparseAttn(
         const dense = (try gatherQsa256(s, q_rope, kv_view.k, kv_view.v, attn_scale, blocks, ratio)) orelse return null;
         // Bit +8: the two arms must not share a one-shot slot, or whichever
         // ran first would silence the other's engagement line for the process.
-        if (qsa_attn_engaged_bits.take(@as(u5, qsaWidthBucket(seq_len)) + 8)) {
+        // +8 keeps the dense arm's bits disjoint from the quantized arm's.
+        // The widen is explicit rather than resting on `qsaWidthBucket`
+        // returning `u2` two hundred lines away: at `u3` the sum wraps a `u5`.
+        if (qsa_attn_engaged_bits.take(@as(u5, @intCast(@as(u8, qsaWidthBucket(seq_len)) + 8)))) {
             log.info(
                 "[qsa-attn] engaged (S={d} kv={d} quant=off) — MLX_SERVE_QSA_ATTN_KERNEL=0 restores the union gather\n",
                 .{ seq_len, mlx.getShape(kv_view.k)[2] },
@@ -4149,6 +4158,27 @@ pub fn qsaSparseAttn(
     const vsc_sh = mlx.getShape(kv_view.v_triple_scales);
     if (ksc_sh.len != 4 or vsc_sh.len != 4 or ksc_sh[3] != groups or vsc_sh[3] != groups) return null;
     if (ksc_sh[2] != kv or vsc_sh[2] != kv) return null;
+
+    // N21. `ensure_row_contiguous = false` is deliberate (the packed triples
+    // are cache VIEWS and a contiguous copy erases the win), so the kernel is
+    // handed raw strides — and it indexes every innermost axis with `+ 1`
+    // arithmetic (`kq[wrow + ...]`, `blk[vi]`, a `vec<T,2>` load off `Qrow`).
+    // That holds for a kv-axis slice of a contiguous cache, which is all that
+    // reaches here today, but it is a precondition rather than a coincidence:
+    // a future layout with a strided last axis would read scrambled keys and
+    // report a plausible answer. Decline instead.
+    const innermost_unit = blk: {
+        if (mlx.mlx_array_strides(q_rope)[3] != 1) break :blk false;
+        if (mlx.mlx_array_strides(blocks)[2] != 1) break :blk false;
+        for ([_]mlx.mlx_array{
+            kv_view.k_triple_q,     kv_view.k_triple_scales, kv_view.k_triple_biases,
+            kv_view.v_triple_q,     kv_view.v_triple_scales, kv_view.v_triple_biases,
+        }) |a| {
+            if (mlx.mlx_array_strides(a)[3] != 1) break :blk false;
+        }
+        break :blk true;
+    };
+    if (!innermost_unit) return null;
 
     const kernel = getQsaAttnQKernel() catch return null;
     const merge_kernel = getQsaAttnMergeKernel() catch return null;
@@ -6809,6 +6839,11 @@ fn capBufAppend(s: mlx.mlx_stream, buf: *mlx.mlx_array, view: *mlx.mlx_array, co
                 defer _ = mlx.mlx_array_free(old);
                 try mlx.check(mlx.mlx_slice(&old, buf.*, &start, nd, &stop, nd, &strides, nd, s));
                 var seeded = mlx.mlx_array_new();
+                // Safe unscoped only because this `if` block ENDS with the
+                // transfer to `grown`: on normal exit the errdefer never runs,
+                // and on failure `grown` is still the old handle, so the two
+                // errdefers free two different arrays.
+                errdefer _ = mlx.mlx_array_free(seeded);
                 try mlx.check(mlx.mlx_slice_update(&seeded, grown, old, &start, nd, &stop, nd, &strides, nd, s));
                 _ = mlx.mlx_array_free(grown);
                 grown = seeded;
@@ -6819,10 +6854,20 @@ fn capBufAppend(s: mlx.mlx_stream, buf: *mlx.mlx_array, view: *mlx.mlx_array, co
     }
     start[axis] = count.*;
     stop[axis] = @intCast(plan.new_rows);
-    var updated = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_slice_update(&updated, buf.*, chunk, &start, nd, &stop, nd, &strides, nd, s));
-    _ = mlx.mlx_array_free(buf.*);
-    buf.* = updated;
+    // S22c. The handle leaked if the update failed — live rather than
+    // theoretical now that the error latch returns a Metal OOM instead of
+    // ending the process. The errdefer is BLOCK-scoped on purpose: `updated`
+    // becomes `buf.*` on the last line, and a function-scoped errdefer would
+    // then free the caller's buffer when the `mlx_slice` for `view` below
+    // fails. Normal exit from the block skips it; only a failure inside it,
+    // where `updated` is still ours alone, runs it.
+    {
+        var updated = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(updated);
+        try mlx.check(mlx.mlx_slice_update(&updated, buf.*, chunk, &start, nd, &stop, nd, &strides, nd, s));
+        _ = mlx.mlx_array_free(buf.*);
+        buf.* = updated;
+    }
     count.* = @intCast(plan.new_rows);
 
     start[axis] = 0;
@@ -39862,7 +39907,7 @@ test "qsa sparse attn: the split-K merge is invariant in the split count (1, 8, 
 }
 
 test "scan: every lazily-cached QSA env read is warmed from main, not raced into" {
-    // L20. These caches are `?bool`/`?c_int` filled on FIRST TOUCH, and first
+    // L20. These caches are optionals filled on FIRST TOUCH, and first
     // touch happens on whichever thread asks first — the HTTP thread parsing a
     // request, or the inference thread inside a forward. A non-atomic optional
     // written from two threads is UB. They are process constants read from the
@@ -39873,16 +39918,26 @@ test "scan: every lazily-cached QSA env read is warmed from main, not raced into
     const body_end = std.mem.indexOfPos(u8, src, fn_start, "\n}\n").?;
     const body = src[fn_start..body_end];
 
-    // Every `var qsa_*: ?bool` / `?c_int` in the file is an env cache (kernel
-    // handles are `?mlx.mlx_fast_metal_kernel`, config caches are structs).
+    // Any `var qsa_*_cached` / `qsa_*_env` optional is an env cache, WHATEVER
+    // its payload. Keying on `?bool`/`?c_int` was the hole: the sheet budget
+    // caches a `?u64` and was the only one with two proven threads reading it,
+    // so the guard could not see the one variable that was genuinely raced.
     var declared: usize = 0;
     var it = std.mem.tokenizeScalar(u8, src, '\n');
     while (it.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " ");
         if (!std.mem.startsWith(u8, trimmed, "var qsa_")) continue;
-        const is_bool = std.mem.indexOf(u8, trimmed, ": ?bool") != null;
-        const is_int = std.mem.indexOf(u8, trimmed, ": ?c_int") != null;
-        if (!is_bool and !is_int) continue;
+        const name_end = std.mem.indexOf(u8, trimmed, ":") orelse continue;
+        const name = trimmed["var ".len..name_end];
+        const is_cache = std.mem.endsWith(u8, name, "_cached") or std.mem.endsWith(u8, name, "_env");
+        if (!is_cache) continue;
+        // Only OPTIONALS are filled on first touch; a plain bool/usize is
+        // either a one-shot flag or a counter, neither of which reads the env.
+        if (std.mem.indexOf(u8, trimmed[name_end..], ": ?") == null) continue;
+        // Compiled kernel handles are cached the same way and named the same
+        // way, but they are built, not read from the environment, and the
+        // inference thread is their only toucher.
+        if (std.mem.indexOf(u8, trimmed[name_end..], "mlx_fast_metal_kernel") != null) continue;
         // Overrides are set by tests, never read from the environment.
         if (std.mem.indexOf(u8, trimmed, "_override") != null) continue;
         declared += 1;
