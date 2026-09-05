@@ -3769,16 +3769,12 @@ fn countDecls(src: []const u8, header: []const u8) usize {
     return n;
 }
 
+/// One declaration's source window. Thin alias for the ONE extractor,
+/// `generate.productionDeclSource` — the same windows the prefill loop's own
+/// ordering scans read, so the two cannot drift. It generalises what this used
+/// to do: any indentation, and the closer at the declaration's own indent.
 fn declBody(src: []const u8, decl: []const u8) ?[]const u8 {
-    var i: usize = 0;
-    while (std.mem.indexOfPos(u8, src, i, decl)) |at| {
-        i = at + 1;
-        if (at == 0 or src[at - 1] != '\n') continue; // a mention, not a declaration
-        const rest = src[at..];
-        const end = std.mem.indexOf(u8, rest, "\n}\n") orelse return rest;
-        return rest[0 .. end + 3];
-    }
-    return null;
+    return generate_mod.productionDeclSource(src, decl);
 }
 
 /// The width a ladder rung actually forwards at for this prompt — the resolver
@@ -4493,8 +4489,12 @@ test "the per-request rung is priced by the SAME estimator that admits it" {
     try t.expect(std.mem.indexOf(u8, sched, ".pinned_prefill_chunk = req_prefill_chunk,") != null);
     try t.expect(std.mem.indexOf(u8, sched, "const pick = prefill_request_chunk orelse break :blk pin;") != null);
     // The hook is installed beside the admission one, so a server that admits
-    // also chooses; a host without it keeps the load-time pin.
-    try t.expect(std.mem.indexOf(u8, src, "scheduler_mod.prefill_request_chunk = &requestPrefillChunkNow;") != null);
+    // also chooses; a host without it keeps the load-time pin. Read inside
+    // `serve`'s OWN body: a bare `indexOf(src, ...)` finds this test's own
+    // copy of the literal, so it stayed green with the install deleted (N15).
+    const serve_body = declBody(src, "pub fn serve(") orelse return error.CallSiteMoved;
+    try t.expect(generate_mod.windowHasNoTestBlock(serve_body));
+    try t.expect(std.mem.indexOf(u8, serve_body, "scheduler_mod.prefill_request_chunk = &requestPrefillChunk" ++ "Now;") != null);
 }
 
 test "the post-eviction re-ask never narrows, and never runs on an arch that has no per-request width" {
@@ -22025,6 +22025,48 @@ test "adaptivePrefillWidth: a widen costs 1.25x AND two consecutive supporting p
     try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, kv, cost_up * 4, 2048, cap, &st3));
 }
 
+test "the tail-merge bound scales ONLY where the per-chunk adaptive width is live" {
+    // BL-5, the arch half. `generate.nextChunkEnd` takes the gate as a
+    // parameter; this is the predicate that fills it. Every arch but an
+    // adaptive-width qwen4_exp keeps the flat `TAIL_MERGE_MAX`, byte for byte,
+    // at every chunk width — including the sub-4096 widths the machine ladder
+    // and the score budget hand out on gemma4, qwen3_5/3_6, muse_glimmer and
+    // deepseek_v4, where the scaled bound was never measured.
+    const t = std.testing;
+
+    // Another arch: the gate fails at its FIRST conjunct (`perRequestPrefillChunk`),
+    // so no env, flag or override can turn it on. Nothing to restore.
+    var other = qwen4RequestTestConfig();
+    other.model_type = "qwen3_5";
+    try t.expect(!other.perRequestPrefillChunk());
+    try t.expect(!adaptivePrefillChunkEnabled(&other));
+    const off = adaptivePrefillChunkEnabled(&other);
+    try t.expectEqual(generate_mod.TAIL_MERGE_MAX, generate_mod.tailMergeMaxFor(512, off));
+    try t.expectEqual(generate_mod.TAIL_MERGE_MAX, generate_mod.tailMergeMaxFor(2048, off));
+    // A 300-token tail at the ladder's 512 rung still merges: ONE chunk.
+    try t.expectEqual(@as(usize, 812), generate_mod.nextChunkEnd(0, 812, 512, false, 0, 0, off));
+
+    // qwen4_exp with the per-chunk width live: the bound scales and the tail
+    // becomes its own chunk.
+    const cfg = qwen4RequestTestConfig();
+    try t.expect(cfg.perRequestPrefillChunk());
+    per_request_chunk_override = true;
+    defer per_request_chunk_override = null;
+    adaptive_chunk_override = true;
+    defer adaptive_chunk_override = null;
+    // The remaining conjuncts are "no operator pinned a width" — env/flag
+    // state, so the gate is asserted against them rather than assumed.
+    const unpinned = explicitPrefillChunk() == 0 and generate_mod.envPrefillChunk() == 0;
+    try t.expectEqual(unpinned, adaptivePrefillChunkEnabled(&cfg));
+    try t.expectEqual(@as(usize, 64), generate_mod.tailMergeMaxFor(512, true));
+    try t.expectEqual(@as(usize, 512), generate_mod.nextChunkEnd(0, 812, 512, false, 0, 0, true));
+    // ...and an operator pin turns the scaling back off with everything else:
+    // that width is what every forward runs, narrowed or not.
+    adaptive_chunk_override = false;
+    try t.expect(!adaptivePrefillChunkEnabled(&cfg));
+    try t.expectEqual(generate_mod.TAIL_MERGE_MAX, generate_mod.tailMergeMaxFor(512, adaptivePrefillChunkEnabled(&cfg)));
+}
+
 test "adaptivePrefillWidth: the ratchet is one-way, and the cap is a ceiling" {
     const t = std.testing;
     const cfg = qwen4RequestTestConfig();
@@ -22265,14 +22307,21 @@ test "the per-chunk width is ONE estimator away from the admission bill, and say
     try t.expect(std.mem.indexOf(u8, impure, "prefillChunk" ++ "Cost(config, kv_bits, next, pos)") != null);
     // ...and the kill switch is consulted before anything is logged or moved.
     try t.expect(std.mem.indexOf(u8, impure, "adaptivePrefillChunkEnabled(") != null);
-    try t.expect(std.mem.indexOf(u8, src, "MLX_SERVE_PREFILL_CHUNK_ADAPTIVE") != null);
+    // ...and the kill switch is read where the gate lives. Inside that
+    // function's OWN body: a bare `indexOf(src, ...)` finds this test's copy
+    // of the name and stays green with the env read deleted (N15).
+    const gate = declBody(src, "pub fn adaptivePrefillChunkEnabled(") orelse return error.CallSiteMoved;
+    try t.expect(generate_mod.windowHasNoTestBlock(gate));
+    try t.expect(std.mem.indexOf(u8, gate, "MLX_SERVE_PREFILL_CHUNK" ++ "_ADAPTIVE") != null);
 
     // And the loop asks it through the hook, not through an import.
     const gen = @embedFile("generate.zig");
     try t.expect(std.mem.indexOf(u8, gen, "options.chunk_width_hook") != null);
     const sched = @embedFile("scheduler.zig");
-    try t.expect(std.mem.indexOf(u8, sched, "prefill_chunk_adapt") != null);
-    try t.expect(std.mem.indexOf(u8, src, "scheduler_mod.prefill_chunk_adapt = &adaptivePrefillWidthNow;") != null);
+    try t.expect(std.mem.indexOf(u8, sched, "const pick = prefill_chunk" ++ "_adapt orelse return cur;") != null);
+    const serve_body = declBody(src, "pub fn serve(") orelse return error.CallSiteMoved;
+    try t.expect(generate_mod.windowHasNoTestBlock(serve_body));
+    try t.expect(std.mem.indexOf(u8, serve_body, "scheduler_mod.prefill_chunk_adapt = &adaptivePrefillWidth" ++ "Now;") != null);
 }
 
 test "resolvedContextForLoad: an auto boot bills the session it will serve, not the placeholder" {

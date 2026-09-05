@@ -1581,10 +1581,21 @@ pub const DiskTier = struct {
         defer _ = mlx.mlx_vector_array_free(vec);
         for (tensors) |*t| {
             var cont = mlx.mlx_array_new();
-            // Own it before anything can fail: a mid-loop error used to leak
-            // the fresh handle. (audit N8)
-            errdefer _ = mlx.mlx_array_free(cont);
-            try mlx.check(mlx.mlx_contiguous(&cont, t.arr, false, s));
+            {
+                // The window where `cont` is owned LOCALLY. Own it before
+                // anything can fail: a mid-loop error used to leak the fresh
+                // handle (audit N8). The scope CLOSES before the transfer —
+                // past `t.arr = cont` the caller's list owns the handle and
+                // its `defer freeNamed(&list)` frees it, so an errdefer still
+                // armed there is a DOUBLE free of the same mlx array on any
+                // later failure in this loop. At `e88cf07` the fallible
+                // per-tensor eval still sat inside that window: a double free
+                // on exactly the Metal working-set abort the errdefer was
+                // written for. Nothing fallible may sit between this `}` and
+                // the transfer. (audit NB-1)
+                errdefer _ = mlx.mlx_array_free(cont);
+                try mlx.check(mlx.mlx_contiguous(&cont, t.arr, false, s));
+            }
             _ = mlx.mlx_array_free(t.arr);
             t.arr = cont;
             try mlx.check(mlx.mlx_vector_array_append_value(vec, t.arr));
@@ -1931,14 +1942,19 @@ pub const DiskTier = struct {
         try self.renderMeta(&buf, e);
 
         const final_path = try std.fmt.allocPrint(self.allocator, "{s}/e{d}/meta.json", .{ self.root, e.id });
-        // Owned from here: the `dupe` below can OOM, and the submit takes the
-        // path only on the path where it succeeds. (audit N8)
-        errdefer self.allocator.free(final_path);
+        // ONE owner per branch. The staged branch keeps the path only until
+        // `submit` takes it, so its cleanup is an `errdefer` scoped to that
+        // branch (the `dupe` below can OOM — audit N8). The synchronous branch
+        // never hands the pointer anywhere, so it owns it outright with a
+        // `defer`. A `defer` does NOT cancel an enclosing `errdefer`: with the
+        // errdefer at function scope, ANY error from the synchronous writes
+        // below (ENOSPC, EIO, a missing entry dir) freed this pointer twice.
         if (self.writer) |w| {
             // Mechanism 2: the index rides the SAME FIFO queue as this entry's
             // chunks, so it is the LAST file to land. A kill -9 mid-flush
             // leaves chunks with no meta.json, which `scan` reads as a miss —
             // never a half-indexed entry.
+            errdefer self.allocator.free(final_path);
             const bytes = try self.allocator.dupe(u8, buf.items);
             w.submit(final_path, bytes);
             return;
@@ -4269,4 +4285,151 @@ test "DiskTier: the staged serializer's eval is batched — ONE eval, outside th
     const ee = std.mem.indexOfPos(u8, source, es, "\n    }\n") orelse
         return error.MissingEncoderEnd;
     try testing.expectEqual(@as(usize, 0), std.mem.count(u8, source[es..ee], "_eval("));
+}
+
+test "DiskTier: a failing synchronous writeMeta frees the final path exactly once" {
+    // BL-1. `writeMeta` allocates `final_path`, then forks: the staged branch
+    // hands it to `Writer.submit`, the synchronous branch keeps it to the end.
+    // The audit-N8 cleanup was added as a FUNCTION-scope `errdefer`, and a
+    // `defer` does not cancel an `errdefer` — so on the synchronous branch any
+    // error from `createFileAbsolute` / `writeAll` / `flush` / `renameAbsolute`
+    // ran BOTH, freeing one pointer twice. Not qwen4-gated: this is the legacy
+    // `--prefix-cache-disk` path, i.e. every arch, on any disk write failure
+    // (ENOSPC, EIO, a read-only volume).
+    //
+    // The injection is the cheapest real one: the entry's `e<id>/` directory
+    // does not exist, so `createFileAbsolute` on `<root>/e777/meta.json.tmp`
+    // fails — the first fallible step past the `defer`. On the pre-fix bytes
+    // `std.testing.allocator` aborts here with "Double free detected".
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-writemeta-err", 0, 128);
+    defer tier.deinit();
+    // The synchronous branch is the one under test.
+    try testing.expect(tier.writer == null);
+
+    var toks = [_]u32{ 1, 2, 3 };
+    var cb = [_]u64{64};
+    var no_pos = [_]u32{};
+    var no_sz = [_]u64{};
+    const e = IndexEntry{
+        .id = 777, // no e777/ directory was ever created
+        .tokens = &toks,
+        .kv_len = 3,
+        .has_tools = false,
+        .quant = kv_quant.KVQuantConfig.dense,
+        .bytes = 64,
+        .chunk_bytes = &cb,
+        .ssm_positions = &no_pos,
+        .ssm_bytes = &no_sz,
+        .last_used = 0,
+    };
+    // The write must fail (otherwise the test proves nothing) and must leave
+    // exactly one free behind.
+    if (tier.writeMeta(e)) |_| {
+        return error.WriteMetaUnexpectedlySucceeded;
+    } else |_| {}
+
+    // ...and the same shape must not come back: the cleanup for the staged
+    // branch lives INSIDE it, so the synchronous branch's `defer` is the only
+    // owner it can reach. Scan-pinned on writeMeta's own body — the needle
+    // must never resolve into this test's bytes.
+    const source = @embedFile("kv_disk_cache.zig");
+    const fs = std.mem.indexOf(u8, source, "fn writeMeta(") orelse return error.MissingWriteMeta;
+    const fe = std.mem.indexOfPos(u8, source, fs, "\n    }\n") orelse return error.MissingWriteMetaEnd;
+    const body = source[fs..fe];
+    const fork = std.mem.indexOf(u8, body, "if (self.writer) |w| {") orelse return error.MissingFork;
+    const errd = std.mem.indexOf(u8, body, "errdefer self.allocator.free(final" ++ "_path);") orelse return error.MissingErrdefer;
+    const defr = std.mem.indexOf(u8, body, "defer self.allocator.free(final" ++ "_path);\n        const tmp" ++ "_path") orelse return error.MissingDefer;
+    // Exactly one of each, the errdefer inside the staged branch (after the
+    // fork), the defer on the synchronous side (after the branch returns).
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "errdefer self.allocator.free(final" ++ "_path);"));
+    try testing.expect(fork < errd);
+    try testing.expect(errd < defr);
+}
+
+test "materializeContiguous: the fresh-handle errdefer never outlives the transfer" {
+    // NB-1. `mlx_contiguous` can fail, so the fresh handle needs an errdefer
+    // (audit N8) — but the loop then does `t.arr = cont`, handing the handle to
+    // the caller's list, whose `defer self.freeNamed(&list)` frees every
+    // `t.arr`. A function-scope errdefer stays armed across that transfer, so a
+    // failure at any LATER step frees the same mlx array twice. History:
+    // `5c4b4bc` had no errdefer (the N8 leak, no double free); `e88cf07` added
+    // one with the fallible `mlx_array_eval(t.arr)` still inside its scope —
+    // a double free on exactly the Metal working-set abort it was written for;
+    // `ssd-persist` moved that eval out of the loop, narrowing it to a
+    // `std::bad_alloc` on the vector append. Narrow is not closed.
+    const t = testing;
+
+    // 1. The ownership rule, exercised for real under `std.testing.allocator`:
+    //    a heap allocation stands in for the mlx handle, so a double free is
+    //    the allocator's own abort and a leak is the suite's leak check. This
+    //    is the production loop transliterated step for step — fresh handle,
+    //    fallible make-contiguous, free the old, TRANSFER, fallible append —
+    //    with the append failing.
+    const Item = struct { arr: *u32 };
+    const S = struct {
+        fn run(a: std.mem.Allocator, items: []Item, fail_at: usize) !void {
+            for (items, 0..) |*it, i| {
+                const cont = try a.create(u32);
+                {
+                    // `cont` is owned LOCALLY only here.
+                    errdefer a.destroy(cont);
+                    cont.* = it.arr.* + 1;
+                }
+                a.destroy(it.arr);
+                it.arr = cont;
+                // The transfer is done: from here the list owns `cont`.
+                if (i == fail_at) return error.Injected;
+            }
+        }
+    };
+
+    var items: [4]Item = undefined;
+    for (&items, 0..) |*it, i| {
+        it.* = .{ .arr = try testing.allocator.create(u32) };
+        it.arr.* = @intCast(i);
+    }
+    // The caller's `defer freeNamed(&list)`: it owns every `arr`, on every
+    // outcome. With the errdefer scoped to the pre-transfer window this frees
+    // each handle exactly once. With it at loop-body scope — the pre-fix shape
+    // — `items[2].arr` is destroyed by the errdefer AND again here, which
+    // `std.testing.allocator` aborts on as a double free.
+    defer for (&items) |*it| testing.allocator.destroy(it.arr);
+    try t.expectError(error.Injected, S.run(testing.allocator, &items, 2));
+    // The transfers that completed before the failure stand.
+    try t.expectEqual(@as(u32, 1), items[0].arr.*);
+    try t.expectEqual(@as(u32, 3), items[2].arr.*);
+    try t.expectEqual(@as(u32, 3), items[3].arr.*);
+
+    // 2. ...and the production loop has that shape. Scan-pinned on
+    //    `materializeContiguous`'s own body, needles split so this test's bytes
+    //    can never satisfy them. RED on the pre-fix bytes: there the errdefer
+    //    sits at loop-body scope with no block to close, so `MissingScopeClose`
+    //    (and, were one added later, `close < transfer` is the real assertion).
+    const source = @embedFile("kv_disk_cache.zig");
+    const fs = std.mem.indexOf(u8, source, "fn materializeContiguous(") orelse
+        return error.MissingMaterializer;
+    const fe = std.mem.indexOfPos(u8, source, fs, "\n    }\n") orelse
+        return error.MissingMaterializerEnd;
+    const body = source[fs..fe];
+    const errd = std.mem.indexOf(u8, body, "errdefer _ = mlx.mlx_array" ++ "_free(cont);") orelse
+        return error.MissingErrdefer;
+    const transfer = std.mem.indexOf(u8, body, "t.arr = " ++ "cont;") orelse
+        return error.MissingTransfer;
+    // The errdefer's scope closes at loop-body indent (8 + 4 = 12) BEFORE the
+    // transfer: past `t.arr = cont` the list owns the handle.
+    const close = std.mem.indexOfPos(u8, body, errd, "\n            }\n") orelse
+        return error.MissingScopeClose;
+    try t.expect(errd < close);
+    try t.expect(close < transfer);
+    // Exactly one errdefer over the handle, and nothing fallible between the
+    // close and the transfer — a `try` there is armed over a handle the list
+    // already owns.
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, body, "errdefer _ = mlx.mlx_array" ++ "_free(cont);"));
+    try t.expect(std.mem.indexOf(u8, body[close..transfer], "try ") == null);
 }

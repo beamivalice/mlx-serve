@@ -802,7 +802,8 @@ pub fn prefillTokensPerSec(prompt_tokens: u32, cached_tokens: u32, prefill_ns: u
 /// score-budget slack `boundedPrefillChunk` already carries.
 pub const TAIL_MERGE_MAX: usize = 512;
 
-/// PURE: the tail a chunk of `default_chunk` tokens may absorb.
+/// PURE: the tail a chunk of `default_chunk` tokens may absorb, WHERE THE
+/// WIDTH IS CHOSEN PER CHUNK.
 ///
 /// `TAIL_MERGE_MAX` is a flat 512 justified by "at most ~6% at 8192". Once the
 /// width is chosen PER CHUNK that justification stops holding at the bottom of
@@ -811,8 +812,26 @@ pub const TAIL_MERGE_MAX: usize = 512;
 /// exists to prevent. An eighth of the width keeps the original ~6% bound at
 /// every rung and is a no-op at 4096 and 8192, where `TAIL_MERGE_MAX` is
 /// already the smaller of the two.
+///
+/// It is NOT the every-arch bound. Reach it through `tailMergeMaxFor`.
 pub fn tailMergeMax(default_chunk: usize) usize {
     return @min(TAIL_MERGE_MAX, @max(default_chunk / 8, 1));
+}
+
+/// PURE: the tail bound the chunk loop actually uses.
+///
+/// The scaling above answers a question only the per-chunk adaptive width
+/// asks — "this chunk narrowed to protect a transient; do not hand the saving
+/// straight back". Every other arch reaches a sub-4096 chunk by a route that
+/// never asked it (`resolvePrefillChunk`'s machine ladder puts a 27B on a
+/// 16 GB Mac at 512; `boundedPrefillChunk`'s score budget and its
+/// composed-causal 2048 cap hit gemma4, qwen3_5/3_6, muse_glimmer,
+/// deepseek_v4; any `--prefill-chunk` / `MLX_SERVE_PREFILL_CHUNK` under 4096
+/// hits everything). Chunk boundaries are not byte-stable, so an ungated
+/// scaling was an unmeasured behaviour change on all of them. Gated: the flat
+/// constant everywhere else, byte for byte.
+pub fn tailMergeMaxFor(default_chunk: usize, adaptive_width: bool) usize {
+    return if (adaptive_width) tailMergeMax(default_chunk) else TAIL_MERGE_MAX;
 }
 
 pub fn nextChunkEnd(
@@ -822,6 +841,11 @@ pub fn nextChunkEnd(
     want_ssm_cp: bool,
     ssm_cp_stride: usize,
     ssm_cp_offset: usize,
+    // `adaptive_width`: is the per-chunk adaptive width live for THIS prefill
+    // (qwen4_exp under `server.adaptivePrefillChunkEnabled`, surfaced to the
+    // loop as an installed `chunk_width_hook`)? Only then does the merge bound
+    // scale — see `tailMergeMaxFor`.
+    adaptive_width: bool,
 ) usize {
     var end = @min(pos + default_chunk, prefix_len);
     if (want_ssm_cp and ssm_cp_stride > 0) {
@@ -834,7 +858,7 @@ pub fn nextChunkEnd(
             return next_boundary_abs - ssm_cp_offset;
         }
     }
-    if (end < prefix_len and prefix_len - end < tailMergeMax(default_chunk)) {
+    if (end < prefix_len and prefix_len - end < tailMergeMaxFor(default_chunk, adaptive_width)) {
         // Absorb a tiny tail instead of paying a full graph build + eval
         // barrier for a few tokens. With checkpointing active this can only
         // extend within a boundary-free span (the boundary case returned
@@ -955,11 +979,12 @@ pub fn prefillChunkCount(
     want_ssm_cp: bool,
     ssm_cp_stride: usize,
     ssm_cp_offset: usize,
+    adaptive_width: bool,
 ) usize {
     var pos: usize = 0;
     var n: usize = 0;
     while (pos < prefix_len) {
-        const end = nextChunkEnd(pos, prefix_len, default_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset);
+        const end = nextChunkEnd(pos, prefix_len, default_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, adaptive_width);
         pos = end;
         n += 1;
     }
@@ -2269,6 +2294,12 @@ pub const Generator = struct {
             // is the point), and it is never wider than `ssm_cp_stride`, so
             // checkpointing still never sub-divides a chunk.
             const adapt_chunked = !(has_vision and !vision_chunked);
+            // S18/BL-5: the scaled tail-merge bound belongs to the per-chunk
+            // adaptive width and to nothing else. The hook is installed only
+            // under `server.adaptivePrefillChunkEnabled` (qwen4_exp + its kill
+            // switches + no operator pin), so this is that gate, read where the
+            // loop can see it. Every other arch keeps the flat TAIL_MERGE_MAX.
+            const width_is_adaptive = adapt_chunked and options.chunk_width_hook != null;
             const cap_adapt: u32 = if (!adapt_chunked) 0 else @intCast(effectivePrefillChunk(
                 xfm.config.prefillScoreHeadDim(),
                 xfm.config.num_attention_heads,
@@ -2377,7 +2408,7 @@ pub const Generator = struct {
                 // chunk-locally. Boundary alignment is in ABSOLUTE position
                 // (pos + offset), so the saved snapshot list is correct for
                 // the full prompt, not the truncated tail.
-                const end = nextChunkEnd(pos, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset);
+                const end = nextChunkEnd(pos, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive);
                 if (has_vision) ctx.vision_splice_offset = vision_rows_consumed;
                 const chunk_len: c_int = @intCast(end - pos);
                 const chunk_shape = [_]c_int{ 1, chunk_len };
@@ -11972,7 +12003,7 @@ fn walkChunkEnds(
     var n: usize = 0;
     while (pos < prefix_len and n < out.len) {
         const w = widths[@min(n, widths.len - 1)];
-        const end = nextChunkEnd(pos, prefix_len, w, want_ssm_cp, stride, offset);
+        const end = nextChunkEnd(pos, prefix_len, w, want_ssm_cp, stride, offset, true);
         out[n] = end;
         n += 1;
         pos = end;
@@ -12056,6 +12087,52 @@ test "every ladder rung the adaptive width can take divides the checkpoint strid
     }
 }
 
+/// The source of ONE named declaration: from `decl` to the `}` that closes it
+/// at the declaration's OWN indentation. zig fmt puts that closer alone on its
+/// line, so it is the one brace that cannot also appear inside the body, a
+/// string literal or a comment. `decl` must START a line — a mid-line
+/// occurrence is a MENTION (a doc comment, a call, a scan's own needle
+/// literal) and is skipped, so a window never anchors on one.
+///
+/// The ONE source-window extractor for scans across the codebase;
+/// `server.declBody` delegates here rather than keeping a second copy.
+///
+/// Every ORDERING scan resolves its needles inside a window like this.
+/// `indexOfPos` over a whole embedded file searches FORWARD from a production
+/// offset, so deleting the very line a scan pins lets the needle fall through
+/// to the TEST'S OWN literal further down the file — the assertion then holds
+/// on a full revert (the B0c class). A window holding no test cannot do that,
+/// whether or not the individual needle happens to be `++`-split. Same for a
+/// bare `indexOf(whole_file, literal) != null` presence check: the test's own
+/// copy of the literal keeps it green after the production line is gone.
+pub fn productionDeclSource(src: []const u8, decl: []const u8) ?[]const u8 {
+    var indent: usize = 0;
+    while (indent < decl.len and decl[indent] == ' ') indent += 1;
+    var closer_buf: [40]u8 = undefined;
+    if (indent + 3 > closer_buf.len) return null;
+    closer_buf[0] = '\n';
+    @memset(closer_buf[1 .. 1 + indent], ' ');
+    closer_buf[1 + indent] = '}';
+    closer_buf[2 + indent] = '\n';
+    const closer = closer_buf[0 .. indent + 3];
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, src, i, decl)) |at| {
+        i = at + 1;
+        if (at != 0 and src[at - 1] != '\n') continue; // a mention, not a declaration
+        const end = std.mem.indexOfPos(u8, src, at, closer) orelse continue;
+        return src[at .. end + closer.len];
+    }
+    return null;
+}
+
+/// True when `window` holds no test block at all — the property that makes a
+/// scan resolved inside it red on a revert. `generate.zig` has test blocks
+/// ABOVE some implementations, so "ends before the first test" is not the
+/// question; "contains no test" is.
+pub fn windowHasNoTestBlock(window: []const u8) bool {
+    return std.mem.indexOf(u8, window, "\n" ++ "test \"") == null;
+}
+
 test "a widen is committed only after the interleave tick, a step-down before it" {
     // S17. Attribution and safety want opposite orderings: the probe must run
     // BEFORE the tick so a co-tenant's decode is not read as this prefill's
@@ -12063,22 +12140,51 @@ test "a widen is committed only after the interleave tick, a step-down before it
     // memory the tick allocated and the probe never saw — and a Metal abort
     // cannot be un-decided. So the growth direction is re-priced after the
     // tick and the safe direction is not. Scan-pinned by index, because the
-    // ordering is the whole fix. Needles split so this test's own source
-    // cannot satisfy them.
+    // ordering is the whole fix.
+    //
+    // BL-6: needles resolve inside `initWithOptions`'s OWN body, never the
+    // whole file. Three of these five (`hk.call(hk.ctx, …`, `cf(widen_ctx.?,`,
+    // `if (next_w < cur_chunk)`) appear verbatim in THIS test's bytes, and
+    // with a whole-file `indexOfPos` a full revert of S17 — delete the
+    // post-tick confirm block, commit the widen pre-tick — left every needle
+    // resolving into this test's own literals below, so all five assertions
+    // survived the revert. Splitting the literals would fix these three; the
+    // window fixes the CLASS, including the next needle somebody adds.
     const t = testing;
     const src = @embedFile("generate.zig");
-    const probe = std.mem.indexOf(u8, src, "hk.call(hk.ctx, ssm_cp_offset + pos, @intCast(cur_chunk)") orelse return error.CallSiteMoved;
-    const tick = std.mem.indexOfPos(u8, src, probe, "options.interleave" ++ "_hook") orelse return error.CallSiteMoved;
-    const confirm = std.mem.indexOfPos(u8, src, probe, "cf(widen_ctx.?,") orelse return error.CallSiteMoved;
+    const impl = productionDeclSource(src, "    pub fn initWithOptions(") orelse return error.CallSiteMoved;
+    // The window is production bytes only — the property the whole fix rests on.
+    try t.expect(windowHasNoTestBlock(impl));
+    try t.expect(impl.len < src.len);
+
+    const probe = std.mem.indexOf(u8, impl, "hk.call(hk.ctx, ssm_cp_offset + pos, @intCast(cur_chunk)") orelse return error.CallSiteMoved;
+    const tick = std.mem.indexOfPos(u8, impl, probe, "options.interleave" ++ "_hook") orelse return error.CallSiteMoved;
+    const confirm = std.mem.indexOfPos(u8, impl, probe, "cf(widen_ctx.?,") orelse return error.CallSiteMoved;
     try t.expect(probe < tick);
     try t.expect(tick < confirm);
 
     // The step-down commits from the pre-tick branch, the widen only from the
     // post-tick one — both through the ONE commit helper.
-    const down = std.mem.indexOfPos(u8, src, probe, "if (next_w < cur_chunk)") orelse return error.CallSiteMoved;
+    const down = std.mem.indexOfPos(u8, impl, probe, "if (next_w < cur_chunk)") orelse return error.CallSiteMoved;
     try t.expect(down < tick);
-    try t.expect(std.mem.indexOfPos(u8, src, down, "commitAdaptive" ++ "Width(") .? < tick);
-    try t.expect(std.mem.indexOfPos(u8, src, confirm, "commitAdaptive" ++ "Width(") != null);
+    try t.expect(std.mem.indexOfPos(u8, impl, down, "commitAdaptive" ++ "Width(").? < tick);
+    try t.expect(std.mem.indexOfPos(u8, impl, confirm, "commitAdaptive" ++ "Width(") != null);
+
+    // The confirm itself is a SERVER-side install, and nothing pinned it. Drop
+    // `scheduler_mod.prefill_chunk_widen_ok` and
+    // `adaptivePrefillWidenStillFits` becomes unreachable: the scheduler side
+    // takes its `orelse return false`, every widen is silently refused, and
+    // the whole post-tick half above is a no-op with no red test. Read through
+    // `serve`'s OWN body — cross-file already, so it cannot fall through to a
+    // literal in this test, and the window stops it falling through to a
+    // server-side test's either.
+    const srv = @embedFile("server.zig");
+    const serve_body = productionDeclSource(srv, "pub fn serve(") orelse return error.CallSiteMoved;
+    try t.expect(windowHasNoTestBlock(serve_body));
+    try t.expect(std.mem.indexOf(u8, serve_body, "scheduler_mod.prefill_chunk_widen_ok = &adaptivePrefillWiden" ++ "StillFits;") != null);
+    // ...and the scheduler consults it rather than assuming a widen fits.
+    const sched = @embedFile("scheduler.zig");
+    try t.expect(std.mem.indexOf(u8, sched, "const ok = prefill_chunk_widen" ++ "_ok orelse return false;") != null);
 }
 
 test "commitAdaptiveWidth: the summary follows the running width from both commit sites" {
@@ -12105,27 +12211,34 @@ test "the per-chunk width is probed after the cache clear and before the interle
     // test, so they are scan-pinned. Probing BEFORE the clear reads the
     // chunk's own peak and narrows on memory that is already gone; probing
     // AFTER the interleave tick reads a co-tenant's decode allocations as this
-    // prefill's pressure. Needles split so this test's own source cannot
-    // satisfy them.
+    // prefill's pressure.
+    //
+    // BL-6 sibling: resolved inside `initWithOptions`'s own body. `clear`'s
+    // needle is unsplit and appears verbatim in this test's bytes, so with a
+    // whole-file scan a deleted trace line would re-anchor the ordering on the
+    // test's own literal. The split needles made it fail closed rather than
+    // green, but the window is what makes that structural.
     const t = testing;
     const src = @embedFile("generate.zig");
+    const impl = productionDeclSource(src, "    pub fn initWithOptions(") orelse return error.CallSiteMoved;
+    try t.expect(windowHasNoTestBlock(impl));
     // Anchored on the eval-trace line, not on the clear plus its next line:
     // the g1 loop-order fix (B0b) inserts `try mlx.checkError()` immediately
     // after the clear, and a needle spanning both lines would go red for that
     // rather than for anything this test is about.
-    const clear = std.mem.indexOf(u8, src, "if (trace_enabled) eval_ns +=") orelse return error.CallSiteMoved;
-    const probe = std.mem.indexOfPos(u8, src, clear, "options.chunk_width" ++ "_hook") orelse return error.CallSiteMoved;
-    const tick = std.mem.indexOfPos(u8, src, clear, "options.interleave" ++ "_hook") orelse return error.CallSiteMoved;
+    const clear = std.mem.indexOf(u8, impl, "if (trace_enabled) eval_ns +=") orelse return error.CallSiteMoved;
+    const probe = std.mem.indexOfPos(u8, impl, clear, "options.chunk_width" ++ "_hook") orelse return error.CallSiteMoved;
+    const tick = std.mem.indexOfPos(u8, impl, clear, "options.interleave" ++ "_hook") orelse return error.CallSiteMoved;
     try t.expect(probe < tick);
 
     // The unchunked vision arm forwards the whole prompt: there is no next
     // chunk to size, and the guard bills the real width already.
-    try t.expect(std.mem.indexOf(u8, src, "const adapt_chunked = " ++ "!(has_vision and !vision_chunked);") != null);
+    try t.expect(std.mem.indexOf(u8, impl, "const adapt_chunked = " ++ "!(has_vision and !vision_chunked);") != null);
     // The stride is still coarsened against the LAUNCH width, never the
     // per-request pin and never the per-chunk width.
-    try t.expect(std.mem.indexOf(u8, src, "effectiveSsmCheckpoint" ++ "Stride(@intCast(options.ssm_checkpoint_stride), @max(PREFILL_CHUNK, prefill_chunk_override))") != null);
+    try t.expect(std.mem.indexOf(u8, impl, "effectiveSsmCheckpoint" ++ "Stride(@intCast(options.ssm_checkpoint_stride), @max(PREFILL_CHUNK, prefill_chunk_override))") != null);
     // And the first chunk always runs the width admission billed.
-    try t.expect(std.mem.indexOf(u8, src, "var cur_chunk: usize = " ++ "default_chunk;") != null);
+    try t.expect(std.mem.indexOf(u8, impl, "var cur_chunk: usize = " ++ "default_chunk;") != null);
 }
 
 test "tailMergeMax: the tail a chunk may absorb scales with the width" {
@@ -12148,8 +12261,61 @@ test "tailMergeMax: the tail a chunk may absorb scales with the width" {
 
     // And the loop honours it: a 300-token tail merges at 8192 and does NOT
     // at the floor, where it would double the chunk.
-    try t.expectEqual(@as(usize, 8492), nextChunkEnd(0, 8492, 8192, false, 0, 0));
-    try t.expectEqual(@as(usize, 512), nextChunkEnd(0, 812, PREFILL_CHUNK_FLOOR, false, 0, 0));
+    try t.expectEqual(@as(usize, 8492), nextChunkEnd(0, 8492, 8192, false, 0, 0, true));
+    try t.expectEqual(@as(usize, 512), nextChunkEnd(0, 812, PREFILL_CHUNK_FLOOR, false, 0, 0, true));
+}
+
+test "the scaled tail-merge bound is gated on the per-chunk adaptive width" {
+    // BL-5. S18 replaced the flat `TAIL_MERGE_MAX` inside `nextChunkEnd` with
+    // the width-scaled bound, and `nextChunkEnd` has no arch parameter —
+    // so EVERY arch whose resolved chunk is under 4096 started merging a
+    // smaller tail, i.e. running an extra chunk on prompts that used to run
+    // one. That reaches `resolvePrefillChunk`'s machine ladder (a 27B on a
+    // 16 GB Mac lands at 512), `boundedPrefillChunk`'s score-budget floor and
+    // its composed-causal 2048 cap (gemma4, qwen3_5/3_6, muse_glimmer,
+    // deepseek_v4), and any `--prefill-chunk`/`MLX_SERVE_PREFILL_CHUNK` under
+    // 4096 anywhere. Chunk boundaries are not byte-stable, so that was an
+    // unmeasured behaviour change on archs the feature never touched.
+    const t = testing;
+
+    // The bound itself, both arms.
+    try t.expectEqual(TAIL_MERGE_MAX, tailMergeMaxFor(PREFILL_CHUNK_FLOOR, false));
+    try t.expectEqual(TAIL_MERGE_MAX, tailMergeMaxFor(1024, false));
+    try t.expectEqual(TAIL_MERGE_MAX, tailMergeMaxFor(2048, false));
+    try t.expectEqual(@as(usize, 64), tailMergeMaxFor(PREFILL_CHUNK_FLOOR, true));
+    try t.expectEqual(@as(usize, 256), tailMergeMaxFor(2048, true));
+    // Where the flat 512 was justified the two arms agree by construction.
+    try t.expectEqual(tailMergeMaxFor(4096, false), tailMergeMaxFor(4096, true));
+    try t.expectEqual(tailMergeMaxFor(8192, false), tailMergeMaxFor(8192, true));
+
+    // ...and the loop honours the gate. A 300-token tail at the ladder's 512
+    // rung: a non-adaptive arch merges it, exactly as it did before S18.
+    try t.expectEqual(@as(usize, 812), nextChunkEnd(0, 812, PREFILL_CHUNK_FLOOR, false, 0, 0, false));
+    // The adaptive arm does not — 300 is +59% of the transient the step-down
+    // just bought.
+    try t.expectEqual(@as(usize, 512), nextChunkEnd(0, 812, PREFILL_CHUNK_FLOOR, false, 0, 0, true));
+    // Same split one rung up, and none at 4096/8192.
+    try t.expectEqual(@as(usize, 1324), nextChunkEnd(0, 1324, 1024, false, 0, 0, false));
+    try t.expectEqual(@as(usize, 1024), nextChunkEnd(0, 1324, 1024, false, 0, 0, true));
+    try t.expectEqual(@as(usize, 8492), nextChunkEnd(0, 8492, 8192, false, 0, 0, false));
+    try t.expectEqual(@as(usize, 8492), nextChunkEnd(0, 8492, 8192, false, 0, 0, true));
+
+    // Chunk COUNT is what the archs above actually pay: one chunk, not two.
+    try t.expectEqual(@as(usize, 1), prefillChunkCount(812, PREFILL_CHUNK_FLOOR, false, 0, 0, false));
+    try t.expectEqual(@as(usize, 2), prefillChunkCount(812, PREFILL_CHUNK_FLOOR, false, 0, 0, true));
+
+    // The gate the loop reads is the per-chunk adaptive width being LIVE, not
+    // the arch spelled out a second time: `chunk_width_hook` is installed only
+    // under `server.adaptivePrefillChunkEnabled` (qwen4_exp + its kill
+    // switches + no operator pin). Scanned inside the implementation's own
+    // body so the needles cannot fall through to this test's bytes.
+    const src = @embedFile("generate.zig");
+    const impl = productionDeclSource(src, "    pub fn initWithOptions(") orelse return error.CallSiteMoved;
+    try t.expect(windowHasNoTestBlock(impl));
+    try t.expect(std.mem.indexOf(u8, impl, "const width_is_adaptive = " ++ "adapt_chunked and options.chunk_width_hook != null;") != null);
+    try t.expect(std.mem.indexOf(u8, impl, "ssm_cp_offset, width" ++ "_is_adaptive);") != null);
+    // And the scaling is reachable ONLY through the gated helper.
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, src, "tailMergeMax(default" ++ "_chunk)"));
 }
 
 test "nextChunkEnd: a tiny trailing remainder merges into the last chunk" {
@@ -12158,39 +12324,39 @@ test "nextChunkEnd: a tiny trailing remainder merges into the last chunk" {
     // FULL graph + eval-barrier + cache-clear for one token — pure overhead.
     // Without checkpoint alignment, remainders under the merge floor extend
     // the current chunk instead.
-    try testing.expectEqual(@as(usize, 8193), nextChunkEnd(0, 8193, 8192, false, 0, 0));
+    try testing.expectEqual(@as(usize, 8193), nextChunkEnd(0, 8193, 8192, false, 0, 0, false));
     // A substantial remainder stays its own chunk.
-    try testing.expectEqual(@as(usize, 8192), nextChunkEnd(0, 8192 + 600, 8192, false, 0, 0));
+    try testing.expectEqual(@as(usize, 8192), nextChunkEnd(0, 8192 + 600, 8192, false, 0, 0, false));
     // Mid-prompt chunks are untouched.
-    try testing.expectEqual(@as(usize, 8192), nextChunkEnd(0, 16385, 8192, false, 0, 0));
-    try testing.expectEqual(@as(usize, 16385), nextChunkEnd(8192, 16385, 8192, false, 0, 0));
+    try testing.expectEqual(@as(usize, 8192), nextChunkEnd(0, 16385, 8192, false, 0, 0, false));
+    try testing.expectEqual(@as(usize, 16385), nextChunkEnd(8192, 16385, 8192, false, 0, 0, false));
     // With SSM-checkpoint alignment active, a tiny tail STILL merges: the old
     // 1-token trailing chunk existed only to lay a snapshot one token before
     // the always-on end-of-prompt snapshot — pure overhead. A boundary strictly
     // INSIDE the chunk still wins over merging (next case).
-    try testing.expectEqual(@as(usize, 8193), nextChunkEnd(0, 8193, 8192, true, 8192, 0));
-    try testing.expectEqual(@as(usize, 4096), nextChunkEnd(0, 8193, 8192, true, 4096, 0));
+    try testing.expectEqual(@as(usize, 8193), nextChunkEnd(0, 8193, 8192, true, 8192, 0, false));
+    try testing.expectEqual(@as(usize, 4096), nextChunkEnd(0, 8193, 8192, true, 4096, 0, false));
 }
 
 test "prefillChunkCount: SSM-checkpoint stride controls cold-prefill chunking" {
     const PREFILL_CHUNK: usize = 8192;
     // Non-hybrid (or checkpointing off): a sub-PREFILL_CHUNK prompt is ONE chunk.
-    try testing.expectEqual(@as(usize, 1), prefillChunkCount(851, PREFILL_CHUNK, false, 0, 0));
-    try testing.expectEqual(@as(usize, 1), prefillChunkCount(8000, PREFILL_CHUNK, false, 0, 0));
+    try testing.expectEqual(@as(usize, 1), prefillChunkCount(851, PREFILL_CHUNK, false, 0, 0, false));
+    try testing.expectEqual(@as(usize, 1), prefillChunkCount(8000, PREFILL_CHUNK, false, 0, 0, false));
     // Tail merge: one token past a chunk boundary is still ONE chunk.
-    try testing.expectEqual(@as(usize, 1), prefillChunkCount(8193, PREFILL_CHUNK, false, 0, 0));
-    try testing.expectEqual(@as(usize, 2), prefillChunkCount(16385, PREFILL_CHUNK, false, 0, 0));
+    try testing.expectEqual(@as(usize, 1), prefillChunkCount(8193, PREFILL_CHUNK, false, 0, 0, false));
+    try testing.expectEqual(@as(usize, 2), prefillChunkCount(16385, PREFILL_CHUNK, false, 0, 0, false));
     // Mechanically, a raw fine stride still splits an 851-token prefill into 4
     // chunks (851 spans boundaries 256/512/768) — which is why
     // effectiveSsmCheckpointStride coarsens every stride to the prefill chunk:
     // per-chunk costs (expert re-streaming on MoE, sub-dq-gemm-floor GEMMs +
     // fixed overhead everywhere) taxed cold prefill 17-25%.
-    try testing.expectEqual(@as(usize, 4), prefillChunkCount(851, PREFILL_CHUNK, true, 256, 0));
+    try testing.expectEqual(@as(usize, 4), prefillChunkCount(851, PREFILL_CHUNK, true, 256, 0, false));
     // Boundary alignment is ABSOLUTE (warm path passes an offset): a tail-only
     // prefill starting mid-sequence still snaps to global strides. offset=2000,
     // prefix tail of 200 (abs 2000..2200), stride 256 -> boundary 2048/2304? only
     // 2048 falls inside (2000..2200) -> 2 chunks.
-    try testing.expectEqual(@as(usize, 2), prefillChunkCount(200, PREFILL_CHUNK, true, 256, 2000));
+    try testing.expectEqual(@as(usize, 2), prefillChunkCount(200, PREFILL_CHUNK, true, 256, 2000, false));
 }
 
 test "boundedPrefillChunk: fused head dims and short contexts keep the base chunk" {
@@ -12360,10 +12526,10 @@ test "effectiveSsmCheckpointStride: checkpointing never sub-divides the prefill 
     try testing.expectEqual(@as(usize, 16384), effectiveSsmCheckpointStride(16384, PREFILL_CHUNK));
     // End-to-end: an 851-tok prefill is 1 chunk (was 4 at the raw 256 stride
     // on dense hybrids — the llm_context_benchmarks small-prompt regression).
-    try testing.expectEqual(@as(usize, 1), prefillChunkCount(851, PREFILL_CHUNK, true, effectiveSsmCheckpointStride(256, PREFILL_CHUNK), 0));
+    try testing.expectEqual(@as(usize, 1), prefillChunkCount(851, PREFILL_CHUNK, true, effectiveSsmCheckpointStride(256, PREFILL_CHUNK), 0, false));
     // An 8K prefill splits only at the (memory-bound) chunk size, never
     // finer: 2 chunks at chunk 4096, not 33.
-    try testing.expectEqual(@as(usize, 2), prefillChunkCount(8238, 4096, true, effectiveSsmCheckpointStride(256, PREFILL_CHUNK), 0));
+    try testing.expectEqual(@as(usize, 2), prefillChunkCount(8238, 4096, true, effectiveSsmCheckpointStride(256, PREFILL_CHUNK), 0, false));
 }
 
 test "vision prefill checkpoints SSM state only when it chunks like text" {
@@ -12381,14 +12547,14 @@ test "vision prefill checkpoints SSM state only when it chunks like text" {
     try testing.expect(!vision_checkpoints);
     try testing.expectEqual(
         prefix_len,
-        nextChunkEnd(0, prefix_len, prefix_len, vision_checkpoints, @intCast(checkpoint_stride), 0),
+        nextChunkEnd(0, prefix_len, prefix_len, vision_checkpoints, @intCast(checkpoint_stride), 0, false),
     );
 
     const text_checkpoints = shouldCheckpointSsmPrefill(checkpoint_stride, true, false);
     try testing.expect(text_checkpoints);
     try testing.expectEqual(
         @as(usize, checkpoint_stride),
-        nextChunkEnd(0, prefix_len, prefix_len, text_checkpoints, @intCast(checkpoint_stride), 0),
+        nextChunkEnd(0, prefix_len, prefix_len, text_checkpoints, @intCast(checkpoint_stride), 0, false),
     );
 }
 

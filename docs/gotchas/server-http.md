@@ -3068,15 +3068,36 @@ out of one pool, so the writer publishes `staged_disk_host_bytes` and
 
 **And an old constant became reachable (S18).** `TAIL_MERGE_MAX` is a flat 512
 justified as "~6% at 8192". At `PREFILL_CHUNK_FLOOR` it is +100% of the
-transient the step-down just bought — pre-existing arithmetic that only this
-feature can reach. `tailMergeMax(width)` keeps the original ~6% bound at every
-rung and is a no-op at 4096 and 8192.
+transient the step-down just bought. `tailMergeMax(width)` keeps the original
+~6% bound at every rung and is a no-op at 4096 and 8192.
+
+**...and it is GATED, because "only this feature can reach it" was false.**
+The first version replaced the constant inside `nextChunkEnd`, which has no
+arch parameter — so the scaling applied to every arch whose resolved chunk is
+under 4096, which is a lot of them: `resolvePrefillChunk`'s machine ladder
+puts a 27B on a 16 GB Mac at 512; `boundedPrefillChunk`'s score-budget floor
+and its composed-causal 2048 cap hit gemma4, qwen3_5/3_6, muse_glimmer and
+deepseek_v4; any `--prefill-chunk` or `MLX_SERVE_PREFILL_CHUNK` under 4096
+hits everything. Chunk boundaries are not byte-stable, so that was a
+behaviour change on archs where the bound was never measured — and the
+sentence claiming otherwise is exactly what a future reader would use to skip
+the A/B. The bound now goes through `tailMergeMaxFor(width, adaptive_width)`,
+the loop passes `adapt_chunked and options.chunk_width_hook != null` (the hook
+exists only under `adaptivePrefillChunkEnabled`), and every other arch keeps
+the flat constant byte for byte. Guards: `generate.zig` "the scaled
+tail-merge bound is gated on the per-chunk adaptive width" (both arms plus the
+wiring scan) and `server.zig` "the tail-merge bound scales ONLY where the
+per-chunk adaptive width is live" (the arch predicate).
 
 ### Rules this produced
 
 - A helper's arguments encode the QUESTION it was written for. Reusing it from
   a new moment silently answers the old question — thread the new input
   through and keep the old call as a named special case.
+- A constant a new feature makes *interesting* is not a constant only that
+  feature can *reach*. Before changing one in a shared helper, enumerate every
+  route into it; if any predates the feature, gate the change on the feature
+  rather than on the value that made you look.
 - When attribution and safety want opposite orderings, do not pick one. Split
   the decision by direction: the safe direction commits early, the risky one
   is confirmed late.
