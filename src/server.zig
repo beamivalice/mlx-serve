@@ -3018,13 +3018,6 @@ pub fn sizerCtxKvBytes(config: *const model_mod.ModelConfig, kv_bits: u64) u64 {
 /// bill and the forward cannot drift.
 pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
     if (config.pinned_prefill_chunk == 0) {
-        // SSD-first sizes the chunk against what is ACTUALLY left beside one
-        // resident session, not the generic quarter-share guess. ONE line, so
-        // repairs to the generic sizer below merge without touching this arm.
-        if (ssdFirstPrefillChunk(config)) |c| {
-            config.pinned_prefill_chunk = c;
-            return config.pinned_prefill_chunk;
-        }
         var active_mem: usize = 0;
         _ = mlx.mlx_get_active_memory(&active_mem);
         const kv_bits: u64 = defaultKvBits();
@@ -3167,83 +3160,6 @@ pub fn ssdFirstPrefixCacheMem(
     const idle = @min(idle_requested, headroom);
     // Never 0: `initWithMem` reads 0 as "no byte cap at all".
     return @max(ctx_kv_bytes +| idle, 1);
-}
-
-/// Slack the SSD-first chunk chooser leaves BESIDE the one-session bill.
-///
-/// It is deliberately NOT a second session. Under SSD-first the resident entry
-/// and the live KV are the SAME buffers, so `one_session_kv` already reserves
-/// the hot cache's floor; subtracting a full second session here would
-/// re-introduce exactly the double count mechanism 5 removes, and would bar
-/// every wide rung on any box. What this covers is the genuinely-not-shared
-/// remainder: the previous turn's entry is not superseded until the commit at
-/// the END of the request, so during a diverged prefill its un-shared tail and
-/// the allocator's churn coexist with the new KV.
-pub const SSD_FIRST_CHUNK_HEADROOM: u64 = 1024 * 1024 * 1024;
-
-/// PURE: the widest ladder rung whose one-off prefill transient fits beside a
-/// resident session, under SSD-first.
-///
-/// The generic sizer spends at most `serving / PREFILL_RESERVE_BUDGET_SHARE` on
-/// the transient, because it does not know what the cache will actually need
-/// and a quarter is a safe guess for a 16 GB Mac. Under SSD-first the need is
-/// KNOWN EXACTLY — one session at the working context — so the guess is the
-/// wrong rule: it bars rung 4096 on a 137 GB box whose real headroom is several
-/// times the reserve, and a no-flag boot then prefills at 1024 (measured
-/// -25..34% at <= 256k). Here the budget is what is actually left.
-///
-/// `rungs` is descending (widest first) and each carries its own transient
-/// reserve, so this stays pure and testable at a box's real numbers.
-pub fn ssdFirstChunkForBudget(
-    serving_budget: u64,
-    one_session_kv: u64,
-    hot_cache_floor: u64,
-    rungs: []const ChunkReserve,
-) u32 {
-    const spoken_for = one_session_kv +| hot_cache_floor;
-    const budget: u64 = if (serving_budget > spoken_for) serving_budget - spoken_for else 0;
-    for (rungs) |r| {
-        if (r.reserve <= budget) return r.chunk;
-    }
-    // Nothing fits beside a resident session. Take the narrowest rung — same
-    // reasoning as the generic sizer: 0 would read as "not pinned". The one
-    // session is never given up for a wider forward; that is the trade this
-    // whole mode exists to refuse.
-    return rungs[rungs.len - 1].chunk;
-}
-
-pub const ChunkReserve = struct { chunk: u32, reserve: u64 };
-
-/// The SSD-first arm of `pinPrefillChunk`: same gate as the budget arm, one
-/// line at the call site, null when the arch gate is off. An explicit
-/// `--prefill-chunk` outranks it, exactly as it outranks the generic sizer.
-///
-/// Ordering matches the generic path's repair: the CHUNK is chosen first
-/// against the post-weights serving budget, and the cache takes the residual —
-/// never the other way round, which is what made the old clamp non-monotone.
-fn ssdFirstPrefillChunk(config: *model_mod.ModelConfig) ?u32 {
-    if (!config.ssdFirstCapable() or !prefix_cache_mod.ssdFirstEnabled()) return null;
-    if (generate_mod.prefill_chunk_explicit) return null;
-    var active_mem: usize = 0;
-    _ = mlx.mlx_get_active_memory(&active_mem);
-    const ceiling = currentGpuMemoryCeiling(active_mem);
-    const serving: u64 = if (ceiling > active_mem) ceiling - active_mem else 0;
-    const kv_bits: u64 = defaultKvBits();
-    const one_session: u64 = (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +|
-        statePerTokenBilled(config)) *| getEffectiveContextLength(config);
-
-    var rungs: [PREFILL_CHUNK_LADDER.len]ChunkReserve = undefined;
-    for (PREFILL_CHUNK_LADDER, 0..) |c, i| {
-        rungs[i] = .{ .chunk = c, .reserve = prefillTransientReserve(config, kv_bits, c) };
-    }
-    const chunk = ssdFirstChunkForBudget(serving, one_session, SSD_FIRST_CHUNK_HEADROOM, &rungs);
-    log.info("[prefill] SSD-first chunk {d} tokens (serving {d} MB - one session {d} MB - {d} MB slack; --prefill-chunk overrides)\n", .{
-        chunk,
-        serving >> 20,
-        one_session >> 20,
-        SSD_FIRST_CHUNK_HEADROOM >> 20,
-    });
-    return chunk;
 }
 
 /// The SSD-first arm of `prefixCacheMemForLoad`, gate and log included, so the
@@ -20810,48 +20726,3 @@ test "ssdFirstPrefixCacheMem: the active session's KV is billed ONCE and is the 
     try t.expect(ssdFirstPrefixCacheMem(0, 0, 0, 0, 0) >= 1);
 }
 
-test "ssdFirstChunkForBudget: a no-flag boot takes the widest rung one session leaves" {
-    const t = std.testing;
-    const MiB: u64 = 1 << 20;
-    // This box, measured: post-weights serving budget 28,909 MiB; the ladder's
-    // transient reserves as the nk-fix-clamp arithmetic reports them.
-    const serving: u64 = 28_909 * MiB;
-    const rungs = [_]ChunkReserve{
-        .{ .chunk = 8192, .reserve = 30_600 * MiB },
-        .{ .chunk = 4096, .reserve = 15_667 * MiB }, // ~15.3 GiB
-        .{ .chunk = 2048, .reserve = 7_987 * MiB },
-        .{ .chunk = 1024, .reserve = 4_403 * MiB }, // ~4.3 GiB
-        .{ .chunk = 512, .reserve = 2_202 * MiB },
-    };
-
-    // The generic rule spends at most serving/4 ≈ 7,227 MiB, which bars 4096
-    // AND 2048 — a no-flag boot lands at 1024 (measured −25..34% prefill at
-    // ≤256k). That is the behaviour this arch-gated sibling replaces.
-    const generic_cap = serving / PREFILL_RESERVE_BUDGET_SHARE;
-    try t.expect(rungs[1].reserve > generic_cap);
-    try t.expect(rungs[2].reserve > generic_cap);
-    try t.expect(rungs[3].reserve <= generic_cap);
-
-    // At an auto-sized working context (~256k at kv8 ≈ 5,184 MiB of session),
-    // 28,909 − 5,184 − 1,024 = 22,701 MiB is left, so the no-flag boot takes
-    // 4096. This is the user's bar: ONE boot, no chunk or cache flags.
-    const session_256k: u64 = 5_184 * MiB;
-    try t.expectEqual(@as(u32, 4096), ssdFirstChunkForBudget(serving, session_256k, SSD_FIRST_CHUNK_HEADROOM, &rungs));
-
-    // At an EXPLICIT `--ctx-size 1048576` one session is 20,736 MiB, so
-    // 28,909 − 20,736 − 1,024 = 7,149 MiB and the ladder lands on 1024 — the
-    // same rung the quarter-share heuristic picks, arrived at honestly. The
-    // win is the no-flag boot above, which is the user's bar; asking for the
-    // full million and a wide forward at once is a real conflict, and the
-    // session wins it. The one thing that must never happen is the reverse.
-    const session_1m: u64 = 20_736 * MiB;
-    try t.expectEqual(@as(u32, 1024), ssdFirstChunkForBudget(serving, session_1m, SSD_FIRST_CHUNK_HEADROOM, &rungs));
-
-    // The one-session floor is NEVER starved: when nothing fits beside it the
-    // narrowest rung is taken rather than a wider forward.
-    try t.expectEqual(@as(u32, 512), ssdFirstChunkForBudget(serving, 28_000 * MiB, SSD_FIRST_CHUNK_HEADROOM, &rungs));
-    try t.expectEqual(@as(u32, 512), ssdFirstChunkForBudget(1 * MiB, session_1m, SSD_FIRST_CHUNK_HEADROOM, &rungs));
-
-    // Plenty of room: the widest rung, never past it.
-    try t.expectEqual(@as(u32, 8192), ssdFirstChunkForBudget(200_000 * MiB, session_1m, SSD_FIRST_CHUNK_HEADROOM, &rungs));
-}

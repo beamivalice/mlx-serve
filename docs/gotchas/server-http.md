@@ -2456,46 +2456,31 @@ converge at rest anyway, since RAM holds one session between requests either
 way. The resolved budget is logged once at load, naming the flag, so nobody
 has to infer which reading applied.
 
-**A knock-on: the prefill chunk stops being a guess.** The generic sizer spends
-at most a QUARTER of the post-weights serving budget on the one-off prefill
-transient (`PREFILL_RESERVE_BUDGET_SHARE`), because it cannot know what the hot
-cache will actually need and a quarter is a safe guess for a 16 GB Mac. On this
-137 GB box that quarter is ~7.2 GiB, and rung 4096's reserve is ~15.3 GiB, so a
-no-flag boot prefills at 1024 — measured 25–34% slower at ≤256k — while the real
-headroom is several times the reserve.
+**A knock-on that turned out to belong somewhere else: the prefill chunk.** The
+generic sizer spends at most a QUARTER of the post-weights serving budget on the
+one-off prefill transient (`PREFILL_RESERVE_BUDGET_SHARE`), because it cannot
+know what the hot cache will actually need and a quarter is a safe guess for a
+16 GB Mac. On this 137 GB box that quarter is ~7.2 GiB against rung 4096's
+~15.3 GiB reserve, so a no-flag boot prefilled at 1024 — measured 25–34% slower
+at ≤256k — while the real headroom was several times the reserve.
 
 Under SSD-first the cache's need is not a guess: it is one session at the
-working context, exactly the quantity mechanism 5 already computes. So the
-arch-gated `ssdFirstChunkForBudget` takes the widest ladder rung whose transient
-fits `serving − one_session − slack`, chunk chosen FIRST and the cache taking
-the residual (never the reverse, which is what made the old clamp
-non-monotone). At an auto-sized ~256k working context that leaves 22,701 MiB
-the boot lands on 4096; at an explicit `--ctx-size 1048576` one session is
-20,736 MiB, only 7,149 MiB is left, and it lands on 1024. When nothing fits the
-narrowest rung is taken rather than the resident session given up.
-`--prefill-chunk` still outranks everything.
+working context, exactly the quantity mechanism 5 already computes. So this work
+briefly carried its own arch-gated chunk chooser, sized against
+`serving − one_session − slack` instead of the quarter-share.
 
-**But be clear about what this does and does not buy.** It does NOT buy the wide
-chunk. The chunk is a per-REQUEST admission decision — the widest rung whose
-transient fits beside THIS prompt's reserved KV, carried on
-`InitOptions.pinned_prefill_chunk` — and on the estimator's numbers a 300k
-prompt bills 12.7 GB at width 4096 and a 384k prompt 15.0 GB, against 28.9 GB
-free. So a real request already gets 4096 at `--ctx-size 1048576` TODAY,
-independently of this arm and of SSD-first entirely.
-
-What a LOAD-time arm must do is bill a session at the CONFIGURED context, and
-almost no request is that long, so it is structurally pessimistic and cannot be
-the thing that decides a forward's width. It is a sane default: the number in
-the boot log, and the input to the load-time clamp. SSD-first buys a
-whole-session hot cache; the wide chunk comes from the per-request chooser.
-
-The slack is deliberately NOT a second session. The resident entry and the live
-KV are the same buffers, so subtracting one session already reserves the cache's
-floor — subtracting it twice is the very double count this mechanism removes,
-and it would bar every wide rung on any box. The 1 GiB covers what genuinely is
-not shared: the previous turn's entry is not superseded until the commit at the
-END of a request, so during a diverged prefill its un-shared tail coexists with
-the new KV.
+It was removed before shipping, and the reason is the more useful lesson: the
+width is a per-REQUEST property, not a boot property. A LOAD-time arm must bill
+a session at the CONFIGURED context, and almost no request is that long, so it
+is structurally pessimistic no matter how honest its arithmetic — at an
+explicit `--ctx-size 1048576` it lands on 1024 while a real 300k prompt bills
+only 12.7 GB at width 4096 and a 384k prompt 15.0 GB, against 28.9 GB free.
+The per-request chooser prices the prompt in front of it and gets 4096, and it
+is gated on `ModelConfig.perRequestPrefillChunk()` — the SAME arch as
+`ssdFirstCapable()`. Two arch-gated choosers for one value on one arch is a
+rule that can only disagree with itself, so there is exactly ONE: the
+per-request one. SSD-first buys a whole-session hot cache, and nothing about
+the forward's width.
 
 **What SSD-first cannot do: serve a 1M prompt on this box.** The live KV must
 be resident — that is the one thing no tier can move — so the longest prompt

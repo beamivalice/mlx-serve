@@ -413,6 +413,10 @@ test carries an arm B for the legacy path.
 | 6 — evict-on-idle + root-wide LRU | `HotPrefixCache.spillIdleEntries` at end of request: RAM keeps the most-recently-used entry (the active session), every other entry spills and leaves — only when its copy comes back COMPLETE. `DiskTier.sweepSiblings` → `sweepBase` walks the OTHER fingerprints under `<base>`: strays (an entry dir with no `meta.json`) always go, and LRU eviction fires once the siblings together exceed one budget. The live tier's own root is skipped — during a write-through its newest entry legitimately has chunks and no index yet. |
 | 7 — reservation adoption | `snapshot`/`restore` refcount-SHARE the capacity buffer, so a restored entry carries the previous turn's `#353` reservation and the grow guard does not fire. `KVCache.kv_cap_buf_grows` counts the moments a second whole-cache copy exists; the guard asserts zero across a sufficient-capacity restore, with a negative arm proving it can see one. |
 
+The prefill WIDTH is not part of this: it is a per-REQUEST decision
+(`chooseRequestPrefillChunk`, gated on `ModelConfig.perRequestPrefillChunk()` —
+the same arch), and SSD-first deliberately has no second chooser for it.
+
 No manifest bump: the on-disk format is unchanged (v5), pinned by a
 both-directions legacy↔SSD-first restore test instead of a version number.
 `volumeSpace` hand-declares darwin's `struct statfs` (std has no binding in this
