@@ -1716,6 +1716,37 @@ Not changed, worth knowing: `new_bytes` bills the slot's RESERVED capacity
 rows, not the token count, so the MB in that line reads high for a slot that
 grew its KV buffer past the prompt.
 
+**The count is a spacing decision, priced against the tier (follow-up).** Span-preserving
+survivors sit ~`L/K` apart, so a warm turn that diverges BETWEEN two of them re-prefills that gap:
+the policy trades an unbounded loss (no checkpoint at or below the match — a full cold prefill)
+for a bounded one. The disk tier's `SSM_DISK_MAX_PER_ENTRY` was the weakest cell at K=8, and a
+checkpoint is not a constant — on qwen4_exp it measures 83 MB + ~3 KB per token of its own
+position (191.3 MB at position 36,864), so the bill grows with K and with where the survivors sit.
+At a 383k entry, 4 entries in the tier, 900 tok/s:
+
+| K | cps/entry | 4 entries (+KV) | max spacing | worst-case re-prefill |
+|---|---|---|---|---|
+| 8 (was) | 5.6 GB | 41 GB | ~54,700 tok | ~61 s |
+| **16 (is)** | **10.6 GB** | **61 GB** | **~25,500 tok** | **~28 s** |
+| 24 | 15.6 GB | 81 GB | ~16,700 tok | ~19 s |
+| 32 | 20.7 GB | 101 GB | ~12,400 tok | ~14 s |
+
+K=32 does not fit a 100 GB tier at all, and K=24 — the smallest holding a ~16k spacing — leaves
+19 GB for a tier that must also hold every other entry and not thrash. 16 halves the worst case at
+61% of the tier. The RAM tier's own cap (32) is unchanged: its checkpoints are already resident,
+so the count costs residency, not disk.
+
+**An even spread is the wrong shape at the end (audit S15a).** Thinning the whole interior
+uniformly makes a warm turn that EDITS NEAR THE END restore up to a full spacing back, where
+drop-oldest restored one stride back — the opposite trade from the one the 383k measurement
+covered, and it binds on every hybrid arch (lfm2, nemotron_h, qwen3_5, bailing_hybrid), not just
+qwen4_exp. `spanPreservingDropIndex` therefore never selects from the newest QUARTER: that part
+stays at capture density and everything below it is thinned span-preservingly. Measured on the
+383k shape at K=32, the last gap goes 10,303 -> 2,111 tokens while the widest gap grows
+16,384 -> 20,480 — about 9 s bought at the end for 4.5 s given up in the middle at 900 tok/s. Both
+halves are pinned: the retention test asserts stride-spaced final gaps AND a front gap many
+strides wide, so neither an even spread nor a return to drop-oldest passes.
+
 Guards (hermetic, no engine): `transformer.zig`'s span-preserving retention
 test (94 positions at 4096 thinned to 16 — both ends kept, no gap past twice
 the ideal), and in `prefix_cache.zig` the 383k arithmetic both ways
