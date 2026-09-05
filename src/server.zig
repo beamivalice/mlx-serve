@@ -3419,7 +3419,7 @@ fn ssdFirstSessionTokensNow(config: *const model_mod.ModelConfig, kv_bits: u64, 
         config.pinned_context,
         ceiling,
         active_mem,
-        CTX_SIZING_CACHE_RESERVE,
+        ctxSizingCacheReserve(config),
         prefillTransientReserve(config, kv_bits, chunk),
         kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config),
         config.contextCap(),
@@ -3515,6 +3515,24 @@ fn ssdFirstBudgetForLoad(
 /// used to bill that ask.
 const CTX_SIZING_CACHE_RESERVE: u64 = 2 * 1024 * 1024 * 1024;
 
+/// a93e2c0's context-sizing cache reserve: the RAW `--prefix-cache-mem` ask.
+///
+/// The constant above is a better number — it is ask-independent, so the
+/// advertised context stops moving when an operator changes the cache ask, and
+/// it closes live check #6 and audit S6 together. But it CHANGES the advertised
+/// `context_length` for every arch at any ask other than the 2 GiB default, and
+/// an agent CLI reads that number once per session and budgets against it for
+/// the whole session. That is not a change to make on archs nobody measured, so
+/// the constant is gated and every other arch keeps this.
+///
+/// The ONE deliberate unmediated read of the ask (`legacy_ask_read`, exempted
+/// by name in the scan that forbids the rest): a93e2c0 parity means the ASK, not
+/// the resolved budget — reading the budget here is audit S6's one-step loop,
+/// which is a different bug from the one this preserves.
+fn legacyCtxSizingCacheReserve() u64 {
+    return prefix_cache_mem_bytes; // legacy_ask_read
+}
+
 /// Impure twin of the SSD arm's wrapper: the context the RAM-first clamp bills,
 /// read through the ONE shared pure resolver so the two arms cannot drift.
 /// They differ in exactly one argument — the cache reserve. SSD-first passes 0
@@ -3527,7 +3545,7 @@ fn ramFirstContextForLoad(config: *const model_mod.ModelConfig, kv_bits: u64, ac
         config.pinned_context,
         currentGpuMemoryCeiling(active_mem),
         active_mem,
-        CTX_SIZING_CACHE_RESERVE,
+        ctxSizingCacheReserve(config),
         prefillTransientReserve(config, kv_bits, chunk),
         kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config),
         config.contextCap(),
@@ -3541,6 +3559,48 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, idl
     var active_mem: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_mem);
     const kv_bits: u64 = defaultKvBits();
+    // ARCH GATE (PR #363). The budget resolver changed THREE inputs at once for
+    // every arch, and each moves the number a different way:
+    //   * the STATIC ceiling replaced the live one (reproducibility — but it
+    //     also stops the budget shrinking when another process holds unified
+    //     memory, which is what #64 added the live read for);
+    //   * `ramFirstContextForLoad` replaced `getEffectiveContextLength` (a
+    //     different context, so a different `ctx_kv` term);
+    //   * `planHotCache` + `clampReserveWidth` replaced the direct clamp (the
+    //     reserve is billed at the ladder FLOOR, which only makes sense on an
+    //     arch that re-bills its width per request).
+    // The third is meaningless off `perRequestPrefillChunk`, and the other two
+    // were measured on the 69 GB qwen4_exp pack alone. Ungated, this is
+    // a93e2c0's `prefixCacheMemForLoad` verbatim
+    // (`git show a93e2c0:src/server.zig:2918`).
+    if (!config.longCtxGated()) {
+        const chunk: u64 = pinPrefillChunk(config);
+        // `statePerTokenBilled` is 0 off qwen4_exp, so this is a93e2c0's
+        // `+| config.qsaHistoryBytesPerToken()` term exactly.
+        const ctx_kv: u64 = (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config)) *|
+            getEffectiveContextLength(config);
+        const clamped = clampedPrefixCacheMem(
+            requested,
+            currentGpuMemoryCeiling(active_mem),
+            active_mem,
+            ctx_kv,
+            prefillTransientReserve(config, kv_bits, chunk),
+        );
+        // The one thing a93e2c0 did NOT do, kept on purpose: publishing the
+        // resolved budget is the class-A half of this work — the ANE gate used
+        // to reserve the raw ask while the cache could only ever hold the
+        // clamp, so three places disagreed about how many bytes the cache
+        // holds. Publishing a number the cache is actually capped at cannot
+        // over-admit. (`computeMemoryContext` still does not read it — audit
+        // S6.)
+        publishResolvedPrefixCacheMem(clamped);
+        if (requested > 0 and clamped < requested) {
+            log.info("[hot-cache] budget clamped {d} -> {d} MB (weights + ctx KV + prefill reserve vs GPU ceiling)\n", .{ requested >> 20, clamped >> 20 });
+        } else if (requested == 0) {
+            log.info("[hot-cache] budget capped at {d} MB (no --prefix-cache-mem; weights + ctx KV + prefill reserve vs GPU ceiling)\n", .{clamped >> 20});
+        }
+        return clamped;
+    }
     // SSD-first (qwen4_exp) takes the budget before the RAM-first plan: the
     // resident entry IS the live KV there, so the plan's residual arithmetic
     // would double-count it. One call site, one early return.
@@ -5035,6 +5095,11 @@ test "every post-load hot-cache reserve reads the RESOLVED budget, not the ask" 
         // than the global — the exemption has to follow it, or the accessor
         // convicts itself and the scan can never be green.
         if (std.mem.indexOf(u8, trimmed, "HOT_CACHE_MEM_" ++ "UNRESOLVED") != null) continue;
+        // The ONE deliberate read: `legacyCtxSizingCacheReserve` reproduces
+        // a93e2c0's context sizing for every arch outside the long-context
+        // gate, and a93e2c0 billed the ASK. Exempted BY NAME rather than by
+        // shape, so a second bypass cannot inherit the exemption.
+        if (std.mem.indexOf(u8, trimmed, "legacy_ask" ++ "_read") != null) continue;
         // A line that names the ask AND calls the accessor in one expression is
         // COMPARING the two — that is the fallback contract, which is the one
         // thing that has to read both. A bypass reads the ask INSTEAD of the
@@ -5111,13 +5176,32 @@ fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
         // Context is the primary claimant and the cache is the residual — the
         // same order the prefill chunk follows. It is the server's own
         // `--prefix-cache-mem` default, so a default boot is unchanged.
-        CTX_SIZING_CACHE_RESERVE +| prefillTransientReserve(config, kv_bits, chunk),
+        //
+        // GATED (PR #363): the constant is the better number, and it is also a
+        // different ADVERTISED context on every arch at any ask other than the
+        // 2 GiB default. `ctxSizingCacheReserve` is the one predicate; off the
+        // gate this is a93e2c0's raw ask, so `/v1/models` reports what it
+        // always did.
+        ctxSizingCacheReserve(config) +| prefillTransientReserve(config, kv_bits, chunk),
         per_tok,
         // 0 = do NOT clamp to the checkpoint's max here. The caller applies that
         // cap AFTER the safety margin, so a model whose own max is the binding
         // constraint keeps every token of it (see `autoContextFor`).
         0,
     );
+}
+
+/// The cache reserve the context sizer bills, and the ONE place PR #363's
+/// change to it is gated. Gated: the ask-independent constant. Ungated:
+/// a93e2c0's raw `--prefix-cache-mem`.
+///
+/// Both load-time wrappers (`ramFirstContextForLoad`, `ssdFirstSessionTokensNow`)
+/// must pass the SAME value as this: the number they bill is the session the
+/// hot-cache floor is built for, and the number `pinAutoContext` freezes right
+/// afterwards is the session the server ADVERTISES. Two reserves there means
+/// the floor is sized for a session the box is never asked to serve.
+fn ctxSizingCacheReserve(config: *const model_mod.ModelConfig) u64 {
+    return if (config.longCtxGated()) CTX_SIZING_CACHE_RESERVE else legacyCtxSizingCacheReserve();
 }
 
 /// Pure memory model behind checkAttentionMemory. All quantities in bytes,
@@ -21339,7 +21423,7 @@ test "checkAttentionMemory wires the CONFIG's key bound, not a dense seq" {
     // clamped-down cache keeps a reserve nobody will ever use.
     // UPDATED (audit S6): the sizer now reserves the CONSTANT, not the
     // resolved budget — reading either dynamic budget is the one-step loop.
-    try t.expect(std.mem.indexOf(u8, src, "CTX_SIZING_CACHE_RESERVE +| prefillTransientReserve(config, kv_bits, chunk)") != null);
+    try t.expect(std.mem.indexOf(u8, src, "ctxSizingCacheReserve(config) +| prefillTransientReserve(config, kv_bits, chunk)") != null);
 }
 
 test "the chunk the guard BILLS is the chunk the forward will RUN" {
@@ -23814,4 +23898,101 @@ test "prefillRequestTerms: the admission bill's new terms are qwen4_exp-only" {
     const at = std.mem.indexOf(u8, src, "pub fn prefillRequest" ++ "Terms(") orelse return error.CallSiteMoved;
     const body = src[at..@min(src.len, at + 2600)];
     try t.expect(std.mem.indexOf(u8, body, "if (!config.longCtx" ++ "Gated()) return .{};") != null);
+}
+
+test "ctxSizingCacheReserve: the advertised context is a93e2c0's on every other arch" {
+    // PR #363 ledger row "computeMemoryContext -> CTX_SIZING_CACHE_RESERVE".
+    //
+    // a93e2c0 reserved the RAW `--prefix-cache-mem` when sizing auto-context
+    // (`git show a93e2c0:src/server.zig:2992`,
+    // `prefix_cache_mem_bytes +| prefillTransientReserve(...)`). The constant
+    // is a better number — ask-independent, and it closes live check #6 and
+    // audit S6 together — but it changes the number the server ADVERTISES as
+    // `context_length` at every ask except the 2 GiB default, and an agent CLI
+    // reads that once per session and budgets against it for the whole session.
+    const t = std.testing;
+    const GiB: u64 = 1 << 30;
+    const saved = prefix_cache_mem_bytes;
+    defer prefix_cache_mem_bytes = saved;
+
+    var q4 = longCtxTestConfig(); // declares qwen4_exp
+    var other = longCtxTestConfig();
+    other.model_type = "qwen3_5_moe";
+
+    for ([_]u64{ 0, 2 * GiB, 10 * GiB, 60 * GiB }) |ask| {
+        prefix_cache_mem_bytes = ask;
+        // Gated: the constant, whatever the operator asked for.
+        try t.expectEqual(CTX_SIZING_CACHE_RESERVE, ctxSizingCacheReserve(&q4));
+        // Every other arch: a93e2c0's ask, byte for byte.
+        try t.expectEqual(ask, ctxSizingCacheReserve(&other));
+    }
+
+    // At the DEFAULT ask the two agree — a default boot is unchanged on every
+    // arch, which is why the constant was chosen to be that default.
+    prefix_cache_mem_bytes = CTX_SIZING_CACHE_RESERVE;
+    try t.expectEqual(ctxSizingCacheReserve(&q4), ctxSizingCacheReserve(&other));
+
+    // The reserve really moves the advertised context on the ungated arch: a
+    // bigger ask has to buy a SMALLER context, exactly as a93e2c0 behaved.
+    const kv_bits: u64 = 8;
+    const per_tok = kvBytesPerTokenAtBits(other.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(&other);
+    const ceiling: u64 = 120 * GiB;
+    const active: u64 = 69 * GiB;
+    const transient = prefillTransientReserve(&other, kv_bits, 4096);
+    const small = safeContextForBudget(ceiling, active, 2 * GiB +| transient, per_tok, 0);
+    const big = safeContextForBudget(ceiling, active, 40 * GiB +| transient, per_tok, 0);
+    try t.expect(big < small);
+
+    // ONE predicate, and the two load-time wrappers bill the SAME reserve the
+    // sizer does — otherwise the hot-cache floor is built for a session the
+    // box never advertises.
+    const src = @embedFile("server.zig");
+    const at = std.mem.indexOf(u8, src, "fn ctxSizingCache" ++ "Reserve(") orelse return error.HelperMoved;
+    try t.expect(std.mem.indexOf(u8, src[at..@min(src.len, at + 400)], "config.longCtx" ++ "Gated()") != null);
+    for ([_][]const u8{ "fn ramFirstContextForLoad(", "fn ssdFirstSessionTokensNow(" }) |decl| {
+        const body = declBody(src, decl) orelse return error.CallSiteMoved;
+        try t.expect(std.mem.indexOf(u8, body, "ctxSizingCache" ++ "Reserve(config)") != null);
+    }
+}
+
+test "prefixCacheMemForLoad: the ungated budget arm is a93e2c0's arithmetic" {
+    // PR #363 ledger row "prefixCacheMemForLoad". Three inputs changed at once
+    // for every arch — the static ceiling, `ramFirstContextForLoad` instead of
+    // `getEffectiveContextLength`, and `planHotCache` + `clampReserveWidth`
+    // instead of the direct clamp. The third is meaningless off
+    // `perRequestPrefillChunk`; the other two were measured on the 69 GB
+    // qwen4_exp pack alone.
+    //
+    // The impure resolver reads live memory, so the SHAPE is pinned by source
+    // rather than by running it — but the arithmetic it delegates to is pure
+    // and is pinned directly.
+    const t = std.testing;
+    const src = @embedFile("server.zig");
+    const body = declBody(src, "pub fn prefixCacheMemForLoad(") orelse return error.CallSiteMoved;
+    const gate_at = std.mem.indexOf(u8, body, "if (!config.longCtx" ++ "Gated()) {") orelse return error.MissingGate;
+    // The ungated arm runs ABOVE the SSD-first arm and above the plan: a gate
+    // that runs after them has already paid for the thing it is declining.
+    const ssd_at = std.mem.indexOf(u8, body, "ssdFirstBudgetForLoad(") orelse return error.CallSiteMoved;
+    const plan_at = std.mem.indexOf(u8, body, "planHotCache(") orelse return error.CallSiteMoved;
+    try t.expect(gate_at < ssd_at);
+    try t.expect(gate_at < plan_at);
+    const arm = body[gate_at..ssd_at];
+    // a93e2c0's four inputs, by name.
+    try t.expect(std.mem.indexOf(u8, arm, "currentGpuMemoryCeiling(active_mem)") != null);
+    try t.expect(std.mem.indexOf(u8, arm, "getEffectiveContextLength(config)") != null);
+    try t.expect(std.mem.indexOf(u8, arm, "clampedPrefixCacheMem(") != null);
+    try t.expect(std.mem.indexOf(u8, arm, "prefillTransientReserve(config, kv_bits, chunk)") != null);
+    // ...and NOT the three the PR swapped in.
+    try t.expect(std.mem.indexOf(u8, arm, "staticGpuMemoryCeiling()") == null);
+    try t.expect(std.mem.indexOf(u8, arm, "ramFirstContextForLoad(") == null);
+    try t.expect(std.mem.indexOf(u8, arm, "clampReserveWidth(") == null);
+    // The resolved budget is still published — that half is class A (the ANE
+    // gate used to reserve the raw ask while the cache was capped lower).
+    try t.expect(std.mem.indexOf(u8, arm, "publishResolvedPrefix" ++ "CacheMem(clamped);") != null);
+
+    // The clamp itself is a93e2c0's and is shared by both arms, so the ungated
+    // budget is exactly what a93e2c0 computed from the same four numbers.
+    const GB: u64 = 1 << 30;
+    try t.expectEqual(@as(u64, 8 * GB), clampedPrefixCacheMem(8 * GB, 96 * GB, 20 * GB, 2 * GB, 2 * GB));
+    try t.expectEqual(96 * GB - 80 * GB, clampedPrefixCacheMem(0, 96 * GB, 70 * GB, 6 * GB, 4 * GB));
 }
