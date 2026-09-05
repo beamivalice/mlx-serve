@@ -3248,3 +3248,42 @@ The rule underneath both halves: **the write-through's job is to make a KILLED
 prefill restartable, not to be the persistence mechanism.** It buys nothing on a
 turn that cannot lose a chunk, and anything it does buy is charged to TTFT — so
 its cost per chunk is a first-class number, not an implementation detail.
+
+## The QSA indexer history was copied per snapshot, and billed as if it were not (2026-09-05)
+
+Flash Next's sparse-attention indexer keeps a raw-key history beside the KV. A
+prefix-cache commit used to hand the new entry its OWN copy of that history, so
+a slot and the entry it just committed held two copies of the same bytes — and
+the admission bill priced only one. Both halves are now one decision:
+`handoffQsaHistoryToLatest` lets the newest snapshot take a VIEW of the live
+buffer at COMMIT (ONE copy per slot ∪ entry), and `statePerTokenBilled` prices
+what is actually held — ONE history copy plus the f32 score bank, 5,376 B/tok.
+
+The bill moves from 20,736 to 18,432 MiB at 1M context, and measured decode
+residency falls 3-4 GB in the 786k-1M band. `MLX_SERVE_QSA_HISTORY_SHARE=0`
+restores the prefill-end copy and the 2x bill, which is also what
+`MLX_SERVE_KV_RESERVE=0` leaves in place — both arms are billed, so the
+estimator is never optimistic about the arm that is running.
+
+The rule: **a buffer two owners can share is billed once only after the sharing
+is real.** The pre-fix code had the sharing in neither place and the bill in
+one; the fix is the pair, not either half.
+
+## A persisted entry ends in its generated tail, so the next turn rewrote every chunk (Defect A, 2026-09-05)
+
+An SSD-first entry is committed at the end of a request, so its last tokens are
+the reply the model just generated. The next turn's prompt contains that reply
+and then diverges INSIDE it — a strict-prefix extend scan therefore finds no
+usable common tail and re-writes every chunk of a multi-hundred-MB entry, every
+turn, for a conversation whose bytes are already on disk.
+
+`chunkShareDonor` hard-links the donor's WHOLE chunks under the common prefix
+instead of rewriting them (SSD-first only, `MLX_SERVE_SSD_CHUNK_SHARE=0`
+restores the copy). Hard links make the accounting the delicate part, and the
+invariant chosen is the strong one: **`total_bytes` is bytes on disk BY
+CONSTRUCTION.** Heirs bill 0 for a shared chunk, `removeAt` frees only files at
+`nlink == 1`, and `scan` counts each inode once — so the budget, the sweep and
+the eviction all read the same number, and a shared chunk cannot be freed while
+another entry still names it. The write-through hook writes ONE chunk per
+boundary (`WRITE_THROUGH_FLUSH_BOUND_BYTES`), so a killed prefill still leaves a
+chunk-aligned restorable prefix.
