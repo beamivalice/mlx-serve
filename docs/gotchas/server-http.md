@@ -2670,6 +2670,11 @@ unexplained slowdown and a widened one as an unexplained peak:
   you turned — a capped resolver makes those different numbers.
 ## SSD-first prefix cache (qwen4_exp) — the disk tier only ever got what RAM kept (2026-09-05)
 
+*Symbols moved here from CLAUDE.md (2026-09-06, to keep `## Rules` under its byte cap):*
+`capturePendingDisk`, `encodeSafetensors`, `writeThroughSpanReached`, `reserve()`,
+`kv_cap_buf_grows`, and the disk-budget formula `min(cap, free − min(64 GiB, 10% vol))`,
+*which CLAUDE.md now calls "the free-space reserve". Each is described below.*
+
 At 1M context on the M5 Max the arithmetic does not close for a RAM-first
 cache. The weights are ~70 GB resident, one session's entry is ~24 GB
 (~24 KB/token: 12.3 KB of 8-bit KV, 3.8 KB of QSA indexer history, the SSM
