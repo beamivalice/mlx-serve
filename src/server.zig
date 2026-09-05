@@ -3886,7 +3886,24 @@ test "the clamp bills the context that will be SERVED, not the placeholder" {
 
     try t.expect(placeholder.budget > 45_000 * MiB); // reproduces the live 48,673
     try t.expectEqual(@as(u64, 1_048_576) * (13_056 + 7_680), real.ctx_kv);
-    try t.expect(real.budget < placeholder.budget / 2);
+
+    // The bar is the ARITHMETIC, not a hand-picked fraction. Both calls share
+    // a ceiling, a resident weight figure and a reserve width, and on this box
+    // the ask exceeds the headroom in both, so each budget IS its headroom and
+    // the whole difference between them is the session each one billed:
+    //
+    //     placeholder.budget - real.budget == real.ctx_kv - placeholder.ctx_kv
+    //
+    // A fraction bar cannot be stated here at all: `real.budget <
+    // placeholder.budget / 2` needs a reserve above ~8.7 GiB, and the
+    // `> 45_000 MiB` line above needs one below ~5.1 GiB. It was written
+    // against arithmetic nothing on this branch ever ran.
+    try t.expectEqual(placeholder.budget - real.budget, real.ctx_kv - placeholder.ctx_kv);
+    try t.expect(real.budget < placeholder.budget);
+    // ...and the placeholder's "session" is the rounding error that made this a
+    // bug: 1024 tokens of KV against a full context's ~20.7 GB.
+    try t.expect(placeholder.ctx_kv < 30 * MiB);
+    try t.expect(real.ctx_kv > 20_000 * MiB);
     try t.expect(real.budget > 0);
 }
 
@@ -4447,6 +4464,16 @@ test "every post-load hot-cache reserve reads the RESOLVED budget, not the ask" 
         if (std.mem.startsWith(u8, trimmed, "//")) continue;
         if (std.mem.startsWith(u8, trimmed, "pub var " ++ needle)) continue;
         if (std.mem.indexOf(u8, trimmed, "hot_cache_mem_resolved") != null) continue;
+        // The accessor's own fallback. Audit S5 moved the global behind an
+        // atomic, so the line that returns the ask names the SENTINEL rather
+        // than the global — the exemption has to follow it, or the accessor
+        // convicts itself and the scan can never be green.
+        if (std.mem.indexOf(u8, trimmed, "HOT_CACHE_MEM_" ++ "UNRESOLVED") != null) continue;
+        // A line that names the ask AND calls the accessor in one expression is
+        // COMPARING the two — that is the fallback contract, which is the one
+        // thing that has to read both. A bypass reads the ask INSTEAD of the
+        // accessor and so can never look like this.
+        if (std.mem.indexOf(u8, trimmed, accessor) != null) continue;
         std.debug.print("unmediated read of the hot-cache ASK: {s}\n", .{trimmed});
         return error.UnmediatedAskRead;
     }
@@ -21569,7 +21596,10 @@ test "both hot-cache budget arms publish hot_cache_mem_resolved" {
     // billed that session twice and roughly halved the auto-context.
     const ssd_start = std.mem.indexOf(u8, src, "fn ssdFirstBudgetForLoad(").?;
     const ssd_end = ssd_start + (std.mem.indexOf(u8, src[ssd_start..], "\n}\n") orelse 0);
-    try std.testing.expect(std.mem.indexOf(u8, src[ssd_start..ssd_end], needle ++ "budget -| ctx_kv;") != null);
+    // The needle closes the CALL: audit S5 turned the assignment
+    // (`hot_cache_mem_resolved = budget -| ctx_kv;`) into a setter, so the
+    // quantity is an argument now and the trailing byte is `)`, not `;`.
+    try std.testing.expect(std.mem.indexOf(u8, src[ssd_start..ssd_end], needle ++ "budget -| ctx_kv)") != null);
 
     // ...and the arithmetic that makes it so: an idle allowance of 0 floors the
     // budget at exactly one session, so the cache costs NOTHING beyond it.
@@ -21983,8 +22013,16 @@ test "the published hot-cache budget is retired when the cache is dropped" {
     while (std.mem.indexOfPos(u8, sched, i, drop)) |at| {
         i = at + 1;
         // The declaration sites (`.hot_prefix_cache = null,` in a struct
-        // literal) are initialisers, not drops.
-        if (at > 0 and sched[at - 1] == '.') continue;
+        // literal) are initialisers, not drops. A BARE leading `.` is what
+        // marks one: every real drop is `self.` or `sch.`, which ALSO puts a
+        // `.` in front of the field — so the dot alone excluded all five drops
+        // and left the count at zero. The field-access dot is preceded by an
+        // identifier byte; the initialiser's is not.
+        if (at > 0 and sched[at - 1] == '.') {
+            const before: u8 = if (at > 1) sched[at - 2] else ' ';
+            const is_field_access = std.ascii.isAlphanumeric(before) or before == '_' or before == ')' or before == ']';
+            if (!is_field_access) continue;
+        }
         drops += 1;
         const tail = sched[at..@min(sched.len, at + 400)];
         try t.expect(std.mem.indexOf(u8, tail, retire) != null);
