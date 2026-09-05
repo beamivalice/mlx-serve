@@ -260,3 +260,23 @@ The one lever that DID pay was RELOCATION (containers detail -> docs/reference.m
 growth policy already sanctions and which loses nothing from the repo.
 Options put to the coordinator: (a) relocate more detail the same way; (b) accept <300 B
 headroom; (c) write the kernel as ONE bullet + one clause instead of three rules.
+
+## Option (a) EXECUTED — b250b24 `docs: relocate two engine stories to the gotchas file (byte budget)`
+
+Relocated the STORIES of the two fattest engine-section bullets (`MtpAdaptive` arming/disarming
+and the bookkeeping-lies rule) into `docs/gotchas/engine-mlx.md` under the existing `MtpAdaptive`
+section. Both rules stay in CLAUDE.md at 373 and 328 chars (<= 3 lines) with EVERY symbol intact —
+verified by grep: MtpAdaptive, MLX_SERVE_MTP_ADAPTIVE_SERIAL=0/_MARGIN/_CONFIRM/_MIN_KV/
+_REENTRY_TOKENS, Table.msPerTok(m_lo), MtpPriceWindow, Table.serial, observeSerialTick,
+--max-mtp-ctx, _FORCE_DEPTH, "bucket resolver", "bounded RETRIES" all still present.
+Remaining bytes came from connective prose in four paragraphs that name no symbol of their own.
+
+### FINAL PART-A LEDGER
+  de41ffc                                   99,273 B
+  + reserve fix                             99,665 B
+  after 591a03e (levers 2-4)                99,390 B
+  after b250b24 (option (a) relocation)     99,077 B   <= 99,080 TARGET MET
+  free-to-cap                                  923 B   (kernel's rules ~510-620 B -> >=300 B headroom)
+
+Part-A build: ReleaseFast exit 0 (before b250b24, which is docs-only; post_fold.sh rebuilds).
+Commits: 0ecc190, 4e1806a, 049b4f6, 591a03e, b250b24 (de41ffc + 5).
