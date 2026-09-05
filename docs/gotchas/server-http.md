@@ -2470,19 +2470,24 @@ arch-gated `ssdFirstChunkForBudget` takes the widest ladder rung whose transient
 fits `serving − one_session − slack`, chunk chosen FIRST and the cache taking
 the residual (never the reverse, which is what made the old clamp
 non-monotone). At an auto-sized ~256k working context that leaves 22,701 MiB
-and the boot lands on 4096; at an explicit `--ctx-size 1048576` one session is
-20,736 MiB, only 7,149 MiB is left, and it lands on 1024 — the same rung the
-heuristic picked, arrived at honestly. Asking for the full million AND a wide
-forward is a real conflict and the session wins it; the reverse is what must
-never happen, so when nothing fits the narrowest rung is taken rather than the
-resident session given up. `--prefill-chunk` still outranks everything.
+the boot lands on 4096; at an explicit `--ctx-size 1048576` one session is
+20,736 MiB, only 7,149 MiB is left, and it lands on 1024. When nothing fits the
+narrowest rung is taken rather than the resident session given up.
+`--prefill-chunk` still outranks everything.
 
-That explicit-1M rung is pessimistic for a reason this arm cannot fix: at LOAD
-it must bill a session at the CONFIGURED context, and almost no request is that
-long. The chunk becomes a per-REQUEST admission decision separately — the widest
-rung whose transient fits beside THIS prompt's reserved KV, carried on
-`InitOptions.pinned_prefill_chunk` — so what is chosen here only has to be a
-sane default, not the last word.
+**But be clear about what this does and does not buy.** It does NOT buy the wide
+chunk. The chunk is a per-REQUEST admission decision — the widest rung whose
+transient fits beside THIS prompt's reserved KV, carried on
+`InitOptions.pinned_prefill_chunk` — and on the estimator's numbers a 300k
+prompt bills 12.7 GB at width 4096 and a 384k prompt 15.0 GB, against 28.9 GB
+free. So a real request already gets 4096 at `--ctx-size 1048576` TODAY,
+independently of this arm and of SSD-first entirely.
+
+What a LOAD-time arm must do is bill a session at the CONFIGURED context, and
+almost no request is that long, so it is structurally pessimistic and cannot be
+the thing that decides a forward's width. It is a sane default: the number in
+the boot log, and the input to the load-time clamp. SSD-first buys a
+whole-session hot cache; the wide chunk comes from the per-request chooser.
 
 The slack is deliberately NOT a second session. The resident entry and the live
 KV are the same buffers, so subtracting one session already reserves the cache's
@@ -2491,6 +2496,17 @@ and it would bar every wide rung on any box. The 1 GiB covers what genuinely is
 not shared: the previous turn's entry is not superseded until the commit at the
 END of a request, so during a diverged prefill its un-shared tail coexists with
 the new KV.
+
+**What SSD-first cannot do: serve a 1M prompt on this box.** The live KV must
+be resident — that is the one thing no tier can move — so the longest prompt
+this machine can serve is set by the prefill peak, not by the cache. At kv8 a
+1M prompt bills 30.3 GB even at the ladder FLOOR against 28.9 GB free, and
+guard 5c measures a 512k prompt peaking at 99.05 GB with `max_safe_context`
+475,737. So the max servable prompt here is ~476k, and SSD-first does not raise
+it by a token. What it changes is what happens to the sessions you are NOT
+currently serving: they survive on disk instead of being re-prefilled. Anyone
+reading "1M context" off the config and expecting a 1M prompt to be admitted is
+reading the wrong number, and it is the same number before and after this work.
 
 **Blast radius.** Every one of these is gated on `ModelConfig.ssdFirstCapable()`
 (`model_type == "qwen4_exp"`) AND `MLX_SERVE_PREFIX_SSD_FIRST`, read at exactly
