@@ -2299,32 +2299,97 @@ The manual path is untouched by all of it: `--ctx-size` wins in the resolver's
 first branch, before any memory arithmetic runs, so a pinned boot bills exactly
 what it billed before.
 
-### Deliberately NOT fixed: crediting reclaimable cache to the width chooser
+### The width is re-asked after the eviction pass (N5)
 
-The audit (N5) notes that `prefillAdmissionBill` computes `available` WITHOUT
-`reclaimable` and hands that to `chooseRequestPrefillChunk`, so a resident hot
-cache can narrow the prefill width — 512 instead of 4096 — rather than being
-evicted. That is arguably the inverse of the stated policy, "a cached prefix is
-an optimization, the request is the work".
+`prefillAdmissionBill` computes `available` WITHOUT `reclaimable` and hands
+that to `chooseRequestPrefillChunk`, so a resident hot cache narrows the
+prefill width — the ladder floor instead of 4096 — rather than being evicted.
+That is the right call at that moment: crediting `reclaimable` there would
+choose a width justified by memory eviction has not actually returned yet, the
+same "credit what you cannot prove" shape as the `evictable` vs `reclaimable`
+split this work introduced after a 383k prompt was admitted on 1,564 MB of
+cache that turned out to be the single entry the prompt itself had just
+restored. The two failure costs are not symmetric: a narrow width costs prefill
+throughput, a width justified by absent memory costs an uncatchable Metal OOM.
 
-**Left as is, deliberately.** Adding `reclaimable` there would choose a width
-justified by memory that eviction has not actually returned yet — the same
-"credit what you cannot prove" shape as the `evictable` vs `reclaimable` split
-this work introduced, after a 383k prompt was admitted on 1,564 MB of cache
-that turned out to be the single entry the prompt itself had just restored.
-Narrowing first and widening later, once the eviction has really happened and
-`prefillFitsNow` is re-asked against live memory, is the safe order. Widening
-on a promise is the unsafe one, and the two failure costs are not symmetric: a
-narrow width costs prefill throughput, a width that was justified by absent
-memory costs an uncatchable Metal OOM.
+The fix is therefore not a wider bill but **a second look**. The scheduler's
+prefill path now asks the width TWICE around the eviction pass:
 
-The genuine improvement is not a wider bill but a second look — re-ask the
-width after the eviction pass, which the scheduler already does for the
-admission decision itself. That is a follow-up, not a one-line argument
-change.
+1. `admitted_prefill_chunk` — the pre-eviction reading, taken through the same
+   `prefill_request_chunk` hook, with the same inputs and the same live memory
+   as the probe that just failed. It is captured ONLY on the path that actually
+   evicts: when the probe already fits, no memory moves and there is nothing to
+   compare a second reading against.
+2. `evictLruToAdmit` runs and returns an `EvictionReport`.
+3. `evicted_live_bytes = report.bytes` — the ALLOCATOR's delta, never
+   `accounted_bytes` (a shared snapshot bills megabytes and returns none of
+   them) and never `reclaimable` (a projection).
+4. The re-ask, then `scheduler.postEvictionPrefillChunk(admitted, reasked)`.
+
+**The clamp is an assertion, not a policy.** An eviction only ever RETURNS
+memory, so post-eviction availability is `>=` pre-eviction and `reasked >=
+admitted` by construction — the chooser's ladder is monotone and its fallback
+is the floor. Taking the MAX therefore changes nothing on the expected path and
+catches the one case that would be a real bug: a narrower re-ask, which can only
+mean memory moved between the two reads (a co-tenant slot's decode
+allocations). There the admitted width is the one a bill was actually taken at,
+and the per-chunk adapter — the mechanism that IS allowed to narrow — re-prices
+from it at the first chunk boundary. Both directions log under `[prefill] re-ask:` (a distinct
+prefix from the per-chunk `[prefill] width N -> M at pos P` contract line), the
+widening at info naming the bytes the pass returned.
+
+The re-asked width has to reach two consumers with different rules, and a
+change that wires one and not the other ships a width nobody runs:
+
+* The request's own chunk: `req_prefill_chunk` →
+  `InitOptions.pinned_prefill_chunk` → `effectivePrefillChunk` →
+  `PREFILL_CHUNK` → `default_chunk` → `cur_chunk`.
+* The per-chunk adapter's ceiling, `cap_adapt`. It is built from the arch
+  resolver with the pin left OUT (a literal `0` rung), so it is `>=` any ladder
+  width the chooser can return and cannot clip a re-ask. If it ever starts
+  reading the pin, the widened width becomes its own ceiling and the adapter
+  can only narrow.
+
+Both are scan-pinned (`the re-asked width reaches the request's chunk AND is
+never capped by the adapter`), as is the ORDER of the four steps above.
+
+### The admission bill is logged on ADMITTED requests too
+
+The tight-admission path used to log nothing when it went through: the numbers
+only ever appeared once a request had already been refused, so there was no way
+to watch the machine walk up to the edge. `checkAttentionMemory` now emits ONE
+line per REQUEST — never per chunk — at the admission decision:
+
+```
+[admission] needed=N MB available=A MB reclaimable=R MB width=W verdict=admit|evict|refuse
+```
+
+Every field comes off the SAME `AdmissionBill` the three arms act on and the
+refusal message quotes, so the two cannot name different numbers for the same
+request; a second estimator call here would be #126 ("a gate that runs BEFORE
+the estimator that knows better IS the estimator") in log form, quoting a bill
+nobody acted on. `admissionVerdict` derives the verdict from that bill with the
+same two predicates the arms branch on (`fits`, `fitsAfterEviction`).
+
+The level is chosen by `admissionLogLevel`: info on the first request after a
+model becomes resident (`model_registry.load_generation`, consumed by one
+compare-and-swap so N racing connection threads produce ONE line), info
+whenever `needed > 0.9 * available` — the band where the next request is the
+one that evicts or refuses — and debug otherwise, because a roomy machine
+would otherwise write one info line per request for the life of the process.
+The level check runs FIRST and the byte divisions and verdict string happen
+only after it; under `--log-level warn` the call returns before it can even
+consume the post-load token, which must not be spent on a line that was never
+going to be written.
 
 ### Rules this produced
 
+- A width chosen from free memory is asked TWICE around an eviction pass, and the
+  second reading is credited only the bytes the ALLOCATOR returned — never
+  `reclaimable`, never `accounted_bytes`. The clamp to the max is the assertion
+  that an eviction cannot take memory away.
+- An admission path logs its bill on the requests it ADMITS, not only on the
+  ones it refuses; both arms format the same fields from the same bill.
 - A resolver whose output is billed back against its own input is a loop; check
   monotonicity in the input before believing the output.
 - A knob that is read on both sides of a bill with opposite signs is not a

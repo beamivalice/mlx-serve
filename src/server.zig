@@ -4256,6 +4256,177 @@ test "the per-request rung is priced by the SAME estimator that admits it" {
     try t.expect(std.mem.indexOf(u8, src, "scheduler_mod.prefill_request_chunk = &requestPrefillChunkNow;") != null);
 }
 
+test "the post-eviction re-ask never narrows, and never runs on an arch that has no per-request width" {
+    // Audit N5, the composition the scheduler runs: `chooseRequestPrefillChunk`
+    // is asked once before the eviction pass and once after, and
+    // `scheduler.postEvictionPrefillChunk` clamps the pair. The pure halves are
+    // tested in their own files; this pins that the two compose to the right
+    // answer, including for the archs that never opted in.
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const seq: u64 = 383_000;
+    const pin: u32 = 512;
+    const floor_width = widthForRung(&cfg, seq, PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1]);
+
+    // Pre-eviction: the hot cache is holding everything, nothing on the ladder
+    // fits and the chooser hands back the floor. That is the width admission
+    // is billed at and the width the prefill used to run for its whole length.
+    const admitted = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, 0, pin, 0);
+    try t.expectEqual(floor_width, admitted);
+
+    // Post-eviction, with the cache's bytes ACTUALLY returned: a wider rung
+    // fits and the request runs at it.
+    const roomy: u64 = prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, widthForRung(&cfg, seq, 4096));
+    const reasked = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, roomy, pin, 0);
+    try t.expect(reasked > admitted);
+    try t.expectEqual(reasked, scheduler_mod.postEvictionPrefillChunk(admitted, reasked));
+
+    // No eviction pass: the single ask stands, whatever it was.
+    try t.expectEqual(admitted, scheduler_mod.postEvictionPrefillChunk(0, admitted));
+
+    // A non-qwen4 arch is untouched end to end: the chooser returns the
+    // load-time pin against ANY availability, so both readings are the pin and
+    // the clamp is a no-op. Same for the gate's kill switch on qwen4 itself.
+    var other = qwen4RequestTestConfig();
+    other.model_type = "qwen3_5";
+    const other_pre = chooseRequestPrefillChunk(&other, seq, 2048, kv_bits, 0, pin, 0);
+    const other_post = chooseRequestPrefillChunk(&other, seq, 2048, kv_bits, roomy, pin, 0);
+    try t.expectEqual(pin, other_pre);
+    try t.expectEqual(pin, other_post);
+    try t.expectEqual(pin, scheduler_mod.postEvictionPrefillChunk(other_pre, other_post));
+
+    per_request_chunk_override = false;
+    defer per_request_chunk_override = null;
+    const off_pre = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, 0, pin, 0);
+    const off_post = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, roomy, pin, 0);
+    try t.expectEqual(pin, scheduler_mod.postEvictionPrefillChunk(off_pre, off_post));
+}
+
+test "admissionLogLevel: free on the first request after a load and at the edge, quiet in the middle" {
+    const t = std.testing;
+    const GiB: u64 = 1 << 30;
+
+    // A fresh load is the reading that says what "normal" is for this
+    // checkpoint on this box — always free, however roomy the machine.
+    try t.expectEqual(log.Level.info, admissionLogLevel(1 * GiB, 100 * GiB, true));
+
+    // Inside 10% of what is available: the next request is the one that
+    // evicts or refuses, so this is where the operator needs the numbers.
+    try t.expectEqual(log.Level.info, admissionLogLevel(95 * GiB, 100 * GiB, false));
+    try t.expectEqual(log.Level.info, admissionLogLevel(120 * GiB, 100 * GiB, false)); // already over
+    // The boundary itself: 10*needed > 9*available, so exactly 0.9 is quiet
+    // and one byte past it talks.
+    try t.expectEqual(log.Level.debug, admissionLogLevel(90 * GiB, 100 * GiB, false));
+    try t.expectEqual(log.Level.info, admissionLogLevel(90 * GiB + 1, 100 * GiB, false));
+
+    // A roomy machine says nothing at info — one line per request forever is
+    // a log nobody greps.
+    try t.expectEqual(log.Level.debug, admissionLogLevel(1 * GiB, 100 * GiB, false));
+
+    // An unknown ceiling is inside the band by construction and reports.
+    try t.expectEqual(log.Level.info, admissionLogLevel(1 * GiB, 0, false));
+
+    // No overflow on the way to the comparison.
+    try t.expectEqual(log.Level.info, admissionLogLevel(std.math.maxInt(u64), 1, false));
+    try t.expectEqual(log.Level.debug, admissionLogLevel(1, std.math.maxInt(u64), false));
+}
+
+test "admissionVerdict names the same three arms the guard acts on" {
+    const t = std.testing;
+    // Fits outright.
+    try t.expectEqual(AdmissionVerdict.admit, admissionVerdict(.{ .needed = 10, .available = 20 }));
+    try t.expectEqual(AdmissionVerdict.admit, admissionVerdict(.{ .needed = 20, .available = 20 }));
+    // Fits once the cache gives back what it can PROVE it will return —
+    // `reclaimable`, never `evictable`.
+    try t.expectEqual(AdmissionVerdict.evict, admissionVerdict(.{ .needed = 30, .available = 20, .reclaimable = 10 }));
+    try t.expectEqual(AdmissionVerdict.refuse, admissionVerdict(.{ .needed = 30, .available = 20, .evictable = 1000, .reclaimable = 0 }));
+    // Does not fit at all.
+    try t.expectEqual(AdmissionVerdict.refuse, admissionVerdict(.{ .needed = 100, .available = 20, .reclaimable = 10 }));
+
+    try t.expectEqualStrings("admit", AdmissionVerdict.admit.name());
+    try t.expectEqualStrings("evict", AdmissionVerdict.evict.name());
+    try t.expectEqualStrings("refuse", AdmissionVerdict.refuse.name());
+}
+
+test "the admission line and the refusal quote the SAME bill, field for field" {
+    // The tight-admission path used to log nothing on an ADMITTED request:
+    // the numbers only appeared once the request had already been refused, so
+    // there was no way to watch the machine walk up to the edge. Adding a line
+    // is only worth it if it names the same numbers the refusal does — a
+    // second estimator call here would be #126 ("a gate that runs BEFORE the
+    // estimator that knows better IS the estimator") in log form, quoting a
+    // bill nobody acted on. Needles ++-split so this scan's own source cannot
+    // satisfy it.
+    const t = std.testing;
+    const src = @embedFile("server.zig");
+    const guard = declBody(src, "fn checkAttentionMemory(") orelse return error.CallSiteMoved;
+    const emitter = declBody(src, "fn logAdmissionDecision(") orelse return error.CallSiteMoved;
+
+    // ONE bill per request. Both arms read it; neither recomputes it.
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, guard, "prefillAdmission" ++ "Bill("));
+    try t.expect(std.mem.indexOf(u8, guard, "logAdmission" ++ "Decision(bill);") != null);
+    try t.expectEqual(@as(usize, 0), std.mem.count(u8, emitter, "prefillAdmission" ++ "Bill("));
+
+    // The same four fields, off the same struct, on both sides.
+    inline for (.{ "needed", "available", "reclaimable", "chunk" }) |field| {
+        try t.expect(std.mem.indexOf(u8, emitter, "bill." ++ field) != null);
+        try t.expect(std.mem.indexOf(u8, guard, "bill." ++ field) != null);
+    }
+    // And the refusal's own numbers are aliases of the bill's, not fresh reads.
+    try t.expect(std.mem.indexOf(u8, guard, "const needed = bill." ++ "needed;") != null);
+    try t.expect(std.mem.indexOf(u8, guard, "const available = bill." ++ "available;") != null);
+
+    // The contract line's shape — the operator (and any harness) greps it.
+    try t.expect(std.mem.indexOf(u8, emitter, "[admission] needed={d} MB available={d} MB " ++ "reclaimable={d} MB width={d} verdict={s}") != null);
+
+    // ONE line per REQUEST, so it is emitted from the once-per-request guard
+    // and nowhere else — never from the prefill chunk loop.
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, src, "logAdmission" ++ "Decision(bill);"));
+    const sched = @embedFile("scheduler.zig");
+    try t.expect(std.mem.indexOf(u8, sched, "[admission] " ++ "needed=") == null);
+    const gen = @embedFile("generate.zig");
+    try t.expect(std.mem.indexOf(u8, gen, "[admission] " ++ "needed=") == null);
+
+    // The level check comes BEFORE the formatting: the divisions and the
+    // verdict string are this call's whole cost.
+    const i_check = std.mem.indexOf(u8, emitter, "if (!log." ++ "enabled(level)) return;") orelse return error.CallSiteMoved;
+    const i_fmt = std.mem.indexOf(u8, emitter, "[admission] " ++ "needed=") orelse return error.CallSiteMoved;
+    try t.expect(i_check < i_fmt);
+}
+
+test "the post-load admission line is armed by the registry, and consumed once" {
+    // "First request after a load" needs an event, not a timer. The registry's
+    // ONE ready transition is that event; a second reader (or N connection
+    // threads racing the same first request) must not each get their own
+    // "first", which is why the token is consumed by a compare-and-swap on a
+    // monotone generation rather than by clearing a flag. Needles ++-split so
+    // this scan cannot satisfy itself.
+    const t = std.testing;
+    const src = @embedFile("server.zig");
+    const reg = @embedFile("model_registry.zig");
+
+    // Armed at the ONE place a model becomes resident. `markReadyLocked` is a
+    // method, so its closing brace is indented and `declBody` (column-0 only)
+    // would swallow the rest of the struct — bound the window by hand.
+    const ready_at = std.mem.indexOf(u8, reg, "\n    pub fn markReadyLocked(") orelse return error.CallSiteMoved;
+    const ready_end = std.mem.indexOfPos(u8, reg, ready_at + 1, "\n    }\n") orelse return error.CallSiteMoved;
+    const ready = reg[ready_at..ready_end];
+    try t.expect(std.mem.indexOf(u8, ready, "load_generation" ++ ".fetchAdd(1, .monotonic)") != null);
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, reg, "load_generation" ++ ".fetchAdd("));
+
+    // Consumed by a CAS, not a load-then-store: two threads must not both win.
+    const first = declBody(src, "fn firstRequestAfterLoad(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, first, "model_registry_mod.load" ++ "_generation.load(.monotonic)") != null);
+    try t.expect(std.mem.indexOf(u8, first, "cmpxchg" ++ "Strong(last, gen") != null);
+    try t.expect(std.mem.indexOf(u8, first, ".store(") == null);
+
+    // And it is CALLED exactly once — the level function's third input and
+    // nothing else's. Keyed on the call's closing `);` so the declaration's own
+    // header is not counted as a use.
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, src, "firstRequest" ++ "AfterLoad());"));
+}
+
 test "every post-load hot-cache reserve reads the RESOLVED budget, not the ask" {
     // `prefixCacheMemForLoad` clamps, but the clamped value used to reach only
     // `initWithMem`: the auto-context sizer and the ANE gate kept reserving
@@ -5139,6 +5310,94 @@ pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: us
     return .{ .needed = needed, .available = available, .evictable = evictable, .reclaimable = reclaimable, .chunk = chunk };
 }
 
+/// What the admission guard decided, derived from ONE bill so the log line and
+/// the arm that acts on it cannot disagree. Mirrors `checkAttentionMemory`'s
+/// three arms exactly (scan-pinned below): fits outright, fits once the hot
+/// cache gives back what it PROVABLY can, or does not fit at all.
+pub const AdmissionVerdict = enum {
+    admit,
+    evict,
+    refuse,
+
+    pub fn name(self: AdmissionVerdict) []const u8 {
+        return switch (self) {
+            .admit => "admit",
+            .evict => "evict",
+            .refuse => "refuse",
+        };
+    }
+};
+
+pub fn admissionVerdict(bill: AdmissionBill) AdmissionVerdict {
+    if (bill.fits()) return .admit;
+    if (bill.fitsAfterEviction()) return .evict;
+    return .refuse;
+}
+
+/// The generation of `markReadyLocked` the last info-level admission line was
+/// emitted for. `maxInt` is never a real generation, so the first request of
+/// the process is also a "first after a load".
+var admission_logged_generation = std.atomic.Value(u64).init(std.math.maxInt(u64));
+
+/// Has a model become resident since the last time this returned true?
+/// Consuming (compare-and-swap on the generation) so N concurrent connection
+/// threads racing the first request after a load produce ONE info line, not N.
+fn firstRequestAfterLoad() bool {
+    const gen = model_registry_mod.load_generation.load(.monotonic);
+    const last = admission_logged_generation.load(.monotonic);
+    if (gen == last) return false;
+    return admission_logged_generation.cmpxchgStrong(last, gen, .monotonic, .monotonic) == null;
+}
+
+/// PURE: the level ONE admission line is emitted at.
+///
+/// Info on the first request after a load — the operator's first look at a
+/// fresh model is the reading that has to be free, because it is the only one
+/// that says what "normal" is for this checkpoint on this box — and info
+/// whenever the bill is within 10% of what is available, the band where the
+/// NEXT request is the one that evicts or refuses. Debug otherwise: a roomy
+/// machine would otherwise write one info line per request for the life of the
+/// process, and a log that always talks is a log nobody greps.
+///
+/// `available == 0` (an unknown arch, or a ceiling already fully spent) is
+/// inside the band by construction and reports.
+pub fn admissionLogLevel(needed: u64, available: u64, first_after_load: bool) log.Level {
+    if (first_after_load) return .info;
+    // `needed > 0.9 * available` without floating point and without an
+    // overflow on the way: 10*needed > 9*available.
+    if (needed *| 10 > available *| 9) return .info;
+    return .debug;
+}
+
+/// ONE line per REQUEST at the admission decision — never per chunk, and on
+/// ADMITTED requests too, which is what was missing: a tight admission that
+/// went through logged nothing at all, so the numbers only ever appeared once
+/// the request had already been refused, and there was no way to see the
+/// machine walking up to the edge.
+///
+/// Every field comes off the SAME `bill` the arms below act on and the refusal
+/// message quotes, so the two cannot name different numbers for the same
+/// request (scan-pinned). The level check runs FIRST: the divisions and the
+/// verdict string are the whole cost of this call and none of them happen on
+/// the debug-suppressed path.
+fn logAdmissionDecision(bill: AdmissionBill) void {
+    // `info` is the LOUDEST level this line is ever emitted at, so under
+    // `--log-level warn` nothing here can print — and `firstRequestAfterLoad`
+    // CONSUMES the post-load token, which must not be spent on a line that was
+    // never going to be written.
+    if (!log.enabled(.info)) return;
+    const level = admissionLogLevel(bill.needed, bill.available, firstRequestAfterLoad());
+    if (!log.enabled(level)) return;
+    const mb = 1024 * 1024;
+    log.atLevel(level, "[admission] needed={d} MB available={d} MB reclaimable={d} MB width={d} verdict={s}\n", .{
+        bill.needed / mb,
+        bill.available / mb,
+        bill.reclaimable / mb,
+        bill.chunk,
+        admissionVerdict(bill).name(),
+    });
+}
+
 /// Inference-thread predicate behind `Scheduler`'s admission hook: does this
 /// request fit RIGHT NOW, with live memory re-read? Re-asked after every
 /// hot-cache eviction, so the estimator — not a precomputed shortfall —
@@ -5176,6 +5435,8 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids:
     if (!mlxMemoryGuardApplies(lm.ds4_engine != null, lm.llama_engine != null)) return true;
     if (config.num_attention_heads == 0) return true; // unknown architecture, skip check
     const bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_override, unchunked_prefill, prompt_ids);
+    // ONE line per request, all three verdicts, from THIS bill.
+    logAdmissionDecision(bill);
     const needed = bill.needed;
     const available = bill.available;
     // LIMIT THE CACHE WHILE MEMORY IS LEFT (issue #353). A resident hot-cache
