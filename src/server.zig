@@ -1260,6 +1260,11 @@ pub fn serve(
     defer scheduler_mod.prefill_request_chunk = null;
     scheduler_mod.prefill_admission_refused_log = &logPrefillRefusal;
     defer scheduler_mod.prefill_admission_refused_log = null;
+    // Fourth of the family, and the only one the PREFILL LOOP asks rather
+    // than the scheduler: the width of the next chunk, re-priced at every
+    // boundary by the same estimator.
+    scheduler_mod.prefill_chunk_adapt = &adaptivePrefillWidthNow;
+    defer scheduler_mod.prefill_chunk_adapt = null;
 
     // Gauge sampler: samples instantaneous system + queue state every 2 s and
     // writes the metrics gauges. Only runs when --metrics is on. Trivial cost
@@ -4561,6 +4566,162 @@ pub fn requestPrefillChunkNow(
         log.debug("[prefill] chunk {d} for this request (reserve {d} MB beside KV {d} MB)\n", .{ width, prefillTransientReserve(config, kv_bits, width) >> 20, kv_bytes >> 20 });
     }
     return chosen;
+}
+
+/// Test hook for `adaptivePrefillChunkEnabled`'s kill switch.
+pub var adaptive_chunk_override: ?bool = null;
+
+/// The per-CHUNK adaptive width: subordinate to the per-REQUEST gate (arch +
+/// its own kill switch, so one switch disables both), plus
+/// `MLX_SERVE_PREFILL_CHUNK_ADAPTIVE=0`, plus "no operator pinned a width".
+/// An explicit `--prefill-chunk` or `MLX_SERVE_PREFILL_CHUNK` means every
+/// forward runs that width and nothing narrows or widens it — the precedence
+/// `effectivePrefillChunk` already keeps. Absent or anything but "0" leaves it
+/// on, so an unset variable is the ON arm.
+pub fn adaptivePrefillChunkEnabled(config: *const model_mod.ModelConfig) bool {
+    // Arch first: it is the cheapest and by far the most selective of the
+    // four, and this runs once per chunk BOUNDARY rather than once per
+    // request.
+    if (!config.perRequestPrefillChunk()) return false;
+    if (explicitPrefillChunk() > 0) return false;
+    if (generate_mod.envPrefillChunk() > 0) return false;
+    if (!perRequestPrefillChunkEnabled(config)) return false;
+    if (adaptive_chunk_override) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_PREFILL_CHUNK_ADAPTIVE") orelse return true;
+    return !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
+}
+
+/// Consecutive supporting probes a WIDENING needs. One probe is a moment; two
+/// is a trend, and the probe is taken after `mlx_clear_cache` so it never
+/// contains a chunk's own peak — the second reading is what pays for that
+/// blind spot.
+pub const PREFILL_WIDEN_PROBES: u8 = 2;
+
+/// PURE: what one chunk of `width` costs BEYOND what is already resident —
+/// its transient envelope plus the per-token state the chunk itself is about
+/// to write. `prefillTransientReserve` is the #126 one estimator (the same
+/// function the load-time sizer and the hot-cache clamp bill); the growth term
+/// is the KV and out-of-cache state for `width` more tokens.
+///
+/// Under the default reservation the KV buffer is resident from chunk 0 for
+/// every prompt this feature targets, so the growth term is usually already
+/// paid — it is billed anyway because `MLX_SERVE_KV_RESERVE=0` and prompts
+/// under `RESERVE_MIN_TOKENS` do grow per chunk, and a safety step-down that
+/// is wrong is an uncatchable Metal abort.
+pub fn prefillChunkCost(config: *const model_mod.ModelConfig, kv_bits: u64, width: u64) u64 {
+    const per_tok: u64 = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +|
+        statePerTokenBilled(config);
+    return prefillTransientReserve(config, kv_bits, width) +| (width *| per_tok);
+}
+
+/// PURE: the width the NEXT chunk runs at, and the state that decision leaves.
+///
+/// ASYMMETRIC on purpose — a Metal working-set abort is uncatchable, so the
+/// two directions are not the same bet:
+///   HOLD while `headroom >= cost(current)`, margin 1.0. The estimator
+///     already carries its own 5/4; a second 1.25 here would step the 768k
+///     prompt this feature is for from the width admission ADMITTED (2048)
+///     down to 1024 — a regression dressed as caution.
+///   STEP DOWN immediately, by as many rungs as it takes, to the widest rung
+///     that holds; floored at `PREFILL_CHUNK_FLOOR` (at the floor it simply
+///     continues — admission already decided whether this request runs).
+///   WIDEN one rung, only at 1.25x its cost, only after
+///     `PREFILL_WIDEN_PROBES` consecutive supporting probes, only up to `cap`,
+///     and never after a step-down.
+///
+/// `cap` is the widest width this arch will forward for this prompt
+/// (`generate.effectivePrefillChunk` at the arch cap) — never a raw ladder
+/// rung, or the top of the ladder gets picked for a width that never runs.
+pub fn adaptivePrefillWidth(
+    config: *const model_mod.ModelConfig,
+    kv_bits: u64,
+    headroom: u64,
+    current: u32,
+    cap: u32,
+    st: *generate_mod.AdaptiveWidthState,
+) u32 {
+    if (cap == 0 or current == 0) return current;
+    const floor: u32 = @min(cap, @as(u32, @intCast(generate_mod.PREFILL_CHUNK_FLOOR)));
+
+    if (prefillChunkCost(config, kv_bits, current) > headroom) {
+        st.supporting = 0;
+        st.ratcheted = true;
+        var best: u32 = floor;
+        for (PREFILL_CHUNK_LADDER) |rung| {
+            const w: u32 = @min(rung, cap);
+            if (w >= current) continue;
+            if (prefillChunkCost(config, kv_bits, w) <= headroom) {
+                best = w;
+                break;
+            }
+        }
+        return @min(best, current);
+    }
+
+    // The narrowest rung strictly wider than the current width, capped.
+    var next: u32 = 0;
+    for (PREFILL_CHUNK_LADDER) |rung| {
+        const w: u32 = @min(rung, cap);
+        if (w > current and (next == 0 or w < next)) next = w;
+    }
+    if (next == 0 or st.ratcheted) {
+        st.supporting = 0;
+        return current;
+    }
+    const asked: u64 = prefillChunkCost(config, kv_bits, next) *| 5 / 4;
+    if (asked > headroom) {
+        st.supporting = 0;
+        return current;
+    }
+    st.supporting +|= 1;
+    if (st.supporting < PREFILL_WIDEN_PROBES) return current;
+    st.supporting = 0;
+    return next;
+}
+
+/// The live headroom one prefill chunk has to fit in: the GPU ceiling less
+/// what MLX's allocator is holding. Allocator counters, not a GPU barrier —
+/// one host read per chunk BOUNDARY is the whole cost, and it is taken after
+/// the boundary's `mlx_clear_cache` so the reading is the steady state the
+/// next chunk starts from rather than the previous chunk's peak.
+///
+/// The same expression `prefillAdmissionBill` compares against, so the width
+/// the loop takes mid-prefill and the width admission billed are answers to
+/// the same question asked at two moments.
+pub fn prefillHeadroomNow() u64 {
+    var active_mem: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active_mem);
+    return currentGpuMemoryCeiling(active_mem) -| active_mem;
+}
+
+/// Impure wrapper the prefill loop reaches through `generate.prefill_chunk_adapt`
+/// (installed beside the scheduler's three admission hooks — this module owns
+/// the estimator and neither generate.zig nor scheduler.zig imports it).
+///
+/// Logs one line per CHANGE, never per boundary: a width that walks
+/// 4096 -> 2048 -> 1024 down a long prompt says so twice, a steady one says
+/// nothing. The line is a CONTRACT (the bench harness greps it).
+pub fn adaptivePrefillWidthNow(
+    config: *const model_mod.ModelConfig,
+    kv_bits: u64,
+    pos: usize,
+    current: u32,
+    cap: u32,
+    st: *generate_mod.AdaptiveWidthState,
+) u32 {
+    if (!adaptivePrefillChunkEnabled(config)) return current;
+    const headroom = prefillHeadroomNow();
+    const next = adaptivePrefillWidth(config, kv_bits, headroom, current, cap, st);
+    if (next != current) {
+        log.info("[prefill] width {d} -> {d} at pos {d} (headroom {d} MB, reserve {d} MB)\n", .{
+            current,
+            next,
+            pos,
+            headroom >> 20,
+            prefillTransientReserve(config, kv_bits, next) >> 20,
+        });
+    }
+    return next;
 }
 
 pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_override: ?transformer_mod.KVQuantConfig, unchunked_prefill: bool, prompt_tokens: ?[]const u32) AdmissionBill {
@@ -20821,4 +20982,270 @@ test "both hot-cache budget arms publish hot_cache_mem_resolved" {
     // not already own.
     const with_idle = ssdFirstPrefixCacheMem(4 * GB, 120 * GB, 70 * GB, ctx_kv, 4 * GB);
     try std.testing.expectEqual(@as(u64, 4 * GB), with_idle -| ctx_kv);
+}
+
+
+/// The widest width the adaptive chooser may take for a prompt on this
+/// config — `generate.effectivePrefillChunk` at the arch cap, spelled once so
+/// the tests cannot drift from the loop.
+fn adaptCapFor(cfg: *const model_mod.ModelConfig, seq: u64) u32 {
+    return widthForRung(cfg, seq, PREFILL_CHUNK_LADDER[0]);
+}
+
+test "adaptivePrefillWidth: a step-down is immediate, by as many rungs as it takes, and never 0" {
+    // A Metal working-set abort is uncatchable, so the DOWN direction does not
+    // wait for a trend, a margin, or a second opinion: the chunk that would
+    // not fit is the next one.
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const seq: u64 = 1_048_576;
+    const cap = adaptCapFor(&cfg, seq);
+
+    // One rung: headroom below the current width's bill, at or above the next.
+    {
+        var st: generate_mod.AdaptiveWidthState = .{};
+        const h = prefillChunkCost(&cfg, kv_bits, 2048);
+        try t.expect(h < prefillChunkCost(&cfg, kv_bits, cap));
+        try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, h, cap, cap, &st));
+        try t.expect(st.ratcheted);
+    }
+    // Several rungs, in ONE call — waiting a boundary per rung is waiting
+    // inside the abort.
+    {
+        var st: generate_mod.AdaptiveWidthState = .{};
+        const h = prefillChunkCost(&cfg, kv_bits, 512);
+        try t.expectEqual(@as(u32, 512), adaptivePrefillWidth(&cfg, kv_bits, h, cap, cap, &st));
+    }
+    // No headroom at all: the ladder FLOOR, never 0 — the loop reads 0 as
+    // "no change" and admission already decided whether this request runs.
+    {
+        var st: generate_mod.AdaptiveWidthState = .{};
+        const got = adaptivePrefillWidth(&cfg, kv_bits, 0, cap, cap, &st);
+        try t.expectEqual(@as(u32, @intCast(generate_mod.PREFILL_CHUNK_FLOOR)), got);
+        try t.expect(got != 0);
+    }
+    // Already at the floor: it stays there rather than reporting 0.
+    {
+        var st: generate_mod.AdaptiveWidthState = .{};
+        const floor: u32 = @intCast(generate_mod.PREFILL_CHUNK_FLOOR);
+        try t.expectEqual(floor, adaptivePrefillWidth(&cfg, kv_bits, 0, floor, cap, &st));
+    }
+}
+
+test "adaptivePrefillWidth: HOLD is margin 1.0 — the admitted width is not second-guessed" {
+    // The regression this bar exists for: `prefillMemoryNeeded` already
+    // carries its own 5/4, so a second 1.25 on the HOLD would take the 768k
+    // prompt this feature is for from the width admission ADMITTED (2048 at
+    // the default ceiling) down to 1024 at its very first boundary — the
+    // feature making the request slower than not having it.
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const cap = adaptCapFor(&cfg, 786_432);
+    const cost_2k = prefillChunkCost(&cfg, kv_bits, 2048);
+
+    // Exactly its own bill: it holds.
+    var st: generate_mod.AdaptiveWidthState = .{};
+    try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, cost_2k, 2048, cap, &st));
+    try t.expect(!st.ratcheted);
+    // And anywhere below a 1.25 hold's bar, which is where a margined HOLD
+    // would have stepped down.
+    try t.expect(cost_2k * 5 / 4 > cost_2k);
+    var st2: generate_mod.AdaptiveWidthState = .{};
+    try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, cost_2k * 5 / 4 - 1, 2048, cap, &st2));
+    // One byte short of its own bill is the other side of the line.
+    var st3: generate_mod.AdaptiveWidthState = .{};
+    try t.expect(adaptivePrefillWidth(&cfg, kv_bits, cost_2k - 1, 2048, cap, &st3) < 2048);
+}
+
+test "adaptivePrefillWidth: a widen costs 1.25x AND two consecutive supporting probes" {
+    // The probe is taken after the chunk's `mlx_clear_cache`, so it never
+    // contains a chunk's own peak. One reading is a moment; the second is
+    // what pays for that blind spot. And the margin is asymmetric on purpose:
+    // holding is free, growing is a bet.
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const cap = adaptCapFor(&cfg, 524_288);
+    const cost_up = prefillChunkCost(&cfg, kv_bits, cap);
+
+    // Plenty of room: still NOT on the first probe.
+    var st: generate_mod.AdaptiveWidthState = .{};
+    try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, cost_up * 4, 2048, cap, &st));
+    try t.expectEqual(@as(u8, 1), st.supporting);
+    try t.expectEqual(cap, adaptivePrefillWidth(&cfg, kv_bits, cost_up * 4, 2048, cap, &st));
+    try t.expectEqual(@as(u8, 0), st.supporting); // and the count restarts at the new width
+
+    // Room for the wider chunk's BILL but not its margin: never, however many
+    // probes agree.
+    var st2: generate_mod.AdaptiveWidthState = .{};
+    const between = cost_up * 5 / 4 - 1;
+    try t.expect(between >= cost_up);
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, between, 2048, cap, &st2));
+    }
+
+    // A single unsupporting probe RESETS the run: "two consecutive", not
+    // "two ever".
+    var st3: generate_mod.AdaptiveWidthState = .{};
+    try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, cost_up * 4, 2048, cap, &st3));
+    try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, between, 2048, cap, &st3));
+    try t.expectEqual(@as(u8, 0), st3.supporting);
+    try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, cost_up * 4, 2048, cap, &st3));
+}
+
+test "adaptivePrefillWidth: the ratchet is one-way, and the cap is a ceiling" {
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const cap = adaptCapFor(&cfg, 1_048_576);
+
+    // Step down once, then hand it the whole machine: it stays. The pressure
+    // that took the width away is a property of this minute, and re-widening
+    // into it turns a safety net into a metronome.
+    var st: generate_mod.AdaptiveWidthState = .{};
+    const narrowed = adaptivePrefillWidth(&cfg, kv_bits, prefillChunkCost(&cfg, kv_bits, 1024), cap, cap, &st);
+    try t.expect(narrowed < cap);
+    try t.expect(st.ratcheted);
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        try t.expectEqual(narrowed, adaptivePrefillWidth(&cfg, kv_bits, std.math.maxInt(u64) / 2, narrowed, cap, &st));
+    }
+
+    // Nothing above the arch cap, ever — a wider rung is a width that never
+    // runs, and picking it would be picking it for the wrong reason.
+    var st2: generate_mod.AdaptiveWidthState = .{};
+    i = 0;
+    while (i < 8) : (i += 1) {
+        try t.expectEqual(cap, adaptivePrefillWidth(&cfg, kv_bits, std.math.maxInt(u64) / 2, cap, cap, &st2));
+    }
+    // A cap of 0 (the unchunked vision arm) is "do not touch the width".
+    var st3: generate_mod.AdaptiveWidthState = .{};
+    try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, 0, 2048, 0, &st3));
+}
+
+test "adaptivePrefillWidth: a 1M prompt walks DOWN as the box fills, and a small one never moves" {
+    // The mechanism, as a sweep rather than a cell: whatever the box does to
+    // the headroom, the width is the widest rung that fits it, it only ever
+    // narrows within one prefill, and every width it picks is one the arch
+    // will actually forward.
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const MiB: u64 = 1 << 20;
+    const cap = adaptCapFor(&cfg, 1_048_576);
+
+    var st: generate_mod.AdaptiveWidthState = .{};
+    var width: u32 = cap;
+    var seen_narrower: usize = 0;
+    var headroom: u64 = 50 * 1024 * MiB; // the wired-limit box, quiet
+    var step: usize = 0;
+    while (step < 64) : (step += 1) {
+        const next = adaptivePrefillWidth(&cfg, kv_bits, headroom, width, cap, &st);
+        try t.expect(next <= width); // never widens after the first step-down
+        try t.expect(next >= @as(u32, @intCast(generate_mod.PREFILL_CHUNK_FLOOR)));
+        try t.expect(next <= cap);
+        // Whatever it picked, it fits — or it is the floor and there is
+        // nothing narrower to pick.
+        try t.expect(prefillChunkCost(&cfg, kv_bits, next) <= headroom or
+            next == @as(u32, @intCast(generate_mod.PREFILL_CHUNK_FLOOR)));
+        if (next < width) seen_narrower += 1;
+        width = next;
+        headroom -|= 1024 * MiB; // a co-tenant, or the accreting state
+    }
+    // It really did walk down the ladder rather than falling off it in one go.
+    try t.expect(seen_narrower >= 2);
+    try t.expectEqual(@as(u32, @intCast(generate_mod.PREFILL_CHUNK_FLOOR)), width);
+
+    // A 32k prompt on the same box: the width never moves, so the machinery
+    // is inert and the prefill is the one it was admitted as.
+    var st2: generate_mod.AdaptiveWidthState = .{};
+    const cap32 = adaptCapFor(&cfg, 32_768);
+    var w32: u32 = cap32;
+    step = 0;
+    while (step < 16) : (step += 1) {
+        w32 = adaptivePrefillWidth(&cfg, kv_bits, 50 * 1024 * MiB, w32, cap32, &st2);
+        try t.expectEqual(cap32, w32);
+    }
+    try t.expect(!st2.ratcheted);
+}
+
+test "adaptivePrefillChunkEnabled: the arch, both kill switches, and any pinned width" {
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    var other = qwen4RequestTestConfig();
+    other.model_type = "qwen3_5_moe";
+
+    try t.expect(adaptivePrefillChunkEnabled(&cfg));
+    // Another arch never adapts: the per-request width is qwen4_exp-only and
+    // this is subordinate to it, so ONE switch disables both.
+    try t.expect(!adaptivePrefillChunkEnabled(&other));
+
+    // The per-REQUEST kill switch takes the per-CHUNK one with it.
+    per_request_chunk_override = false;
+    try t.expect(!adaptivePrefillChunkEnabled(&cfg));
+    per_request_chunk_override = null;
+    try t.expect(adaptivePrefillChunkEnabled(&cfg));
+
+    // Its own kill switch.
+    adaptive_chunk_override = false;
+    try t.expect(!adaptivePrefillChunkEnabled(&cfg));
+    adaptive_chunk_override = null;
+
+    // An operator who pinned a width pinned EVERY forward — the same
+    // precedence `effectivePrefillChunk` keeps for the flag and the env.
+    generate_mod.prefill_chunk_override = 4096;
+    generate_mod.prefill_chunk_explicit = true;
+    defer {
+        generate_mod.prefill_chunk_override = 8192;
+        generate_mod.prefill_chunk_explicit = false;
+    }
+    try t.expect(!adaptivePrefillChunkEnabled(&cfg));
+}
+
+test "the per-chunk width is ONE estimator away from the admission bill, and says so once per change" {
+    // Three claims, all scan-pinned because the whole feature is a second
+    // opinion about the same bytes: the chooser prices with the estimator the
+    // load-time sizer and the hot-cache clamp already share (#126), the
+    // ADMISSION bill never learns about it (the width the request was admitted
+    // at is the width it is billed at, forever), and the transition line is a
+    // CONTRACT the bench harness greps.
+    const t = std.testing;
+    const src = @embedFile("server.zig");
+
+    // One chooser, and it bills through `prefillChunkCost` -> the shared
+    // `prefillTransientReserve`. Needles split so this test's own source
+    // cannot satisfy them.
+    try t.expectEqual(@as(usize, 1), countDecls(src, "pub fn adaptivePrefill" ++ "Width("));
+    const chooser = declBody(src, "pub fn adaptivePrefill" ++ "Width(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, chooser, "prefillChunk" ++ "Cost(") != null);
+    const cost = declBody(src, "pub fn prefillChunk" ++ "Cost(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, cost, "prefillTransient" ++ "Reserve(") != null);
+
+    // The admission bill is untouched by it: it must not consult a width the
+    // prefill might move to later, or the guard and the forward drift.
+    const bill = declBody(src, "pub fn prefillAdmission" ++ "Bill(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, bill, "adaptivePrefill") == null);
+
+    // The probe is one live read per boundary and reads the same ceiling every
+    // request-time guard does.
+    const probe = declBody(src, "pub fn prefillHeadroom" ++ "Now()") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, probe, "currentGpuMemory" ++ "Ceiling(") != null);
+    try t.expect(std.mem.indexOf(u8, probe, "staticGpuMemory" ++ "Ceiling()") == null);
+
+    // The transition line, byte for byte.
+    const impure = declBody(src, "pub fn adaptivePrefillWidth" ++ "Now(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, impure, "[prefill] width {d} -> {d} at pos {d} (headroom {d} MB, reserve {d} MB)") != null);
+    // ...and the kill switch is consulted before anything is logged or moved.
+    try t.expect(std.mem.indexOf(u8, impure, "adaptivePrefillChunkEnabled(") != null);
+    try t.expect(std.mem.indexOf(u8, src, "MLX_SERVE_PREFILL_CHUNK_ADAPTIVE") != null);
+
+    // And the loop asks it through the hook, not through an import.
+    const gen = @embedFile("generate.zig");
+    try t.expect(std.mem.indexOf(u8, gen, "options.chunk_width_hook") != null);
+    const sched = @embedFile("scheduler.zig");
+    try t.expect(std.mem.indexOf(u8, sched, "prefill_chunk_adapt") != null);
+    try t.expect(std.mem.indexOf(u8, src, "scheduler_mod.prefill_chunk_adapt = &adaptivePrefillWidthNow;") != null);
 }

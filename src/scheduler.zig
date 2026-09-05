@@ -312,6 +312,19 @@ pub var prefill_admission_fits: ?*const fn (*const model_mod.ModelConfig, usize,
 /// exactly the behaviour every arch but qwen4_exp gets anyway.
 pub var prefill_request_chunk: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool) u32 = null;
 
+/// Fourth of the family, and the only one the PREFILL LOOP asks rather than
+/// the scheduler: the width of the NEXT chunk, re-priced at every chunk
+/// boundary against live memory (`server.adaptivePrefillWidthNow`). Null keeps
+/// the request's admitted width for the whole prefill.
+pub var prefill_chunk_adapt: ?*const fn (
+    *const model_mod.ModelConfig,
+    u64,
+    usize,
+    u32,
+    u32,
+    *generate_mod.AdaptiveWidthState,
+) u32 = null;
+
 /// Twin of the above for the REFUSAL: logs the numbers the estimator
 /// compared, from the module that owns them. A refusal quotes the number it
 /// compared, and the scheduler cannot format a bill it has no estimator for.
@@ -5346,6 +5359,29 @@ fn writeThroughArmed(slot: *Slot) bool {
     return d.writer != null and slot.vision_key == 0;
 }
 
+/// Context for `Generator.InitOptions.chunk_width_hook`: everything the
+/// per-chunk width policy needs about THIS request, and nothing about the
+/// scheduler. `cfg` is optional because a slot's model may carry none (the
+/// embedded engines), in which case the hook is a no-op and the prefill keeps
+/// its admitted width.
+const ChunkWidthCtx = struct {
+    cfg: ?*const model_mod.ModelConfig,
+    kv_bits: u64,
+};
+
+fn chunkWidthCb(
+    opaque_ctx: *anyopaque,
+    pos: usize,
+    cur: u32,
+    cap: u32,
+    st: *generate_mod.AdaptiveWidthState,
+) u32 {
+    const wc: *ChunkWidthCtx = @ptrCast(@alignCast(opaque_ctx));
+    const cfg = wc.cfg orelse return cur;
+    const pick = prefill_chunk_adapt orelse return cur;
+    return pick(cfg, wc.kv_bits, pos, cur, cap, st);
+}
+
 fn interleaveDecodeTickCb(opaque_ctx: *anyopaque) void {
     const ic: *InterleaveCtx = @ptrCast(@alignCast(opaque_ctx));
     if (ic.ticks == 0) {
@@ -5682,6 +5718,14 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // out of prefill_ns below (the decoding slots got the time).
     var interleave_ctx = InterleaveCtx{ .sch = sch };
     var write_through_ctx = WriteThroughCtx{ .slot = slot };
+    // Per-CHUNK prefill width. The context is this request's config and KV
+    // width; the POLICY and the live probe live in server.zig, reached through
+    // the fourth admission hook. Stack-scoped like `interleave_ctx` — it must
+    // outlive `initWithOptions`, and nothing else may see it.
+    var width_ctx = ChunkWidthCtx{
+        .cfg = slot.model.config,
+        .kv_bits = if (slot.cache.config.scheme == .off) 16 else slot.cache.config.bits,
+    };
 
     // Ownership of the restored spec caches transfers AT THE CALL:
     // initWithOptions adopts them and frees them via its own errdefers on
@@ -5767,6 +5811,10 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             // Mechanism 3, SSD-first only.
             .write_through_hook = if (writeThroughArmed(slot))
                 .{ .ctx = &write_through_ctx, .call = prefillWriteThroughCb }
+            else
+                null,
+            .chunk_width_hook = if (prefill_chunk_adapt != null)
+                .{ .ctx = &width_ctx, .call = chunkWidthCb }
             else
                 null,
             // Init's argmax-only gate must see logprobs BEFORE the split-

@@ -42,6 +42,31 @@ pub var prefill_chunk_override: usize = 8192;
 pub var prefill_chunk_explicit: bool = false;
 pub var prefill_trace_force: bool = false;
 
+/// The width `MLX_SERVE_PREFILL_CHUNK` asked for, or 0 when nothing did.
+/// `effectivePrefillChunk` honours it VERBATIM, so it is also the thing that
+/// turns the per-chunk adaptive width off: an operator who pinned a width
+/// pinned every forward.
+pub fn envPrefillChunk() usize {
+    return readEnvUsize("MLX_SERVE_PREFILL_CHUNK", 0);
+}
+
+/// The state one prefill carries between chunk boundaries for the adaptive
+/// width. Lives on `runPrefill`'s stack, so it dies with the request and two
+/// concurrent prefills cannot share a ratchet. The POLICY that reads it is
+/// `server.adaptivePrefillWidth`; the type lives here because the loop owns
+/// the instance and this module has no server.zig import.
+pub const AdaptiveWidthState = struct {
+    /// Consecutive probes that supported the next rung up.
+    supporting: u8 = 0,
+    /// One-way ratchet: a prefill that has stepped DOWN never widens again.
+    ratcheted: bool = false,
+    /// Summary, for the one per-request line: how many times the width moved,
+    /// and the headroom at the first and last probe.
+    transitions: u32 = 0,
+    width_min: u32 = 0,
+    width_max: u32 = 0,
+};
+
 /// MTP prefill-history window (`--mtp-history-window`; 0 = full history).
 /// Same set-once-at-CLI-parse contract as `prefill_chunk_override`.
 /// DEFAULT 0 (full): the A/B gate failed for windowing — at 64K ctx on the
@@ -1822,6 +1847,13 @@ pub const Generator = struct {
         interleave_hook: ?InterleaveHook = null,
         /// SSD-first mechanism 3 (qwen4_exp only; see `WriteThroughHook`).
         write_through_hook: ?WriteThroughHook = null,
+        /// The per-CHUNK prefill width. Asked at every chunk boundary AFTER
+        /// that chunk's `mlx_clear_cache` and BEFORE the interleave tick, so
+        /// the probe behind it reads the steady state the next chunk starts
+        /// from and not the tick's allocations. Null keeps the request's
+        /// admitted width for the whole prefill — which is every arch but
+        /// qwen4_exp, every unit test, and every host without the HTTP server.
+        chunk_width_hook: ?ChunkWidthHook = null,
     };
 
     pub const InterleaveHook = struct {
@@ -1839,6 +1871,12 @@ pub const Generator = struct {
     pub const WriteThroughHook = struct {
         ctx: *anyopaque,
         call: *const fn (ctx: *anyopaque, abs_kv_pos: usize, cps: []const SSMCheckpoint) void,
+    /// Same shape as `InterleaveHook`: the caller owns the context, this loop
+    /// owns the `AdaptiveWidthState` it hands in. Returns the width the next
+    /// chunk should run at (`cur` unchanged = no change).
+    pub const ChunkWidthHook = struct {
+        ctx: *anyopaque,
+        call: *const fn (ctx: *anyopaque, pos: usize, cur: u32, cap: u32, st: *AdaptiveWidthState) u32,
     };
 
     /// Selects the source slice that `initWithOptions` will dupe into
@@ -2139,6 +2177,13 @@ pub const Generator = struct {
         // so that path is byte-identical to the old whole-prompt behavior.
         const vision_chunked = has_vision and visionChunkedPrefillEnabled();
         var vision_rows_consumed: usize = options.vision_rows_before;
+        // Per-request adaptive-width bookkeeping. Declared out here so the
+        // one summary line can be emitted beside the prefill trace, which
+        // sits outside the chunk loop's scope.
+        var adapt_state: AdaptiveWidthState = .{
+            .width_min = @intCast(PREFILL_CHUNK),
+            .width_max = @intCast(PREFILL_CHUNK),
+        };
 
         if (prompt_ids.len > 1) {
             const prefix_len = prompt_ids.len - 1;
@@ -2149,6 +2194,29 @@ pub const Generator = struct {
             // below keeps the row scatter chunk-exact. Kill switch restores
             // the whole-prompt forward.
             const default_chunk = if (has_vision and !vision_chunked) loop_end else PREFILL_CHUNK;
+            // PER-CHUNK adaptive width. The request's pin is what the first
+            // chunk runs; every boundary after it re-asks the SAME estimator
+            // admission used, against the memory the next chunk will actually
+            // run in. The prompt's own KV is the thing that moves: at 1M
+            // tokens on qwen4_exp the score sheet and the QSA mask grow with
+            // the KV until the width that was affordable at token 0 is not,
+            // and a fixed width has to be the LAST one to be right for the
+            // whole prompt. `cap_adapt` is the widest this arch will forward
+            // for this prompt (the pin left out on purpose — widening past it
+            // is the point), and it is never wider than `ssm_cp_stride`, so
+            // checkpointing still never sub-divides a chunk.
+            const adapt_chunked = !(has_vision and !vision_chunked);
+            const cap_adapt: u32 = if (!adapt_chunked) 0 else @intCast(effectivePrefillChunk(
+                xfm.config.prefillScoreHeadDim(),
+                xfm.config.num_attention_heads,
+                total_ctx_for_chunk,
+                xfm.config.has_sliding_window,
+                xfm.config.isMoe(),
+                0,
+            ));
+            adapt_state.width_min = @intCast(default_chunk);
+            adapt_state.width_max = @intCast(default_chunk);
+            var cur_chunk: usize = default_chunk;
             // Last-window MTP history: chunks entirely before the window skip
             // the full-hidden capture AND the head forward (see
             // mtp.SUGGESTED_HISTORY_WINDOW). 0 = capture every chunk.
@@ -2235,7 +2303,7 @@ pub const Generator = struct {
                 // chunk-locally. Boundary alignment is in ABSOLUTE position
                 // (pos + offset), so the saved snapshot list is correct for
                 // the full prompt, not the truncated tail.
-                const end = nextChunkEnd(pos, loop_end, default_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset);
+                const end = nextChunkEnd(pos, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset);
                 if (has_vision) ctx.vision_splice_offset = vision_rows_consumed;
                 const chunk_len: c_int = @intCast(end - pos);
                 const chunk_shape = [_]c_int{ 1, chunk_len };
@@ -2407,6 +2475,29 @@ pub const Generator = struct {
                 if (options.write_through_hook) |wt| {
                     wt.call(wt.ctx, pos + ssm_cp_offset, ssm_checkpoints.items);
                 }
+                // The width of the NEXT chunk, re-priced against live memory
+                // at this boundary and nowhere else. Two placements are
+                // load-bearing: AFTER the chunk's `mlx_clear_cache` above, so
+                // the probe reads the steady state the next chunk starts from
+                // rather than this one's peak; and BEFORE the interleave tick
+                // below, so a co-tenant's decode allocations are not counted
+                // as this prefill's pressure. `pos < loop_end` because the
+                // last boundary has no next chunk to size.
+                //
+                // The first chunk always runs the width admission billed —
+                // this only ever moves it afterwards, and the admission bill
+                // itself never moves.
+                if (adapt_chunked and pos < loop_end) {
+                    if (options.chunk_width_hook) |hk| {
+                        const next_w = hk.call(hk.ctx, ssm_cp_offset + pos, @intCast(cur_chunk), cap_adapt, &adapt_state);
+                        if (next_w != 0 and next_w != cur_chunk) {
+                            cur_chunk = next_w;
+                            adapt_state.transitions +|= 1;
+                            adapt_state.width_min = @min(adapt_state.width_min, next_w);
+                            adapt_state.width_max = @max(adapt_state.width_max, next_w);
+                        }
+                    }
+                }
                 // Yield to the scheduler between chunks — never after the
                 // last (the post-prefill decode tick covers that boundary).
                 if (pos < loop_end) {
@@ -2415,6 +2506,17 @@ pub const Generator = struct {
             }
             // The last chunk's failure has no next iteration to catch it.
             try mlx.checkError();
+            // ONE line per request when the width MOVED — the per-transition
+            // lines say where and why, this one says what the prefill ran as
+            // a whole. A prefill that held its admitted width says nothing.
+            if (adapt_state.transitions > 0) {
+                log.info("[prefill] adaptive: {d} chunks, width {d}..{d}, {d} change(s)\n", .{
+                    n_chunks,
+                    adapt_state.width_min,
+                    adapt_state.width_max,
+                    adapt_state.transitions,
+                });
+            }
 
             // Phase 1: always-on snapshot at the post-prefill position
             // (= prefix_len, i.e., prompt_ids.len - 1). The stride loop
@@ -2569,11 +2671,13 @@ pub const Generator = struct {
             const total_ns = prefill_sw.read();
             const ms = std.time.ns_per_ms;
             std.debug.print(
-                "  [prefill-trace] tokens={d} chunks={d} chunk_size={d} chunked={d}ms eval={d}ms last_token={d}ms total={d}ms{s}{s}\n",
+                "  [prefill-trace] tokens={d} chunks={d} chunk_size={d} chunk_widths={d}..{d} chunked={d}ms eval={d}ms last_token={d}ms total={d}ms{s}{s}\n",
                 .{
                     prompt_ids.len,
                     n_chunks,
                     PREFILL_CHUNK,
+                    adapt_state.width_min,
+                    adapt_state.width_max,
                     chunked_ns / ms,
                     eval_ns / ms,
                     last_ns / ms,
@@ -11580,6 +11684,131 @@ test "degenerateTail: the long-period tier keeps one copy of its sentence cycle"
     const d = degenerateTail(ids.items) orelse return error.TestExpectedLoop;
     try testing.expectEqual(DegenerateTail.Tier.long_cycle, d.tier);
     try testing.expectEqual(@as(usize, 2 + cycle.len), d.start);
+}
+
+/// PURE: walk a chunked prefill exactly as `runPrefill` does, taking the
+/// width from `widths` at each boundary (the last entry repeats). The loop's
+/// only chunk-end decision IS `nextChunkEnd`, so this is a faithful proxy for
+/// a prefill whose width moves — the same relationship `prefillChunkCount`
+/// has to the fixed-width loop.
+fn walkChunkEnds(
+    out: []usize,
+    prefix_len: usize,
+    widths: []const usize,
+    want_ssm_cp: bool,
+    stride: usize,
+    offset: usize,
+) []usize {
+    var pos: usize = 0;
+    var n: usize = 0;
+    while (pos < prefix_len and n < out.len) {
+        const w = widths[@min(n, widths.len - 1)];
+        const end = nextChunkEnd(pos, prefix_len, w, want_ssm_cp, stride, offset);
+        out[n] = end;
+        n += 1;
+        pos = end;
+    }
+    return out[0..n];
+}
+
+test "a width that changes at every boundary never moves a checkpoint" {
+    // The invariant the whole per-chunk feature rests on. `ssm_cp_stride`
+    // derives from the LAUNCH width, not the per-request or per-chunk one, and
+    // every ladder rung divides it — so a chunk that starts narrow still ends
+    // exactly on the stride boundaries a wide one would have hit, and the
+    // prefix cache sees the same restore points either way. If this breaks,
+    // a mixed-width prefill silently changes which prefixes a later turn can
+    // restore from.
+    const t = testing;
+    // The widths a real prefill can walk through, in a deliberately nasty
+    // order: down several rungs, back up, down to the floor.
+    const mixed = [_]usize{ 4096, 4096, 2048, 1024, 512, 512, 1024, 2048, 4096, 512, 2048, 1024, 4096, 512 };
+    const fixed = [_]usize{4096};
+
+    for ([_]usize{ 8192, 4096 }) |stride| {
+        for ([_]usize{ 0, 1000 }) |offset| {
+            for ([_]usize{ 40960, 40000 }) |prefix_len| {
+                var fb: [512]usize = undefined;
+                var mb: [512]usize = undefined;
+                const f = walkChunkEnds(&fb, prefix_len, &fixed, true, stride, offset);
+                const m = walkChunkEnds(&mb, prefix_len, &mixed, true, stride, offset);
+
+                // Both cover [0, prefix_len) exactly once, in order, with no
+                // empty chunk (an empty one is an infinite loop in `runPrefill`).
+                for ([_][]usize{ f, m }) |ends| {
+                    var pos: usize = 0;
+                    for (ends) |end| {
+                        try t.expect(end > pos);
+                        try t.expect(end <= prefix_len);
+                        // No chunk STRADDLES a stride boundary: the boundary is
+                        // the snapshot point, and a chunk that crosses it skips
+                        // a checkpoint.
+                        const abs_pos = pos + offset;
+                        const abs_end = end + offset;
+                        const next_b = ((abs_pos / stride) + 1) * stride;
+                        if (end != prefix_len) try t.expect(!(next_b > abs_pos and next_b < abs_end));
+                        pos = end;
+                    }
+                    try t.expectEqual(prefix_len, pos);
+                }
+
+                // And the checkpoint positions are IDENTICAL — same set, same
+                // order — however the width moved in between.
+                var fi: usize = 0;
+                var mi: usize = 0;
+                while (true) {
+                    while (fi < f.len and (f[fi] + offset) % stride != 0) fi += 1;
+                    while (mi < m.len and (m[mi] + offset) % stride != 0) mi += 1;
+                    if (fi >= f.len or mi >= m.len) break;
+                    try t.expectEqual(f[fi], m[mi]);
+                    fi += 1;
+                    mi += 1;
+                }
+                while (fi < f.len and (f[fi] + offset) % stride != 0) fi += 1;
+                while (mi < m.len and (m[mi] + offset) % stride != 0) mi += 1;
+                try t.expectEqual(fi >= f.len, mi >= m.len);
+            }
+        }
+    }
+}
+
+test "every ladder rung the adaptive width can take divides the checkpoint stride" {
+    // The other half of the same invariant, at the source: "SSM-checkpoint
+    // stride never sub-divides the chunk" holds for a NARROWED chunk only
+    // because the stride is coarsened against the LAUNCH width. Narrowing to
+    // 512 must not densify checkpoints, and widening cannot outrun the stride
+    // because the arch cap is the top of the same ladder.
+    const t = testing;
+    const stride = effectiveSsmCheckpointStride(256, prefill_chunk_override);
+    try t.expect(stride > 0);
+    for ([_]usize{ 8192, 4096, 2048, 1024, PREFILL_CHUNK_FLOOR }) |rung| {
+        try t.expect(rung <= stride);
+        try t.expectEqual(@as(usize, 0), stride % rung);
+    }
+}
+
+test "the per-chunk width is probed after the cache clear and before the interleave tick" {
+    // Both placements are load-bearing and neither is visible from a unit
+    // test, so they are scan-pinned. Probing BEFORE the clear reads the
+    // chunk's own peak and narrows on memory that is already gone; probing
+    // AFTER the interleave tick reads a co-tenant's decode allocations as this
+    // prefill's pressure. Needles split so this test's own source cannot
+    // satisfy them.
+    const t = testing;
+    const src = @embedFile("generate.zig");
+    const clear = std.mem.lastIndexOf(u8, src, "_ = mlx.mlx_clear" ++ "_cache();\n                if (trace_enabled) eval_ns") orelse return error.CallSiteMoved;
+    const probe = std.mem.indexOfPos(u8, src, clear, "options.chunk_width" ++ "_hook") orelse return error.CallSiteMoved;
+    const tick = std.mem.indexOfPos(u8, src, clear, "options.interleave" ++ "_hook") orelse return error.CallSiteMoved;
+    try t.expect(probe < tick);
+
+    // The unchunked vision arm forwards the whole prompt: there is no next
+    // chunk to size, and the guard bills the real width already.
+    try t.expect(std.mem.indexOf(u8, src, "const adapt_chunked = " ++ "!(has_vision and !vision_chunked);") != null);
+    // The stride is still coarsened against the LAUNCH width, never the
+    // per-request pin and never the per-chunk width.
+    try t.expect(std.mem.indexOf(u8, src, "effectiveSsmCheckpoint" ++ "Stride(@intCast(options.ssm_checkpoint_stride), @max(PREFILL_CHUNK, prefill_chunk_override))") != null);
+    // And the first chunk always runs the width admission billed.
+    try t.expect(std.mem.indexOf(u8, src, "var cur_chunk: usize = " ++ "default_chunk;") != null);
 }
 
 test "nextChunkEnd: a tiny trailing remainder merges into the last chunk" {
