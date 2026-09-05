@@ -1873,6 +1873,10 @@ accumulated. Pricing a transient you can delete is the wrong trade.
   is true and the bill is ONE copy. That halving is not cosmetic: at
   `--ctx-size 1048576` on qwen4_exp the doubled bill clamped a requested
   24,576 MB hot cache to 5,703 MB, and the single copy gives most of it back.
+  (Later: the prefill-end checkpoint attach turned out to MATERIALIZE a second
+  copy anyway, so 63cf6bd re-doubled the bill; the commit-time handoff of
+  2026-09-05 removed that copy and the bill is one copy + the f32 score bank —
+  story in `engine-mlx.md`, "HELD twice from prefill end to commit".)
   The flag exists so the two move together — flip it back only if the append
   ever returns to `mlx_concatenate_axis(old, new)`.
 * `HotPrefixCache.evictLruToAdmit` gives memory back rather than refusing: a
@@ -3308,3 +3312,15 @@ the eviction all read the same number, and a shared chunk cannot be freed while
 another entry still names it. The write-through hook writes ONE chunk per
 boundary (`WRITE_THROUGH_FLUSH_BOUND_BYTES`), so a killed prefill still leaves a
 chunk-aligned restorable prefix.
+
+## SSD-first: every prefix-diverging turn re-persisted the whole entry — chunk sharing by hard link (2026-09-05)
+
+Control run on the bundle: `[disk-cache] persisted 32426/32426 tokens (+32 chunks, 403.9 MB, 363ms)` on a 31-token warm turn; the judge's 64k rung: `reused 24576/65665 … persisted 32768/32768 tokens (+32 chunks, 464.5 MB, 375ms)` — TTFT +369 ms at 32k, +737 ms at 64k, ~10 s per turn at 786k. Two defects.
+
+**Defect B** (fixed in 9f43b7a): the write-through serialized with one eval per tensor and ran on sub-chunk warm turns. **Defect A** (this story): `DiskTier.appendCommitWithSpec`'s extend scan reuses chunk files only under a STRICT prefix relation — `e.tokens` a prefix of the new tokens, or vice versa. A persisted entry's tokens are `prompt ++ generated`, so the next prompt (re-tokenized assistant text + `<|im_end|>` + the user turn) diverges INSIDE the generated span, neither relation holds, `next_id` mints a fresh `e<id>` and `writeChunkFile` writes every chunk from 0 again. Nothing bounded it on the SSD-first arm (`max_flush_bytes` = 2 GiB), and the caller was `prefillWriteThroughCb` at the first chunk boundary — inside the prefill, before the first token.
+
+Fix, two halves. (1) `chunkShareDonor` picks the resident entry (same `has_tools`, same kv-quant config by `std.meta.eql`, and the same model fingerprint by construction — `self.root` IS the fingerprint dir) with the most WHOLE chunks under the common prefix, clamped to the KV this commit holds and the donor's persisted length; `linkInheritedChunks` fences the donor's directory against the background writer and HARD-LINKS those files into the new `e<id>/` (`std.Io.Dir.hardLink`, same filesystem), then only the tail is written. `[disk-cache] chunk share: e5 inherits 4 chunks (…) from e3 by hard link` is the engagement line. (2) `prefillWriteThroughCb` passes `WRITE_THROUGH_FLUSH_BOUND_BYTES` (1) to `appendCommitBounded` — one chunk per boundary; `flushPendingDisk` in `finishSlot` completes the rest after the response.
+
+Accounting — `total_bytes` is bytes on disk BY CONSTRUCTION, and the filesystem is the refcount: an heir bills 0 for inherited chunks (`inherited_chunks`, meta.json v6; `bytes` = files the entry created); `removeAt` frees `nonChunkBytes` plus every chunk file whose `stat.nlink == 1` (`bytesFreedByRemoving`), so the donor's removal keeps the shared files billed and the LAST holder frees them; `scan` counts every inode once (`billChunksOnce`), so a heir whose donor died before a reboot becomes the payer; extend and ssm-only commits move `total_bytes` by file DELTAS, never by recomputing an entry's bill. A manifest counter would have gone stale in the crash window between the link and `meta.json`; `nlink` cannot — and a crash there leaves an `e<id>` without meta.json, which `scan` deletes, dropping the extra link. A rewrite never lands on a link: links are whole chunks below `inherited`, and the rewritten partial chunk sits at `keep >= inherited`. Bars: the donor-then-heir / heir-then-donor test (`total_bytes` returns to the pre-commit value both ways), the link+restore test (one inode, two links, heir restores whole through a fresh scan with the same bill), the legacy-arm + kill-switch test (never links), v6 round-trip + v5 load, and the hook-bound scan pin. `MLX_SERVE_SSD_CHUNK_SHARE=0` restores the write-everything commit.
+
+Follow-up: the LEGACY (non-SSD-first) tier has the same per-turn rewrite and is deliberately gated OFF here (qwen4_exp blast radius); it shares `appendCommitWithSpecBounded`, so enabling it is `chunkShareDonor`'s `ssd_first` check plus its own A/B.

@@ -3734,6 +3734,58 @@ test "HotPrefixCache: prefix-extend keeps ONE QSA history across turns" {
     try testing.expectEqual(@as(c_int, 8), mlx.getShape(merged[1].layers[0].aux_state)[1]);
 }
 
+test "HotPrefixCache: a handed-off QSA history commits, restores and bills exactly like the prefill-end copy" {
+    // The commit handoff gives the newest snap a VIEW of the slot's live
+    // history instead of the materialized copy the prefill used to attach.
+    // The entry must be indistinguishable from the copy arm: same restored
+    // rows and bytes on a warm turn, same `ssm_bytes` on the budget — and it
+    // must outlive the slot whose buffer it borrowed.
+    const s = mlx.gpuStream();
+    const tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+    const lookup_tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 70, 71 };
+    var restored_val: [2]f32 = .{ -1.0, -2.0 };
+    var billed: [2]u64 = .{ 0, 0 };
+    for ([_]bool{ false, true }, 0..) |handoff, arm| {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        defer hc.deinit();
+        hc.qsa_history_required = true;
+        var cache = try KVCache.init(testing.allocator, 3);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 3, tokens.len);
+        var live = pcBuildQsaHybrid(s, 10, 100.0);
+        const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
+        cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 4, s);
+        if (handoff) {
+            try transformer_mod.handoffQsaHistoryToLatest(cps, &live, s);
+        } else {
+            try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
+        }
+        try hc.commitWithState(&cache, &tokens, false, 0, cps, null, null);
+        // The slot dies: its handles go, the entry's view keeps the buffer.
+        pcFreeQsaHybrid(&live);
+        billed[arm] = hc.entries.items[0].ssm_bytes;
+
+        var target_cache = try KVCache.init(testing.allocator, 3);
+        defer target_cache.deinit();
+        var target = pcEmptySsm();
+        defer pcFreeQsaHybrid(&target);
+        var moe_off: usize = 0;
+        const r = try hc.lookupAndRestore(&target_cache, &moe_off, &target, s, &lookup_tokens, false, 0, null, null);
+        try testing.expectEqual(@as(usize, 4), r.matched);
+        try testing.expectEqual(@as(c_int, 4), mlx.getShape(target[0].aux_state)[1]);
+        var got = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(got);
+        try mlx.check(mlx.mlx_astype(&got, target[0].aux_state, .float32, s));
+        try mlx.check(mlx.mlx_array_eval(got));
+        const d = mlx.mlx_array_data_float32(got) orelse return error.TestUnexpectedNullData;
+        restored_val[arm] = d[3 * 8 + 5];
+    }
+    try testing.expectEqual(@as(f32, 3.0 * 8.0 + 5.0), restored_val[1]);
+    try testing.expectEqual(restored_val[0], restored_val[1]);
+    try testing.expect(billed[0] > 0);
+    try testing.expectEqual(billed[0], billed[1]);
+}
+
 test "HotPrefixCache: replace path sheds inherited checkpoints instead of evicting its own entry (#330)" {
     const s = mlx.gpuStream();
 
@@ -4902,4 +4954,54 @@ test "prefix cache: the trim's row price is the entry's own bytes divided by its
         };
         try testing.expectEqual(2 * per_layer, row_bytes);
     }
+}
+
+test "HotPrefixCache: a bounded disk flush leaves disk_dirty set and later flushes complete the entry — never a whole-entry claim in between" {
+    // The write-through hook writes ONE chunk per boundary and the SSD-first
+    // end-of-request flush is bounded too, so a long entry reaches the tier
+    // in pieces. Each piece is a valid SHORTER entry (meta.json's kv_len is
+    // the chunk-complete length, restore is clamped to it), `disk_dirty`
+    // stays set until the tier reports complete, and the next
+    // `flushPendingDisk` — the scheduler's post-finish call — extends it.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    const base = buf[0..root_len];
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-partial", 0, 128);
+    defer hc.deinit();
+    hc.disk.?.max_flush_bytes = 1; // one chunk per flush: the bounded shape
+
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 2, 600);
+    try hc.commit(&cache, &tokens, false);
+    try testing.expect(hc.disk_dirty);
+
+    // 600 tokens at 128/chunk = 5 chunks; each flush lands one.
+    var flushes: usize = 0;
+    var last_kv: u32 = 0;
+    while (hc.disk_dirty and flushes < 10) : (flushes += 1) {
+        hc.flushPendingDisk(s);
+        const d = &hc.disk.?;
+        try testing.expectEqual(@as(usize, 1), d.entryCount());
+        const kv = d.entries.items[0].kv_len;
+        // Monotone, chunk-aligned while partial, and what a lookup would
+        // restore — never the whole entry before its chunks are there.
+        try testing.expect(kv >= last_kv);
+        if (hc.disk_dirty) try testing.expectEqual(@as(u32, 0), kv % 128);
+        const m = d.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
+        try testing.expectEqual(kv, m.usable);
+        last_kv = kv;
+    }
+    try testing.expect(!hc.disk_dirty);
+    try testing.expectEqual(@as(usize, 5), flushes);
+    try testing.expectEqual(@as(u32, 600), hc.disk.?.entries.items[0].kv_len);
 }

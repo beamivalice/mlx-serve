@@ -3941,7 +3941,8 @@ test "the clamp bills the context that will be SERVED, not the placeholder" {
     const real = planHotCache(&cfg, kv_bits, static_ceiling, active, 1_048_576, 0, ask, 4096);
 
     try t.expect(placeholder.budget > 45_000 * MiB); // reproduces the live 48,673
-    try t.expectEqual(@as(u64, 1_048_576) * (13_056 + 7_680), real.ctx_kv);
+    // 13,056 KV + 5,376 state (one history copy + the f32 score bank).
+    try t.expectEqual(@as(u64, 1_048_576) * (13_056 + 5_376), real.ctx_kv);
 
     // The bar is the ARITHMETIC, not a hand-picked fraction. Both calls share
     // a ceiling, a resident weight figure and a reserve width, and on this box
@@ -3959,7 +3960,7 @@ test "the clamp bills the context that will be SERVED, not the placeholder" {
     // ...and the placeholder's "session" is the rounding error that made this a
     // bug: 1024 tokens of KV against a full context's ~20.7 GB.
     try t.expect(placeholder.ctx_kv < 30 * MiB);
-    try t.expect(real.ctx_kv > 20_000 * MiB);
+    try t.expect(real.ctx_kv > 18_000 * MiB);
     try t.expect(real.budget > 0);
 }
 
@@ -4025,20 +4026,27 @@ test "an auto boot advertises the session the SSD-first budget floor was billed 
     // The defect, as the number it was: sizing the session against a reserve of
     // its own hands back a BIGGER session than the box will ever be asked to
     // serve, so the floor holds KV for tokens nobody can send.
-    const old_billed = resolvedContextForLoad(0, 0, ceiling, active, 0, transient, per_tok, cfg.contextCap());
-    try t.expect(old_billed > billed);
+    // Under the one-copy history bill this box fits the checkpoint's whole
+    // context cap on BOTH arms (old and new both clamp to 1,048,576), so the
+    // disagreement is shown on a TIGHTER box where the cap does not bind —
+    // the arithmetic is the same, only the ceiling moves.
+    const tight: u64 = active + 24_000 * MiB;
+    const billed_t = ssdFirstSessionTokensNow(&cfg, kv_bits, tight, active, chunk);
+    const old_billed = resolvedContextForLoad(0, 0, tight, active, 0, transient, per_tok, cfg.contextCap());
+    try t.expect(old_billed > billed_t);
     // Both are real contexts — this is a disagreement, not a collapse, which is
     // why it survived: neither number looks wrong on its own.
     try t.expect(billed > 500_000);
+    try t.expect(billed_t > 300_000);
 
     // ...and what the disagreement costs, in the one place it lands: the budget
     // floor is one session's KV, so an over-billed session over-reserves RAM
     // for a context the server never advertises.
     const idle: u64 = 4 * 1024 * MiB;
-    const floor_now = ssdFirstPrefixCacheMem(idle, ceiling, active, per_tok *| @as(u64, billed), transient);
-    const floor_old = ssdFirstPrefixCacheMem(idle, ceiling, active, per_tok *| @as(u64, old_billed), transient);
+    const floor_now = ssdFirstPrefixCacheMem(idle, tight, active, per_tok *| @as(u64, billed_t), transient);
+    const floor_old = ssdFirstPrefixCacheMem(idle, tight, active, per_tok *| @as(u64, old_billed), transient);
     try t.expect(floor_old > floor_now);
-    try t.expectEqual(per_tok *| @as(u64, old_billed - billed), floor_old - floor_now);
+    try t.expectEqual(per_tok *| @as(u64, old_billed - billed_t), floor_old - floor_now);
 }
 
 test "an explicit --ctx-size boot never consults the session reserve" {
@@ -4243,9 +4251,14 @@ test "the per-token widths the request chooser is built on" {
     const cfg = qwen4RequestTestConfig();
     try t.expectEqual(@as(u32, 12), cfg.attnCacheLayerCount());
     try t.expectEqual(@as(u64, 13_056), kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8));
-    try t.expectEqual(@as(u64, 7_680), statePerTokenBilled(&cfg));
+    // One copy of the history (3,840) + the f32 score bank (1,536).
+    transformer_mod.qsa_history_share_override = true;
+    defer transformer_mod.qsa_history_share_override = null;
+    try t.expectEqual(@as(u64, 3_840), cfg.qsaHistoryBytesPerToken());
+    try t.expectEqual(@as(u64, 1_536), cfg.qsaScoreBankBytesPerToken());
+    try t.expectEqual(@as(u64, 5_376), statePerTokenBilled(&cfg));
     // And therefore the 1M context bill the load-time clamp subtracts.
-    try t.expectEqual(@as(u64, 20_736 * (1 << 20)), (13_056 + 7_680) * @as(u64, 1_048_576));
+    try t.expectEqual(@as(u64, 18_432 * (1 << 20)), (13_056 + 5_376) * @as(u64, 1_048_576));
 }
 
 test "chooseRequestPrefillChunk: an ordinary prompt buys the wide chunk a 1M session cannot" {
@@ -4278,14 +4291,17 @@ test "chooseRequestPrefillChunk: an ordinary prompt buys the wide chunk a 1M ses
     // 4x the pinned width, and the whole point of the change.
     try t.expect(4096 > pin);
 
-    // The full 1M context does not fit on this box at ANY width — 30,261 MiB
-    // at the ladder floor against 28,909 available — so the chooser bottoms
-    // out and admission refuses. That is honest: the advertised context is
-    // larger than this machine can prefill, which is what the ctx-KV bill on
-    // the SSD-first branch is about, not something a width can fix.
+    // The full 1M context: under the two-copy history bill it did not fit on
+    // this box at ANY width (30,261 MiB at the ladder floor against 28,909
+    // available) and the chooser bottomed out at 512 for admission to refuse.
+    // The one-copy bill (the commit handoff, `statePerTokenBilled` 5,376
+    // B/tok) takes 2,304 B/tok off — ~2,304 MiB at 1M — and the same prompt
+    // now fits at 2048, not at 4096. Honest either way: the chooser hands out
+    // the widest rung the estimator can afford, and the bill is the residency.
     const full = chooseRequestPrefillChunk(&cfg, 1_048_576, 2048, kv_bits, available, pin, 0);
-    try t.expectEqual(@as(u32, 512), full);
-    try t.expect(prefillNeededAtChunk(&cfg, 1_048_576, 2048, kv_bits, 512) > available);
+    try t.expectEqual(@as(u32, 2048), full);
+    try t.expect(prefillNeededAtChunk(&cfg, 1_048_576, 2048, kv_bits, 2048) <= available);
+    try t.expect(prefillNeededAtChunk(&cfg, 1_048_576, 2048, kv_bits, 4096) > available);
 
     // The invariant behind all of it, true of any checkpoint's ladder: a
     // shorter prompt holds less KV, so it can afford at least as wide a
@@ -5004,29 +5020,32 @@ fn mlxMemoryGuardApplies(uses_ds4: bool, uses_llama: bool) bool {
 /// entirely (see `mlxMemoryGuardApplies`) — this is the single chokepoint, so
 /// every current and future call site is covered without per-site gating.
 /// Per-token bytes of the arch's own out-of-cache request state AS BILLED:
-/// TWO copies of the QSA indexer history, always.
+/// the QSA indexer history at the number of copies a live slot HOLDS, plus
+/// the f32 block-score bank the slot keeps beside it.
 ///
-/// The second copy is not the growth transient — it is
-/// `transformer.attachQsaHistoryToLatest`, which every prefill calls at its
-/// end and which MATERIALIZES the history onto the newest SSM checkpoint
-/// (`copyQsaHistorySliced(… materialize = true)`; a checkpoint must outlive
-/// the live entry, and the sliced arm cannot share a view of a slice
-/// anyway). 1.76 GB at 458,832 tokens on qwen4_exp, and both
-/// `qsaHistoryBytesPerToken` and `ssmCheckpointBytes` used to document the
-/// opposite ("checkpoints stopped cloning it").
+/// ONE copy on the default arm: the history lives in the slot's capacity
+/// buffer (`qsaAppendKeys` -> `capBufAppend`, grown ONCE by the reservation),
+/// and the newest SSM checkpoint takes a slice VIEW of that buffer at COMMIT
+/// (`transformer.handoffQsaHistoryToLatest`, the slot dying next) — no
+/// second copy ever exists. TWO copies when either lever is off:
+/// `MLX_SERVE_QSA_HISTORY_SHARE=0` restores the prefill-end attach that
+/// MATERIALIZES the history onto the checkpoint (`copyQsaHistorySliced(…
+/// materialize = true)`, 1.76 GB at 458,832 tokens, beside the buffer for
+/// the whole decode); `MLX_SERVE_KV_RESERVE=0` restores the +25% ladder,
+/// whose old + new pair at the last grow is the same two-copy bound.
 ///
-/// The growth transient — old + new across the per-chunk
-/// `mlx_concatenate_axis` — peaks at the same two copies and never coexists
-/// with the attach (one is inside the chunk loop, the other after it), so
-/// this ONE bound covers both and does not change when the history gains a
-/// capacity buffer. `QSA_HISTORY_GROWS_IN_PLACE` therefore documents the
-/// growth arm without changing the bill.
+/// The score bank (`qsaScoreBankBytesPerToken`, 1,536 B/tok on qwen4_exp)
+/// was never billed: the two-copy history bill had 3,840 B/tok of slack
+/// that covered it by accident. The one-copy bill does not, so it is named.
 ///
 /// One helper because the auto-context sizer and the admission guard must
 /// agree on it: a sizer that bills one copy advertises a context the guard
 /// then refuses (issue #353).
 pub fn statePerTokenBilled(config: *const model_mod.ModelConfig) u64 {
-    return config.qsaHistoryBytesPerToken() * 2;
+    const one = config.qsaHistoryBytesPerToken();
+    if (one == 0) return 0;
+    const copies: u64 = if (transformer_mod.qsaHistoryShareEnabled() and transformer_mod.KVCache.kvReservationEnabled()) 1 else 2;
+    return one * copies + config.qsaScoreBankBytesPerToken();
 }
 
 /// Tokens of cache capacity a request RESERVES at admission: the prompt, the
@@ -5084,9 +5103,8 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
     const kv_per_tok = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);
     return .{
         .reserved_kv_bytes = (reserved -| seq) * kv_per_tok,
-        // The indexer history at the width `statePerTokenBilled` decides:
-        // the live copy plus the one the end-of-prefill checkpoint attach
-        // materializes.
+        // The indexer history at the width `statePerTokenBilled` decides
+        // (one copy + the score bank; two copies with a lever off).
         .state_bytes = reserved * statePerTokenBilled(config),
         .checkpoint_bytes = retainedSsmCheckpointBytes(config, seq, chunk),
     };
@@ -5096,10 +5114,9 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
 /// `entry.qsa_key_buf` (`capBufAppend`) instead of rebuilding the history
 /// with `mlx_concatenate_axis(old, new)`, so the growth transient is gone on
 /// this tree. DOCUMENTATION ONLY: it does not enter the bill. The bill above
-/// is two copies either way, because the end-of-prefill checkpoint attach
-/// materializes a second one regardless of how the history grew — removing
-/// the growth transient does not remove that, which is exactly why this flag
-/// stopped being read.
+/// reads the two LEVERS that decide the copy count (the commit handoff and
+/// the reservation), never this flag — a flag that is a fact about the
+/// append cannot say whether a second copy exists.
 pub const QSA_HISTORY_GROWS_IN_PLACE: bool = true;
 
 /// A slot that errored reports WHY. The MLX error latch turns a Metal
@@ -21491,14 +21508,14 @@ test "the 458k prefill's two unbilled terms are billed: retained checkpoints and
     const kv_per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8);
     try t.expectEqual((2048 + chunk) * kv_per_tok, terms.reserved_kv_bytes);
     try t.expect(terms.reserved_kv_bytes * 4 < seq * kv_per_tok); // headroom, not a copy
-    // The indexer history is billed at TWO copies even here, where the growth
-    // transient is gone (`qsaAppendKeys` appends into a capacity buffer, so no
-    // old+new pair is live in the chunk's graph): the end-of-prefill
-    // checkpoint attach materializes the second one regardless. The sizer
-    // bills the same width, so advertised and admitted contexts cannot
-    // diverge. Full contract in "billed at BOTH copies" below.
+    // The indexer history is billed at ONE copy here: the growth transient is
+    // gone (`qsaAppendKeys` appends into a capacity buffer the reservation
+    // sized once) and the newest checkpoint takes a VIEW of that buffer at
+    // commit instead of a prefill-end copy. The score bank rides beside it.
+    // The sizer bills the same width, so advertised and admitted contexts
+    // cannot diverge. Full contract in "billed at the copies it HOLDS" below.
     try t.expect(QSA_HISTORY_GROWS_IN_PLACE);
-    try t.expectEqual(cfg.qsaHistoryBytesPerToken() * 2, statePerTokenBilled(&cfg));
+    try t.expectEqual(cfg.qsaHistoryBytesPerToken() + cfg.qsaScoreBankBytesPerToken(), statePerTokenBilled(&cfg));
     try t.expectEqual((seq + 2048 + chunk) * statePerTokenBilled(&cfg), terms.state_bytes);
     try t.expectEqual(held, terms.checkpoint_bytes);
 
@@ -21756,30 +21773,47 @@ test "the admission probe bills the request's OWN kv-quant and chunking, not the
     try t.expect(std.mem.indexOf(u8, sched, ".unchunked = generate_mod.visionPrefillUnchunked(slot.vision_embeddings != null),") != null);
 }
 
-test "the QSA history is billed at BOTH copies: the live one and the checkpoint attach" {
+test "the QSA history is billed at the copies a slot HOLDS: one with the commit handoff, two with a lever off, plus the score bank" {
     const t = std.testing;
-    // `attachQsaHistoryToLatest` runs at the end of EVERY prefill and
-    // materializes the history onto the newest SSM checkpoint
-    // (`copyQsaHistorySliced(… materialize = true)`) — 1.76 GB at 458,832
-    // tokens on qwen4_exp, and the two doc comments that mention it claimed
-    // checkpoints had stopped cloning it.
+    // The two-copy bill was honest while `attachQsaHistoryToLatest` ran at
+    // the end of every prefill and MATERIALIZED the history onto the newest
+    // SSM checkpoint (1.76 GB at 458,832 tokens; 3.0 GB at 786k beside the
+    // live buffer for the whole decode). The commit handoff
+    // (`handoffQsaHistoryToLatest`) makes that snap a VIEW of the live
+    // buffer, so the bill follows the residency down to one copy — and picks
+    // up the f32 score bank that the old slack hid.
     const cfg = qwen4ExpOomConfig();
     const one = cfg.qsaHistoryBytesPerToken();
+    const bank = cfg.qsaScoreBankBytesPerToken();
     try t.expect(one > 0);
-    try t.expectEqual(one * 2, statePerTokenBilled(&cfg));
+    try t.expect(bank > 0 and bank < one);
+    defer transformer_mod.qsa_history_share_override = null;
+    transformer_mod.qsa_history_share_override = true;
+    try t.expectEqual(one + bank, statePerTokenBilled(&cfg));
+    // The kill switch restores the prefill-end copy AND its bill together.
+    transformer_mod.qsa_history_share_override = false;
+    try t.expectEqual(one * 2 + bank, statePerTokenBilled(&cfg));
+    transformer_mod.qsa_history_share_override = true;
 
-    // The bill does NOT depend on how the history grows: the growth transient
-    // (old + new across a concatenate, inside the chunk loop) and the attach
-    // (after it) never coexist, so two copies bounds both — which is what
-    // makes a capacity buffer safe to adopt without re-deriving this term.
+    // The bill reads the LEVERS, never the append-shape flag: a flag that is
+    // a fact about the append cannot say whether a second copy exists.
     const src = @embedFile("server.zig");
     try t.expect(std.mem.indexOf(u8, src, "QSA_HISTORY_GROWS" ++ "_IN_PLACE) per_tok") == null);
+    const fn_start = std.mem.indexOf(u8, src, "pub fn statePerToken" ++ "Billed(").?;
+    const fn_end = std.mem.indexOfPos(u8, src, fn_start, "\n}\n").?;
+    const body = src[fn_start..fn_end];
+    try t.expect(std.mem.indexOf(u8, body, "qsaHistoryShare" ++ "Enabled()") != null);
+    try t.expect(std.mem.indexOf(u8, body, "kvReservation" ++ "Enabled()") != null);
+    try t.expect(std.mem.indexOf(u8, body, "qsaScoreBankBytes" ++ "PerToken()") != null);
+    try t.expect(std.mem.indexOf(u8, body, "QSA_HISTORY_GROWS" ++ "_IN_PLACE") == null);
 
-    // At the live 458,832-token length the second copy is real money.
+    // At the live 458,832-token length the copy the handoff removes is real
+    // money, and the bill is exactly one copy plus the bank.
     const seq: u64 = 458_832;
     try t.expect(seq * one > 1_700_000_000);
     const terms = prefillRequestTerms(&cfg, seq, 2048, 8, 4096);
-    try t.expect(terms.state_bytes >= 2 * seq * one);
+    try t.expectEqual((seq + 2048 + 4096) * (one + bank), terms.state_bytes);
+    try t.expect(terms.state_bytes < 2 * seq * one);
 
     // Both sizer sites read the BILLED width, never the one-copy helper.
     try t.expect(std.mem.indexOf(u8, src, "+| config.qsaHistoryBytes" ++ "PerToken()) *|") == null);

@@ -815,11 +815,14 @@ pub const ModelConfig = struct {
     /// `[kv, idx_hd]` plus pooled blocks `[kv/ratio, idx_hd]`, per full-attn
     /// layer. Not kv-quantized. Zero on archs without an indexer.
     ///
-    /// This is ONE copy. The prefill's peak holds TWO: stride checkpoints no
-    /// longer clone it, but `transformer.attachQsaHistoryToLatest` still
-    /// MATERIALIZES it onto the newest checkpoint at the end of every
-    /// prefill. `server.statePerTokenBilled` is the billed width and is what
-    /// the sizer and the guard both read — never this helper directly.
+    /// This is ONE copy — what a hot-cache ENTRY holds, and (with
+    /// `MLX_SERVE_QSA_HISTORY_SHARE` on) what a live slot holds: the newest
+    /// checkpoint takes a VIEW of the slot's buffer at commit
+    /// (`transformer.handoffQsaHistoryToLatest`). With the switch off the
+    /// prefill-end attach MATERIALIZES a second copy that lives beside the
+    /// buffer for the whole decode. `server.statePerTokenBilled` is the
+    /// billed width (copies + the f32 score bank) and is what the sizer and
+    /// the guard both read — never this helper directly.
     pub fn qsaHistoryBytesPerToken(self: *const ModelConfig) u64 {
         if (self.indexer_budget == 0 or self.indexer_head_dim == 0) return 0;
         const n = @as(u64, self.attnCacheLayerCount());
@@ -828,13 +831,28 @@ pub const ModelConfig = struct {
         return n * hd * 2 + n * hd * 2 / ratio;
     }
 
+    /// f32 bytes of the QSA block-score operand ONE token occupies on a LIVE
+    /// slot: `SSMCacheEntry.qsa_score_bank` is `[B, 1, idx_hd, nb]` per
+    /// full-attn layer, one block per `ratio` tokens, rebuilt whenever a
+    /// block completes and resident for the request (1,536 B/tok on
+    /// qwen4_exp — 1.1 GB at 786k). Never in an entry (`ssmFreeQsaState` at
+    /// slot teardown); never billed until the one-copy history bill made
+    /// the gap visible. Zero on archs without an indexer.
+    pub fn qsaScoreBankBytesPerToken(self: *const ModelConfig) u64 {
+        if (self.indexer_budget == 0 or self.indexer_head_dim == 0) return 0;
+        const n = @as(u64, self.attnCacheLayerCount());
+        const hd = @as(u64, self.indexer_head_dim);
+        const ratio = @max(@as(u64, self.indexer_compress_ratio), 1);
+        return n * hd * 4 / ratio;
+    }
+
     /// Bytes ONE SSM checkpoint holds: the recurrent state plus the conv
     /// window of every LINEAR layer, materialized (`captureSsmCheckpoint`
     /// forces an owned copy of each). The QSA key history is NOT here: it
-    /// lands on ONE checkpoint (the newest), not on every one, so it is
-    /// billed once by `server.statePerTokenBilled` — which counts it TWICE
-    /// per token for exactly this reason, the live history plus that
-    /// materialized copy.
+    /// lands on ONE checkpoint (the newest), not on every one — as a VIEW of
+    /// the live buffer at commit, or as the prefill-end copy with
+    /// `MLX_SERVE_QSA_HISTORY_SHARE=0` — and `server.statePerTokenBilled`
+    /// prices it per token (one copy, or two on that arm).
     ///
     /// GatedDeltaNet state is `[B, v_heads, v_head_dim, key_head_dim]` bf16
     /// and the conv window is `[B, kernel-1, 2*key_dim + value_dim]` bf16 —

@@ -185,6 +185,12 @@ pub const IndexEntry = struct {
     /// to the last contiguous valid chunk — a kill -9 mid-flush truncates a
     /// chunk, and restoring it would poison the cache. Owned.
     chunk_bytes: []u64,
+    /// The first `inherited_chunks` chunk files are HARD LINKS into a donor
+    /// entry's chunks (SSD-first chunk sharing across prefix-diverging
+    /// entries): sizes ride `chunk_bytes` for restore, but this entry created
+    /// none of those bytes and never billed them. Persisted as meta.json v6
+    /// `inherited_chunks`; 0 on every older manifest.
+    inherited_chunks: u32 = 0,
     /// Phase 3: persisted SSM checkpoint positions (sorted ascending; empty
     /// for pure-attention entries) and per-file byte sizes (parallel array —
     /// the same kill -9 salvage role as `chunk_bytes`: the scan drops
@@ -900,6 +906,27 @@ pub const DiskTier = struct {
         return self.appendCommitWithSpec(kv_entries, step, config, tokens, has_tools, ssm_checkpoints, null, null, s);
     }
 
+    /// `appendCommit` with an explicit per-call flush bound (bytes): the loop
+    /// stops after the first chunk that crosses it. The prefill write-through
+    /// hook passes ONE byte — one chunk per boundary — so a restored prefix
+    /// that is not on disk yet is never serialized whole on the TTFT path;
+    /// the end-of-request flush (`HotPrefixCache.flushPendingDisk`) completes
+    /// the rest. The default arms (`appendCommit`/`appendCommitWithSpec`)
+    /// pass `max_flush_bytes`.
+    pub fn appendCommitBounded(
+        self: *DiskTier,
+        kv_entries: []const transformer_mod.KVCacheEntry,
+        step: usize,
+        config: kv_quant.KVQuantConfig,
+        tokens: []const u32,
+        has_tools: bool,
+        ssm_checkpoints: ?[]const transformer_mod.SSMCheckpoint,
+        s: mlx.mlx_stream,
+        flush_bound: u64,
+    ) !bool {
+        return self.appendCommitWithSpecBounded(kv_entries, step, config, tokens, has_tools, ssm_checkpoints, null, null, s, flush_bound);
+    }
+
     /// `appendCommit` plus the v4 spec snapshots (dflash assistant context /
     /// MTP committed history). Eligibility is enforced UPSTREAM, same as the
     /// RAM tier: the caller passes only what `commitWithState` was handed.
@@ -914,6 +941,22 @@ pub const DiskTier = struct {
         dflash_snap: ?SpecCommit,
         mtp_snap: ?SpecCommit,
         s: mlx.mlx_stream,
+    ) !bool {
+        return self.appendCommitWithSpecBounded(kv_entries, step, config, tokens, has_tools, ssm_checkpoints, dflash_snap, mtp_snap, s, self.max_flush_bytes);
+    }
+
+    fn appendCommitWithSpecBounded(
+        self: *DiskTier,
+        kv_entries: []const transformer_mod.KVCacheEntry,
+        step: usize,
+        config: kv_quant.KVQuantConfig,
+        tokens: []const u32,
+        has_tools: bool,
+        ssm_checkpoints: ?[]const transformer_mod.SSMCheckpoint,
+        dflash_snap: ?SpecCommit,
+        mtp_snap: ?SpecCommit,
+        s: mlx.mlx_stream,
+        flush_bound: u64,
     ) !bool {
         // On EOS-terminated turns the cache runs 1-2 positions AHEAD of the
         // committed token record (forwarded terminator tokens that never
@@ -1008,8 +1051,18 @@ pub const DiskTier = struct {
         // positions) is (re)written — up to the per-flush byte cap. Stopping
         // early lands on a full-chunk boundary; the entry then records the
         // shorter kv_len and the NEXT flush resumes from there.
+        //
+        // A FRESH entry may instead INHERIT its leading whole chunks from a
+        // resident entry that shares a prefix with it, by hard link (Defect A
+        // of the warm-turn re-persist): a persisted entry's tokens are
+        // `prompt ++ generated`, so the next turn's prompt diverges INSIDE the
+        // generated span, never satisfies the strict-prefix extend scan above,
+        // and used to have every chunk from 0 written again — 32 chunks,
+        // 464 MB, 375 ms inside the prefill at 64k. SSD-first arm only.
         const old_kv: u32 = if (extend_idx) |i| self.entries.items[i].kv_len else 0;
-        const keep: u32 = old_kv / self.chunk_tokens;
+        const donor = if (extend_idx == null) self.chunkShareDonor(tokens, kv_target, has_tools, config) else null;
+        var inherited: u32 = if (extend_idx) |i| self.entries.items[i].inherited_chunks else if (donor) |d| d.chunks else 0;
+        var keep: u32 = if (extend_idx != null) old_kv / self.chunk_tokens else inherited;
         const n_chunks: u32 = @intCast((@as(u64, kv_target) + self.chunk_tokens - 1) / self.chunk_tokens);
 
         var chunk_sizes = std.ArrayList(u64).empty;
@@ -1017,12 +1070,20 @@ pub const DiskTier = struct {
         if (extend_idx) |i| {
             const old_cb = self.entries.items[i].chunk_bytes;
             try chunk_sizes.appendSlice(self.allocator, old_cb[0..@min(keep, old_cb.len)]);
+        } else if (donor) |d| {
+            self.linkInheritedChunks(d, id, &chunk_sizes) catch {
+                // Write everything instead: no inheritance, no links left behind.
+                chunk_sizes.clearRetainingCapacity();
+                inherited = 0;
+                keep = 0;
+            };
         }
+        std.debug.assert(keep >= inherited);
 
         var written_bytes: u64 = 0;
         var chunk_i: u32 = keep;
         while (chunk_i < n_chunks) : (chunk_i += 1) {
-            if (written_bytes >= self.max_flush_bytes and chunk_i > keep) break;
+            if (written_bytes >= flush_bound and chunk_i > keep) break;
             const c0: u32 = chunk_i * self.chunk_tokens;
             const c1: u32 = @intCast(@min(@as(u64, c0) + self.chunk_tokens, kv_target));
             const csize = try self.writeChunkFile(kv_entries, config, dir_rel, chunk_i, c0, c1, s);
@@ -1079,13 +1140,17 @@ pub const DiskTier = struct {
             try fw.interface.flush();
         }
 
-        var bytes: u64 = 0;
-        for (chunk_sizes.items) |b| bytes += b;
-        for (ssm_res.bytes) |b| bytes += b;
-        bytes += spec_res.bytes;
-        bytes += @as(u64, record.len) * 4;
+        // `bytes` is what this entry CREATED on disk: inherited (linked) chunks
+        // bill 0 — the donor already did. `total_bytes` is bytes on disk BY
+        // CONSTRUCTION: a commit adds only files it wrote, `removeAt` frees
+        // only files whose link count says nobody else holds them, `scan`
+        // counts every inode once.
+        var non_chunk: u64 = @as(u64, record.len) * 4 + spec_res.bytes;
+        for (ssm_res.bytes) |b| non_chunk += b;
+        var bytes: u64 = non_chunk;
+        for (chunk_sizes.items[@min(inherited, chunk_sizes.items.len)..]) |b| bytes += b;
 
-        const new_entry: IndexEntry = .{
+        var new_entry: IndexEntry = .{
             .id = id,
             .tokens = try self.allocator.dupe(u32, record),
             .kv_len = kv_len,
@@ -1093,6 +1158,7 @@ pub const DiskTier = struct {
             .quant = config,
             .bytes = bytes,
             .chunk_bytes = try chunk_sizes.toOwnedSlice(self.allocator),
+            .inherited_chunks = inherited,
             .ssm_positions = ssm_res.positions,
             .ssm_bytes = ssm_res.bytes,
             .spec_bytes = spec_res.bytes,
@@ -1104,12 +1170,22 @@ pub const DiskTier = struct {
             self.allocator.free(new_entry.tokens);
             self.allocator.free(new_entry.chunk_bytes);
         }
-        // meta.json is the commit point — written last, atomically.
-        try self.writeMeta(new_entry);
 
         if (extend_idx) |i| {
             const e = &self.entries.items[i];
-            self.total_bytes -|= e.bytes;
+            // An extension's delta is FILE-based: the chunks it wrote (the
+            // rewritten partial chunk replaces its old size — never a link, a
+            // link is always a whole chunk below `inherited`), plus the
+            // non-chunk change. `e.bytes` after a `scan` may already include
+            // chunks the manifest lists as inherited (their donor died first),
+            // so it is carried forward, never recomputed.
+            var delta: i64 = @as(i64, @intCast(non_chunk)) - @as(i64, @intCast(nonChunkBytes(e)));
+            for (new_entry.chunk_bytes[@min(keep, new_entry.chunk_bytes.len)..]) |b| delta += @as(i64, @intCast(b));
+            if (e.chunk_bytes.len > keep) delta -= @as(i64, @intCast(e.chunk_bytes[keep]));
+            new_entry.bytes = clampAdd(e.bytes, delta);
+            // meta.json is the commit point — written last, atomically.
+            try self.writeMeta(new_entry);
+            self.total_bytes = clampAdd(self.total_bytes, delta);
             // ssm_positions/ssm_bytes ownership moved into new_entry.ssm_res —
             // free only the fields NOT carried forward.
             self.allocator.free(e.tokens);
@@ -1117,8 +1193,9 @@ pub const DiskTier = struct {
             self.allocator.free(e.ssm_positions);
             self.allocator.free(e.ssm_bytes);
             e.* = new_entry;
-            self.total_bytes += new_entry.bytes;
         } else {
+            // meta.json is the commit point — written last, atomically.
+            try self.writeMeta(new_entry);
             try self.entries.append(self.allocator, new_entry);
             self.total_bytes += new_entry.bytes;
         }
@@ -1131,6 +1208,16 @@ pub const DiskTier = struct {
             @as(f64, @floatFromInt(self.total_bytes)) / (1024.0 * 1024.0),
             self.entries.items.len,
         });
+        // The ONE completion marker: every chunk AND every wanted checkpoint
+        // of this commit is staged (the manifest rides the same writer queue,
+        // last). A flush bounded by `flush_bound` leaves this line out and
+        // `HotPrefixCache.disk_dirty` set; the next `flushPendingDisk` (after
+        // the next request finishes) extends the entry until it appears.
+        // Harnesses assert on THIS line, not on `persisted N/M` — a bounded
+        // flush prints N < M and is not a defect.
+        if (complete) {
+            log.info("  [disk-cache] e{d} complete on disk: {d} tokens, {d} chunks, {d} ssm-cp\n", .{ id, kv_len, new_entry.chunk_bytes.len, new_entry.ssm_positions.len });
+        }
         return complete;
     }
 
@@ -1166,18 +1253,19 @@ pub const DiskTier = struct {
 
         // Recompute total bytes: chunks + token record are unchanged; only the
         // ssm/spec contributions changed.
-        var kv_and_tokens: u64 = @as(u64, e.tokens.len) * 4;
-        for (e.chunk_bytes) |b| kv_and_tokens += b;
-        var new_bytes: u64 = kv_and_tokens + e.spec_bytes;
-        for (ssm_res.bytes) |b| new_bytes += b;
+        // Delta-based like the extend path: only the checkpoint files moved,
+        // so inherited (linked) chunks stay unbilled and a post-scan bill
+        // stays what the scan made it.
+        var delta: i64 = 0;
+        for (ssm_res.bytes) |b| delta += @as(i64, @intCast(b));
+        for (e.ssm_bytes) |b| delta -= @as(i64, @intCast(b));
 
         self.allocator.free(e.ssm_positions);
         self.allocator.free(e.ssm_bytes);
         e.ssm_positions = ssm_res.positions;
         e.ssm_bytes = ssm_res.bytes;
-        self.total_bytes -|= e.bytes;
-        e.bytes = new_bytes;
-        self.total_bytes += new_bytes;
+        e.bytes = clampAdd(e.bytes, delta);
+        self.total_bytes = clampAdd(self.total_bytes, delta);
         e.last_used = self.bump();
         try self.writeMeta(e.*);
         self.gcToBudget();
@@ -1899,9 +1987,106 @@ pub const DiskTier = struct {
 
     fn removeAt(self: *DiskTier, idx: usize) void {
         var e = self.entries.swapRemove(idx);
-        self.total_bytes -|= e.bytes;
+        self.total_bytes -|= self.bytesFreedByRemoving(&e);
         self.deleteEntryDir(e.id);
         self.freeIndexEntryOwned(&e);
+    }
+
+    /// Bytes deleting `e`'s directory returns to the volume: its non-chunk
+    /// files, plus every chunk file NOBODY else links (`nlink == 1`). A chunk
+    /// with a second link (a donor's, or an heir's) stays on disk and stays
+    /// in `total_bytes`; the LAST holder frees it. The filesystem is the
+    /// refcount — it survives a crash between a link and its manifest, which
+    /// a counter in meta.json would not. A chunk file already missing (the
+    /// writer dropped it) is credited at the size THIS entry was billed.
+    fn bytesFreedByRemoving(self: *DiskTier, e: *const IndexEntry) u64 {
+        const dir_abs = std.fmt.allocPrint(self.allocator, "{s}/e{d}/", .{ self.root, e.id }) catch return e.bytes;
+        defer self.allocator.free(dir_abs);
+        if (self.writer) |w| w.fence(dir_abs);
+        var freed: u64 = nonChunkBytes(e);
+        for (e.chunk_bytes, 0..) |cb, i| {
+            const cp = std.fmt.allocPrint(self.allocator, "{s}c{d:0>6}.safetensors", .{ dir_abs, i }) catch {
+                freed += cb;
+                continue;
+            };
+            defer self.allocator.free(cp);
+            if (statFile(self.io, cp)) |st| {
+                if (st.nlink <= 1) freed += st.size;
+            } else if (i >= e.inherited_chunks) {
+                freed += cb;
+            }
+        }
+        return freed;
+    }
+
+    /// The resident entry whose leading chunk files a NEW entry for `tokens`
+    /// may hard-link instead of writing: same tool flag, the SAME kv-quant
+    /// config (`std.meta.eql` — scheme, bits and group size), and — by
+    /// construction — the same model fingerprint: `self.root` IS the
+    /// fingerprint directory and `self.entries` never holds another root's
+    /// files. Picks the donor with the most WHOLE chunks below the common
+    /// prefix, clamped to the KV this commit holds and to the donor's own
+    /// persisted length (a partial last chunk is never linked). Null when
+    /// nothing shares a whole chunk, on the legacy arm, or under
+    /// `MLX_SERVE_SSD_CHUNK_SHARE=0`.
+    fn chunkShareDonor(self: *DiskTier, tokens: []const u32, kv_target: u32, has_tools: bool, config: kv_quant.KVQuantConfig) ?ChunkDonor {
+        if (!self.ssd_first or !chunkShareEnabled()) return null;
+        var best: ?ChunkDonor = null;
+        for (self.entries.items, 0..) |*e, i| {
+            if (e.has_tools != has_tools) continue;
+            if (!std.meta.eql(e.quant, config)) continue;
+            const shared: u64 = @min(@min(@as(u64, commonPrefixLen(e.tokens, tokens)), @as(u64, kv_target)), @as(u64, e.kv_len));
+            const whole: u32 = @intCast(shared / self.chunk_tokens);
+            const usable: u32 = @min(whole, @as(u32, @intCast(e.chunk_bytes.len)));
+            if (usable == 0) continue;
+            if (best == null or usable > best.?.chunks) best = .{ .idx = i, .id = e.id, .chunks = usable };
+        }
+        return best;
+    }
+
+    const ChunkDonor = struct { idx: usize, id: u64, chunks: u32 };
+
+    /// Hard-link the donor's first `d.chunks` chunk files into `e<id>/` and
+    /// record their sizes. The donor's files may still sit in the background
+    /// writer's queue, so its directory is FENCED first — a link to a file
+    /// that is not there yet is a miss, not a share. Any failure unwinds the
+    /// links made so far and returns an error; the caller then writes every
+    /// chunk itself. Never a half-inherited entry.
+    fn linkInheritedChunks(self: *DiskTier, d: ChunkDonor, id: u64, chunk_sizes: *std.ArrayList(u64)) !void {
+        const donor_dir_abs = try std.fmt.allocPrint(self.allocator, "{s}/e{d}/", .{ self.root, d.id });
+        defer self.allocator.free(donor_dir_abs);
+        if (self.writer) |w| w.fence(donor_dir_abs);
+        var root_dir = try std.Io.Dir.openDirAbsolute(self.io, self.root, .{});
+        defer root_dir.close(self.io);
+        const donor_cb = self.entries.items[d.idx].chunk_bytes;
+        var linked: u32 = 0;
+        errdefer self.unlinkChunks(root_dir, id, linked);
+        var i: u32 = 0;
+        while (i < d.chunks) : (i += 1) {
+            const old_sub = try std.fmt.allocPrint(self.allocator, "e{d}/c{d:0>6}.safetensors", .{ d.id, i });
+            defer self.allocator.free(old_sub);
+            const new_sub = try std.fmt.allocPrint(self.allocator, "e{d}/c{d:0>6}.safetensors", .{ id, i });
+            defer self.allocator.free(new_sub);
+            std.Io.Dir.hardLink(root_dir, old_sub, root_dir, new_sub, self.io, .{}) catch |err| {
+                log.warn("  [disk-cache] chunk share: link e{d}/c{d} -> e{d} failed: {s} — writing the chunks instead\n", .{ d.id, i, id, @errorName(err) });
+                return error.ChunkShareLinkFailed;
+            };
+            linked += 1;
+            try chunk_sizes.append(self.allocator, donor_cb[i]);
+        }
+        var mb: f64 = 0;
+        for (donor_cb[0..d.chunks]) |b| mb += @as(f64, @floatFromInt(b));
+        mb /= 1024.0 * 1024.0;
+        log.info("  [disk-cache] chunk share: e{d} inherits {d} chunks ({d:.1} MB) from e{d} by hard link\n", .{ id, d.chunks, mb, d.id });
+    }
+
+    fn unlinkChunks(self: *DiskTier, root_dir: std.Io.Dir, id: u64, n: u32) void {
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            const sub = std.fmt.allocPrint(self.allocator, "e{d}/c{d:0>6}.safetensors", .{ id, i }) catch continue;
+            defer self.allocator.free(sub);
+            root_dir.deleteFile(self.io, sub) catch {};
+        }
     }
 
     fn deleteEntryDir(self: *DiskTier, id: u64) void {
@@ -1979,7 +2164,7 @@ pub const DiskTier = struct {
         const a = self.allocator;
         try out.print(
             a,
-            "{{\"v\":5,\"kv_len\":{d},\"tokens\":{d},\"has_tools\":{},\"scheme\":\"{s}\",\"bits\":{d},\"group_size\":{d},\"chunk_tokens\":{d},\"bytes\":{d},\"chunk_bytes\":[",
+            "{{\"v\":6,\"kv_len\":{d},\"tokens\":{d},\"has_tools\":{},\"scheme\":\"{s}\",\"bits\":{d},\"group_size\":{d},\"chunk_tokens\":{d},\"inherited_chunks\":{d},\"bytes\":{d},\"chunk_bytes\":[",
             .{
                 e.kv_len,
                 e.tokens.len,
@@ -1988,6 +2173,7 @@ pub const DiskTier = struct {
                 e.quant.bits,
                 e.quant.group_size,
                 self.chunk_tokens,
+                e.inherited_chunks,
                 e.bytes,
             },
         );
@@ -2051,8 +2237,13 @@ pub const DiskTier = struct {
             }
         }.lessThan);
 
+        // Shared chunk files are counted ONCE: an entry whose donor died before
+        // this boot now holds the only link and is billed for it here.
+        var seen = std.AutoHashMap(u64, void).init(self.allocator);
+        defer seen.deinit();
         for (pending.items) |*p| {
             p.e.last_used = self.bump();
+            self.billChunksOnce(&p.e, &seen);
             self.entries.append(self.allocator, p.e) catch {
                 self.freeIndexEntryOwned(&p.e);
                 continue;
@@ -2066,6 +2257,38 @@ pub const DiskTier = struct {
                 self.root,
             });
         }
+    }
+
+    /// Re-bill a scanned entry's chunk files against the inodes already
+    /// counted this scan: the first entry to see an inode pays for it, every
+    /// later holder pays 0. `loadEntry` billed the entry's own (non-inherited)
+    /// chunks; this corrects both directions — a donor that died leaves its
+    /// heir as the payer, and a chunk another entry already paid for is not
+    /// paid twice.
+    fn billChunksOnce(self: *DiskTier, e: *IndexEntry, seen: *std.AutoHashMap(u64, void)) void {
+        var billed: u64 = nonChunkBytes(e);
+        for (e.chunk_bytes, 0..) |cb, i| {
+            const cp = std.fmt.allocPrint(self.allocator, "{s}/e{d}/c{d:0>6}.safetensors", .{ self.root, e.id, i }) catch {
+                billed += cb;
+                continue;
+            };
+            defer self.allocator.free(cp);
+            const st = statFile(self.io, cp) orelse {
+                billed += cb;
+                continue;
+            };
+            if (st.nlink <= 1) {
+                billed += st.size;
+                continue;
+            }
+            const ino: u64 = @intCast(st.inode);
+            const gop = seen.getOrPut(ino) catch {
+                billed += st.size;
+                continue;
+            };
+            if (!gop.found_existing) billed += st.size;
+        }
+        e.bytes = billed;
     }
 
     fn loadEntry(self: *DiskTier, id: u64) ?struct { e: IndexEntry, mtime: i128 } {
@@ -2089,7 +2312,10 @@ pub const DiskTier = struct {
         // state, so an upgrade doesn't nuke existing disk caches (a v4 spec
         // sidecar is still a valid KV-only snap; only the qwen4 head declines
         // it). Older layouts are dropped, not migrated.
-        if (version < 2 or version > 5) return null;
+        if (version < 2 or version > 6) return null;
+        // v6: the leading `inherited_chunks` chunk files are hard links into a
+        // donor's (SSD-first chunk sharing). Absent on every older manifest.
+        const inherited_rec: u64 = jsonU64(obj, "inherited_chunks") orelse 0;
         var kv_len = jsonU64(obj, "kv_len") orelse return null;
         const n_tokens = jsonU64(obj, "tokens") orelse return null;
         const chunk_tokens = jsonU64(obj, "chunk_tokens") orelse return null;
@@ -2169,8 +2395,9 @@ pub const DiskTier = struct {
             t.* = std.mem.readInt(u32, raw[i * 4 ..][0..4], .little);
         }
 
+        const inherited: u32 = @intCast(@min(inherited_rec, chunk_bytes.len));
         var total: u64 = @as(u64, tokens.len) * 4;
-        for (chunk_bytes) |cb| total += cb;
+        for (chunk_bytes[inherited..]) |cb| total += cb;
 
         // v3 SSM checkpoints (v2 entries have no "ssm" field → pure-attention,
         // stays empty). Each file's size is validated against the recorded one
@@ -2282,6 +2509,7 @@ pub const DiskTier = struct {
                 .has_tools = has_tools_v.bool,
                 .quant = quant,
                 .bytes = total,
+                .inherited_chunks = inherited,
                 .chunk_bytes = chunk_bytes,
                 .ssm_positions = ssm_positions,
                 .ssm_bytes = ssm_bytes,
@@ -2493,6 +2721,45 @@ pub fn defaultBaseDir(allocator: std.mem.Allocator) ![]u8 {
 }
 
 // ── Small fs helpers ──
+
+/// Bytes of an entry's files that are never shared: tokens.bin, the SSM
+/// checkpoints and the spec sidecar.
+fn nonChunkBytes(e: *const IndexEntry) u64 {
+    var n: u64 = @as(u64, e.tokens.len) * 4 + e.spec_bytes;
+    for (e.ssm_bytes) |b| n += b;
+    return n;
+}
+
+fn clampAdd(base: u64, delta: i64) u64 {
+    const v: i128 = @as(i128, base) + @as(i128, delta);
+    return if (v < 0) 0 else @intCast(v);
+}
+
+/// Length of the longest common prefix of two token slices. PURE.
+pub fn commonPrefixLen(a: []const u32, b: []const u32) usize {
+    const n = @min(a.len, b.len);
+    var i: usize = 0;
+    while (i < n and a[i] == b[i]) : (i += 1) {}
+    return i;
+}
+
+var chunk_share_env_cached: ?bool = null;
+pub var chunk_share_override: ?bool = null;
+
+/// MLX_SERVE_SSD_CHUNK_SHARE=0 restores the write-everything commit for a
+/// new entry that shares a prefix with a resident one (SSD-first arm only;
+/// the legacy tier never shares). Read on the inference thread — the tier's
+/// only caller — so the lazy cache is not a race.
+pub fn chunkShareEnabled() bool {
+    if (chunk_share_override) |v| return v;
+    if (chunk_share_env_cached) |v| return v;
+    const v = blk: {
+        const raw = std.c.getenv("MLX_SERVE_SSD_CHUNK_SHARE") orelse break :blk true;
+        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
+    };
+    chunk_share_env_cached = v;
+    return v;
+}
 
 fn statFile(io: std.Io, abs_path: []const u8) ?std.Io.File.Stat {
     if (abs_path.len == 0 or !std.fs.path.isAbsolute(abs_path)) return null;
@@ -3511,7 +3778,7 @@ test "DiskTier: v4 spec snapshots round-trip; geometry mismatches decline; v3 re
         defer rewritten.deinit(testing.allocator);
         try rewritten.appendSlice(testing.allocator, content[0..spec_at]);
         try rewritten.append(testing.allocator, '}');
-        _ = std.mem.replace(u8, rewritten.items, "\"v\":5", "\"v\":3", rewritten.items);
+        _ = std.mem.replace(u8, rewritten.items, "\"v\":6", "\"v\":3", rewritten.items);
         const f = try std.Io.Dir.createFileAbsolute(io, meta_path, .{});
         defer f.close(io);
         var wb: [4096]u8 = undefined;
@@ -3972,10 +4239,11 @@ test "volumeSpace: the live probe is plausible or null (statfs ABI guard)" {
     try testing.expect(vs.total > 1024 * 1024 * 1024); // a macOS root volume
 }
 
-test "DiskTier: v5 entries cross the SSD-first boundary in BOTH directions (no manifest bump)" {
+test "DiskTier: entries cross the SSD-first boundary in BOTH directions (SSD-first itself bumps no manifest)" {
     // D6. SSD-first changes WHEN chunks are written (write-through) and WHICH
     // checkpoints are present (outside the byte budget) — never the on-disk
-    // FORMAT. So the manifest stays at v5, and this is the test that buys that
+    // FORMAT. So SSD-first bumps no manifest (v6 is chunk sharing's field,
+    // written by BOTH arms), and this is the test that buys that
     // decision: an entry written by the legacy path must restore under
     // SSD-first, and an entry written by the SSD-first path (hand-serialized
     // safetensors from the background writer, not `mlx_save_safetensors`) must
@@ -4032,10 +4300,11 @@ test "DiskTier: v5 entries cross the SSD-first boundary in BOTH directions (no m
         for ([_]u32{ 0, 1, 2 }) |li| for ([_]u32{ 0, 127, 128, 599 }) |pos| {
             try testing.expectEqual(try cacheValueAt(&cache, li, pos, 3, s), try cacheValueAt(&out, li, pos, 3, s));
         };
-        // The manifest is still v5 — no bump rode in with SSD-first.
+        // The manifest version is the one BOTH arms write (v6, chunk
+        // sharing's `inherited_chunks`) — no bump rode in with SSD-first.
         const meta = try tmp.dir.readFileAlloc(io, "fp-x-ssd/e1/meta.json", testing.allocator, .limited(1 << 20));
         defer testing.allocator.free(meta);
-        try testing.expect(std.mem.indexOf(u8, meta, "\"v\":5") != null);
+        try testing.expect(std.mem.indexOf(u8, meta, "\"v\":6") != null);
     }
 }
 
@@ -4432,4 +4701,259 @@ test "materializeContiguous: the fresh-handle errdefer never outlives the transf
     // already owns.
     try t.expectEqual(@as(usize, 1), std.mem.count(u8, body, "errdefer _ = mlx.mlx_array" ++ "_free(cont);"));
     try t.expect(std.mem.indexOf(u8, body[close..transfer], "try ") == null);
+}
+
+// ── SSD-first chunk sharing (Defect A of the warm-turn re-persist) ──
+
+/// Two 600-token sequences that agree for the first `shared` tokens and
+/// diverge after — the shape of turn N+1's prompt against turn N's persisted
+/// `prompt ++ generated`.
+const ShareToks = struct { a: [600]u32, b: [600]u32 };
+fn chunkShareTokens(shared: usize) ShareToks {
+    var out: ShareToks = undefined;
+    for (&out.a, 0..) |*t, i| t.* = @intCast(i + 7);
+    for (&out.b, 0..) |*t, i| t.* = if (i < shared) @intCast(i + 7) else @intCast(9000 + i);
+    return out;
+}
+
+fn chunkStat(io: std.Io, base: []const u8, fp: []const u8, id: u64, chunk: u32) ?std.Io.File.Stat {
+    var buf: [1024]u8 = undefined;
+    const p = std.fmt.bufPrint(&buf, "{s}/{s}/e{d}/c{d:0>6}.safetensors", .{ base, fp, id, chunk }) catch return null;
+    return statFile(io, p);
+}
+
+test "commonPrefixLen: the longest shared prefix, never past the shorter slice" {
+    const a = [_]u32{ 1, 2, 3, 4 };
+    const b = [_]u32{ 1, 2, 9, 4, 5 };
+    try testing.expectEqual(@as(usize, 2), commonPrefixLen(&a, &b));
+    try testing.expectEqual(@as(usize, 4), commonPrefixLen(&a, &a));
+    try testing.expectEqual(@as(usize, 0), commonPrefixLen(&a, &[_]u32{}));
+    try testing.expectEqual(@as(usize, 3), commonPrefixLen(&a, a[0..3]));
+}
+
+test "DiskTier chunk share: a prefix-diverging entry hard-links the donor's whole chunks, writes only its tail, bills once, restores whole" {
+    // Turn N persists `prompt ++ generated`; turn N+1's prompt diverges inside
+    // the generated span. The strict-prefix extend scan cannot see that, and
+    // the tier used to write every chunk again. Now the heir LINKS the whole
+    // chunks below the common prefix and writes the rest.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    chunk_share_override = true;
+    defer chunk_share_override = null;
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-share", 0, 128);
+    defer tier.deinit();
+    tier.ssd_first = true;
+
+    // 600 tokens => chunks 0..3 whole (512 tokens), chunk 4 partial (88).
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    const toks = chunkShareTokens(520); // diverges at 520: 4 whole chunks shared
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.a, false, null, s);
+    try testing.expectEqual(@as(usize, 1), tier.entryCount());
+    const donor_bytes = tier.total_bytes;
+    const donor_id = tier.entries.items[0].id;
+
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.b, false, null, s);
+    try testing.expectEqual(@as(usize, 2), tier.entryCount());
+    const heir = &tier.entries.items[1];
+    try testing.expectEqual(@as(u32, 4), heir.inherited_chunks);
+    try testing.expectEqual(@as(usize, 5), heir.chunk_bytes.len);
+    try testing.expectEqual(@as(u32, 600), heir.kv_len);
+    // The leading files are ONE inode with two links; the tail is its own.
+    const d0 = chunkStat(io, base, "fp-share", donor_id, 0).?;
+    const h0 = chunkStat(io, base, "fp-share", heir.id, 0).?;
+    try testing.expectEqual(d0.inode, h0.inode);
+    try testing.expectEqual(@as(u64, 2), @as(u64, @intCast(h0.nlink)));
+    const h4 = chunkStat(io, base, "fp-share", heir.id, 4).?;
+    try testing.expectEqual(@as(u64, 1), @as(u64, @intCast(h4.nlink)));
+    // Billed once: the heir added only its tail chunk and its tokens.bin.
+    try testing.expectEqual(donor_bytes + heir.chunk_bytes[4] + 600 * 4, tier.total_bytes);
+    try testing.expectEqual(heir.chunk_bytes[4] + 600 * 4, heir.bytes);
+
+    // The heir restores whole through a fresh tier (the restart path), and
+    // its bill survives the scan: every inode counted once.
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-share", 0, 128);
+    defer tier2.deinit();
+    try testing.expectEqual(@as(usize, 2), tier2.entryCount());
+    try testing.expectEqual(tier.total_bytes, tier2.total_bytes);
+    const m = tier2.bestMatch(&toks.b, false, kv_quant.KVQuantConfig.dense).?;
+    try testing.expectEqual(@as(u32, 600), m.usable);
+    var out = try KVCache.init(testing.allocator, 3);
+    defer out.deinit();
+    try tier2.restorePrefixInto(&out, m.idx, 600, s);
+    try testing.expectEqual(@as(usize, 600), out.step);
+    inline for (.{ 0, 300, 599 }) |pos| {
+        try testing.expectEqual(try cacheValueAt(&cache, 1, pos, 3, s), try cacheValueAt(&out, 1, pos, 3, s));
+    }
+}
+
+test "DiskTier chunk share: total_bytes is bytes on disk whichever holder dies first" {
+    // The filesystem is the refcount: removing the donor frees only the files
+    // nobody else links, the last holder frees the rest — donor-then-heir and
+    // heir-then-donor both land back on the pre-commit number.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    chunk_share_override = true;
+    defer chunk_share_override = null;
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    const toks = chunkShareTokens(520);
+
+    for ([_]bool{ true, false }) |donor_first| {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var buf: [512]u8 = undefined;
+        const base = try tmpRoot(&tmp, io, &buf);
+        var tier = try DiskTier.init(testing.allocator, io, base, "fp-order", 0, 128);
+        defer tier.deinit();
+        tier.ssd_first = true;
+        try testing.expectEqual(@as(u64, 0), tier.total_bytes);
+
+        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.a, false, null, s);
+        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.b, false, null, s);
+        try testing.expectEqual(@as(usize, 2), tier.entryCount());
+        const donor_idx: usize = 0;
+        const heir_idx: usize = 1;
+        const donor_id = tier.entries.items[donor_idx].id;
+        const heir_id = tier.entries.items[heir_idx].id;
+        var shared_bytes: u64 = 0;
+        for (tier.entries.items[heir_idx].chunk_bytes[0..4]) |b| shared_bytes += b;
+        const donor_own = tier.entries.items[donor_idx].bytes - shared_bytes; // its tail + tokens
+        const heir_own = tier.entries.items[heir_idx].bytes; // its tail + tokens (links billed 0)
+        try testing.expectEqual(shared_bytes + donor_own + heir_own, tier.total_bytes);
+
+        if (donor_first) {
+            tier.removeAt(donor_idx);
+            // The shared chunks stay on disk under the heir, and stay billed.
+            try testing.expectEqual(shared_bytes + heir_own, tier.total_bytes);
+            try testing.expect(chunkStat(io, base, "fp-order", heir_id, 0) != null);
+            try testing.expect(chunkStat(io, base, "fp-order", donor_id, 0) == null);
+            try testing.expectEqual(@as(u64, 1), @as(u64, @intCast(chunkStat(io, base, "fp-order", heir_id, 0).?.nlink)));
+            tier.removeAt(0);
+        } else {
+            tier.removeAt(heir_idx);
+            try testing.expectEqual(shared_bytes + donor_own, tier.total_bytes);
+            try testing.expect(chunkStat(io, base, "fp-order", donor_id, 0) != null);
+            try testing.expectEqual(@as(u64, 1), @as(u64, @intCast(chunkStat(io, base, "fp-order", donor_id, 0).?.nlink)));
+            tier.removeAt(0);
+        }
+        try testing.expectEqual(@as(usize, 0), tier.entryCount());
+        try testing.expectEqual(@as(u64, 0), tier.total_bytes);
+    }
+}
+
+test "DiskTier chunk share: the legacy arm and the kill switch never link" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    const toks = chunkShareTokens(520);
+    // Arm 1: legacy tier (not SSD-first), switch on. Arm 2: SSD-first, switch off.
+    for ([_]struct { ssd: bool, share: bool }{ .{ .ssd = false, .share = true }, .{ .ssd = true, .share = false } }) |arm| {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var buf: [512]u8 = undefined;
+        const base = try tmpRoot(&tmp, io, &buf);
+        chunk_share_override = arm.share;
+        defer chunk_share_override = null;
+        var tier = try DiskTier.init(testing.allocator, io, base, "fp-nolink", 0, 128);
+        defer tier.deinit();
+        tier.ssd_first = arm.ssd;
+        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.a, false, null, s);
+        const before = tier.total_bytes;
+        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.b, false, null, s);
+        const heir = &tier.entries.items[1];
+        try testing.expectEqual(@as(u32, 0), heir.inherited_chunks);
+        try testing.expectEqual(@as(u64, 1), @as(u64, @intCast(chunkStat(io, base, "fp-nolink", heir.id, 0).?.nlink)));
+        var all: u64 = 600 * 4;
+        for (heir.chunk_bytes) |b| all += b;
+        try testing.expectEqual(before + all, tier.total_bytes);
+    }
+}
+
+test "DiskTier chunk share: meta v6 carries inherited_chunks; a v5 manifest loads with none" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    chunk_share_override = true;
+    defer chunk_share_override = null;
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    const toks = chunkShareTokens(520);
+    var heir_id: u64 = 0;
+    {
+        var tier = try DiskTier.init(testing.allocator, io, base, "fp-v6", 0, 128);
+        defer tier.deinit();
+        tier.ssd_first = true;
+        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.a, false, null, s);
+        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.b, false, null, s);
+        heir_id = tier.entries.items[1].id;
+    }
+    var mp: [128]u8 = undefined;
+    const meta_rel = try std.fmt.bufPrint(&mp, "fp-v6/e{d}/meta.json", .{heir_id});
+    const meta = try tmp.dir.readFileAlloc(io, meta_rel, testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(meta);
+    try testing.expect(std.mem.indexOf(u8, meta, "\"v\":6") != null);
+    try testing.expect(std.mem.indexOf(u8, meta, "\"inherited_chunks\":4") != null);
+    {
+        var tier = try DiskTier.init(testing.allocator, io, base, "fp-v6", 0, 128);
+        defer tier.deinit();
+        var found = false;
+        for (tier.entries.items) |*e| {
+            if (e.id == heir_id) {
+                found = true;
+                try testing.expectEqual(@as(u32, 4), e.inherited_chunks);
+            }
+        }
+        try testing.expect(found);
+    }
+    // An older binary's manifest (v5, no field) still loads: nothing inherited.
+    var rewritten = std.ArrayList(u8).empty;
+    defer rewritten.deinit(testing.allocator);
+    try rewritten.appendSlice(testing.allocator, meta);
+    _ = std.mem.replace(u8, rewritten.items, "\"v\":6", "\"v\":5", rewritten.items);
+    const stripped = try std.mem.replaceOwned(u8, testing.allocator, rewritten.items, "\"inherited_chunks\":4,", "");
+    defer testing.allocator.free(stripped);
+    try tmp.dir.writeFile(io, .{ .sub_path = meta_rel, .data = stripped });
+    {
+        var tier = try DiskTier.init(testing.allocator, io, base, "fp-v6", 0, 128);
+        defer tier.deinit();
+        for (tier.entries.items) |*e| {
+            if (e.id == heir_id) try testing.expectEqual(@as(u32, 0), e.inherited_chunks);
+        }
+    }
+}
+
+test "scan: the write-through hook bounds its flush to ONE chunk, and the bound is a call-site parameter" {
+    // Defect A's TTFT half: the hook runs inside the prefill, so whatever it
+    // serializes lands before the first token. One chunk per boundary is the
+    // contract; the end-of-request flush completes the rest. The bound is an
+    // explicit argument (scan-pinnable), never mutable tier state.
+    const sched = @embedFile("scheduler.zig");
+    try testing.expect(std.mem.indexOf(u8, sched, "pub const WRITE_THROUGH_FLUSH" ++ "_BOUND_BYTES: u64 = 1;") != null);
+    const call = std.mem.indexOf(u8, sched, "d.appendCommit" ++ "Bounded(") orelse return error.HookNotBounded;
+    const call_end = std.mem.indexOfPos(u8, sched, call, ");").?;
+    try testing.expect(std.mem.indexOf(u8, sched[call..call_end], "WRITE_THROUGH_FLUSH" ++ "_BOUND_BYTES") != null);
+    // The hook has exactly one commit call and it is the bounded one.
+    const hook = std.mem.indexOf(u8, sched, "fn prefillWriteThroughCb(").?;
+    const hook_end = std.mem.indexOfPos(u8, sched, hook, "\nconst WriteThroughCtx").?;
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, sched[hook..hook_end], "d.appendCommit"));
+    // ...and the loop reads the PARAMETER, not the tier field.
+    const src = @embedFile("kv_disk_cache.zig");
+    const fn_start = std.mem.indexOf(u8, src, "fn appendCommitWithSpec" ++ "Bounded(").?;
+    const fn_end = std.mem.indexOfPos(u8, src, fn_start, "\n    }\n").?;
+    try testing.expect(std.mem.indexOf(u8, src[fn_start..fn_end], "written_bytes >= flush_bound and chunk_i > keep") != null);
+    try testing.expect(std.mem.indexOf(u8, src[fn_start..fn_end], "written_bytes >= self.max_flush" ++ "_bytes") == null);
 }
