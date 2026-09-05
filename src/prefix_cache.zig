@@ -1598,6 +1598,15 @@ pub const HotPrefixCache = struct {
                     // declining. The old arm swallowed the error entirely.
                     decline = .snapshot_copy_failed;
                     decline_err = err;
+                    // ARCH GATE (PR #363). a93e2c0 declined the commit on a
+                    // failed trimmed copy; retrying at the next-lower
+                    // checkpoint means allocating AGAIN, immediately, on a
+                    // path whose failure is usually memory pressure — and a
+                    // retry loop under pressure is how a clean decline becomes
+                    // an uncatchable Metal abort. It was measured on the gated
+                    // arch's oversized 383k commits; off it a declined commit
+                    // costs one cache entry, which is what a93e2c0 paid.
+                    if (self.cp_thin == .min_span) break :trim_blk;
                     log.warn("  [hot-cache] trimmed copy to {d} tokens failed: {s}; retrying at the next-lower checkpoint\n", .{ tl, @errorName(err) });
                     if (tl == 0) break :trim_blk;
                     limit = tl - 1;
@@ -5638,9 +5647,25 @@ test "prefix cache: a failed trimmed copy retries at the next-lower checkpoint" 
     const source = @embedFile("prefix_cache.zig");
     const at = std.mem.indexOf(u8, source, "new_snap.trimmedCopy(tl, mlx.gpuStream()) catch") orelse
         return error.MissingTrimCopy;
-    const arm = source[at..@min(source.len, at + 800)];
+    const arm = source[at..@min(source.len, at + 1700)];
     try testing.expect(std.mem.indexOf(u8, arm, "limit = tl - 1") != null);
     try testing.expect(std.mem.indexOf(u8, arm, "@errorName(err)") != null);
+    // ARCH GATE (PR #363). The retry allocates AGAIN, immediately, on a path
+    // whose failure is usually memory pressure; a retry loop under pressure is
+    // how a clean decline becomes an uncatchable Metal abort. Every other arch
+    // keeps a93e2c0's behaviour — decline the commit, at a cost of one cache
+    // entry — and the gate is the SAME field the retention policy reads, so a
+    // tier cannot have one without the other.
+    try testing.expect(std.mem.indexOf(u8, arm, "if (self.cp_thin == .min_span) break :trim_blk;") != null);
+    // ...and it is checked BEFORE the retry's own log line, so an ungated
+    // decline does not announce a retry it will not do.
+    const gate_at = std.mem.indexOf(u8, arm, "if (self.cp_thin == .min_span) break").?;
+    const log_at = std.mem.indexOf(u8, arm, "retrying at the next-lower checkpoint").?;
+    try testing.expect(gate_at < log_at);
+    // The error is still LATCHED on both arms: an ungated decline names its
+    // cause rather than swallowing it, which was the original defect.
+    const decl_at = std.mem.indexOf(u8, arm, "decline_err = err;").?;
+    try testing.expect(decl_at < gate_at);
 }
 
 test "prefix cache: an oversized commit names WHICH outcome declined it" {

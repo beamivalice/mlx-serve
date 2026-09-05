@@ -3830,7 +3830,7 @@ is not a guard — every D below was checked by reading the predicate body).
 | 4 | `server.prefillRequestTerms` (all four terms) | reserved KV headroom billed on every arch while its allocator twin was gated; retained SSM checkpoints (~1.9 GB) billed on qwen3_5/qwen3_5_moe/qwen3_next/bailing_hybrid but NOT lfm2/nemotron_h; the warm credit under-bills on every arch | `if (!config.longCtxGated()) return .{};` — `.{}` is the identity for `prefillMemoryNeeded`, so the bill is a93e2c0's 13-argument expression | bill characterization + the sizer/bill consistency test on qwen4 |
 | 5 | `server.prefillChunkCap` (ex-`resolvePrefillChunk`) | TWO changes at once: the hot-cache ask was dropped from the serving budget (widens the rung) and the ctx bar was added (can pin chunk 512 for a process) | one gated helper; the ungated arm is a93e2c0's `(ceiling − (active + ask)) / SHARE` | `prefillChunkCap:` characterization over seven archs |
 
-### Class C — found by the sweep, still open
+### Class C — found by the sweep (all closed in the second round, below)
 
 | site | reach | note |
 |---|---|---|
@@ -3862,11 +3862,64 @@ pre-prefill refusal into a 400 instead of a generic 500; and
 sidecar's size delta and drifts `total_bytes` on every sidecar-only commit
 (reachable on any arch with a dflash/MTP snap plus `--prefix-cache-disk`).
 
+### Class C — gated by the second round (open list closed)
+
+| # | site | reach off qwen4 | gate | test |
+|---|---|---|---|---|
+| A-1 | `ModelConfig.perRequestPrefillChunk` (`src/model.zig:790`) | hand-rolled `"qwen4_exp"`; the ONLY gate on the admission re-ask, the tail-merge bound and the per-chunk adapter | delegates to `longCtxGated()` | `no policy predicate hand-rolls the qwen4_exp literal` — a PRODUCTION-WINDOW scan of the literal, since counting predicate CALLS cannot see an inline `std.mem.eql` |
+| 6 | `kv_disk_cache.SSM_DISK_MAX_PER_ENTRY` 8 → 16 | every hybrid with `--prefix-cache-disk`: double the persisted checkpoint footprint per entry, and different `gcToBudget` pressure for the whole tier | `DiskTier.ssm_max_per_entry`, mirrored beside `cp_thin` at the ONE wiring site; `SSM_DISK_MAX_PER_ENTRY_LEGACY` (8) is the default | `the per-entry checkpoint cap is gated; a legacy tier keeps a93e2c0's 8` |
+| 7 | `meta.json` `"v":6` written unconditionally | every arch with disk on: a93e2c0's reader accepts 2/3/4 only, so a downgrade discards the WHOLE persisted tier | `metaVersionFor` stamps the LOWEST version that describes the entry (v6 = inherited chunks, v5 = the MTP head's QSA half, else v4). Not an arch gate — a property of the entry | `the manifest stamps the LOWEST version that describes the entry` |
+| 8 | `server.prefixCacheMemForLoad` | every arch, THREE inputs at once: static ceiling, `ramFirstContextForLoad`, `planHotCache` + `clampReserveWidth` | ungated arm is a93e2c0's verbatim, placed ABOVE both the SSD arm and the plan | `the ungated budget arm is a93e2c0's arithmetic` |
+| 9 | `server.computeMemoryContext` → `CTX_SIZING_CACHE_RESERVE` | every arch: a different ADVERTISED `context_length` at any `--prefix-cache-mem` but the 2 GiB default, read once per session by every agent CLI | `ctxSizingCacheReserve(config)`; both load-time wrappers read it too, so the billed session and the advertised session stay one number | `the advertised context is a93e2c0's on every other arch` |
+| 10 | evict-to-admit: the two credits, the two new `checkAttentionMemory` admit arms, `evictLruToAdmit`, `error.PrefillDoesNotFit` | every arch, every request | the two CREDITS zeroed in `prefillAdmissionBill` (one lever: `fitsAfterEviction()` becomes `fits()`, `pinnedResidentBytes` becomes 0, so both arms go dead together) + the same predicate on the scheduler's pass | `the evict-to-admit credits are qwen4_exp-only` |
+| 11 | `prefix_cache` trim retry loop | every arch, error path: retries an allocation immediately on a path whose failure is memory pressure | `self.cp_thin == .min_span` → decline, a93e2c0's behaviour; the error is still LATCHED on both arms | the retry test's gate/log/latch ordering assertions |
+
+### Class A — the second round's additions
+
+`kv_disk_cache.appendSsmOnly` billed its `total_bytes` delta from the
+checkpoint files alone while also writing `spec.safetensors`, and assigned
+`e.spec_bytes` before taking the delta — so the sidecar was written and never
+billed, `gcToBudget` priced the tier low, and the footprint drifted past
+`--prefix-cache-disk`. Reachable on any arch with a dflash/MTP snap plus a disk
+tier; fixed for everyone (`an ssm/spec-only append bills the SPEC sidecar's byte
+delta`, red at 80,739 vs 118,668).
+
+`publishResolvedPrefixCacheMem` stays ungated **on purpose**, and it is the one
+place this round knowingly departs from a93e2c0 on other archs: a93e2c0's ANE
+gate reserved the RAW `--prefix-cache-mem` while the cache could only ever hold
+the clamp, so three places disagreed about how many bytes the cache holds.
+Publishing a number the cache is actually capped at cannot over-admit, and it
+only affects `--ane-prefill` boots. Recorded here so it can be objected to
+rather than discovered.
+
+### Sweep extension: aad0315 → f3f0a25
+
+| commit | site | class | note |
+|---|---|---|---|
+| `c7f0657` | ONE error mapping for streaming and non-streaming | **A** | a streaming fault answered differently from the same non-streaming fault. Pinned by `a streaming fault answers with the SAME mapped error a non-streaming one does` |
+| `035da33` | a latched MLX failure ends the request, never a 200 | **A** | the terminator reads the latch BEFORE it publishes, and is the only publisher. `peekErrorName names the class WITHOUT consuming the latch`, `a finish over a latched MLX failure ends the request as an ERROR, never a 200`, `the slot terminator reads the MLX latch BEFORE it publishes, and is the only publisher` |
+| `db9fa58` | `DiskTier.deinit` lifts the writer pause before `w.drain()` | **A** | a paused background writer deadlocked `zig build test` (the B-A1 hang this branch reproduced on aad0315). `DiskTier: deinit RETURNS with the writer paused, and lands what was queued`, `every test that PAUSES the background writer owes a deferred unpause`, `kv_disk_writer: a PAUSED writer deinits without blocking` |
+| `8959c78` | the post-eviction re-ask is the width that runs, in both directions | **C, already gated** | `postEvictionPrefillChunk` runs only where there IS a per-request width, i.e. behind `perRequestPrefillChunk` — which A-1 now routes through `longCtxGated()`. `the post-eviction re-ask never exceeds what live memory affords, and never runs on an arch that has no per-request width` |
+| `124f19d` | the warm KV credit fires only where the restore CHECKS OUT its entry (B-A3) | **C, subsumed** | `WarmPrefix.will_donate` gates `creditedRows`; off qwen4_exp the credit is already zero because `prefillRequestTerms` returns `.{}` (gate 4). The two compose — the fold's fix tightens the gated arm, this branch removes the ungated one |
+| `e59e259` | one round-cost `Layout` resolver | **D** | `layoutFor` is the single resolver and `Layout.legacy` keeps a sidecar pack booting warm off the `rc1` file 26.9.1 wrote. Verified gated, not assumed: `layoutFor is THE round-cost layout resolver`, `every round-cost layout assignment routes through the ONE resolver` |
+
+### The round-cost / planner cluster — class D, verified
+
+The adaptive MTP width/depth planner, the EV cost profiles and the persisted
+round-cost table do not reach a non-qwen4 arch's behaviour: the adaptive-serial
+block is behind `mtpAdaptiveArchEligible`, `MtpCostProfile` falls back to
+`generic`/cap-6 for any unmeasured fingerprint, and the table's on-disk layout
+is resolved by the ONE `layoutFor` with `.legacy` preserving the `rc1` file a
+sidecar pack (the qwen3_5 27B) already has. The 27B's SIDECAR MTP head
+therefore boots warm off its existing table rather than re-measuring — which is
+the property that would otherwise have been a silent first-request regression
+on that pack.
+
 ### The rule this leaves
 
 A "qwen4_exp long-context" change that touches a shared function is a
 cross-arch change until a predicate says otherwise. The predicate is
 `ModelConfig.longCtxGated()`, it has ONE body, and a site that cannot see a
 ModelConfig mirrors it ONCE into a field at wiring time
-(`HotPrefixCache.span_preserving_cps`, the `qsa_history_required` pattern) and
+(`HotPrefixCache.cp_thin`, the `qsa_history_required` pattern) and
 is scan-pinned to it.
