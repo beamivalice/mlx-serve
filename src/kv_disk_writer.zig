@@ -101,11 +101,21 @@ pub const Writer = struct {
             return;
         }
         self.deinited = true;
+        // A PAUSED writer must not make teardown block, and neither may it
+        // leave another thread parked in `drain`/`submit` forever: lift the
+        // pause and wake BOTH condition variables before the loop is stopped.
+        // `drain` waits on `done`, and stopping the loop alone never signals
+        // it. (B-A1 chunk-share audit: a failed assertion under a paused
+        // writer deadlocked the suite.)
+        self.paused = false;
+        self.work.broadcast(self.io);
+        self.done.broadcast(self.io);
         self.mutex.unlock(self.io);
         self.mutex.lockUncancelable(self.io);
         self.running = false;
         self.paused = false;
         self.work.broadcast(self.io);
+        self.done.broadcast(self.io);
         self.mutex.unlock(self.io);
         if (self.thread) |t| t.join();
         self.thread = null;
@@ -486,4 +496,33 @@ test "kv_disk_writer: the host-byte permit bounds staged bytes" {
     }
     w.drain();
     try testing.expectEqual(@as(u64, 32), w.filesWritten());
+}
+
+test "kv_disk_writer: a PAUSED writer deinits without blocking" {
+    // A test that pauses the writer and then fails an assertion must not hang
+    // the SUITE. The B-A1 chunk-share test did exactly that: `setPaused(true)`
+    // + `defer tier.deinit()` and the teardown drain waited forever on a queue
+    // the paused loop would never take. `deinit` lifts the pause (and wakes
+    // `done` as well as `work`, since `drain` parks on `done`) before it stops
+    // the loop, so this returns whatever the queue holds.
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+
+    var w = Writer.init(testing.allocator, std.testing.io);
+    try w.start();
+    w.setPaused(true);
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/held.bin", .{root});
+    const bytes = try testing.allocator.alloc(u8, 4096);
+    @memset(bytes, 3);
+    w.submit(path, bytes);
+    try testing.expect(w.pendingBytes() > 0);
+
+    // The bar is that this RETURNS. Nothing frees the blob but `deinit`, so a
+    // leak-checked run also proves it took ownership of the paused queue.
+    w.deinit();
+    try testing.expect(w.thread == null);
+    // Safe to call twice, paused or not.
+    w.deinit();
 }

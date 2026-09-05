@@ -561,6 +561,13 @@ pub const DiskTier = struct {
         if (self.base_dir) |b| self.allocator.free(b);
         self.base_dir = null;
         if (self.writer) |w| {
+            // Teardown must never block on a PAUSED writer. `drain` waits for
+            // the queue to empty and a paused writer never empties it, so a
+            // test that paused the writer and then failed an assertion hung
+            // the whole suite in its `defer tier.deinit()` (the B-A1 chunk-
+            // share test). Lift the pause first: the queue then drains for
+            // real, which is also what a paused-but-committed entry deserves.
+            w.setPaused(false);
             w.drain();
             w.deinit();
             self.allocator.destroy(w);
@@ -4301,6 +4308,10 @@ test "DiskTier: SSD-first stages the flush off-thread and indexes LAST" {
     // The readback bound REPLACES the 512 MB synchronous-stall cap.
     try testing.expectEqual(SSD_FIRST_READBACK_BYTES, tier.max_flush_bytes);
     tier.writer.?.setPaused(true);
+    // Never let a failed assertion below hang the SUITE: teardown drains,
+    // and a drain against a paused writer waits forever. (Scan-pinned: every
+    // `setPaused(true)` in a test owes a deferred unpause.)
+    defer tier.writer.?.setPaused(false);
 
     var cache = try KVCache.init(testing.allocator, 3);
     defer cache.deinit();
@@ -4409,6 +4420,10 @@ test "DiskTier: SSD-first write-through extends without rewriting a persisted ch
     // Chunk boundary 2: the prefill continues to 768. Only chunk 5 is new.
     try fillCache(&cache, s, 2, 128, 8, 640.0, .float32);
     tier.writer.?.setPaused(true);
+    // Never let a failed assertion below hang the SUITE: teardown drains,
+    // and a drain against a paused writer waits forever. (Scan-pinned: every
+    // `setPaused(true)` in a test owes a deferred unpause.)
+    defer tier.writer.?.setPaused(false);
     _ = try tier.appendCommit(cache.entries, 768, cache.config, tokens[0..768], false, &cps640, s);
     var staged = std.ArrayList([]const u8).empty;
     defer {
@@ -5284,30 +5299,48 @@ test "DiskTier chunk share: an heir links ONLY the donor's landed chunks; the do
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-landed", 0, 128);
     defer tier.deinit();
     tier.ssd_first = true;
+    // SSD-first refreshes the budget from FREE SPACE on every store, so a
+    // test that does not arm this asserts the tester's disk (item 1).
+    tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
     tier.enableBackgroundWriter();
     try testing.expect(tier.writer != null);
-    tier.max_flush_bytes = 1; // one chunk per flush, like the hook
 
     var cache = try KVCache.init(testing.allocator, 3);
     defer cache.deinit();
     try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
     const toks = chunkShareTokens(520);
 
+    // The DONOR is the one that lands one chunk per flush, so the bound goes
+    // on ITS commits (`appendCommitBounded(.., 1)`, the write-through hook's
+    // form) and not on the tier. `tier.max_flush_bytes = 1` bounds the HEIR
+    // too, and the heir's write loop then stops one chunk past the links
+    // (`written_bytes >= flush_bound and chunk_i > keep`) — 3 chunks / 384,
+    // never the completed 5 / 600 this test is about. The heir commits
+    // unbounded, the way `flushPendingDisk` completes an entry after the
+    // response.
+    const donor_bound: u64 = 1;
+
     // Donor: chunks 0 and 1 LANDED (two flushes, drained), chunk 2 QUEUED
     // (third flush with the writer paused).
-    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.a, false, null, s);
+    _ = try tier.appendCommitBounded(cache.entries, cache.step, cache.config, &toks.a, false, null, s, donor_bound);
     tier.drainWriter();
-    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.a, false, null, s);
+    _ = try tier.appendCommitBounded(cache.entries, cache.step, cache.config, &toks.a, false, null, s, donor_bound);
     tier.drainWriter();
     try testing.expectEqual(@as(u32, 256), tier.entries.items[0].kv_len);
     tier.writer.?.setPaused(true);
-    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.a, false, null, s);
+    // A failed assertion below must not hang the SUITE: `deinit` drains, and
+    // a drain against a paused writer waits forever. (The tier's own teardown
+    // lifts the pause now too — belt and braces, and the scan-pin below makes
+    // this defer the rule for every test.)
+    defer tier.writer.?.setPaused(false);
+    _ = try tier.appendCommitBounded(cache.entries, cache.step, cache.config, &toks.a, false, null, s, donor_bound);
     try testing.expectEqual(@as(u32, 384), tier.entries.items[0].kv_len);
     const donor_id = tier.entries.items[0].id;
     try testing.expect(chunkStat(io, base, "fp-landed", donor_id, 2) == null); // still queued
     const dropped_before = tier.writer.?.files_dropped;
 
-    // Heir: the overlap allows 4 whole chunks; only 2 have landed.
+    // Heir: the overlap allows 4 whole chunks; only 2 have landed. Unbounded,
+    // so it links those 2 and WRITES 2..4 — a complete entry.
     _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.b, false, null, s);
     try testing.expectEqual(@as(usize, 2), tier.entryCount());
     const heir = &tier.entries.items[1];
@@ -5346,4 +5379,87 @@ test "DiskTier chunk share: an heir links ONLY the donor's landed chunks; the do
     const fn_end = std.mem.indexOfPos(u8, src, fn_start, "\n    }\n").?;
     try testing.expect(std.mem.indexOf(u8, src[fn_start..fn_end], ".fence(") == null);
     try testing.expect(std.mem.indexOf(u8, src[fn_start..fn_end], "chunkLanded(") != null);
+}
+
+test "DiskTier: deinit RETURNS with the writer paused, and lands what was queued" {
+    // The other half of the B-A1 deadlock. `DiskTier.deinit` drains before it
+    // deinits the writer, and only `Writer.deinit` used to clear `paused` — so
+    // the drain waited forever and the whole suite hung on one failed
+    // assertion. A deferred unpause in the test is not enough: the next test
+    // to pause would inherit the trap. Teardown lifts the pause itself.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 640, 8, 0.0, .float32); // > MIN_PERSIST_TOKENS
+    var tokens: [640]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-paused-deinit", 0, 128);
+    tier.ssd_first = true;
+    // SSD-first refreshes the budget from FREE SPACE on every store, so a
+    // test that does not arm this asserts the tester's disk (item 1).
+    tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
+    tier.enableBackgroundWriter();
+    try testing.expect(tier.writer != null);
+    tier.writer.?.setPaused(true);
+    // pause-scan-exempt: no deferred unpause ON PURPOSE — teardown IS the
+    // release under test here, and `tier.deinit()` nulls `tier.writer`, so a
+    // deferred `tier.writer.?` would fire on a destroyed writer.
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
+    try testing.expect(tier.writer.?.pendingBytes() > 0);
+
+    // Not deferred: the bar is that the call RETURNS.
+    tier.deinit();
+
+    // And it lifted the pause rather than skipping the drain — the committed
+    // entry is really on disk, which is what a paused-but-committed entry
+    // deserves at teardown.
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-paused-deinit", 0, 128);
+    defer tier2.deinit();
+    try testing.expectEqual(@as(usize, 1), tier2.entryCount());
+    try testing.expectEqual(@as(u32, 640), tier2.entries.items[0].kv_len);
+}
+
+test "every test that PAUSES the background writer owes a deferred unpause" {
+    // Class guard for the B-A1 deadlock. `setPaused` is a test-only hold, and
+    // every hold in this repo is inside a test whose teardown drains. Teardown
+    // lifts the pause now, but the deferred unpause is still the rule: it
+    // keeps the release next to the hold, and it releases at the FAILURE
+    // point rather than at the tier's teardown. Needles split so this test's
+    // own source cannot satisfy them.
+    const hold = ".setPaused(" ++ "true);";
+    const release = ".setPaused(" ++ "false);";
+    var checked: usize = 0;
+    for ([_][]const u8{ @embedFile("kv_disk_cache.zig"), @embedFile("prefix_cache.zig") }) |src| {
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, src, i, hold)) |at| {
+            i = at + hold.len;
+            // The receiver is everything back to the start of the line.
+            const ls = std.mem.lastIndexOfScalar(u8, src[0..at], '\n') orelse 0;
+            const recv = std.mem.trim(u8, src[ls .. at + 1], " \n\t"); // include the '.'
+            const window = src[at..@min(src.len, at + 600)];
+            // One named escape, spelled AT the hold: the test whose subject is
+            // teardown-under-pause cannot defer a release (teardown destroys
+            // the writer the defer would touch).
+            if (std.mem.indexOf(u8, window, "pause-scan-" ++ "exempt") != null) continue;
+            const rel = std.mem.indexOf(u8, window, release) orelse return error.PausedWriterIsNeverReleased;
+            // ...on the SAME receiver, and DEFERRED: the release line must
+            // read `defer <recv>setPaused(false);`.
+            const rls = std.mem.lastIndexOfScalar(u8, window[0..rel], '\n') orelse 0;
+            const line = std.mem.trim(u8, window[rls .. rel + release.len], " \n\t");
+            const kw = "defer ";
+            if (!std.mem.startsWith(u8, line, kw)) return error.PausedWriterReleaseIsNotDeferred;
+            const rest = line[kw.len..];
+            if (!std.mem.startsWith(u8, rest, recv) or
+                !std.mem.eql(u8, rest[recv.len..], release[1..])) return error.PausedWriterReleaseIsNotDeferred;
+            checked += 1;
+        }
+    }
+    try testing.expect(checked >= 4);
 }
