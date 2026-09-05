@@ -4476,9 +4476,15 @@ test "the session bill and the advertised context read ONE reserve and ONE margi
     // cannot satisfy it.
     const t = std.testing;
     const src = @embedFile("server.zig");
-    const reserve = "CTX_SIZING_CACHE_" ++ "RESERVE";
+    // ONE reserve, at all three sites: both load-time arms and the sizer. It
+    // is now a RESOLVER rather than the bare constant (PR #363's arch gate:
+    // the ask-independent constant is the gated arch's, and every other arch
+    // keeps a93e2c0's raw ask). Three sites reading one FUNCTION is the
+    // stronger form of the same rule — the gate cannot be applied to two of
+    // them and forgotten at the third, which is exactly the drift this scan
+    // exists for.
+    const reserve = "ctxSizingCache" ++ "Reserve(config)";
 
-    // ONE reserve, at all three sites: both load-time arms and the sizer.
     for ([_][]const u8{
         "fn ramFirstContextForLoad(",
         "fn ssdFirstSessionTokensNow(",
@@ -4486,14 +4492,26 @@ test "the session bill and the advertised context read ONE reserve and ONE margi
     }) |decl| {
         const body = declBody(src, decl) orelse return error.CallSiteMoved;
         std.testing.expect(std.mem.indexOf(u8, body, reserve) != null) catch |err| {
-            std.debug.print("site does not reserve the shared constant: {s}\n", .{decl});
+            std.debug.print("site does not reserve through the shared resolver: {s}\n", .{decl});
             return err;
         };
-        // ...and none of them may reach for the ask or the resolved budget,
-        // which is live check #6 and audit S6 respectively.
+        // ...and none of them SPELLS the ask or the resolved budget itself.
+        // The ask now has exactly one reader (`legacyCtxSizingCacheReserve`,
+        // a93e2c0 parity) and the resolved budget still has none: reading the
+        // ask is live check #6, which a93e2c0 shipped and the gate preserves
+        // off qwen4_exp; reading the BUDGET is audit S6's one-step loop, which
+        // is a different bug and stays closed on both arms.
         try t.expect(std.mem.indexOf(u8, body, "resolvedPrefixCache" ++ "Mem()") == null);
         try t.expect(std.mem.indexOf(u8, body, "prefix_cache_mem" ++ "_bytes") == null);
     }
+
+    // The resolver holds both arms, and the constant is defined once.
+    const res_body = declBody(src, "fn ctxSizingCacheReserve(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, res_body, "CTX_SIZING_CACHE_" ++ "RESERVE") != null);
+    try t.expect(std.mem.indexOf(u8, res_body, "legacyCtxSizingCache" ++ "Reserve()") != null);
+    // The ask is read in ONE place, and it is not the resolved budget.
+    const legacy_body = declBody(src, "fn legacyCtxSizingCacheReserve(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, legacy_body, "resolvedPrefixCache" ++ "Mem()") == null);
 
     // ONE margin: both consumers apply it through the shared helper rather than
     // spelling `safeAutoContext` + the cap themselves, so the 85% and the
@@ -4540,9 +4558,14 @@ test "the RAM-first clamp's context comes from the shared resolver, ask-independ
     const resolver = "ramFirstContextFor" ++ "Load(config, kv_bits, active_mem, pinned)";
     try t.expect(std.mem.indexOf(u8, body, resolver) != null);
 
-    // The wrapper passes the CONSTANT, never `requested`.
+    // The wrapper passes the SHARED RESOLVER, never `requested`. (It passed
+    // the bare constant until PR #363's arch gate made the reserve per-arch;
+    // the invariant is unchanged — the wrapper must not respell the reserve —
+    // and `requested` is still the thing it may never touch, because a reserve
+    // derived from THIS call's ask is the loop, on either arm.)
     const wrap = declBody(src, "fn ramFirstContextForLoad(") orelse return error.CallSiteMoved;
-    try t.expect(std.mem.indexOf(u8, wrap, "CTX_SIZING_CACHE_RESERVE") != null);
+    try t.expect(std.mem.indexOf(u8, wrap, "ctxSizingCache" ++ "Reserve(config)") != null);
+    try t.expect(std.mem.indexOf(u8, wrap, "CTX_SIZING_CACHE_RESERVE") == null);
     try t.expect(std.mem.indexOf(u8, wrap, "requested") == null);
     try t.expect(std.mem.indexOf(u8, wrap, "resolvedPrefixCache" ++ "Mem()") == null);
     // ONE shared resolver: both arms reach it.
@@ -24010,7 +24033,13 @@ test "prefixCacheMemForLoad: the ungated budget arm is a93e2c0's arithmetic" {
     const plan_at = std.mem.indexOf(u8, body, "planHotCache(") orelse return error.CallSiteMoved;
     try t.expect(gate_at < ssd_at);
     try t.expect(gate_at < plan_at);
-    const arm = body[gate_at..ssd_at];
+    // The arm ends at ITS OWN closing brace, not at the ssd call: everything
+    // between the two is the SSD prelude, which legitimately reads
+    // `staticGpuMemoryCeiling()` and would satisfy the negative assertions
+    // below for the wrong reason.
+    const arm_end = std.mem.indexOfPos(u8, body, gate_at, "\n    }\n") orelse return error.CallSiteMoved;
+    const arm = body[gate_at..arm_end];
+    try t.expect(arm_end < ssd_at);
     // a93e2c0's four inputs, by name.
     try t.expect(std.mem.indexOf(u8, arm, "currentGpuMemoryCeiling(active_mem)") != null);
     try t.expect(std.mem.indexOf(u8, arm, "getEffectiveContextLength(config)") != null);
