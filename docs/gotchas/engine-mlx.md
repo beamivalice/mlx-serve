@@ -5006,6 +5006,36 @@ plan rejected, and 3 of 16 rounds at a rejected width would poison it);
 extension rounds are kept, because the vote asks whether the whole speculation
 is worth running and an extension is part of it.
 
+### The bullets these paragraphs replace (CLAUDE.md byte budget, 2026-09-05)
+
+Two rules moved their story here so the rule text could stay inside the 100k cap.
+Nothing below is new; it is what the two CLAUDE.md bullets used to spell out.
+
+**Arming and disarming.** The switch is per KV bucket. `Table.msPerTok(m_lo)` —
+the planned speculative price — AND `MtpPriceWindow`, the realized 16-round
+trailing window, must BOTH exceed `Table.serial` by `MLX_SERVE_MTP_ADAPTIVE_MARGIN`
+(5%) for `_CONFIRM` (3) consecutive rounds. `Table.serial` is its OWN row with its
+own reseed clock, never width 0: sharing `seq` with the width cells would reseed
+the serial cell every time a width cell moved. Crossing a bucket re-decides from
+scratch. The periodic re-open (`MLX_SERVE_MTP_ADAPTIVE_REENTRY_TOKENS`) is default
+OFF, and re-entry must PROVE the head is in sync before it drafts again.
+`MLX_SERVE_MTP_ADAPTIVE_MIN_KV` (8192) kills both the vote and the probe below the
+floor; `--max-mtp-ctx` and `MLX_SERVE_MTP_FORCE_DEPTH` outrank the whole mechanism.
+`MLX_SERVE_MTP_ADAPTIVE_SERIAL=0` is the zero-cost kill switch.
+
+**Why every bookkeeping site is a place it can lie to itself.** The bucket must be
+resolved by ONE resolver at both the read and the write site — two resolvers and a
+switch undoes itself every tick, because the tick that observes lands in a
+different bucket than the tick that decided. The price window DROPS whenever the
+arm or the bucket moves, since a window that spans an arm change is measuring two
+different things. `observeSerialTick` folds a sample only for a model that HAS a
+head, or every model on the box rewrites the same table. An interleaved tick drops
+its interval — a prefill chunk is not a token, and billing it as one makes serial
+look slow exactly where the switch is deciding. The serial row keeps its own
+counters. Probes are bounded RETRIES on one bucket, not a flag burned at arming:
+a probe that fails to land must be re-runnable, or a bucket can end up permanently
+unmeasured.
+
 ### The switch has a floor as well as a ceiling
 
 The same A/B recorded 14 switches, and 11 of them were in the `<2k` bucket —

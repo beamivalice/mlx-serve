@@ -225,3 +225,38 @@ exit 0, binary 13,082,648 B, `--version` = 26.9.1-dev / mlx 0.32.2. So both the 
 and the kernel's `src/transformer.zig` edits coexist at compile level, not just textually.
 Suite NOT run (post_fold.sh's job on the real fold).
 Scratch reset: `scratch-fold2` deleted, `mega-k-scratch` detached at de41ffc, clean.
+
+## FOLD PART A — EXECUTED (2026-09-05)
+
+Coordinator's sha list was superseded TWICE mid-flight (2ef2571/1bcd484 -> 6fc7a7a/0edafea).
+Picked the corrected pair. `.zig-toolchain` is NOT tracked on the amended commits
+(`git ls-files | grep -c zig-toolchain` = 0), so P1's `git rm --cached` is MOOT; only the
+.gitignore widening shipped.
+
+Commits on longctx-mega-k (de41ffc + 4):
+  0ecc190  fix(admission): the reservation buys the PREFILL's coexistence  (= 6fc7a7a)
+  4e1806a  test(qwen4): PLE rollback leaves no freed-but-non-null QSA handle (= 0edafea)
+  049b4f6  chore: .gitignore /.zig-toolchain/ -> /.zig-toolchain
+  591a03e  docs: CLAUDE.md trims + CHANGELOG entry for the reserve fix
+
+### BYTE LEDGER (actual)
+  de41ffc                                   99,273 B
+  + reserve fix (one 3-line bullet)         99,665 B   (+392)
+  - lever 2a containers row -> pointer      99,522 B   (-143; detail MOVED to docs/reference.md +598 B)
+  - lever 2b website row -> pointer         99,455 B   (-67)
+  - lever 3 post-mortem bullet prose        99,403 B   (-52)
+  - lever 4 Stack paragraph prose           99,390 B   (-13)
+  CURRENT                                   99,390 B   free-to-cap 610
+Lever 1 (merge the reserve bullets) was ALREADY DONE by the fix's owner — it lands as ONE
+3-line bullet, so there was nothing to merge.
+
+### SHORTFALL — needs a coordinator decision before PART B
+Target was: final < 99,700 B after the kernel's rules, i.e. <= ~99,080 B before them.
+Actual 99,390 B — SHORT BY ~310 B. The four approved levers yielded 275 B, not the ~1,050 B
+estimated, because that estimate priced the rows by their FULL length while the ruling forbids
+dropping a symbol, and these rows are almost entirely symbols (paths, guard filenames, version
+pins, grep tokens). What is left in them is connective prose worth tens of bytes, not hundreds.
+The one lever that DID pay was RELOCATION (containers detail -> docs/reference.md), which the
+growth policy already sanctions and which loses nothing from the repo.
+Options put to the coordinator: (a) relocate more detail the same way; (b) accept <300 B
+headroom; (c) write the kernel as ONE bullet + one clause instead of three rules.
