@@ -5187,15 +5187,6 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
     };
 }
 
-/// True since `qsaAppendKeys` appends into the capacity buffer behind
-/// `entry.qsa_key_buf` (`capBufAppend`) instead of rebuilding the history
-/// with `mlx_concatenate_axis(old, new)`, so the growth transient is gone on
-/// this tree. DOCUMENTATION ONLY: it does not enter the bill. The bill above
-/// reads the two LEVERS that decide the copy count (the commit handoff and
-/// the reservation), never this flag — a flag that is a fact about the
-/// append cannot say whether a second copy exists.
-pub const QSA_HISTORY_GROWS_IN_PLACE: bool = true;
-
 /// A slot that errored reports WHY. The MLX error latch turns a Metal
 /// working-set abort into `error.OutOfMemory` on the inference thread instead
 /// of `exit(-1)` (issue #353); a request that dies that way is a MEMORY
@@ -21644,7 +21635,10 @@ test "the 458k prefill's two unbilled terms are billed: retained checkpoints and
     // commit instead of a prefill-end copy. The score bank rides beside it.
     // The sizer bills the same width, so advertised and admitted contexts
     // cannot diverge. Full contract in "billed at the copies it HOLDS" below.
-    try t.expect(QSA_HISTORY_GROWS_IN_PLACE);
+    // What the bill reads is `statePerTokenBilled`, which follows the two
+    // LEVERS that decide the copy count (the commit handoff and the
+    // reservation) — asserted directly on the next line, so there is nothing
+    // for a flag about the append to add.
     try t.expectEqual(cfg.qsaHistoryBytesPerToken() + cfg.qsaScoreBankBytesPerToken(), statePerTokenBilled(&cfg));
     try t.expectEqual((seq + 2048 + chunk) * statePerTokenBilled(&cfg), terms.state_bytes);
     try t.expectEqual(held, terms.checkpoint_bytes);

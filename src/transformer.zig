@@ -3758,31 +3758,25 @@ const QSA_ATTN_MERGE_SOURCE =
 /// floor, i.e. unresolved. So this is one flat constant rather than a
 /// per-width table two data points could not justify.
 ///
-/// (Both best cells happen to sit at S*Hk*NSPLIT = 192 threadgroups, which
-/// would make the occupancy formula right with the target retuned 320 -> 192.
-/// Recorded as a hypothesis, not adopted: it rests on ONE resolved point, and
-/// a second sweep at other widths would be needed to tell it from coincidence.)
-pub const QSA_ATTN_NSPLIT_DEFAULT: c_int = 16;
-
-/// The occupancy target the first default was DERIVED from, kept only to
-/// explain why deriving it was wrong. Aiming at 8 resident threadgroups per
-/// core over-splits: past ~192 threadgroups the f32 partial buffer
-/// (S*Hq*NSPLIT*256*4 B, written by the split pass and read by the merge)
-/// costs more traffic than the extra parallelism buys back. Unused by policy.
-pub const QSA_ATTN_TARGET_TGS_UNUSED: c_int = 320;
-
-/// Split-K occupancy target, in threadgroups.
+/// Why split at all: the un-split kernel's natural grid is one threadgroup
+/// per (query row, kv head) — 12 threadgroups at S=6 on a 40-core GPU, each
+/// walking ~2k keys serially. Measured on this box (in-situ forward ubench,
+/// S=6, kv 62k, 4 counterbalanced boots) it ran 52.50 ms/forward against the
+/// union gather's 45.41, +15.6% and five times the 3.0% within-arm boot
+/// spread, while issuing 735 FEWER ops and reading the same bytes for a sixth
+/// of the MACs. Work was never the problem; the machine was idle.
 ///
-/// The un-split kernel's natural grid is one threadgroup per (query row, kv
-/// head): on a 24q/2kv pack that is 12 threadgroups at S=6 and 2 at S=1, each
-/// walking ~2k keys serially, on a GPU with 40 cores. Measured on this box
-/// (in-situ forward ubench, S=6, kv 62k, 4 boots counterbalanced): the fused
-/// kernel was 52.50 ms/forward against the union gather's 45.41 — +15.6%,
-/// about five times the 3.0% within-arm boot spread — while issuing 735 FEWER
-/// ops and reading the same bytes for a sixth of the MACs. Work was never the
-/// problem; the machine was idle. 8 resident threadgroups per core is the
-/// target, so 320.
-
+/// The first default was DERIVED instead of measured, from an occupancy
+/// target of 8 resident threadgroups per core (320). That over-splits: past
+/// ~192 threadgroups the f32 partial buffer (S*Hq*NSPLIT*256*4 B, written by
+/// the split pass and read by the merge) costs more traffic than the extra
+/// parallelism buys back. Both best cells above happen to sit at
+/// S*Hk*NSPLIT = 192, which would make the formula right with the target
+/// retuned 320 -> 192 — recorded as a hypothesis, not adopted: it rests on
+/// ONE resolved point, and a second sweep at other widths would be needed to
+/// tell it from coincidence. No constant holds 320; the measured 16 below is
+/// the policy.
+pub const QSA_ATTN_NSPLIT_DEFAULT: c_int = 16;
 
 /// Ceiling on the split count. 64 lets S=1..2 still reach >= 128 threadgroups
 /// at Hk=2; past it the f32 partial buffer starts costing more traffic than

@@ -5380,7 +5380,8 @@ operands it runs THREE arms — the kernel at the boot's NSPLIT, the same kernel
 body at NSPLIT=1 (one split, the merge an identity), and the union gather — and
 an offline f32 reference rebuilds each row's own visible set from the same
 dequantized K/V. Reproducing it needs the patch re-applied and one boot; the
-arms are `qsa_attn_arm.sh` at `MLX_SERVE_MTP_FORCE_DEPTH=5`. At S=6, kv 62754, kb 512 saturated, 8-bit gs64, over all
+arms are driven at `MLX_SERVE_MTP_FORCE_DEPTH=5` by a `qsa_attn_arm.sh` that
+is parked with the patch, not in `tests/` — nothing here re-runs this. At S=6, kv 62754, kb 512 saturated, 8-bit gs64, over all
 144 (row, head) pairs, in bf16 ULPs of that pair's own scale:
 
 | arm | max | mean of row maxima | max rel on \|o\| > 1e-3 |

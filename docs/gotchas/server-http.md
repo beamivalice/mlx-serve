@@ -1869,16 +1869,19 @@ accumulated. Pricing a transient you can delete is the wrong trade.
   the latter read by the auto-context sizer AND the guard so advertised and
   admitted contexts cannot diverge. The QSA history was billed at TWO copies
   while it re-concatenated per chunk; with the capacity-buffer append in the
-  same tree (`qsaAppendKeys` -> `capBufAppend`), `QSA_HISTORY_GROWS_IN_PLACE`
-  is true and the bill is ONE copy. That halving is not cosmetic: at
+  same tree (`qsaAppendKeys` -> `capBufAppend`) the bill is ONE copy. That
+  halving is not cosmetic: at
   `--ctx-size 1048576` on qwen4_exp the doubled bill clamped a requested
   24,576 MB hot cache to 5,703 MB, and the single copy gives most of it back.
   (Later: the prefill-end checkpoint attach turned out to MATERIALIZE a second
   copy anyway, so 63cf6bd re-doubled the bill; the commit-time handoff of
   2026-09-05 removed that copy and the bill is one copy + the f32 score bank —
   story in `engine-mlx.md`, "HELD twice from prefill end to commit".)
-  The flag exists so the two move together — flip it back only if the append
-  ever returns to `mlx_concatenate_axis(old, new)`.
+  The bill reads the two LEVERS that decide the copy count (the commit handoff
+  and the reservation), not the shape of the append: a `QSA_HISTORY_GROWS_IN_PLACE`
+  flag once stood here and was removed because a fact about the append cannot
+  say whether a second copy exists. If the append ever returns to
+  `mlx_concatenate_axis(old, new)`, `statePerTokenBilled` is what has to move.
 * `HotPrefixCache.evictLruToAdmit` gives memory back rather than refusing: a
   cached prefix is an optimization, the request is the work. It runs on the
   inference thread (sole mlx caller, even for frees) after the prefix restore
