@@ -43288,8 +43288,13 @@ test "qsa history reservation: a reserved prefill allocates its buffers ONCE (#3
     const chunk_rows: c_int = 4096;
     const total: usize = 409_600;
 
-    var t = Transformer{ .s = s, .allocator = ta };
-    var entries = [_]SSMCacheEntry{.{ .ssm_state = mlx.mlx_array_new(), .conv_state = mlx.mlx_array_new() }};
+    // Same construction the sibling append test uses: `Transformer` has
+    // required fields this test never touches, so only the two the append
+    // path reads are set.
+    var t: Transformer = undefined;
+    t.s = s;
+    t.allocator = ta;
+    var entries = [_]SSMCacheEntry{.{ .ssm_state = mlx.mlx_array_new(), .conv_state = mlx.mlx_array_new(), .initialized = false }};
     const entry = &entries[0];
     defer {
         ssmFreeQsaState(entry);

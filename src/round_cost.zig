@@ -192,7 +192,7 @@ pub const Table = struct {
             return .transition;
         }
         self.folded += 1;
-        return self.foldInto(&self.cells[width][bucketFor(kv_len)], ms, tokens, self.seq);
+        return foldInto(&self.cells[width][bucketFor(kv_len)], ms, tokens, self.seq);
     }
 
     /// Feed one realized PLAIN serial decode token into `serial[bucket]`.
@@ -215,10 +215,10 @@ pub const Table = struct {
             return .transition;
         }
         self.serial_folded += 1;
-        return self.foldInto(&self.serial[bucketFor(kv_len)], ms, 1.0, self.serial_seq);
+        return foldInto(&self.serial[bucketFor(kv_len)], ms, 1.0, self.serial_seq);
     }
 
-    fn foldInto(self: *Table, cell: *Cell, ms: f32, tokens: f32, clock: u32) Verdict {
+    fn foldInto(cell: *Cell, ms: f32, tokens: f32, clock: u32) Verdict {
         defer cell.last_seen = clock;
         if (cell.n == 0) {
             cell.ms = ms;

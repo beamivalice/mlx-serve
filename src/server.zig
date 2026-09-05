@@ -18319,7 +18319,10 @@ test "checkAttentionMemory does not bill resident hot-cache buffers twice" {
     // as the PUBLISHED atomic, never by dereferencing the inference thread's
     // `hot_prefix_cache` pointer from a connection thread.
     try t.expect(std.mem.indexOf(u8, body, "resident_hot_cache_bytes.load(.monotonic)") != null);
-    try t.expect(std.mem.indexOf(u8, body, "hot_prefix_cache") == null);
+    // The forbidden thing is the DEREFERENCE, not the name: the comment above
+    // the published read has to be free to say which pointer it is avoiding.
+    try t.expect(std.mem.indexOf(u8, body, "sch." ++ "hot_prefix_cache") == null);
+    try t.expect(std.mem.indexOf(u8, body, ".hot_prefix_cache.?") == null);
     try t.expect(std.mem.indexOf(u8, body, "needed = needed +") == null);
 }
 
@@ -19257,7 +19260,9 @@ test "the admission probe bills the request's OWN kv-quant and chunking, not the
     // The probe is a pure forward of its inputs into that one estimator.
     const src = @embedFile("server.zig");
     const fwd = "return prefillAdmission" ++ "Bill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill).fits();";
-    try t.expectEqual(@as(usize, 2), std.mem.count(u8, src, fwd)); // the site + this literal
+    // The needle is assembled with `++`, so this test's own source does NOT
+    // contain it: the call site is the only occurrence.
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, src, fwd));
     // And the scheduler hands it the SLOT's own scheme and vision state.
     const sched = @embedFile("scheduler.zig");
     try t.expect(std.mem.indexOf(u8, sched, ".kv_cfg = slot.cache.config,") != null);
@@ -19281,7 +19286,7 @@ test "the QSA history is billed at BOTH copies: the live one and the checkpoint 
     // (after it) never coexist, so two copies bounds both — which is what
     // makes a capacity buffer safe to adopt without re-deriving this term.
     const src = @embedFile("server.zig");
-    try t.expect(std.mem.indexOf(u8, src, "QSA_HISTORY_GROWS_IN_PLACE) per_tok") == null);
+    try t.expect(std.mem.indexOf(u8, src, "QSA_HISTORY_GROWS" ++ "_IN_PLACE) per_tok") == null);
 
     // At the live 458,832-token length the second copy is real money.
     const seq: u64 = 458_832;
@@ -19290,8 +19295,8 @@ test "the QSA history is billed at BOTH copies: the live one and the checkpoint 
     try t.expect(terms.state_bytes >= 2 * seq * one);
 
     // Both sizer sites read the BILLED width, never the one-copy helper.
-    try t.expect(std.mem.indexOf(u8, src, "+| config.qsaHistoryBytesPerToken()) *|") == null);
-    try t.expect(std.mem.indexOf(u8, src, "kv_bits) + config.qsaHistoryBytesPerToken();") == null);
+    try t.expect(std.mem.indexOf(u8, src, "+| config.qsaHistoryBytes" ++ "PerToken()) *|") == null);
+    try t.expect(std.mem.indexOf(u8, src, "kv_bits) + config.qsaHistoryBytes" ++ "PerToken();") == null);
     // An arch with no indexer is billed nothing, either way.
     var dense = model_mod.ModelConfig{};
     dense.num_hidden_layers = 32;

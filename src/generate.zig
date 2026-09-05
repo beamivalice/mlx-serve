@@ -14169,7 +14169,7 @@ test "mtpAdaptiveBucketOf: the decision and the re-entry resolve ONE bucket (H6 
     var osc = G.MtpAdaptive{};
     _ = osc.round(0, G.mtpAdaptiveBucketOf(own + 1, kv), .serial, 1);
     try testing.expectEqual(G.MtpAdaptiveArm.serial, osc.arm);
-    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, osc.serialTick(round_cost.bucketFor(kv)));
+    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, osc.serialTick(round_cost.bucketFor(kv), 0));
 
     // With one resolver the switch is sticky, which is the contract.
     var ok = G.MtpAdaptive{};
@@ -14177,7 +14177,7 @@ test "mtpAdaptiveBucketOf: the decision and the re-entry resolve ONE bucket (H6 
     _ = ok.round(0, b, .serial, 1);
     var i: u32 = 0;
     while (i < 50) : (i += 1) {
-        try testing.expectEqual(G.MtpAdaptiveAction.none, ok.serialTick(G.mtpAdaptiveBucketOf(own + 1, kv)));
+        try testing.expectEqual(G.MtpAdaptiveAction.none, ok.serialTick(G.mtpAdaptiveBucketOf(own + 1, kv), 0));
     }
     try testing.expectEqual(G.MtpAdaptiveArm.serial, ok.arm);
 }
