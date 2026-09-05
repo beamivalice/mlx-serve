@@ -5693,7 +5693,12 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 // evicted a stranger's entries, protected the wrong MRU, and
                 // returned none of the memory this request needs — then
                 // refused it by name. (audit S19)
-                const report = if (slot.model.prefix_cache) |hc|
+                // Captured BY POINTER: the cache is a by-value field on the
+                // LoadedModel, so a `|hc|` capture would evict from a stack
+                // COPY and free nothing. `slot.model` is the registry's own
+                // mutable entry and the inference thread is the cache's sole
+                // mutator, so the mutable borrow is legitimate here.
+                const report = if (slot.model.prefix_cache) |*hc|
                     // `true` = never evict the entry THIS request restored
                     // from: its buffers are refcount-shared with the slot's
                     // cache, so dropping it frees nothing and only throws

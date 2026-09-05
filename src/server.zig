@@ -21357,8 +21357,20 @@ test "resolvedContextForLoad: an auto boot bills the session it will serve, not 
     const fixed = ssdFirstPrefixCacheMem(ask, ceiling, active, real_kv, transient);
     // Published reserve is the IDLE half; under the placeholder it is the whole
     // ask, which is what collapsed the advertised context.
-    try t.expect(bogus -| placeholder_kv > 20 * 1024 * MiB);
-    try t.expect(fixed -| real_kv < 10 * 1024 * MiB);
+    try t.expect(bogus -| placeholder_kv == ask);
+    // ...and under the real session bill the same ask no longer fits: it is
+    // clamped to what is left after the weights, ONE session and the prefill
+    // transient. The bar is that arithmetic — `ssdFirstPrefixCacheMem`'s own
+    // pinned contract ("an idle request past the headroom is clamped to the
+    // headroom") — and not a hand-picked byte count: with 20,736 B/token the
+    // session alone is ~14 GiB of this box's 28,909 MiB serving budget, so any
+    // constant bar below that headroom asserts a rule the helper never had.
+    const idle_headroom: u64 = ceiling - (active + real_kv + transient);
+    try t.expectEqual(real_kv + idle_headroom, fixed);
+    try t.expect(fixed -| real_kv < ask);
+    // The whole point of the fix, in one comparison: billing the real session
+    // more than halves what the idle allowance is handed.
+    try t.expect(fixed -| real_kv < (bogus -| placeholder_kv) / 2);
 
     // An explicit --ctx-size wins outright, and a pinned context is used as-is;
     // neither may consult the sizer.

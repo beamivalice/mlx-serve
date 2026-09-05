@@ -3965,10 +3965,17 @@ test "DiskTier: v5 entries cross the SSD-first boundary in BOTH directions (no m
 
 test "DiskTier: the root-wide sweep drops strays and never touches the live tier's own root" {
     // Mechanism 6, disk half. A sibling fingerprint's entry with no meta.json
-    // is a crash leftover — nothing can restore from it — and goes. The LIVE
-    // tier's own root is skipped entirely: during a write-through its newest
-    // entry legitimately holds chunks with no index yet, and sweeping on that
-    // signal would delete the prefill in flight.
+    // and no recent writes is a crash leftover — nothing can restore from it —
+    // and goes. The LIVE tier's own root is skipped entirely: during a
+    // write-through its newest entry legitimately holds chunks with no index
+    // yet, and sweeping on that signal would delete the prefill in flight.
+    //
+    // Index-less is NOT by itself the stray signal (audit S4): another
+    // mlx-serve sharing `~/.mlx-serve/kv-cache` writes meta.json LAST, so a
+    // fresh chunks-without-index directory is what its flush IN PROGRESS looks
+    // like, and our epoch fence cannot reach another process. AGE is the
+    // signal, so the stray fixture is BACKDATED past `STRAY_MIN_AGE_NS` and a
+    // young twin is staged beside it to pin that the sweep leaves it alone.
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -3989,6 +3996,15 @@ test "DiskTier: the root-wide sweep drops strays and never touches the live tier
     }
     try tmp.dir.createDirPath(io, "fp-stray/e9");
     try tmp.dir.writeFile(io, .{ .sub_path = "fp-stray/e9/c000000.safetensors", .data = "orphan" });
+    // Old enough that no live flush could still be holding it.
+    const aged: std.Io.Timestamp = .{
+        .nanoseconds = std.Io.Timestamp.now(io, .real).nanoseconds - 2 * @as(i96, @intCast(STRAY_MIN_AGE_NS)),
+    };
+    try tmp.dir.setTimestamps(io, "fp-stray/e9/c000000.safetensors", .{ .modify_timestamp = .{ .new = aged } });
+    // Its young twin: index-less, but written just now — indistinguishable from
+    // another process's flush in flight, so it must SURVIVE.
+    try tmp.dir.createDirPath(io, "fp-inflight/e3");
+    try tmp.dir.writeFile(io, .{ .sub_path = "fp-inflight/e3/c000000.safetensors", .data = "another server" });
     var live = try DiskTier.init(testing.allocator, io, base, "fp-live", 0, 128);
     defer live.deinit();
     live.ssd_first = true;
@@ -4003,8 +4019,10 @@ test "DiskTier: the root-wide sweep drops strays and never touches the live tier
     live.max_bytes = 1 << 40;
     sweepBase(testing.allocator, io, base, live.root, live.max_bytes);
 
-    // The stray sibling is gone; the real sibling and the live root survive.
+    // The aged stray is gone; the real sibling, the young index-less twin and
+    // the live root survive.
     try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "fp-stray/e9/c000000.safetensors", .{}));
+    try testing.expect(tmp.dir.statFile(io, "fp-inflight/e3/c000000.safetensors", .{}) catch null != null);
     try testing.expect(tmp.dir.statFile(io, "fp-sibling/e1/meta.json", .{}) catch null != null);
     try testing.expect(tmp.dir.statFile(io, "fp-live/e1/c000000.safetensors", .{}) catch null != null);
 
@@ -4013,4 +4031,7 @@ test "DiskTier: the root-wide sweep drops strays and never touches the live tier
     sweepBase(testing.allocator, io, base, live.root, 0);
     try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "fp-sibling/e1/meta.json", .{}));
     try testing.expect(tmp.dir.statFile(io, "fp-live/e1/c000000.safetensors", .{}) catch null != null);
+    // A zero budget is an LRU bar over INDEXED entries; it is not a licence to
+    // delete what might be another server's flush.
+    try testing.expect(tmp.dir.statFile(io, "fp-inflight/e3/c000000.safetensors", .{}) catch null != null);
 }
