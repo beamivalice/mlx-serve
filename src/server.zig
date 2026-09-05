@@ -5081,7 +5081,14 @@ test "every post-load hot-cache reserve reads the RESOLVED budget, not the ask" 
     const needle = "prefix_cache_mem" ++ "_bytes";
     const accessor = "resolvedPrefix" ++ "CacheMem()";
 
-    var lines = std.mem.splitScalar(u8, src, '\n');
+    // PRODUCTION window only. The rule is about the two RESERVES that used to
+    // read the ask instead of the accessor; a test that deliberately drives the
+    // global (setting it, or saving and restoring it) is exercising the
+    // contract, not bypassing it, and scoping the scan is what keeps the
+    // exemption list from growing one entry per such test until it stops
+    // catching anything.
+    const prod = src[0 .. std.mem.indexOf(u8, src, "\ntest \"") orelse src.len];
+    var lines = std.mem.splitScalar(u8, prod, '\n');
     while (lines.next()) |line| {
         if (std.mem.indexOf(u8, line, needle) == null) continue;
         const trimmed = std.mem.trim(u8, line, " \t");

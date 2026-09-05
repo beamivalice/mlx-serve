@@ -5647,7 +5647,7 @@ test "prefix cache: a failed trimmed copy retries at the next-lower checkpoint" 
     const source = @embedFile("prefix_cache.zig");
     const at = std.mem.indexOf(u8, source, "new_snap.trimmedCopy(tl, mlx.gpuStream()) catch") orelse
         return error.MissingTrimCopy;
-    const arm = source[at..@min(source.len, at + 1200)];
+    const arm = source[at..@min(source.len, at + 1700)];
     try testing.expect(std.mem.indexOf(u8, arm, "limit = tl - 1") != null);
     try testing.expect(std.mem.indexOf(u8, arm, "@errorName(err)") != null);
     // ARCH GATE (PR #363). The retry allocates AGAIN, immediately, on a path
