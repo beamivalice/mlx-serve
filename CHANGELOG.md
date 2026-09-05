@@ -27,6 +27,7 @@
 
 ### Notes
 
+- The fused split-K sparse-attention kernel for speculative verification is PARKED, not shipped. It is exact to two bf16 ulps against the reference in the hermetic tests, but an end-to-end greedy check at 62.7k tokens put 2 of 8 prompts over the 0.15-nat first-divergence bar with the kernel on and 0 of 8 with it off, so it needs a real-scale parity bar before it can ride.
 - `MLX_SERVE_QSA_SCORE_SHEET_MB` sets the working budget Flash Next's indexer scoring is allowed per pass (default 256, unchanged). It is a diagnostic knob: raising it to 1024 measured 12% SLOWER at 374k on a 128 GB M5 Max, because the extra 3.5 GiB of peak comes out of the same residency the prefill needs.
 
 ---
