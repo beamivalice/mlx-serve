@@ -19920,7 +19920,16 @@ test "checkAttentionMemory wires the CONFIG's key bound, not a dense seq" {
         wired_at = hit + 1;
     }
     try t.expectEqual(@as(usize, 2), wired_seen); // the call site + this literal
-    try t.expect(std.mem.indexOf(u8, src, "        config.prefillAttnKeys(chunk),\n        prefillStreamBytesPerToken(config),\n        prefillDequantWeightBytes(config),\n") != null);
+    // The RESERVE half of the same estimator is pinned at the same site rule.
+    // Since B1 it lives in `prefillTransientReserveAtKv`, which bills at an
+    // EXPLICIT KV length because two terms of it — the attention score sheet
+    // and the QSA sheet — are linear in the KV, and the load-time wrapper is
+    // only its `kv = chunk` case. So the length is pinned too: `seq` must stay
+    // `@max(kv_len, chunk)`, or a per-chunk decision drops back to the
+    // load-time bill (the B1 blocker, ~0.5-9 GB under-billed) while the
+    // argument needle below still matches.
+    try t.expect(std.mem.indexOf(u8, src, "    const seq: u64 = @max(kv_len, chunk);\n") != null);
+    try t.expect(std.mem.indexOf(u8, src, "        config.prefillAttnKeys(seq),\n        prefillStreamBytesPerToken(config),\n        prefillDequantWeightBytes(config),\n") != null);
 
     // Auto-context sizing reads the same helpers — the two must not drift.
     // The KV width: both bill through `kvBytesPerTokenAtBits`, so a
@@ -21491,13 +21500,18 @@ test "the per-chunk width is ONE estimator away from the admission bill, and say
 
     // The probe is one live read per boundary and reads the same ceiling every
     // request-time guard does.
-    const probe = declBody(src, "pub fn prefillHeadroom" ++ "Now()") orelse return error.CallSiteMoved;
+    const probe = declBody(src, "pub fn prefillHeadroom" ++ "Now(") orelse return error.CallSiteMoved;
     try t.expect(std.mem.indexOf(u8, probe, "currentGpuMemory" ++ "Ceiling(") != null);
     try t.expect(std.mem.indexOf(u8, probe, "staticGpuMemory" ++ "Ceiling()") == null);
 
-    // The transition line, byte for byte.
+    // The transition line, byte for byte. It quotes `cost`, not `reserve`: the
+    // decision is `prefillChunkCost` at the live KV, and the line used to print
+    // the strictly smaller `prefillTransientReserve` — an under-bill rendered
+    // as a comfortable margin. A decision quotes the number it COMPARED, so
+    // the word is part of the contract, not cosmetic.
     const impure = declBody(src, "pub fn adaptivePrefillWidth" ++ "Now(") orelse return error.CallSiteMoved;
-    try t.expect(std.mem.indexOf(u8, impure, "[prefill] width {d} -> {d} at pos {d} (headroom {d} MB, reserve {d} MB)") != null);
+    try t.expect(std.mem.indexOf(u8, impure, "[prefill] width {d} -> {d} at pos {d} (headroom {d} MB, cost {d} MB)") != null);
+    try t.expect(std.mem.indexOf(u8, impure, "prefillChunk" ++ "Cost(config, kv_bits, next, pos)") != null);
     // ...and the kill switch is consulted before anything is logged or moved.
     try t.expect(std.mem.indexOf(u8, impure, "adaptivePrefillChunkEnabled(") != null);
     try t.expect(std.mem.indexOf(u8, src, "MLX_SERVE_PREFILL_CHUNK_ADAPTIVE") != null);
