@@ -1871,6 +1871,8 @@ pub const Generator = struct {
     pub const WriteThroughHook = struct {
         ctx: *anyopaque,
         call: *const fn (ctx: *anyopaque, abs_kv_pos: usize, cps: []const SSMCheckpoint) void,
+    };
+
     /// Same shape as `InterleaveHook`: the caller owns the context, this loop
     /// owns the `AdaptiveWidthState` it hands in. Returns the width the next
     /// chunk should run at (`cur` unchanged = no change).

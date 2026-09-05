@@ -2660,3 +2660,123 @@ the data actually needs the room, and on a warm turn it usually never does. The
 negative arm therefore cannot be "reserve more than the donor" (that also
 counts zero, which is why the first version of the test failed); it has to be a
 write that genuinely runs past the donor's capacity.
+
+## The prefill width, re-chosen per chunk (2026-09-05)
+
+The per-request width above answers "how wide may this prompt prefill?" once,
+at admission, and then holds that answer for the whole prefill. A 1M-token
+prefill on Flash Next runs for minutes and 256 chunks. Everything the answer
+was based on can move in that time.
+
+### What actually moves, and what does not
+
+The obvious story — "the KV fills as the prefill proceeds, so the width has to
+narrow" — is FALSE for every prompt this feature targets, and getting that
+wrong would have shipped a mechanism that fires for a reason that does not
+exist. `KVCache.reservedTokens` reserves `seq + headroom + chunk` up front for
+any prompt past `RESERVE_MIN_TOKENS` (32,768) and `nextCapacityReserved` grows
+the buffer exactly once, so the whole request's KV — 21.7 GB at 1M tokens on
+the deployed pack — is resident before the first chunk runs. Re-billing it per
+boundary would have subtracted the same bytes twice and walked every prompt to
+the ladder floor.
+
+What does move between boundaries:
+
+- Another slot's decode, hosted by `interleaveDecodeTick` at the very
+  boundaries this decision is taken at. Nothing bills it against this prefill.
+- A process outside the server. `currentGpuMemoryCeiling` is
+  `min(static, footprint + free RAM)`, so a docker stack starting mid-prefill
+  lowers the ceiling under a forward that was admitted against the old one.
+- The state that genuinely accretes per chunk: the QSA indexer key history
+  (`statePerTokenBilled`), the retained SSM checkpoints (~1.9 GB at the cap),
+  the MTP and DFlash contexts.
+- `MLX_SERVE_KV_RESERVE=0`, and any prompt under 32,768 tokens, where the KV
+  really does grow chunk by chunk.
+
+So this is a safety net and a multi-slot feature, not a single-session speed
+win. On a quiet box serving one request it changes nothing at all, which is
+the correct amount.
+
+### The rule is asymmetric because the failure is
+
+A Metal working-set abort is uncatchable — the process dies. Being one rung
+too narrow costs throughput. The two directions are therefore not the same
+bet:
+
+- **HOLD at margin 1.0.** `prefillMemoryNeeded` already multiplies its whole
+  bill by 5/4; a second 1.25 on the hold would have taken a 768k prompt at the
+  default ceiling from the width admission ADMITTED (2048) down to 1024 at its
+  very first boundary — the feature making the request slower than not having
+  it. The margin belongs on the direction that is a bet, not on the one that
+  is a continuation.
+- **STEP DOWN immediately**, by as many rungs as it takes. Waiting a boundary
+  per rung is waiting inside the abort.
+- **WIDEN one rung at 1.25, after TWO consecutive supporting probes.** The
+  probe is taken after the boundary's `mlx_clear_cache`, so it never contains
+  a chunk's own peak; the second reading is what pays for that blind spot.
+- **One-way ratchet.** A prefill that has stepped down never widens again. The
+  pressure that took the width away is a property of this minute, and
+  re-widening into it turns a safety net into a metronome — the step-down
+  frees exactly the bytes that make the wider rung look affordable again.
+
+### The cliff is 2048, not the ladder
+
+`PREFILL_DQ_GEMM_MIN_M` is 2048: widths at or above it take the dequant+GEMM
+prefill route, 1024 and 512 do not, and most of the measured 25-34% spread
+between the widest and narrowest rung lives at that step. 2048 is the rung
+worth defending; 512 versus 1024 is per-chunk fixed cost only. A policy that
+treats the ladder as uniform will spend its caution in the wrong place.
+
+### Two placements that no unit test can see
+
+The probe sits AFTER the chunk's `mlx_clear_cache` and BEFORE the interleave
+tick. Before the clear it reads the chunk's own peak and narrows on memory
+that is already gone; after the tick it reads a co-tenant's decode
+allocations as this prefill's pressure. Both are scan-pinned, by index, in
+generate.zig.
+
+### Checkpoints do not move
+
+`ssm_cp_stride` is coarsened against the LAUNCH width
+(`max(PREFILL_CHUNK, prefill_chunk_override)`), never the per-request pin and
+never the per-chunk width, and every ladder rung divides it. `nextChunkEnd`
+truncates any chunk that would cross a stride boundary, in ABSOLUTE position.
+So a prefill that walks 4096 -> 512 -> 2048 ends on exactly the stride
+boundaries a fixed-width one would have, in the same order — the prefix cache
+sees the same restore points either way, and the hermetic test walks a
+deliberately nasty width sequence at two strides, two offsets and two prompt
+lengths to say so.
+
+Output is NOT byte-stable across widths, and no test asserts that it is: a
+different width is a different GEMM shape, and 4-bit near-ties flip. That is
+the same bar `#197` set for chunked vision prefill (perceived content), and
+the same reason `tests/test_vision_chunked_prefill.sh` compares colours rather
+than bytes.
+
+### Scope and switches
+
+`ModelConfig.perRequestPrefillChunk` (qwen4_exp) gates both features, so the
+per-request kill switch takes this one with it;
+`MLX_SERVE_PREFILL_CHUNK_ADAPTIVE=0` disables only this one. An explicit
+`--prefill-chunk` or `MLX_SERVE_PREFILL_CHUNK` outranks it — an operator who
+pinned a width pinned every forward — and so does the unchunked vision arm,
+which has no next chunk to size. The ADMISSION bill never learns about any of
+it: the width a request was admitted at is the width it is billed at.
+
+One line per transition, and one summary per request that moved:
+
+```
+[prefill] width 4096 -> 2048 at pos 606208 (headroom 2216 MB, reserve 2287 MB)
+[prefill] adaptive: 261 chunks, width 1024..4096, 2 change(s)
+```
+
+### Rules this produced
+
+- Establish which quantity actually moves before you write the controller. A
+  plausible mechanism that does not happen is worse than no mechanism: it
+  fires for the wrong reason and the reason is invisible.
+- When one direction of a control loop is fatal and the other is merely slow,
+  the margins are not equal, and the safe-looking symmetric choice is a
+  regression.
+- A probe taken where the transient has just been freed cannot see the
+  transient. Pay for that with a second reading, not with a bigger margin.
