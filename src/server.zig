@@ -776,12 +776,39 @@ pub var prefix_cache_mem_bytes: u64 = 2 * 1024 * 1024 * 1024;
 /// and re-clamping an already-clamped value on the next model load would
 /// ratchet the budget toward 1 byte across a model swap. 0 = no load has
 /// resolved it yet, in which case the ask is the honest (larger) reserve.
-var hot_cache_mem_resolved: u64 = 0;
+/// ATOMIC because the writer and the readers are different threads (audit S5):
+/// written on the INFERENCE thread by `prefixCacheMemForLoad`, read from
+/// CONNECTION threads through `computeMemoryContext` (via `pinAutoContext` on
+/// an on-demand load, and via `/props` -> `computeMaxSafeContext`). Same rule
+/// the sibling counters already follow — `resident_hot_cache_bytes` and
+/// `reclaimable_hot_cache_bytes` are `std.atomic.Value(u64)` for exactly this.
+/// An aligned u64 will not tear on arm64, so the practical hazard is the
+/// compiler caching or reordering the read, not a torn value.
+///
+/// `maxInt(u64)` is the UNRESOLVED sentinel, not 0: `--prefix-cache-mem 0`
+/// with an SSD-first budget legitimately publishes a resolved ZERO, and a
+/// `> 0` test then fell back to the raw ask and printed a boot line claiming
+/// a 2048 MB cap for a cache whose real cap was `ctx_kv` (audit N2).
+const HOT_CACHE_MEM_UNRESOLVED: u64 = std.math.maxInt(u64);
+var hot_cache_mem_resolved = std.atomic.Value(u64).init(HOT_CACHE_MEM_UNRESOLVED);
 
 /// The hot-cache byte budget every post-load reserve must bill: the clamp's
 /// answer once a model is loaded, the raw ask before that.
 pub fn resolvedPrefixCacheMem() u64 {
-    return if (hot_cache_mem_resolved > 0) hot_cache_mem_resolved else prefix_cache_mem_bytes;
+    const v = hot_cache_mem_resolved.load(.monotonic);
+    return if (v != HOT_CACHE_MEM_UNRESOLVED) v else prefix_cache_mem_bytes;
+}
+
+/// Publish the clamp's answer. Called on the inference thread at the end of a
+/// load; `clearResolvedPrefixCacheMem` puts it back to the sentinel on unload
+/// so the NEXT model does not inherit this one's budget (the budget is
+/// per-model, the global is process-wide — audit S5, second half).
+pub fn publishResolvedPrefixCacheMem(v: u64) void {
+    hot_cache_mem_resolved.store(v, .monotonic);
+}
+
+pub fn clearResolvedPrefixCacheMem() void {
+    hot_cache_mem_resolved.store(HOT_CACHE_MEM_UNRESOLVED, .monotonic);
 }
 
 /// SSD tier for the hot prefix cache (`--prefix-cache-disk`). Committed KV
@@ -3268,7 +3295,7 @@ fn ssdFirstBudgetForLoad(
     // the per-token cost. Publishing `budget` would bill that session twice and
     // roughly halve the auto-context. The RETURN value stays `budget`: that is
     // the cache's byte cap, and `initWithMem` needs the whole of it.
-    hot_cache_mem_resolved = budget -| ctx_kv;
+    publishResolvedPrefixCacheMem(budget -| ctx_kv);
     // D1: on this arch `--prefix-cache-mem` is the IDLE allowance, not the
     // whole cache — 0 means "no idle entries", not "use all the headroom".
     // Say so once, naming the flag, so the resolved budget is never a mystery.
@@ -3347,7 +3374,10 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64) u64
     // budget is a property of the machine, not of the minute. Reading the live
     // ceiling here made the SSD budget swing boot-to-boot — and on this arm the
     // budget IS the one-session RAM floor, so "one session" would have meant a
-    // different number every boot. (audit S1)
+    // different number every boot. This arm also short-circuits above the RAM
+    // plan on qwen4_exp, so a live ceiling here BYPASSED the reproducibility fix
+    // on the only arch the gates are about. The callee takes the ceiling as a
+    // parameter and no longer derives one. (audit S1)
     if (ssdFirstBudgetForLoad(config, requested, staticGpuMemoryCeiling(), active_mem, ssd_ctx_kv, prefillTransientReserve(config, kv_bits, ssd_chunk))) |b| return b;
     // Pin first, then hand the pinned width in as the override: the plan must
     // bill the width `generate.effectivePrefillChunk` will resolve to, and the
@@ -3370,7 +3400,7 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64) u64
         requested,
         pinned,
     );
-    hot_cache_mem_resolved = plan.budget;
+    publishResolvedPrefixCacheMem(plan.budget);
     // Say so when the box is under external pressure RIGHT NOW, but do not
     // shrink the budget for it: the pressure is a property of this minute, the
     // budget is a property of the machine, and admission is what reconciles
@@ -3721,9 +3751,23 @@ test "free RAM still binds where it can be acted on: request-time admission" {
     const live = "currentGpuMemory" ++ "Ceiling(";
     const static_c = "staticGpuMemory" ++ "Ceiling()";
 
-    // The load-time clamp bills the static term...
+    // Audit S1. The old form asserted `staticGpuMemoryCeiling()` appeared
+    // SOMEWHERE in `prefixCacheMemForLoad` — it did, in the RAM arm, which
+    // qwen4_exp never takes because `ssdFirstBudgetForLoad` short-circuits
+    // above it. A term present in the file but absent from the path taken is
+    // exactly what a body-scoped scan cannot see, so both budget-returning
+    // calls are checked at the CALL, on their arguments.
     const load = declBody(src, "pub fn prefixCacheMemForLoad(") orelse return error.CallSiteMoved;
-    try t.expect(std.mem.indexOf(u8, load, static_c) != null);
+    for ([_][]const u8{ "ssdFirstBudgetFor" ++ "Load(", "planHot" ++ "Cache(" }) |callee| {
+        const at = std.mem.indexOf(u8, load, callee) orelse return error.CallSiteMoved;
+        const args = load[at..@min(load.len, at + 600)];
+        const close = std.mem.indexOf(u8, args, ");") orelse return error.CallSiteMoved;
+        try t.expect(std.mem.indexOf(u8, args[0..close], static_c) != null);
+    }
+    // ...and neither callee may re-derive a live ceiling behind the argument.
+    for ([_][]const u8{ "fn ssdFirstBudgetForLoad(", "fn ssdFirstSessionTokensNow(", "pub fn planHotCache(" }) |decl| {
+        if (declBody(src, decl)) |arm| try t.expect(std.mem.indexOf(u8, arm, live) == null);
+    }
 
     // ...and every request-time guard still reads live memory.
     for ([_][]const u8{ "pub fn prefillAdmissionBill(", "pub fn requestPrefillChunkNow(" }) |decl| {
@@ -4110,10 +4154,16 @@ test "the refusal names the width it tried, and one rule picks it everywhere" {
     const src = @embedFile("server.zig");
     const chooser = "chooseRequest" ++ "PrefillChunk(";
 
-    try t.expect(std.mem.indexOf(u8, src, "at prefill chunk {d} (the narrowest width tried)") != null);
-    try t.expect(std.mem.indexOf(u8, src, "prompt_len, bill.needed / mb, bill.chunk, bill.available / mb") != null);
-    try t.expect(std.mem.indexOf(u8, src, "(KV+working+margin) at prefill chunk {d}") != null);
-    try t.expect(std.mem.indexOf(u8, src, "prompt_len, needed_mb, bill.chunk, avail_mb") != null);
+    // SPLIT needles (audit B0c). These four were unsplit and this test sits
+    // ABOVE the lines it checks, so `indexOf` matched the test's own literal
+    // every time and all four assertions were unconditionally true — they
+    // could not have gone red on the regression they exist for. Two lines up,
+    // `chooser` was already split correctly, so the mitigation was known here
+    // and missed.
+    try t.expect(std.mem.indexOf(u8, src, "at prefill chunk {d} (the narrowest width " ++ "tried)") != null);
+    try t.expect(std.mem.indexOf(u8, src, "prompt_len, bill.needed / mb, bill.chunk, bill." ++ "available / mb") != null);
+    try t.expect(std.mem.indexOf(u8, src, "(KV+working+margin) at prefill " ++ "chunk {d}") != null);
+    try t.expect(std.mem.indexOf(u8, src, "prompt_len, needed_mb, bill.chunk, " ++ "avail_mb") != null);
 
     // ONE rule, both sides. `prefillFitsNow` (the inference-thread probe, and
     // the connection thread's guard through the same bill) and
@@ -4190,7 +4240,7 @@ test "every post-load hot-cache reserve reads the RESOLVED budget, not the ask" 
         try t.expect(std.mem.indexOf(u8, body, accessor) != null);
     }
     // The load site publishes it — otherwise the accessor is a synonym for the ask.
-    try t.expect(std.mem.indexOf(u8, src, "hot_cache_mem_resolved = plan.budget;") != null);
+    try t.expect(std.mem.indexOf(u8, src, "publishResolvedPrefix" ++ "CacheMem(plan.budget);") != null);
 }
 
 /// The largest context this model's per-token footprint fits into RAM right
@@ -21155,7 +21205,9 @@ test "both hot-cache budget arms publish hot_cache_mem_resolved" {
     //
     // The needle is split so this test's own source cannot satisfy the scan.
     const src = @embedFile("server.zig");
-    const needle = "hot_cache_mem_" ++ "resolved = ";
+    // Both arms now publish through the setter (the global went atomic —
+    // audit S5), so the needle is the CALL, not an assignment.
+    const needle = "publishResolvedPrefix" ++ "CacheMem(";
     const arms = [_][]const u8{ "fn ssdFirstBudgetForLoad(", "pub fn prefixCacheMemForLoad(" };
     for (arms) |decl| {
         const start = std.mem.indexOf(u8, src, decl) orelse return error.ArmNotFound;
