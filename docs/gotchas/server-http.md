@@ -2914,6 +2914,96 @@ negative arm therefore cannot be "reserve more than the donor" (that also
 counts zero, which is why the first version of the test failed); it has to be a
 write that genuinely runs past the donor's capacity.
 
+### The external review of PR #363: six defects, all of them in the EVICTION half (2026-09-05)
+
+Every mechanism above is about writing to the SSD. An external reviewer on an
+M4 Max with 14 GiB free on `/` found that the writing was fine and the
+*discarding* was not — six defects, five of which only bite on a box the
+authors did not have.
+
+**A free-space probe that reads the real volume makes every test a property of
+the tester's disk.** `refreshDiskBudget` runs on every store in this mode and
+calls `statfs`, so with 14 GiB free `diskBudgetFromFreeSpace` returned null
+against the 64 GiB reserve, the tier latched `store_declined`, and the
+write-through test went red with `kv_len` stuck at the first commit's value.
+The engine was correct; the suite was measuring the machine. `DiskTier.space_probe`
+is now injectable (`armTestSpace`), every SSD-first test arms it, and a scan
+pins the pairing so the class cannot come back. Writing the inverse case — 10
+GiB free, the store must decline — immediately found a second defect underneath:
+the `store_declined` early-out sat ABOVE the refresh, so the commit that first
+observed a short volume latched the flag and then wrote anyway. A filling disk
+always got one entry more than the budget allowed.
+
+**A bool that means "nothing more to write" also means "I wrote nothing".**
+This is the one that mattered. `appendCommitWithSpec` returned `true` for a
+completed copy AND for every silent skip: under `MIN_PERSIST_TOKENS`,
+TurboQuant, a layer offset short of the range, a non-B1 shape, a declined
+volume. `spillIdleEntries` read that bool as "the SSD holds this session" and
+called `evictAt`. So on qwen4_exp with `--prefix-cache-disk` on and a disk under
+~65 GiB free, EVERY idle hot-cache entry was discarded from RAM at the end of
+EVERY request with nothing whatsoever written in its place — the mode's promise
+("idle sessions live on the SSD") inverted into "idle sessions are deleted".
+The same shape, quietly, for a TurboQuant boot or a sub-512-token session on any
+disk. `PersistOutcome { persisted, partial, skipped }` names the three, and only
+`.persisted` licenses eviction. And `.persisted` is only the write path's
+*claim*, so the INDEX must agree too (`holdsFullPrefix`: an entry at the same
+key whose `kv_len` reaches the persist target and whose `chunk_bytes` has one
+non-zero size per chunk that length implies — the same array `scan` clamps
+against real file sizes after a `kill -9`).
+
+**Writing and evicting are two decisions.** The spill evicted every non-newest
+entry on every `finishSlot`, ignoring the resolved `--prefix-cache-mem`
+entirely, so two alternating sessions bounced off the SSD on every single turn
+even though RAM had been budgeted to hold both. Writing is cheap and stays
+unconditional; EVICTING is what the allowance bounds. The allowance had to be
+plumbed to reach the cache at all — `prefixCacheMemForLoad` now writes it
+through an out-parameter beside its return value, because on this arm the flag
+means the idle allowance and the return value is the whole budget including the
+live session.
+
+The allowance is a HARD cap, shed in two tiers, and the ordering is what lets
+it coexist with the rule above: shed idle entries that have a proven durable
+copy first, oldest first; only if still over, shed the rest, oldest first, with
+a log line naming why. An unpersistable entry therefore survives while the cache
+is under the cap and is dropped only past it — losing WORK (a cold prefill),
+never data. A soft cap was the tempting alternative and it is wrong: the
+allowance exists to bound RAM for the NEXT admission, and "0 = nothing idle
+stays resident" has to mean what it says even when the disk refuses.
+
+**A mode is not an arch.** `ssdFirstEnabled()` never checked that a disk tier
+exists, and `--prefix-cache-disk` is OFF by default — so out of the box
+qwen4_exp armed the mode with no tier underneath it, took the "one full-context
+session + idle" budget floor (~20 GB, plus the whole ask at 1M) and could run
+none of the spill machinery, because every mechanism needs somewhere to write.
+A budget sized for a tier that does not exist is RAM the server cannot use.
+`ssdFirstActive(config, has_disk)` is now THE predicate, asked at both sites
+(the load-time budget and the arming), scan-pinned; the arming moved BELOW the
+attach block, because the tier is part of the answer.
+
+**An arm that short-circuits above a fix does not get the fix.** Audit S1
+caught this for the GPU ceiling; the same argument list carried a second
+instance. `ssdFirstBudgetForLoad` returns before `planHotCache`, so
+`clampReserveWidth` — the fix that made the clamp monotone in the ceiling by
+reserving only the ladder FLOOR on an arch that re-bills its width per request —
+never ran on the one arch these gates are about. The arm now derives its clamp
+reserve through the same helper. Two reserves, exactly as on the RAM arm: the
+SESSION is billed at the pinned width (that is what `computeMemoryContext`
+advertises against), the BUDGET at the floor (the load-time reserve is only a
+promise to the FIRST request; every request re-bills its real width at
+admission).
+
+**A durability check that WAITS is a decode stall.** The audit-S3 fix above
+("drain the writer, then re-read `writeErrors()`") was correct about durability
+and wrong about where it ran: `drainWriter` waits on the whole queue, and
+`spillIdleEntries` runs on the INFERENCE thread inside `finishSlot`. Every
+finished request with a flush outstanding parked decode until the background
+writer caught up — precisely the stall the writer was added to remove. The
+question is now asked without blocking (`Writer.pendingPrefix` ->
+`DiskTier.entryWritesPending`): an entry whose files are still in flight is not
+evictable on THIS pass, the pass returns, and the next one asks again. Nothing
+is lost by waiting — the entry is safe in RAM meanwhile — and no drain runs on
+the inference thread at all. Scan-pinned over both end-of-request functions.
+
 ### The JSON grammar's token->bytes table was a process singleton (relocated from CLAUDE.md, 2026-09-05)
 
 The table is derived from a MODEL's vocabulary, but it was built once per process. A second model
@@ -2936,9 +3026,11 @@ scan-pinned, because the wrong order compiles and serves correctly until the one
 
 **A "complete" disk commit is STAGED, not durable** (audit S3). The background writer logs a failed
 blob, counts it and drops it; the entry is still "committed" from the caller's point of view. So
-anything that discards the RAM copy on the strength of a disk commit must first drain the writer
-and re-read `writeErrors()`. Treating the commit itself as durability is how a cache entry that
-exists in neither tier gets created.
+anything that discards the RAM copy on the strength of a disk commit must first confirm the files
+actually landed. Treating the commit itself as durability is how a cache entry that exists in
+neither tier gets created. The first fix confirmed it by DRAINING the writer, which was a decode
+stall on the inference thread — see item 6 of the external review below: the confirmation is now
+non-blocking (`entryWritesPending`), and an entry still in flight simply waits for the next pass.
 
 **An index-less entry directory is another process's flush in progress until proven old** (audit
 S4). Meta lands last by design, so a directory without it is indistinguishable from a partial
