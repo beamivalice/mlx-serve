@@ -6435,6 +6435,33 @@ pub const KVCache = struct {
         return @intCast(shape[2]);
     }
 
+    /// Tokens of capacity every caching layer's buffer ALREADY holds.
+    ///
+    /// The WARM bill's one gate. A prefix-cache restore rebinds the entry's
+    /// buffers by REFCOUNT — those bytes are already inside
+    /// `mlx_get_active_memory` and the request allocates none of them again —
+    /// but only for as long as the buffer is reused IN PLACE. Past this
+    /// capacity `nextCapacityReserved` allocates the whole new capacity beside
+    /// the old one (`growQuantBuf` slice_updates the old into the new and both
+    /// live until the eval), and the old copy is the hot entry's, which
+    /// eviction protects: so a grow really does cost a second full buffer and
+    /// nothing may be credited against it.
+    ///
+    /// The MINIMUM across layers, and 0 as soon as one layer is uninitialized:
+    /// the credit must be provable for every buffer the prefill writes, and a
+    /// maximum would credit rows the narrowest layer is about to reallocate.
+    /// Linear layers hold no KV entry and are not part of the question.
+    pub fn residentCapacityTokens(self: *const KVCache) usize {
+        var cap: usize = std.math.maxInt(usize);
+        var seen: usize = 0;
+        for (self.entries) |*e| {
+            if (!e.initialized) return 0;
+            seen += 1;
+            cap = @min(cap, bufferCapacity(e.keys));
+        }
+        return if (seen == 0) 0 else cap;
+    }
+
     /// Buffer-grow / slice-update / view-build, parameterized over the
     /// buffer's last dim and dtype: six calls per `updateAffine` (3 buffers ×
     /// K and V) and two per `updateDense`. Every caller passes the width of
