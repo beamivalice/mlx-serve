@@ -6066,7 +6066,21 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // delta, never `reclaimable`.
     var admitted_prefill_chunk: u32 = 0;
     var evicted_live_bytes: u64 = 0;
-    if (prefill_admission_fits) |fits_fn| {
+    // THE ARCH GATE for this whole pass (PR #363). a93e2c0 had no eviction-to-
+    // admit and no `error.PrefillDoesNotFit`: a prefill that reached the
+    // inference thread ran. The pass trades hot-cache entries for the request
+    // in front of it, and can end in a refusal the connection thread already
+    // admitted — measured on qwen4_exp (the live 1,047,556-token chain
+    // extension) and on nothing else. Its connection-thread half is gated in
+    // `server.prefillAdmissionBill`, which zeroes the two credits that drive
+    // the admit arms; this is the same predicate on the acting half, so the
+    // two cannot disagree about whether the mechanism exists.
+    //
+    // `publishHotCacheResidency` is NOT gated — it runs at every other call
+    // site for every arch, and it is the class-A fix (the guard used to
+    // dereference `hot_prefix_cache`, freed on every model switch).
+    const admission_pass_armed = if (slot.model.config) |c| c.longCtxGated() else false;
+    if (admission_pass_armed) if (prefill_admission_fits) |fits_fn| {
         if (slot.model.config) |cfg| {
             // The probe bills what the connection thread's guard admitted
             // with — the request's OWN kv-quant scheme and vision chunking,
@@ -6172,7 +6186,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 }
             }
         }
-    }
+    };
 
     // The prefill WIDTH for THIS request, chosen HERE and not at load: the
     // admission pass above has just finished evicting, so this is the first

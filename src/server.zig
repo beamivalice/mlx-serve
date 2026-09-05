@@ -6313,6 +6313,33 @@ pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: us
             sch.reclaimable_hot_cache_bytes.load(.monotonic)
     else
         0;
+    // THE ARCH GATE for the whole evict-to-admit half (PR #363), in ONE place.
+    //
+    // a93e2c0's guard had a single arm: `needed > available` refuses. The PR
+    // added two ADMIT arms above it — evict-and-admit, and the warm deferral —
+    // and both are driven ENTIRELY by these two credits:
+    //   `fitsAfterEviction()` is `fits()` when `reclaimable == 0`, so the
+    //   evict-and-admit arm cannot fire; `pinnedResidentBytes` is
+    //   `evictable -| reclaimable`, so the deferral arm cannot either.
+    // Zeroing them here therefore restores a93e2c0's decision exactly, for the
+    // connection thread and for `admissionVerdict`'s log line together, without
+    // a gate at each arm that could drift from the others.
+    //
+    // Why gate at all: on the gated arch this trades a cache hit for a request
+    // the machine can serve, and it was measured there (the live 1,047,556-token
+    // chain extension). Off it, the same two arms admit a request a93e2c0
+    // refused pre-flight with a clean 400 — and it can then die mid-prefill in
+    // an uncatchable Metal abort, after evicting the whole hot cache on the way.
+    // A 400 the operator can act on is better than that, on an arch nobody
+    // measured the trade on.
+    //
+    // What is NOT gated: `resident_hot_cache_bytes` / `reclaimable_hot_cache_bytes`
+    // are still PUBLISHED by the inference thread. That is the class-A half —
+    // the guard used to dereference `hot_prefix_cache`, which is freed on every
+    // model switch — and it stays for every arch.
+    if (!config.longCtxGated()) {
+        return .{ .needed = needed, .available = available, .chunk = chunk };
+    }
     return .{ .needed = needed, .available = available, .evictable = evictable, .reclaimable = reclaimable, .chunk = chunk };
 }
 
@@ -23995,4 +24022,68 @@ test "prefixCacheMemForLoad: the ungated budget arm is a93e2c0's arithmetic" {
     const GB: u64 = 1 << 30;
     try t.expectEqual(@as(u64, 8 * GB), clampedPrefixCacheMem(8 * GB, 96 * GB, 20 * GB, 2 * GB, 2 * GB));
     try t.expectEqual(96 * GB - 80 * GB, clampedPrefixCacheMem(0, 96 * GB, 70 * GB, 6 * GB, 4 * GB));
+}
+
+test "prefillAdmissionBill: the evict-to-admit credits are qwen4_exp-only" {
+    // PR #363 ledger row "evictLruToAdmit + reclaimable + the two new
+    // checkAttentionMemory admit arms".
+    //
+    // a93e2c0's guard had ONE arm: `if (needed > available) reject`
+    // (`git show a93e2c0:src/server.zig:3257`). The PR added two ADMIT arms
+    // above it, and both are driven entirely by the two credits this bill
+    // carries — so zeroing them restores a93e2c0's decision exactly, for the
+    // guard and for `admissionVerdict`'s log line together.
+    //
+    // The trade is real on the gated arch: a resident cache entry is an
+    // optimization and the request is the work. Off it, the same arms admit a
+    // request a93e2c0 refused pre-flight with a clean 400, which can then die
+    // mid-prefill in an uncatchable Metal abort after evicting the whole hot
+    // cache on the way. A 400 the operator can act on is the better failure on
+    // an arch nobody measured the trade on.
+    const t = std.testing;
+    const MB: u64 = 1024 * 1024;
+
+    // The two admit arms, as pure predicates over the bill.
+    const gated = AdmissionBill{ .needed = 30 * MB, .available = 20 * MB, .evictable = 15 * MB, .reclaimable = 15 * MB };
+    try t.expect(!gated.fits());
+    try t.expect(gated.fitsAfterEviction()); // evict-and-admit
+    try t.expectEqual(AdmissionVerdict.evict, admissionVerdict(gated));
+
+    const deferral = AdmissionBill{ .needed = 30 * MB, .available = 20 * MB, .evictable = 15 * MB, .reclaimable = 0 };
+    try t.expect(!deferral.fitsAfterEviction());
+    try t.expect(pinnedResidentBytes(deferral) > 0); // warm deferral
+
+    // Ungated the bill carries neither credit, and BOTH arms go dead: the
+    // guard reaches a93e2c0's single `needed > available` reject.
+    const ungated = AdmissionBill{ .needed = 30 * MB, .available = 20 * MB };
+    try t.expectEqual(ungated.fits(), ungated.fitsAfterEviction());
+    try t.expectEqual(@as(u64, 0), pinnedResidentBytes(ungated));
+    try t.expectEqual(AdmissionVerdict.refuse, admissionVerdict(ungated));
+    // ...and a bill that FITS still admits, on both arms — the gate removes
+    // the new arms, never the old one.
+    const roomy = AdmissionBill{ .needed = 10 * MB, .available = 20 * MB };
+    try t.expectEqual(AdmissionVerdict.admit, admissionVerdict(roomy));
+
+    // ONE gate, in the ONE function that builds the bill, and it returns a
+    // struct with the two credits DEFAULTED rather than re-listing the fields.
+    const src = @embedFile("server.zig");
+    const body = declBody(src, "pub fn prefillAdmissionBill(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, body, "if (!config.longCtx" ++ "Gated()) {") != null);
+    try t.expect(std.mem.indexOf(u8, body, ".needed = needed, .available = available, .chunk = chunk }") != null);
+    // The PUBLISHERS are untouched: reading a published scalar instead of
+    // dereferencing `hot_prefix_cache` from a connection thread is the class-A
+    // fix and belongs to every arch.
+    try t.expect(std.mem.indexOf(u8, body, "resident_hot_cache_bytes.load(.monotonic)") != null);
+    try t.expect(std.mem.indexOf(u8, body, "reclaimable_hot_cache_bytes.load(.monotonic)") != null);
+
+    // Both halves of the mechanism read the SAME predicate: the connection
+    // thread's credits and the inference thread's eviction pass must agree
+    // about whether evict-to-admit exists at all, or a request is admitted on
+    // an eviction that never runs.
+    const sch = @embedFile("scheduler.zig");
+    try t.expect(std.mem.indexOf(u8, sch, "const admission_pass_armed = if (slot.model.config) |c| c.longCtx" ++ "Gated() else false;") != null);
+    try t.expect(std.mem.indexOf(u8, sch, "if (admission_pass_armed) if (prefill_admission_fits) |fits_fn| {") != null);
+    // `publishHotCacheResidency` is NOT inside the gate — it runs for every
+    // arch at every other call site.
+    try t.expect(std.mem.count(u8, sch, "publishHotCacheResidency(sch);") > 1);
 }
