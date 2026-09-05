@@ -2921,6 +2921,19 @@ pub fn aneGateHeadroom(config: *const model_mod.ModelConfig, chunk: u32) u64 {
         prefillTransientReserve(config, kv_bits, chunk);
 }
 
+var ctx_bar_cached: ?bool = null;
+
+/// `MLX_SERVE_PREFILL_CHUNK_CTX_BAR=0` restores the share-only rung cap.
+pub fn ctxBarEnabled() bool {
+    if (ctx_bar_cached) |v| return v;
+    const v = blk: {
+        const raw = std.c.getenv("MLX_SERVE_PREFILL_CHUNK_CTX_BAR") orelse break :blk true;
+        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
+    };
+    ctx_bar_cached = v;
+    return v;
+}
+
 /// Widths `resolvePrefillChunk` will step down through. Descending, floored at
 /// `generate.PREFILL_CHUNK_FLOOR` — below that the score-budget path refuses to
 /// go either, and a 256-token forward stops amortizing the per-chunk sweeps.
@@ -2991,10 +3004,16 @@ pub fn resolvePrefillChunk(
     // the serving budget (one forward never trades the whole session for its
     // own speed), and whatever the pinned context leaves, less a cache worth
     // having.
-    const cap: u64 = @min(
-        serving_budget / PREFILL_RESERVE_BUDGET_SHARE,
-        (serving_budget -| ctx_kv_bytes) -| HOT_CACHE_FLOOR_BYTES,
-    );
+    const share_bar: u64 = serving_budget / PREFILL_RESERVE_BUDGET_SHARE;
+    // The ctx bar is a BEHAVIOUR CHANGE for every arch, not just the one this
+    // work is about, and it can only ever narrow (audit S9). `--ctx-size` is a
+    // CAP, not an allocation — the KV reservation itself deliberately refuses
+    // to pre-buy the whole window — so billing the entire configured context
+    // here can pin chunk 512 for the life of a process on a dense model with a
+    // large `--ctx-size`. `MLX_SERVE_PREFILL_CHUNK_CTX_BAR=0` restores the
+    // share-only cap, and the narrowing is LOGGED rather than silent.
+    const ctx_bar: u64 = if (ctxBarEnabled()) (serving_budget -| ctx_kv_bytes) -| HOT_CACHE_FLOOR_BYTES else share_bar;
+    const cap: u64 = @min(share_bar, ctx_bar);
     for (PREFILL_CHUNK_LADDER) |chunk| {
         if (prefillTransientReserve(config, kv_bits, chunk) <= cap) return chunk;
     }
@@ -3011,6 +3030,18 @@ pub fn resolvePrefillChunk(
 /// clamp had reserved a 512- or 1024-token transient — an under-reserve of
 /// several GB, and the memory the clamp is there to protect.
 pub fn explicitPrefillChunk() u32 {
+    // `MLX_SERVE_PREFILL_CHUNK` outranks EVERYTHING in
+    // `generate.effectivePrefillChunk` — it returns the env width before it
+    // even looks at the pin — so a bill that only knew about the CLI flag
+    // described the machine-sized rung while every forward ran the env width
+    // (audit S8). With `MLX_SERVE_PREFILL_CHUNK=8192` on any arch that
+    // over-granted the hot-cache budget by several GB, which is the exact bug
+    // this function was added to close for `--prefill-chunk`.
+    //
+    // The env value is unbounded at its source, so it is clamped here rather
+    // than `@intCast` on trust (audit N4: a value past 4 Gi is ReleaseFast UB).
+    const env_w: usize = @min(generate_mod.envPrefillChunk(), @as(usize, std.math.maxInt(u32)));
+    if (env_w > 0) return @intCast(env_w);
     if (!generate_mod.prefill_chunk_explicit) return 0;
     const raw: usize = @min(generate_mod.prefill_chunk_override, @as(usize, std.math.maxInt(u32)));
     return @intCast(raw);
@@ -3061,6 +3092,15 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
             sizerCtxKvBytes(config, kv_bits),
             explicitPrefillChunk(),
         );
+        // The ctx bar can narrow the rung on ANY arch, so say when it is the
+        // binding one — a chunk pinned at 512 by a large `--ctx-size` is
+        // otherwise indistinguishable from a small box (audit S9).
+        if (ctxBarEnabled() and explicitPrefillChunk() == 0) {
+            const share_only = resolvePrefillChunk(config, kv_bits, currentGpuMemoryCeiling(active_mem), active_mem, 0);
+            if (share_only > config.pinned_prefill_chunk) {
+                log.info("[prefill] chunk {d} (ctx bar: the --ctx-size KV bill; share-only would allow {d}; MLX_SERVE_PREFILL_CHUNK_CTX_BAR=0 restores)\n", .{ config.pinned_prefill_chunk, share_only });
+            }
+        }
         // Say it once per model, wherever the model was pinned from (startup
         // primary or on-demand load) — a narrowed prefill otherwise reads as an
         // unexplained slowdown.
@@ -4160,8 +4200,10 @@ test "the refusal names the width it tried, and one rule picks it everywhere" {
     // could not have gone red on the regression they exist for. Two lines up,
     // `chooser` was already split correctly, so the mitigation was known here
     // and missed.
-    try t.expect(std.mem.indexOf(u8, src, "at prefill chunk {d} (the narrowest width " ++ "tried)") != null);
-    try t.expect(std.mem.indexOf(u8, src, "prompt_len, bill.needed / mb, bill.chunk, bill." ++ "available / mb") != null);
+    try t.expect(std.mem.indexOf(u8, src, "at prefill chunk {d} " ++ "({s})") != null);
+    try t.expect(std.mem.indexOf(u8, src, "prompt_len, bill.needed / mb, bill.chunk, width_note, bill." ++ "available / mb") != null);
+    // The label is qualified by the arch, not asserted as a bare claim (N1).
+    try t.expect(std.mem.indexOf(u8, src, "perRequestPrefillChunkEnabled(config)) \"the narrowest width " ++ "tried\"") != null);
     try t.expect(std.mem.indexOf(u8, src, "(KV+working+margin) at prefill " ++ "chunk {d}") != null);
     try t.expect(std.mem.indexOf(u8, src, "prompt_len, needed_mb, bill.chunk, " ++ "avail_mb") != null);
 
@@ -4767,14 +4809,20 @@ pub fn chooseRequestPrefillChunk(
     if (chunk_override > 0) return chunk_override;
     if (!perRequestPrefillChunkEnabled(config)) return load_time_pin;
     for (PREFILL_CHUNK_LADDER) |rung| {
-        const width: u64 = @intCast(generate_mod.effectivePrefillChunk(
-            config.prefillScoreHeadDim(),
-            config.num_attention_heads,
-            @intCast(seq),
-            config.has_sliding_window,
-            config.isMoe(),
-            rung,
-        ));
+        // `effectivePrefillChunk` can return `MLX_SERVE_PREFILL_CHUNK` verbatim,
+        // which has no upper bound at its source — clamp before narrowing
+        // (audit N4), the same way `explicitPrefillChunk` does.
+        const width: u64 = @min(
+            @as(u64, generate_mod.effectivePrefillChunk(
+                config.prefillScoreHeadDim(),
+                config.num_attention_heads,
+                @intCast(seq),
+                config.has_sliding_window,
+                config.isMoe(),
+                rung,
+            )),
+            @as(u64, std.math.maxInt(u32)),
+        );
         if (prefillNeededAtChunk(config, seq, max_tokens, kv_bits, width) <= available) return @intCast(width);
     }
     return @intCast(generate_mod.effectivePrefillChunk(
@@ -5088,8 +5136,13 @@ pub fn prefillFitsNow(config: *const model_mod.ModelConfig, prompt_len: usize, m
 pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, unchunked_prefill: bool) void {
     const bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null);
     const mb = 1024 * 1024;
-    log.warn("  prompt {d} tokens needs ~{d}MB at prefill chunk {d} (the narrowest width tried), ~{d}MB available after evicting ~{d}MB of hot cache — refused before prefill\n", .{
-        prompt_len, bill.needed / mb, bill.chunk, bill.available / mb, bill.evictable / mb,
+    // "narrowest width TRIED" is only true where the ladder was walked; on a
+    // non-per-request arch the chooser returns the load-time pin immediately
+    // (audit N1), so the label is qualified rather than claiming a search that
+    // did not happen.
+    const width_note: []const u8 = if (perRequestPrefillChunkEnabled(config)) "the narrowest width tried" else "the pinned width";
+    log.warn("  prompt {d} tokens needs ~{d}MB at prefill chunk {d} ({s}), ~{d}MB available after evicting ~{d}MB of hot cache — refused before prefill\n", .{
+        prompt_len, bill.needed / mb, bill.chunk, width_note, bill.available / mb, bill.evictable / mb,
     });
 }
 
