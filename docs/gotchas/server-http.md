@@ -3260,3 +3260,35 @@ Tests: the two live-numbered bills (786,707 @ 19,032 MB admits at ~10.8 GB;
 1,047,556 over the same entry is credited nothing until its buffer covers the
 reservation), the exactly-once scan across both files, and `pinnedResidentBytes`
 at the live 24,826/10,294 MB reading.
+
+### Follow-ups the 1M rung is still waiting on
+
+The 1,047,556-token chain extension above is refused by MARGIN, not by this
+defect. The terms sum to ~27.9 GB against 31,717 MB free; the estimator's 5/4
+takes the bill to 33.2 GB (the log's own number, 32,953 MB). Two levers were
+costed and DECLINED for the change that fixed the warm bill, because shaving a
+margin on a path where a real OOM is uncatchable is not a trade a warm-bill fix
+gets to make:
+
+* **(B) one copy of `state_bytes` while the QSA capacity buffer is being
+  reallocated.** `statePerTokenBilled` bills two — the live history plus the
+  copy `attachQsaHistoryToLatest` materializes at the end of the prefill. On a
+  GROW the old history belongs to the protected hot entry and is already in
+  `active_mem`, so the pair that actually coexists may be one new buffer plus
+  the attach, not two new ones. Worth ~4 GB at 1M. Needs the attach's lifetimes
+  checked against the grow's, not assumed.
+* **(C) exempt exactly-known buffer sizes from the 5/4.** The margin exists for
+  transients whose peak is estimated; a reserved KV buffer's size is arithmetic,
+  not an estimate. Worth ~1.5 GB at 1M — probably not enough on its own.
+
+Note also that the QSA-history bill fix landing beside this one takes 2,304 MiB
+off the 1M bill directly (33.2 GB -> ~30.2 GB against 31,717 MB free), so the
+rung may admit without either lever. The re-judge is what decides that, not this
+arithmetic.
+
+One seam between the two changes, since they touch the same terms: the credit
+here is `credited *| (kv_per_tok +| config.qsaHistoryBytesPerToken())` — ONE
+copy of the history, spelled with the per-token helper and deliberately NOT with
+`statePerTokenBilled`. A change to how many copies the bill charges therefore
+does not have to be mirrored in the credit: the credit is what a restore SHARES,
+which is one live history whatever the bill's multiplier is.
