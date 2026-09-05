@@ -1655,6 +1655,77 @@ shed-not-evict, FailingAllocator ownership) and the catch-arm/detach source
 scan in scheduler.zig. NOT built: the issue's proposed `--prefix-cache-mem
 auto` context-sized floor — the default-sizing question is still open.
 
+## The trim #330 promised never fired: retention had end-anchored the checkpoints (#330 follow-up, 2026-09-05)
+
+**Symptom.** qwen4_exp, SSM checkpoint stride 4096, a long agent session. The
+commit of a 383,069-token entry logged
+
+    [hot-cache] skipped oversized entry (383069 tokens, 8757.79 MB > 3873.54 MB budget)
+
+— the FLAT DECLINE #330 exists to prevent. Every later turn cold-prefilled
+while the cap "held" zero bytes, exactly the cliff #330 was written for.
+
+**Three defects, one line.**
+
+**1. Retention was end-anchored.** Both capture sites in `generate.zig` (the
+stride capture in the chunk loop and the end-of-prompt snap after it) honoured
+`ssm_checkpoint_max` with `orderedRemove(0)` — drop the OLDEST. With max 16 and
+stride 4096 the survivors of a 383k prefill are the highest 16 positions, i.e.
+they cover only the last `max * stride` = 65k tokens; the LOWEST survivor sits
+around 320k, and 320k rows at 13,056 B/token plus its checkpoint is ~4,004 MB
+against a 3,873.54 MB budget. `trimLenForBudget` walks the list downward
+looking for an affordable position, finds none at all, and returns null — the
+decline. Thinned span-preservingly instead, the same 16 survivors span the
+whole prompt (4,096 … 383,039) and a trim point like 126,976 = 31 x 4096 costs
+about 1.73 GB. The disk tier (`ssmTargetPositions`) thinned from the front for
+the same stated reason and had the same consequence for a restore that
+diverges early.
+
+The hot cache had ALREADY solved this twice — `mergeCheckpointLists` and
+`shedCheckpointsToFit` both thin the interior, and the merge comment even
+names the 415 s cold prefill that taught it. Two policies for one decision is
+how the third site kept the old one, so the selection is now ONE pure helper,
+`transformer.spanPreservingDropIndex` (typed as `ssmCheckpointDropIndex` /
+`positionDropIndex`), and all four sites call it: keep index 0 (a prompt that
+diverges early restores only there) and the last (where warm turns match),
+drop whichever interior checkpoint sits between the closest pair of
+neighbours. Under three there is no interior, so the oldest goes.
+
+**2. The trim billed checkpoints the commit sheds anyway.** At candidate `k`
+the cost was `p * row_bytes + Σ bytes(list[0..k+1])` — every LOWER checkpoint
+at full price, although the commit path's own `shedCheckpointsToFit` thins
+them the moment the entry lands over the cap. The bill is now what SURVIVES a
+span-preserving shed to the remaining allowance (`shedSurvivorBytes`, the same
+selection helper, simulated on stack arrays; a list past `SHED_SIM_MAX` falls
+back to the old all-lower bill, which can only pick a shorter prefix). The
+promise has to be kept on the other side too: the replace path already ended
+with `shedCheckpointsToFit`, and the NEW-entry path now does as well.
+
+**3. One line for three outcomes.** `trimLenForBudget` returning null, the
+`trimmedCopy` failing, and the trimmed checkpoint list's `dupe` failing all
+printed the identical `skipped oversized entry` line, and the two failures
+swallowed their error entirely — so the live log above could not be read as
+"the arithmetic declined" versus "a copy failed". `TrimDecline` now names
+which, with `@errorName` appended, and a failed `trimmedCopy` retries at the
+next-lower checkpoint (`limit = tl - 1`) before declining rather than treating
+one width's failure as a verdict on the entry. The `dupe` arm leaks nothing —
+`new_snap` is by then the trimmed copy and the decline path deinits exactly
+that — but it throws the copy away, which is worth its own line.
+
+Not changed, worth knowing: `new_bytes` bills the slot's RESERVED capacity
+rows, not the token count, so the MB in that line reads high for a slot that
+grew its KV buffer past the prompt.
+
+Guards (hermetic, no engine): `transformer.zig`'s span-preserving retention
+test (94 positions at 4096 thinned to 16 — both ends kept, no gap past twice
+the ideal), and in `prefix_cache.zig` the 383k arithmetic both ways
+(end-anchored survivors → null, thinned survivors → a trim ≥ 126,976 that
+fits once shed), `shedSurvivorBytes`, the retry-lower selection, the three
+distinct `TrimDecline` reasons, and a class scan that no retention site has
+gone back to drop-oldest. `kv_disk_cache.zig`'s retention test changed sides
+with the policy: it asserted the lowest position was dropped and now asserts
+both ends survive.
+
 ## The schema thinking-off gate lived on one surface of three (#331, 2026-08-31)
 
 A JSON-schema grammar mask constrains from token 0 and cannot express "think
