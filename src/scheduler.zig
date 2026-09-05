@@ -155,7 +155,7 @@ pub const LoadParams = struct {
     /// Clamp the hot-cache byte budget against live post-load headroom
     /// (`server.prefixCacheMemForLoad`) — a pointer because the scheduler
     /// deliberately has no server.zig import. Null = no clamp (tests).
-    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64) u64 = null,
+    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, *u64) u64 = null,
     /// SSD tier byte budget for the hot prefix cache (`--prefix-cache-disk`).
     /// 0 disables persistence. Attached per model at load for pure-attention
     /// archs; entries live under `~/.mlx-serve/kv-cache/<fingerprint>`.
@@ -1167,7 +1167,7 @@ pub const LoadRequest = struct {
     kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.dense,
     prefix_cache_capacity: u32 = 1,
     prefix_cache_mem_bytes: u64 = 0,
-    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64) u64 = null,
+    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, *u64) u64 = null,
     /// SSD tier byte budget (mirrors `LoadParams.prefix_cache_disk_bytes`).
     prefix_cache_disk_bytes: u64 = 0,
     /// Phase 1 (perf-plan): SSM/conv state snapshot stride during prefill.
@@ -1291,7 +1291,7 @@ pub const Scheduler = struct {
     /// every model switch.
     prefix_cache_capacity: u32,
     prefix_cache_mem_bytes: u64,
-    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64) u64,
+    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, *u64) u64,
     prefix_cache_disk_bytes: u64,
     ssm_checkpoint_stride: u32,
     ssm_checkpoint_max: u32,
@@ -4035,8 +4035,12 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         // The weights are resident here, so the resolver's active-memory read
         // is honest; the raw launch budget never reaches initWithMem (a 40 GB
         // cap beside a ~70 GB pack was the 2026-08-30 uncatchable Metal OOM).
+        // The RAM allowance for IDLE entries on the SSD-first arm — 0 on
+        // every other arch, and 0 when the resolver is absent (unit tests).
+        // `spillIdleEntries` enforces it; see `HotPrefixCache.ssd_idle_mem`.
+        var ssd_idle_mem: u64 = 0;
         const clamped_prefix_mem: u64 = if (params.prefix_cache_mem_resolver) |resolve|
-            resolve(params.config, params.prefix_cache_mem_bytes)
+            resolve(params.config, params.prefix_cache_mem_bytes, &ssd_idle_mem)
         else
             params.prefix_cache_mem_bytes;
         entry.prefix_cache = prefix_cache_mod.HotPrefixCache.initWithMem(
@@ -4045,11 +4049,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             clamped_prefix_mem,
         );
         entry.prefix_cache.?.qsa_history_required = params.config.indexer_budget != 0;
-        // SSD-first prefix cache: ONE arch predicate, checked here. Every
-        // mechanism reads `HotPrefixCache.ssd_first`, so a non-qwen4_exp model
-        // (or `MLX_SERVE_PREFIX_SSD_FIRST=0`) keeps today's paths exactly.
-        entry.prefix_cache.?.ssd_first = params.config.ssdFirstCapable() and
-            prefix_cache_mod.ssdFirstEnabled();
+        entry.prefix_cache.?.ssd_idle_mem = ssd_idle_mem;
         // SSD tier (`--prefix-cache-disk`). Phase 3 persists hybrid recurrent
         // state too: the disk tier is allowed whenever the RAM tier accepted
         // the arch — i.e. pure-attention always, hybrid iff SSM checkpoints
@@ -4078,15 +4078,25 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 log.warn("[disk-cache] init failed: {s} — persistence off for this model\n", .{@errorName(err)});
                 break :attach;
             };
-            // Mirror the ONE arch predicate onto the disk tier (mechanism 4).
-            entry.prefix_cache.?.disk.?.ssd_first = entry.prefix_cache.?.ssd_first;
+        }
+        // SSD-first prefix cache: ONE predicate, checked here — arch, env
+        // switch, AND a live disk tier. It runs BELOW the attach because the
+        // tier is part of the answer: with `--prefix-cache-disk` off (the
+        // default) there is nowhere to spill to, so qwen4_exp takes the RAM
+        // arm byte for byte like every other arch. The budget site
+        // (`server.ssdFirstBudgetForLoad`) asks the same predicate.
+        entry.prefix_cache.?.ssd_first = prefix_cache_mod.ssdFirstActive(
+            params.config,
+            entry.prefix_cache.?.disk != null,
+        );
+        if (entry.prefix_cache.?.ssd_first) {
+            // Mirror the predicate onto the disk tier (mechanism 4).
+            entry.prefix_cache.?.disk.?.ssd_first = true;
             // Mechanism 2: the background writer, SSD-first only.
-            if (entry.prefix_cache.?.ssd_first) {
-                entry.prefix_cache.?.disk.?.enableBackgroundWriter();
-                // Mechanism 6: startup sweep of strays + root-wide LRU across
-                // the other models' fingerprints under the same base.
-                entry.prefix_cache.?.disk.?.sweepSiblings();
-            }
+            entry.prefix_cache.?.disk.?.enableBackgroundWriter();
+            // Mechanism 6: startup sweep of strays + root-wide LRU across the
+            // other models' fingerprints under the same base.
+            entry.prefix_cache.?.disk.?.sweepSiblings();
         }
         entry.ssm_checkpoint_stride = params.ssm_checkpoint_stride;
         entry.ssm_checkpoint_max = params.ssm_checkpoint_max;
@@ -8127,9 +8137,16 @@ test "SSD-first behaviour is gated on ONE arch predicate at one place per mechan
     const source = whole[0 .. std.mem.indexOf(u8, whole, "test \"SSD-first behaviour is gated") orelse whole.len];
     try testing.expectEqual(
         @as(usize, 1),
-        std.mem.count(u8, source, "prefix_cache.?.ssd_first = params.config.ssdFirstCapable() and"),
+        std.mem.count(u8, source, "prefix_cache.?.ssd_first = prefix_cache_mod.ssdFirstActive("),
     );
-    try testing.expect(std.mem.indexOf(u8, source, "prefix_cache_mod.ssdFirstEnabled()") != null);
+    // ...and the predicate takes the DISK as an argument, so the mode cannot
+    // arm without a tier to spill into (external review item 4). The
+    // assignment must also sit BELOW the attach block, or `disk != null` is
+    // read before it can be true.
+    const arm_at = std.mem.indexOf(u8, source, "prefix_cache.?.ssd_first = prefix_cache_mod.ssdFirstActive(").?;
+    const attach_at = std.mem.indexOf(u8, source, "if (params.prefix_cache_disk_bytes > 0 and disk_ok) attach: {").?;
+    try testing.expect(attach_at < arm_at);
+    try testing.expect(std.mem.indexOf(u8, source[arm_at..@min(source.len, arm_at + 200)], "prefix_cache.?.disk != null") != null);
 
     // Mechanism 3 is wired only behind `writeThroughArmed`, which itself
     // demands ssd_first + a live background writer.

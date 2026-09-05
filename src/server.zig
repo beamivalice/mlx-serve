@@ -3383,8 +3383,14 @@ fn ssdFirstBudgetForLoad(
     active_mem: usize,
     ctx_kv: u64,
     transient_reserve: u64,
+    idle_out: *u64,
 ) ?u64 {
-    if (!config.ssdFirstCapable() or !prefix_cache_mod.ssdFirstEnabled()) return null;
+    // THE predicate, shared with the spill site. `--prefix-cache-disk` is OFF
+    // by default, and without a tier none of this mode's machinery can run —
+    // so granting its "one full-context session + idle" floor (~20 GB plus the
+    // whole ask at 1M) would be RAM the server cannot use. Disk off means the
+    // RAM arm below, byte for byte. (external review item 4)
+    if (!prefix_cache_mod.ssdFirstActive(config, prefix_cache_disk_bytes > 0)) return null;
     const budget = ssdFirstPrefixCacheMem(
         requested,
         ceiling,
@@ -3405,6 +3411,12 @@ fn ssdFirstBudgetForLoad(
     // roughly halve the auto-context. The RETURN value stays `budget`: that is
     // the cache's byte cap, and `initWithMem` needs the whole of it.
     publishResolvedPrefixCacheMem(budget -| ctx_kv);
+    // ...and the same quantity, handed to the CACHE. On this arm
+    // `--prefix-cache-mem` is the RAM allowance for IDLE entries, and
+    // `spillIdleEntries` is what enforces it — without the number the spill
+    // had no cap to work against and evicted every non-active entry on every
+    // finished request (external review item 3).
+    idle_out.* = budget -| ctx_kv;
     // D1: on this arch `--prefix-cache-mem` is the IDLE allowance, not the
     // whole cache — 0 means "no idle entries", not "use all the headroom".
     // Say so once, naming the flag, so the resolved budget is never a mystery.
@@ -3464,7 +3476,10 @@ fn ramFirstContextForLoad(config: *const model_mod.ModelConfig, kv_bits: u64, ac
     );
 }
 
-pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64) u64 {
+pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, idle_out: *u64) u64 {
+    // RAM-first default: this arch has no idle allowance, because it has no
+    // SSD to spill to. Written FIRST so every early return carries it.
+    idle_out.* = 0;
     var active_mem: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_mem);
     const kv_bits: u64 = defaultKvBits();
@@ -3487,7 +3502,20 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64) u64
     // plan on qwen4_exp, so a live ceiling here BYPASSED the reproducibility fix
     // on the only arch the gates are about. The callee takes the ceiling as a
     // parameter and no longer derives one. (audit S1)
-    if (ssdFirstBudgetForLoad(config, requested, staticGpuMemoryCeiling(), active_mem, ssd_ctx_kv, prefillTransientReserve(config, kv_bits, ssd_chunk))) |b| return b;
+    // The CLAMP reserve, at the same width `planHotCache` reserves for: the
+    // ladder FLOOR on an arch that re-bills its prefill width per request
+    // (`clampReserveWidth`). This arm short-circuits above the RAM plan on
+    // qwen4_exp, so billing the sizer's rung here meant the floor-reserve fix
+    // never ran on the deployed pack at all — the same shape as the ceiling
+    // bypass audit S1 caught one line up. Two reserves, exactly as on the RAM
+    // arm: the SESSION is billed at the pinned width (`ssdFirstSessionTokensNow`,
+    // twin of `ramFirstContextForLoad`) because that is the width
+    // `computeMemoryContext` advertises against; the BUDGET is billed at the
+    // floor, because the load-time reserve is only a promise to the FIRST
+    // request and every request re-bills its own real width at admission.
+    // (external review item 5)
+    const ssd_clamp_reserve: u64 = prefillTransientReserve(config, kv_bits, clampReserveWidth(config, @intCast(ssd_chunk)));
+    if (ssdFirstBudgetForLoad(config, requested, staticGpuMemoryCeiling(), active_mem, ssd_ctx_kv, ssd_clamp_reserve, idle_out)) |b| return b;
     // Pin first, then hand the pinned width in as the override: the plan must
     // bill the width `generate.effectivePrefillChunk` will resolve to, and the
     // pin is that width (it already folded in an explicit `--prefill-chunk`).
@@ -3774,6 +3802,32 @@ fn countDecls(src: []const u8, header: []const u8) usize {
     return n;
 }
 
+/// The ARGUMENT TEXT of the call whose name starts at `at` — balanced from
+/// the opening paren, so a multi-line call and a nested call are both exact.
+///
+/// The scans that check "this call passes that term" used a fixed-size window
+/// and cut at the first `);`. Both calls this file scans end in `))` or span
+/// several lines, so the window ran 400+ characters PAST the call and the
+/// assertion could be satisfied by unrelated code below it — the same
+/// self-satisfying-scan class as audit B0c, one level out. A scan that cannot
+/// go red is not a scan. (external review item 5)
+fn callArgs(src: []const u8, at: usize) ?[]const u8 {
+    const open = std.mem.indexOfScalarPos(u8, src, at, '(') orelse return null;
+    var depth: usize = 0;
+    var i: usize = open;
+    while (i < src.len) : (i += 1) {
+        switch (src[i]) {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if (depth == 0) return src[open + 1 .. i];
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
 /// One declaration's source window. Thin alias for the ONE extractor,
 /// `generate.productionDeclSource` — the same windows the prefill loop's own
 /// ordering scans read, so the two cannot drift. It generalises what this used
@@ -3865,9 +3919,12 @@ test "free RAM still binds where it can be acted on: request-time admission" {
     const load = declBody(src, "pub fn prefixCacheMemForLoad(") orelse return error.CallSiteMoved;
     for ([_][]const u8{ "ssdFirstBudgetFor" ++ "Load(", "planHot" ++ "Cache(" }) |callee| {
         const at = std.mem.indexOf(u8, load, callee) orelse return error.CallSiteMoved;
-        const args = load[at..@min(load.len, at + 600)];
-        const close = std.mem.indexOf(u8, args, ");") orelse return error.CallSiteMoved;
-        try t.expect(std.mem.indexOf(u8, args[0..close], static_c) != null);
+        // Balanced from the opening paren: the old form cut at the first `);`
+        // in a 600-byte window, and BOTH calls here end in `))` or span
+        // several lines, so it ran ~420 bytes past the call and could be
+        // satisfied by code below it. (external review item 5)
+        const args = callArgs(load, at) orelse return error.CallSiteMoved;
+        try t.expect(std.mem.indexOf(u8, args, static_c) != null);
     }
     // ...and neither callee may re-derive a live ceiling behind the argument.
     for ([_][]const u8{ "fn ssdFirstBudgetForLoad(", "fn ssdFirstSessionTokensNow(", "pub fn planHotCache(" }) |decl| {
@@ -3967,6 +4024,197 @@ test "the clamp bills the context that will be SERVED, not the placeholder" {
     try t.expect(placeholder.ctx_kv < 30 * MiB);
     try t.expect(real.ctx_kv > 18_000 * MiB);
     try t.expect(real.budget > 0);
+}
+
+test "the SSD-first budget bills the FLOOR reserve, at the deployed pack's live numbers" {
+    // External review item 5. `ssdFirstBudgetForLoad` short-circuits ABOVE
+    // `planHotCache`, so `clampReserveWidth` — the fix that made the clamp
+    // monotone in the ceiling by reserving only the ladder FLOOR on an arch
+    // that re-bills its width per request — never executed on qwen4_exp, the
+    // one arch these gates are about. Exactly the shape audit S1 caught for
+    // the ceiling, one argument along.
+    //
+    // Live numbers, the same boot the other clamp tests use (2026-09-05,
+    // wired 120000): the guards' boot lines are
+    //   [hot-cache] budget clamped 10240 -> 9642 MB          (RAM arm)
+    //   [hot-cache] SSD-first budget 34748 MB                (SSD arm)
+    const t = std.testing;
+    var cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const MiB: u64 = 1 << 20;
+    const active: u64 = 69_827 * MiB;
+    const ceiling: u64 = 109_395 * MiB;
+
+    const orig_ctx = server_config.max_context_size;
+    defer server_config.max_context_size = orig_ctx;
+    server_config.max_context_size = 0;
+    cfg.pinned_context = 0;
+    // Both gates pinned, so the environment cannot decide this test's verdict.
+    per_request_chunk_override = true;
+    defer per_request_chunk_override = null;
+    const orig_explicit = generate_mod.prefill_chunk_explicit;
+    defer generate_mod.prefill_chunk_explicit = orig_explicit;
+    generate_mod.prefill_chunk_explicit = false;
+
+    // The PURE chunk resolver — the same one the neighbouring clamp tests use.
+    // `pinPrefillChunk` reads live memory, and a box that happened to resolve
+    // the floor rung would make the floor-vs-pinned comparison below vacuous.
+    const chunk: u32 = @intCast(generate_mod.effectivePrefillChunk(
+        cfg.prefillScoreHeadDim(),
+        cfg.num_attention_heads,
+        0,
+        cfg.has_sliding_window,
+        cfg.isMoe(),
+        cfg.pinned_prefill_chunk,
+    ));
+    // The arch DOES re-bill per request, so the two widths really differ —
+    // otherwise this test would be vacuous.
+    try t.expect(perRequestPrefillChunkEnabled(&cfg));
+    const floor_w = clampReserveWidth(&cfg, chunk);
+    try t.expectEqual(PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1], floor_w);
+    try t.expect(floor_w < chunk);
+
+    const reserve_pinned = prefillTransientReserve(&cfg, kv_bits, chunk);
+    const reserve_floor = prefillTransientReserve(&cfg, kv_bits, floor_w);
+    try t.expect(reserve_floor < reserve_pinned);
+
+    const ctx_kv: u64 = (kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(&cfg)) *|
+        ssdFirstSessionTokensNow(&cfg, kv_bits, ceiling, active, chunk);
+    const ask: u64 = 10 * 1024 * MiB;
+
+    // What the arm bills now, and what it billed before: the idle allowance
+    // is the residual after the reserve, so the whole difference lands there.
+    const now = ssdFirstPrefixCacheMem(ask, ceiling, active, ctx_kv, reserve_floor);
+    const before = ssdFirstPrefixCacheMem(ask, ceiling, active, ctx_kv, reserve_pinned);
+    try t.expect(now >= before);
+
+    // ...and the RAM arm reserves the same floor for the same pack, which is
+    // the point: the two arms differ in their SEMANTICS (residual vs
+    // one-session floor), never in the width they promise the first request.
+    const plan = planHotCache(&cfg, kv_bits, ceiling, active, 1_048_576, sizerCtxKvBytes(&cfg, kv_bits), ask, chunk);
+    try t.expectEqual(floor_w, plan.reserve_chunk);
+    try t.expectEqual(reserve_floor, plan.reserve);
+
+    // The session the floor holds is the one the server advertises — unchanged
+    // by this fix, and asserted here so the two reserves cannot be conflated
+    // by a later tidy-up. `ssdFirstSessionTokensNow` bills the PINNED width
+    // because that is what `computeMemoryContext` sizes against.
+    const advertised = autoContextFrom(
+        safeContextForBudget(ceiling, active, CTX_SIZING_CACHE_RESERVE +| reserve_pinned, kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(&cfg), 0),
+        cfg.contextCap(),
+    );
+    try t.expectEqual(advertised, ssdFirstSessionTokensNow(&cfg, kv_bits, ceiling, active, chunk));
+}
+
+test "the SSD-first budget arm reads the same clamp reserve the RAM plan does" {
+    // Scan half of item 5: a body-scoped assertion cannot see which arm ran,
+    // so the reserve is checked AT THE CALL, on its arguments — the lesson
+    // audit S1 wrote down for the ceiling. Needles split.
+    const t = std.testing;
+    const src = @embedFile("server.zig");
+    const clamp = "clampReserve" ++ "Width(config, ";
+    const load = declBody(src, "pub fn prefixCacheMemForLoad(") orelse return error.CallSiteMoved;
+    // The SSD arm derives its clamp reserve through the shared helper...
+    const at = std.mem.indexOf(u8, load, "ssdFirstBudgetFor" ++ "Load(") orelse return error.CallSiteMoved;
+    const args = callArgs(load, at) orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, args, "ssd_clamp_reserve") != null);
+    // ...and it is the ONLY reserve the arm passes: a second, pinned-width
+    // term beside it would be the bug wearing the fix's name.
+    try t.expect(std.mem.indexOf(u8, args, "prefillTransientReserve(") == null);
+    const decl = std.mem.indexOf(u8, load, "const ssd_clamp_reserve") orelse return error.ReserveMoved;
+    try t.expect(std.mem.indexOf(u8, load[decl..@min(load.len, decl + 200)], clamp) != null);
+    // ...and the RAM arm still reaches it through `planHotCache`.
+    const plan = declBody(src, "pub fn planHotCache(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, plan, clamp) != null);
+}
+
+test "SSD-first is gated on a DISK TIER: with --prefix-cache-disk off, qwen4_exp takes the RAM arm" {
+    // External review item 4. `ssdFirstEnabled()` never checked that a tier
+    // exists, and `--prefix-cache-disk` is OFF by default — so out of the box
+    // qwen4_exp got the mode's "one full-context session + idle" budget floor
+    // (~20 GB, plus the whole ask at 1M) with none of the spill machinery
+    // under it. A budget sized for a tier that does not exist is RAM the
+    // server cannot use.
+    const t = std.testing;
+    var cfg = qwen4RequestTestConfig();
+
+    const orig_disk = prefix_cache_disk_bytes;
+    defer prefix_cache_disk_bytes = orig_disk;
+    // `prefixCacheMemForLoad` PUBLISHES its answer into a process global that
+    // the auto-context sizer and the ANE gate both read, so a test that calls
+    // it must put the global back. Leaving it set made
+    // `aneGateHeadroom: reserves a usable context...` fail depending on test
+    // ORDER — green alone, red in the suite.
+    defer clearResolvedPrefixCacheMem();
+    const orig_over = prefix_cache_mod.ssd_first_override;
+    defer prefix_cache_mod.ssd_first_override = orig_over;
+    prefix_cache_mod.ssd_first_override = true; // the env switch is not what is on trial
+
+    // The predicate itself: three conjuncts, and the disk is one of them.
+    try t.expect(!prefix_cache_mod.ssdFirstActive(&cfg, false));
+    try t.expect(prefix_cache_mod.ssdFirstActive(&cfg, true));
+    var dense = model_mod.ModelConfig{};
+    dense.model_type = "qwen3";
+    try t.expect(!prefix_cache_mod.ssdFirstActive(&dense, true));
+    prefix_cache_mod.ssd_first_override = false;
+    try t.expect(!prefix_cache_mod.ssdFirstActive(&cfg, true));
+    prefix_cache_mod.ssd_first_override = true;
+
+    // ...and the budget arm follows it. Both arms are computed from the SAME
+    // live numbers, so the comparison is between the two formulas and not
+    // between two instants: the SSD arm FLOORS at one session's KV, the RAM
+    // arm is a residual bounded by the ask. A 4 GiB ask against a 1M context
+    // separates them by orders of magnitude.
+    const orig_ctx = server_config.max_context_size;
+    defer server_config.max_context_size = orig_ctx;
+    server_config.max_context_size = 1_048_576; // explicit: no auto-sizing in the way
+    cfg.pinned_context = 0;
+    const ask: u64 = 4 * 1024 * 1024 * 1024;
+
+    prefix_cache_disk_bytes = 0;
+    var idle_off: u64 = 12345;
+    const ram_arm = prefixCacheMemForLoad(&cfg, ask, &idle_off);
+    // The RAM arm publishes no idle allowance — the concept does not exist
+    // there, and `spillIdleEntries` never runs.
+    try t.expectEqual(@as(u64, 0), idle_off);
+    try t.expect(ram_arm <= ask);
+
+    prefix_cache_disk_bytes = 64 * 1024 * 1024 * 1024;
+    var idle_on: u64 = 0;
+    const ssd_arm = prefixCacheMemForLoad(&cfg, ask, &idle_on);
+    // One session at 1M on this pack is tens of GB; the floor makes the SSD
+    // arm's budget larger than the whole ask, which the RAM arm can never be.
+    try t.expect(ssd_arm > ask);
+    try t.expect(ssd_arm > ram_arm);
+    // The idle allowance is the ask clamped to what is left; on any box with
+    // headroom for a 4 GiB cache that is the ask itself, and it is never more.
+    try t.expect(idle_on > 0 and idle_on <= ask);
+    try t.expect(ssd_arm -| idle_on > ask); // the one-session floor
+}
+
+test "ONE SSD-first predicate: both the budget site and the spill site ask it" {
+    // Scan, across both files. The mode used to be spelled out at each site
+    // (`ssdFirstCapable() and ssdFirstEnabled()`), which is exactly how the
+    // disk conjunct came to be missing from one of them. Needles split so
+    // this test's own source cannot satisfy them.
+    const t = std.testing;
+    const pred = "ssdFirst" ++ "Active(";
+    const old_form = "ssdFirst" ++ "Enabled()";
+
+    const srv = @embedFile("server.zig");
+    const budget = declBody(srv, "fn ssdFirstBudgetForLoad(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, budget, pred) != null);
+    try t.expect(std.mem.indexOf(u8, budget, old_form) == null);
+
+    const sch = @embedFile("scheduler.zig");
+    try t.expect(std.mem.indexOf(u8, sch, "ssd_first = prefix_cache_mod." ++ pred) != null);
+    // The raw env reader survives only inside the predicate itself and the
+    // warm-up call; no OTHER site may spell the mode out by hand.
+    const pc = @embedFile("prefix_cache.zig");
+    const decl = declBody(pc, "pub fn ssdFirstActive(") orelse return error.PredicateMoved;
+    try t.expect(std.mem.indexOf(u8, decl, "ssdFirstCapable()") != null);
+    try t.expect(std.mem.indexOf(u8, decl, old_form) != null);
+    try t.expect(std.mem.indexOf(u8, decl, "has_disk") != null);
 }
 
 test "an auto boot advertises the session the SSD-first budget floor was billed for" {

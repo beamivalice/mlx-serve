@@ -148,6 +148,12 @@ const Entry = struct {
     /// 8-bit slot's findBestMatch lookup and crash SDPA with a packed-shape
     /// mismatch on restore. Repro: `tests/test_kv_quant_per_request.sh`.
     quant_config: kv_quant.KVQuantConfig,
+    /// TRANSIENT, one `spillIdleEntries` pass only: did THIS pass leave a
+    /// durable, index-verified copy of the entry on the SSD tier? Reset for
+    /// every entry at the top of every pass, so it can never be read stale —
+    /// the eviction tiers are decided from it and a stale `true` would
+    /// discard a session that is not on disk.
+    spill_durable: bool = false,
     /// KV-resident bytes for this entry, computed at commit time (Wave 1.B).
     /// Used for `--prefix-cache-mem` memory-budget enforcement; sum across
     /// all entries == `current_kv_bytes`.
@@ -264,6 +270,32 @@ pub fn restoreMoveEnabled() bool {
     };
     restore_move_env_cached = v;
     return v;
+}
+
+/// THE SSD-first predicate. Arch, env switch, AND a disk tier.
+///
+/// `ssdFirstEnabled()` alone is only two thirds of the answer, and the missing
+/// third is the default: `--prefix-cache-disk` is OFF out of the box, so on
+/// qwen4_exp the mode used to arm with no tier underneath it. That handed the
+/// budget arm its "one full-context session + idle" floor — ~20 GB plus the
+/// whole ask at 1M — while none of the spill machinery could run, because
+/// every mechanism needs somewhere to write. A budget sized for a tier that
+/// does not exist is just RAM the server cannot use.
+///
+/// Called at BOTH sites (the load-time budget and the arming), so with the
+/// disk off qwen4_exp takes the RAM arm byte for byte, exactly like every
+/// other arch. Scan-pinned in `scheduler.zig` and `server.zig`.
+///
+/// The two sites answer `has_disk` from what they can see, and they are not
+/// identical: the budget resolver runs BEFORE the tier is built, so it asks
+/// `--prefix-cache-disk > 0` (the operator's ask), while the arming asks
+/// `disk != null` (the tier that exists). A boot that asks for a tier and
+/// fails to build one therefore gets the SSD budget with the RAM mode for
+/// that boot — one log line explains both, and it is a strictly rarer and
+/// smaller inconsistency than the default it replaces (the mode armed with no
+/// tier at all). (external review item 4)
+pub fn ssdFirstActive(config: *const model_mod.ModelConfig, has_disk: bool) bool {
+    return has_disk and config.ssdFirstCapable() and ssdFirstEnabled();
 }
 
 /// SSD-first mechanism 1: what the LIVE cache held at commit time, captured
@@ -394,6 +426,16 @@ pub const HotPrefixCache = struct {
     /// SSD-first mode (`ModelConfig.ssdFirstCapable()` and the env switch).
     /// Set by the scheduler at load; false keeps every legacy path.
     ssd_first: bool = false,
+    /// SSD-first: the RAM allowance for IDLE entries, in bytes — the resolved
+    /// `--prefix-cache-mem` on this arm (`ssdFirstPrefixCacheMem`'s `idle`
+    /// term, published beside the budget). `spillIdleEntries` evicts only
+    /// PAST it; 0 really does mean "nothing idle stays resident".
+    ///
+    /// Without it the spill had no cap to work against and evicted every
+    /// non-active entry on every finished request, so two alternating
+    /// sessions bounced off the SSD every single turn (external review
+    /// item 3).
+    ssd_idle_mem: u64 = 0,
     /// SSD-first mechanism 1: the live-cache state of the most recent commit,
     /// flushed instead of the (possibly trimmed) RAM entry.
     pending_disk: ?PendingDiskFlush = null,
@@ -1884,16 +1926,25 @@ pub const HotPrefixCache = struct {
         };
     }
 
-    /// SSD-first mechanism 6: at the end of a request RAM keeps exactly the
-    /// ACTIVE session's entry and every other entry spills to the SSD tier and
-    /// leaves RAM.
+    /// SSD-first mechanism 6: at the end of a request every idle entry is
+    /// WRITTEN to the SSD tier, and RAM is trimmed back to the active session
+    /// plus the idle allowance (`ssd_idle_mem`).
     ///
-    /// This is what makes the budget's promise real. `ssdFirstPrefixCacheMem`
-    /// floors RAM at one entry precisely because the resident entry for the
-    /// session being served is the SAME buffers as the live KV; a second
-    /// resident session is a second real 24 GB. Spilling is safe only because
-    /// mechanisms 1–4 make the disk copy COMPLETE — an entry whose copy is
-    /// still partial stays in RAM rather than being thrown away.
+    /// Write and evict are two decisions, and conflating them was external
+    /// review item 3: the spill used to evict every non-newest entry on every
+    /// `finishSlot`, so two alternating sessions bounced off the SSD on every
+    /// single turn even when RAM had room for both. Writing is cheap and has
+    /// no downside — it happens unconditionally. EVICTING is what the
+    /// allowance bounds.
+    ///
+    /// The allowance is a HARD cap in two tiers (review decision (c)):
+    ///   1. shed idle entries that have a proven durable copy, oldest first;
+    ///   2. only if still over, shed the rest, oldest first, naming the reason
+    ///      — that is a cache losing WORK (a cold prefill next time), never
+    ///      data, and the alternative is an allowance that quietly does not
+    ///      hold whenever the disk refuses.
+    /// `ssd_idle_mem == 0` therefore means exactly what it says: nothing idle
+    /// stays resident.
     ///
     /// The active entry is the most recently used one: the commit that just
     /// ran bumped it, and a restore bumps the entry it restored from.
@@ -1911,22 +1962,37 @@ pub const HotPrefixCache = struct {
         var newest_used: u64 = 0;
         for (self.entries.items) |*e| newest_used = @max(newest_used, e.last_used);
 
+        // ── Pass 1: WRITE. Unconditional, and independent of the allowance.
+        //
+        // The writer's error counter as of the start of this pass. A blob it
+        // drops after logging an error never reaches the disk, so an entry
+        // whose files were staged during a pass that saw ANY error is treated
+        // as not-yet-durable and re-checked next pass. Conservative on
+        // purpose: the cost of being wrong here is a lost session.
+        const errs_before = d.writeErrors();
         var spilled: usize = 0;
-        var i: usize = self.entries.items.len;
-        while (i > 0) {
-            i -= 1;
-            const e = &self.entries.items[i];
+        var idle_bytes: u64 = 0;
+        for (self.entries.items) |*e| {
+            e.spill_durable = false;
             if (e.last_used == newest_used) continue; // the active session
             // Checked out: the bytes are the slot's, the snapshot is empty,
             // and there is nothing here to write. (The spill runs on the
             // inference thread at another slot's `finishSlot`, so it can meet
-            // a checkout that is still open.)
+            // a checkout that is still open.) Skipped BEFORE the allowance
+            // count too — billing a slot's bytes to the idle cap would shed
+            // some other session to make room for memory the cap does not own.
             if (e.checked_out_by != null) continue;
+            // Counted against the allowance BEFORE the vision skip: a vision
+            // entry occupies RAM whether or not it can be written, so it is
+            // part of what the cap is about even though it is never the one
+            // shed (`oldestIdleIndex` skips it — the allowance is not a licence
+            // to lose a session to a token-only disk key).
+            idle_bytes +|= e.kv_bytes;
             // Vision entries never spill: an image placeholder token is
             // identical across images, so a token-only disk key is ambiguous.
             if (e.vision_key != 0) continue;
             const specs = entrySpecCommits(e);
-            const complete = d.appendCommitWithSpec(
+            const outcome = d.appendCommitWithSpec(
                 e.snapshot.entries,
                 e.snapshot.step,
                 e.snapshot.config,
@@ -1940,28 +2006,116 @@ pub const HotPrefixCache = struct {
                 log.warn("  [hot-cache] idle spill failed: {s} — entry stays resident\n", .{@errorName(err)});
                 continue;
             };
-            // A partial copy is not a copy. Keep the entry until it is whole.
-            if (!complete) continue;
+            // ONLY `.persisted`. The old test was `complete == true`, which the
+            // append path also returns for every SILENT SKIP — a declined
+            // volume, a prefix under `MIN_PERSIST_TOKENS`, TurboQuant, a layer
+            // offset short of the range. On qwen4_exp with the disk tier on and
+            // a disk under ~65 GiB free, that discarded every idle entry from
+            // RAM at the end of every request with nothing written in its place.
+            // A `.partial` copy is not a copy either; its writer may finish it,
+            // and the next pass re-checks.
+            if (outcome != .persisted) continue;
+            // ...and `.persisted` is the WRITE path's claim. The INDEX has to
+            // agree: an entry at this key whose `kv_len` reaches the persist
+            // target and whose chunk array has one non-zero size per chunk that
+            // length implies.
+            const disk_id = d.fullPrefixEntryId(e.snapshot.entries, e.snapshot.step, e.tokens, e.has_tools, e.snapshot.config) orelse {
+                log.warn("  [hot-cache] idle spill: the tier does not hold the full prefix — entry stays resident\n", .{});
+                continue;
+            };
             // ...and a STAGED copy is not a durable one. `appendCommit` reports
             // what it handed the writer, not what reached the disk: the writer
-            // logs a failed blob, counts it, and drops it. Discarding RAM on
-            // that promise loses the session outright. Wait for the queue, then
-            // check the counter — only a write that actually landed earns the
-            // eviction. Cost is bounded and paid at END of request, never on
-            // the next turn's TTFT path (which is why the RESTORE drain is
-            // entry-scoped instead — audit S12). (audit S3)
-            const errs_before = d.writeErrors();
-            d.drainWriter();
+            // logs a failed blob, counts it, and drops it, so discarding RAM on
+            // that promise loses the session outright. (audit S3)
+            //
+            // But the check must NOT be a drain. `drainWriter` waits on the
+            // whole queue, and this runs on the INFERENCE thread at the end of
+            // every request — a decode stall on every finished turn with a
+            // flush outstanding, which is precisely what the background writer
+            // exists to remove. An entry whose files are still in flight is
+            // simply not evictable on THIS pass; the next pass asks again, and
+            // meanwhile the entry is safe in RAM. (external review item 6)
+            if (d.entryWritesPending(disk_id)) continue;
             if (d.writeErrors() != errs_before) {
                 log.warn("  [hot-cache] idle spill: background write failed — entry stays resident\n", .{});
                 continue;
             }
-            self.evictAt(i, "SSD-first idle spill");
+            // Proven durable for THIS pass. The flag is reset at the top of
+            // every pass, so it can never be read stale.
+            e.spill_durable = true;
             spilled += 1;
         }
-        if (spilled > 0) {
-            log.info("  [hot-cache] SSD-first: spilled {d} idle entries to disk; RAM holds the active session\n", .{spilled});
+
+        // ── Pass 2: EVICT the durable, oldest first, down to the allowance.
+        var evicted: usize = 0;
+        while (idle_bytes > self.ssd_idle_mem) {
+            const idx = self.oldestIdleIndex(newest_used, true) orelse break;
+            idle_bytes -|= self.entries.items[idx].kv_bytes;
+            self.evictAt(idx, "SSD-first idle spill");
+            evicted += 1;
         }
+
+        // ── Pass 3: still over. An entry with no durable copy is now costing
+        // RAM the next admission needs, so it goes too — oldest first, and the
+        // log names why, once per entry. This loses WORK (a cold prefill),
+        // never data.
+        while (idle_bytes > self.ssd_idle_mem) {
+            const idx = self.oldestIdleIndex(newest_used, false) orelse break;
+            const e = &self.entries.items[idx];
+            log.info("  [hot-cache] idle allowance exceeded: dropped unpersistable entry ({s}) {d} tokens, {d:.1} MB\n", .{
+                unpersistableReason(d, e),
+                e.tokens.len,
+                @as(f64, @floatFromInt(e.kv_bytes)) / (1024.0 * 1024.0),
+            });
+            idle_bytes -|= e.kv_bytes;
+            self.evictAt(idx, "SSD-first idle allowance");
+            evicted += 1;
+        }
+
+        if (spilled > 0 or evicted > 0) {
+            log.info("  [hot-cache] SSD-first: wrote {d} idle entries to disk, evicted {d}; RAM holds the active session + {d} MB idle allowance\n", .{
+                spilled, evicted, self.ssd_idle_mem >> 20,
+            });
+        }
+    }
+
+    /// Least-recently-used IDLE entry (never the active session, never a
+    /// vision entry — those are not spillable and the allowance is not a
+    /// licence to lose one to a token-only disk key). `durable_only` picks
+    /// between the two eviction tiers.
+    fn oldestIdleIndex(self: *HotPrefixCache, newest_used: u64, durable_only: bool) ?usize {
+        var best: ?usize = null;
+        var best_used: u64 = std.math.maxInt(u64);
+        for (self.entries.items, 0..) |*e, i| {
+            if (e.last_used == newest_used) continue;
+            if (e.vision_key != 0) continue;
+            // A checked-out entry is a live slot's buffers under another name
+            // (restore-move); evicting it is not a cache decision at all.
+            if (e.checked_out_by != null) continue;
+            if (durable_only and !e.spill_durable) continue;
+            if (e.last_used < best_used) {
+                best_used = e.last_used;
+                best = i;
+            }
+        }
+        return best;
+    }
+
+    /// Why pass 1 could not leave a durable copy of `e`. Diagnostic only — the
+    /// decision was already made; this names it for the log so a user reading
+    /// "dropped unpersistable entry" is not left guessing.
+    fn unpersistableReason(d: *kv_disk_cache.DiskTier, e: *const Entry) []const u8 {
+        if (d.store_declined) return "store declined: volume is short";
+        if (e.tokens.len < @as(usize, kv_disk_cache.MIN_PERSIST_TOKENS)) return "under the persist floor";
+        switch (e.snapshot.config.scheme) {
+            .off, .affine => {},
+            else => return "TurboQuant state does not survive a restore",
+        }
+        const target = kv_disk_cache.persistTargetLen(e.snapshot.entries, e.snapshot.step, e.tokens.len);
+        for (e.snapshot.entries) |*le| {
+            if (le.initialized and le.offset < target) return "layer offset short of the range";
+        }
+        return "partial copy";
     }
 
     /// Flush the most recent commit to the SSD tier. Called by the scheduler
@@ -2010,7 +2164,10 @@ pub const HotPrefixCache = struct {
                 log.warn("  [disk-cache] persist failed: {s}\n", .{@errorName(err)});
                 return;
             };
-            if (!ok) self.disk_dirty = true;
+            // `.partial` is the only outcome with more to write. A `.skipped`
+            // state does not become writable by retrying, so it must not keep
+            // the dirty flag set — exactly today's behaviour, now said out loud.
+            if (!ok.nothingPending()) self.disk_dirty = true;
             return;
         }
         if (self.entries.items.len == 0) return;
@@ -2045,7 +2202,7 @@ pub const HotPrefixCache = struct {
         };
         // Byte-capped flush: a large entry persists incrementally — keep the
         // dirty flag set so the next finished request continues the write.
-        if (!complete) self.disk_dirty = true;
+        if (!complete.nothingPending()) self.disk_dirty = true;
     }
 
     /// #330 adjacent: when the byte budget is exceeded with the just-updated
@@ -4663,6 +4820,500 @@ test "SSD-first: an idle entry spills to disk and leaves RAM; the active session
         hc.spillIdleEntries(s);
         try testing.expectEqual(@as(usize, 2), hc.entryCount());
     }
+}
+
+test "SSD-first: an in-flight write does not stall the tick — the entry is re-checked next pass" {
+    // External review item 6. The durability check was `drainWriter()` + a
+    // write-error comparison, and `drainWriter` WAITS on the whole queue. It
+    // runs on the INFERENCE thread inside `finishSlot`, so every finished
+    // request with a flush outstanding parked decode until the background
+    // writer caught up — the exact stall the writer was added to remove.
+    //
+    // The bar is behavioural, with a writer held deliberately: an entry whose
+    // files are still staged is NOT evictable, the pass returns anyway, and
+    // the next pass evicts once the files have landed.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+
+    var tok_a: [600]u32 = undefined;
+    for (&tok_a, 0..) |*t, i| t.* = @intCast(i + 7);
+    var tok_b: [600]u32 = undefined;
+    for (&tok_b, 0..) |*t, i| t.* = @intCast(i + 90_000);
+
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 1, 600);
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 8, 0);
+    hc.ssd_first = true;
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, buf[0..root_len], "fp-inflight", 0, 128);
+    defer hc.deinit();
+    hc.disk.?.ssd_first = true;
+    hc.disk.?.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
+    hc.disk.?.enableBackgroundWriter();
+    // Generous allowance: this test is about the WRITE state, not the cap
+    // (tier 3 would otherwise drop the entry for a different, named reason).
+    hc.ssd_idle_mem = 64 * 1024 * 1024 * 1024;
+
+    try hc.commit(&cache, &tok_a, false);
+    try hc.commit(&cache, &tok_b, false);
+
+    // The writer is held: everything the spill stages stays in flight.
+    hc.disk.?.writer.?.setPaused(true);
+    hc.spillIdleEntries(s);
+    // It RETURNED (a drain would have deadlocked against the paused writer),
+    // the index knows the entry, and RAM still holds it.
+    try testing.expect(hc.disk.?.writer.?.pendingBytes() > 0);
+    try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+    try testing.expectEqual(@as(usize, 2), hc.entryCount());
+
+    // Let the writer run, and drop the allowance so eviction is permitted at
+    // all. The NEXT pass sees the files on disk and evicts.
+    hc.disk.?.writer.?.setPaused(false);
+    hc.disk.?.drainWriter(); // test-side only: the engine never waits here
+    hc.ssd_idle_mem = 0;
+    hc.spillIdleEntries(s);
+    try testing.expectEqual(@as(usize, 1), hc.entryCount());
+    try testing.expectEqualSlices(u32, &tok_b, hc.entries.items[0].tokens);
+}
+
+test "the end-of-request path never WAITS on the background writer" {
+    // Scan half of item 6. The inference thread runs `flushPendingDisk` then
+    // `spillIdleEntries` inside `finishSlot`; neither may block on a write.
+    // Needles split so this test's own source cannot satisfy them.
+    const src = @embedFile("prefix_cache.zig");
+    const waits = [_][]const u8{ "drain" ++ "Writer()", "drain" ++ "Prefix(", ".drain(" };
+    for ([_][]const u8{ "pub fn spillIdleEntries(", "pub fn flushPendingDisk(" }) |decl| {
+        const at = std.mem.indexOf(u8, src, decl) orelse return error.CallSiteMoved;
+        const body = src[at..];
+        const end = std.mem.indexOf(u8, body, "\n    }\n") orelse body.len;
+        for (waits) |w| {
+            if (std.mem.indexOf(u8, body[0..end], w) != null) return error.EndOfRequestPathWaitsOnTheWriter;
+        }
+    }
+    // ...and the non-blocking query it uses instead really is non-blocking:
+    // `Writer.pendingPrefix` takes the mutex, reads, and returns — no wait.
+    const wsrc = @embedFile("kv_disk_writer.zig");
+    const at = std.mem.indexOf(u8, wsrc, "pub fn pendingPrefix(") orelse return error.QueryMissing;
+    const body = wsrc[at..];
+    const end = std.mem.indexOf(u8, body, "\n    }\n") orelse body.len;
+    try testing.expect(std.mem.indexOf(u8, body[0..end], "waitUncancelable") == null);
+}
+
+test "SSD-first: the idle ALLOWANCE bounds eviction, not the fact of being idle" {
+    // External review item 3. `spillIdleEntries` evicted every non-newest
+    // entry on every `finishSlot`, ignoring `--prefix-cache-mem` entirely — so
+    // two alternating sessions bounced off the SSD on every single turn even
+    // though RAM had been budgeted to hold both. Writing is free and stays
+    // unconditional; EVICTING is what the allowance bounds.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+
+    var tok_a: [600]u32 = undefined;
+    for (&tok_a, 0..) |*t, i| t.* = @intCast(i + 7);
+    var tok_b: [600]u32 = undefined;
+    for (&tok_b, 0..) |*t, i| t.* = @intCast(i + 90_000);
+    var tok_c: [600]u32 = undefined;
+    for (&tok_c, 0..) |*t, i| t.* = @intCast(i + 300_000);
+
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 1, 600);
+
+    // Two sessions, an allowance that covers the idle one: BOTH stay.
+    {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var buf: [512]u8 = undefined;
+        const root_len = try tmp.dir.realPath(io, &buf);
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 8, 0);
+        hc.ssd_first = true;
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, buf[0..root_len], "fp-allow2", 0, 128);
+        defer hc.deinit();
+
+        try hc.commit(&cache, &tok_a, false);
+        try hc.commit(&cache, &tok_b, false);
+        hc.ssd_idle_mem = hc.entries.items[0].kv_bytes; // room for one idle entry
+        hc.spillIdleEntries(s);
+        try testing.expectEqual(@as(usize, 2), hc.entryCount());
+        // ...and the WRITE still happened: the idle session is on the SSD too,
+        // so the next admission can evict it for free.
+        hc.disk.?.drainWriter();
+        try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+    }
+
+    // A third session past the allowance: the OLDEST idle entry goes, and only
+    // that one.
+    {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var buf: [512]u8 = undefined;
+        const root_len = try tmp.dir.realPath(io, &buf);
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 8, 0);
+        hc.ssd_first = true;
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, buf[0..root_len], "fp-allow3", 0, 128);
+        defer hc.deinit();
+
+        try hc.commit(&cache, &tok_a, false); // oldest
+        try hc.commit(&cache, &tok_b, false);
+        try hc.commit(&cache, &tok_c, false); // active
+        hc.ssd_idle_mem = hc.entries.items[0].kv_bytes; // room for ONE of the two idle
+        hc.spillIdleEntries(s);
+        try testing.expectEqual(@as(usize, 2), hc.entryCount());
+        // A is gone; B (the newer idle) and C (active) remain.
+        for (hc.entries.items) |*e| try testing.expect(!std.mem.eql(u32, e.tokens, &tok_a));
+        var saw_b = false;
+        var saw_c = false;
+        for (hc.entries.items) |*e| {
+            if (std.mem.eql(u32, e.tokens, &tok_b)) saw_b = true;
+            if (std.mem.eql(u32, e.tokens, &tok_c)) saw_c = true;
+        }
+        try testing.expect(saw_b and saw_c);
+    }
+
+    // Allowance 0 means what it says: nothing idle stays resident.
+    {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var buf: [512]u8 = undefined;
+        const root_len = try tmp.dir.realPath(io, &buf);
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 8, 0);
+        hc.ssd_first = true;
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, buf[0..root_len], "fp-allow0", 0, 128);
+        defer hc.deinit();
+
+        try hc.commit(&cache, &tok_a, false);
+        try hc.commit(&cache, &tok_b, false);
+        try hc.commit(&cache, &tok_c, false);
+        hc.ssd_idle_mem = 0;
+        hc.spillIdleEntries(s);
+        try testing.expectEqual(@as(usize, 1), hc.entryCount());
+        try testing.expectEqualSlices(u32, &tok_c, hc.entries.items[0].tokens);
+    }
+}
+
+test "SSD-first: the allowance is a HARD cap, shed in two tiers (durable first)" {
+    // Review decision (c). Item 2 says an unpersistable entry must not be
+    // evicted as if it were on disk; item 3 says the allowance is a real RAM
+    // bound the next admission depends on. Both hold at once by ORDER: shed
+    // the entries that have a durable copy first, and only if that is not
+    // enough shed the rest, naming the reason. An unpersistable entry
+    // therefore survives while the cache is under the cap and is dropped only
+    // past it — losing WORK (a cold prefill), never data.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+
+    var tok_a: [600]u32 = undefined;
+    for (&tok_a, 0..) |*t, i| t.* = @intCast(i + 7);
+    var tok_b: [600]u32 = undefined;
+    for (&tok_b, 0..) |*t, i| t.* = @intCast(i + 90_000);
+    var tok_c: [600]u32 = undefined;
+    for (&tok_c, 0..) |*t, i| t.* = @intCast(i + 300_000);
+
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 1, 600);
+
+    // A is the OLDEST and is UNPERSISTABLE (TurboQuant on its snapshot); B is
+    // newer and persists fine; C is the active session. The allowance leaves
+    // room for exactly one idle entry.
+    {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var buf: [512]u8 = undefined;
+        const root_len = try tmp.dir.realPath(io, &buf);
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 8, 0);
+        hc.ssd_first = true;
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, buf[0..root_len], "fp-tier2", 0, 128);
+        defer hc.deinit();
+
+        try hc.commit(&cache, &tok_a, false);
+        try hc.commit(&cache, &tok_b, false);
+        try hc.commit(&cache, &tok_c, false);
+        for (hc.entries.items) |*e| {
+            if (std.mem.eql(u32, e.tokens, &tok_a)) e.snapshot.config = .{ .scheme = .turboquant_4, .bits = 4, .group_size = 64 };
+        }
+        hc.ssd_idle_mem = hc.entries.items[0].kv_bytes;
+        hc.spillIdleEntries(s);
+
+        // Tier 1 shed B — the DURABLE one — even though A is older, because
+        // dropping A would have lost a session with no copy anywhere.
+        try testing.expectEqual(@as(usize, 2), hc.entryCount());
+        var saw_a = false;
+        for (hc.entries.items) |*e| {
+            if (std.mem.eql(u32, e.tokens, &tok_a)) saw_a = true;
+            try testing.expect(!std.mem.eql(u32, e.tokens, &tok_b));
+        }
+        try testing.expect(saw_a);
+
+        // Now take the allowance to zero: A has nowhere to go, and the cap is
+        // hard, so tier 2 drops it.
+        hc.ssd_idle_mem = 0;
+        hc.spillIdleEntries(s);
+        try testing.expectEqual(@as(usize, 1), hc.entryCount());
+        try testing.expectEqualSlices(u32, &tok_c, hc.entries.items[0].tokens);
+    }
+
+    // ...and past the cap, the unpersistable entries go OLDEST first.
+    {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var buf: [512]u8 = undefined;
+        const root_len = try tmp.dir.realPath(io, &buf);
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 8, 0);
+        hc.ssd_first = true;
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, buf[0..root_len], "fp-tier2b", 0, 128);
+        defer hc.deinit();
+        // Nothing can persist at all: the volume is short.
+        hc.disk.?.ssd_first = true;
+        hc.disk.?.armTestSpace(10 * 1024 * 1024 * 1024, 512 * 1024 * 1024 * 1024);
+
+        try hc.commit(&cache, &tok_a, false); // oldest
+        try hc.commit(&cache, &tok_b, false);
+        try hc.commit(&cache, &tok_c, false); // active
+        hc.ssd_idle_mem = hc.entries.items[0].kv_bytes;
+        hc.spillIdleEntries(s);
+        try testing.expectEqual(@as(usize, 0), hc.disk.?.entryCount());
+        try testing.expectEqual(@as(usize, 2), hc.entryCount());
+        for (hc.entries.items) |*e| try testing.expect(!std.mem.eql(u32, e.tokens, &tok_a));
+    }
+}
+
+test "SSD-first: a silent SKIP is not a durable copy — the idle entry stays resident" {
+    // External review item 2, the real bug. `appendCommitWithSpec` returned
+    // `true` for "nothing more to write", and every SILENT SKIP returns that
+    // too. `spillIdleEntries` read it as "the SSD holds this session" and
+    // called `evictAt`. On qwen4_exp with `--prefix-cache-disk` on and a disk
+    // under ~65 GiB free, EVERY idle entry was discarded from RAM at the end of
+    // EVERY request with nothing whatsoever written in its place.
+    //
+    // Four skip reasons, each a separate arm, each asserting BOTH halves: the
+    // tier holds nothing, and RAM still holds the idle entry.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+
+    var tokens_a: [600]u32 = undefined;
+    for (&tokens_a, 0..) |*t, i| t.* = @intCast(i + 7);
+    var tokens_b: [600]u32 = undefined;
+    for (&tokens_b, 0..) |*t, i| t.* = @intCast(i + 90_000);
+
+    // Arm 1 — the volume declined the store (the reviewer's 14 GiB box).
+    {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var buf: [512]u8 = undefined;
+        const root_len = try tmp.dir.realPath(io, &buf);
+        var cache = try KVCache.init(testing.allocator, 1);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 1, 600);
+
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc.ssd_first = true;
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, buf[0..root_len], "fp-declined", 0, 128);
+        defer hc.deinit();
+        // A generous idle allowance: this test is about the SKIP rule, not
+        // about the allowance (item 3's tier-3 drop would evict for a
+        // different, named reason).
+        hc.ssd_idle_mem = 64 * 1024 * 1024 * 1024;
+        hc.disk.?.ssd_first = true;
+        hc.disk.?.armTestSpace(10 * 1024 * 1024 * 1024, 512 * 1024 * 1024 * 1024);
+
+        try hc.commit(&cache, &tokens_a, false);
+        try hc.commit(&cache, &tokens_b, false);
+        hc.spillIdleEntries(s);
+        try testing.expectEqual(@as(usize, 0), hc.disk.?.entryCount());
+        try testing.expectEqual(@as(usize, 2), hc.entryCount());
+    }
+
+    // Arm 2 — under `MIN_PERSIST_TOKENS`: too short to be worth a file, and
+    // therefore too short to justify losing.
+    {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var buf: [512]u8 = undefined;
+        const root_len = try tmp.dir.realPath(io, &buf);
+        var cache = try KVCache.init(testing.allocator, 1);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 1, 400);
+
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc.ssd_first = true;
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, buf[0..root_len], "fp-short", 0, 128);
+        defer hc.deinit();
+        // A generous idle allowance: this test is about the SKIP rule, not
+        // about the allowance (item 3's tier-3 drop would evict for a
+        // different, named reason).
+        hc.ssd_idle_mem = 64 * 1024 * 1024 * 1024;
+        try hc.commit(&cache, tokens_a[0..400], false);
+        try hc.commit(&cache, tokens_b[0..400], false);
+        hc.spillIdleEntries(s);
+        try testing.expectEqual(@as(usize, 0), hc.disk.?.entryCount());
+        try testing.expectEqual(@as(usize, 2), hc.entryCount());
+    }
+
+    // Arm 3 — TurboQuant: the rotation state does not survive a restore, so
+    // the tier refuses. Losing RAM on that refusal loses the session.
+    {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var buf: [512]u8 = undefined;
+        const root_len = try tmp.dir.realPath(io, &buf);
+        var cache = try KVCache.init(testing.allocator, 1);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 1, 600);
+
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc.ssd_first = true;
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, buf[0..root_len], "fp-tq", 0, 128);
+        defer hc.deinit();
+        // A generous idle allowance: this test is about the SKIP rule, not
+        // about the allowance (item 3's tier-3 drop would evict for a
+        // different, named reason).
+        hc.ssd_idle_mem = 64 * 1024 * 1024 * 1024;
+        try hc.commit(&cache, &tokens_a, false);
+        try hc.commit(&cache, &tokens_b, false);
+        // The scheme is flipped on the COMMITTED snapshot rather than on the
+        // live cache: the arrays stay dense (a real TurboQuant fixture is a
+        // whole cache shape), and the append path's scheme switch is what
+        // this arm is about.
+        for (hc.entries.items) |*e| {
+            if (std.mem.eql(u32, e.tokens, &tokens_a)) e.snapshot.config = .{ .scheme = .turboquant_4, .bits = 4, .group_size = 64 };
+        }
+        hc.spillIdleEntries(s);
+        try testing.expectEqual(@as(usize, 0), hc.disk.?.entryCount());
+        try testing.expectEqual(@as(usize, 2), hc.entryCount());
+    }
+
+    // Arm 4 — a layer offset short of the persist target. Mid-spec-decode and
+    // batched states look like this, and the tier declines them by design.
+    {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var buf: [512]u8 = undefined;
+        const root_len = try tmp.dir.realPath(io, &buf);
+        var cache = try KVCache.init(testing.allocator, 2);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 2, 600);
+
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc.ssd_first = true;
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, buf[0..root_len], "fp-offset", 0, 128);
+        defer hc.deinit();
+        // A generous idle allowance: this test is about the SKIP rule, not
+        // about the allowance (item 3's tier-3 drop would evict for a
+        // different, named reason).
+        hc.ssd_idle_mem = 64 * 1024 * 1024 * 1024;
+        try hc.commit(&cache, &tokens_a, false);
+        try hc.commit(&cache, &tokens_b, false);
+        // The idle entry (A) is the one that is not newest; shorten one of its
+        // layers so the snapshot no longer covers the range it claims.
+        for (hc.entries.items) |*e| {
+            if (std.mem.eql(u32, e.tokens, &tokens_a)) e.snapshot.entries[1].offset = 300;
+        }
+        hc.spillIdleEntries(s);
+        try testing.expectEqual(@as(usize, 0), hc.disk.?.entryCount());
+        try testing.expectEqual(@as(usize, 2), hc.entryCount());
+    }
+}
+
+test "SSD-first: a PARTIAL copy is not a copy — the idle entry stays resident" {
+    // The second half of item 2. A byte-capped flush lands real bytes and
+    // stops on a chunk boundary; the entry on disk is genuinely short. The
+    // old bool said `false` here and the spill did keep the entry — this pins
+    // that the enum did not lose that, and that a partial entry IS indexed
+    // (so a `holdsFullPrefix` bar alone would not have been enough either).
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+
+    var tokens_a: [600]u32 = undefined;
+    for (&tokens_a, 0..) |*t, i| t.* = @intCast(i + 7);
+    var tokens_b: [600]u32 = undefined;
+    for (&tokens_b, 0..) |*t, i| t.* = @intCast(i + 90_000);
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 1, 600);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc.ssd_first = true;
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, buf[0..root_len], "fp-partial", 0, 128);
+    defer hc.deinit();
+    // Generous allowance: this test is about PARTIAL, not about the cap.
+    hc.ssd_idle_mem = 64 * 1024 * 1024 * 1024;
+    // One byte: the loop writes chunk 0 and stops.
+    hc.disk.?.max_flush_bytes = 1;
+
+    try hc.commit(&cache, &tokens_a, false);
+    try hc.commit(&cache, &tokens_b, false);
+    hc.spillIdleEntries(s);
+    hc.disk.?.drainWriter();
+    // A short entry IS on disk — that is what makes this different from a skip.
+    try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+    try testing.expect(hc.disk.?.entries.items[0].kv_len < 600);
+    // ...and RAM kept both.
+    try testing.expectEqual(@as(usize, 2), hc.entryCount());
+
+    // Lift the cap AND the allowance: the next pass completes the copy, and
+    // with no idle allowance the now-durable entry is the one that goes.
+    hc.disk.?.max_flush_bytes = 512 * 1024 * 1024;
+    hc.ssd_idle_mem = 0;
+    hc.spillIdleEntries(s);
+    try testing.expectEqual(@as(usize, 1), hc.entryCount());
+    try testing.expectEqualSlices(u32, &tokens_b, hc.entries.items[0].tokens);
+    try testing.expectEqual(@as(u32, 600), hc.disk.?.entries.items[0].kv_len);
+}
+
+test "DiskTier.holdsFullPrefix: the INDEX must agree before a RAM copy is discarded" {
+    // `.persisted` is the write path's claim; this is the manifest's. Both,
+    // or the entry stays. The negative arms are the ones that matter: a
+    // truncated chunk (what `scan` leaves after a kill -9 mid-flush) and a
+    // record that does not cover the prefix asked about.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 1, 600);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    var tier = try kv_disk_cache.DiskTier.init(testing.allocator, io, buf[0..root_len], "fp-holds", 0, 128);
+    defer tier.deinit();
+
+    // Nothing stored yet.
+    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config));
+
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
+    tier.drainWriter();
+    try testing.expect(tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config));
+    // A different key is a different entry.
+    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, true, cache.config));
+    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, .{ .scheme = .affine, .bits = 4, .group_size = 64 }));
+
+    // A truncated tail chunk — the shape `scan` records after a kill -9.
+    const cb = tier.entries.items[0].chunk_bytes;
+    const keep = cb[cb.len - 1];
+    cb[cb.len - 1] = 0;
+    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config));
+    cb[cb.len - 1] = keep;
+    try testing.expect(tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config));
+
+    // A shorter persisted extent than the commit would target.
+    tier.entries.items[0].kv_len = 400;
+    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config));
 }
 
 test "SSD-first: one resident session makes reclaimableBytes truthfully ZERO" {
