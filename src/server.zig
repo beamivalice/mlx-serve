@@ -19086,6 +19086,16 @@ fn qwen4ExpOomConfig() model_mod.ModelConfig {
     cfg.indexer_budget = 512;
     cfg.indexer_head_dim = 128;
     cfg.indexer_compress_ratio = 4;
+    // PINNED, and load-bearing: the reservation is clamped to the effective
+    // context, and with nothing pinned `getEffectiveContextLength` falls
+    // through to `autoContextFor`, which reads LIVE GPU memory. That made
+    // every expectation below a function of how much RAM this box happened to
+    // have free — on a busy machine the auto context came out BELOW the
+    // 458,832-token prompt, the clamp took the whole generation headroom away,
+    // and the test failed for a reason that had nothing to do with the
+    // estimator. 1,048,576 is the `--ctx-size` of the live run these numbers
+    // come from.
+    cfg.pinned_context = 1_048_576;
     return cfg;
 }
 
