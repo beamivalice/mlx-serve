@@ -2727,6 +2727,25 @@ pub fn qsaDecodeGatherEnabled() bool {
     return v;
 }
 
+var qsa_history_share_env_cached: ?bool = null;
+pub var qsa_history_share_override: ?bool = null;
+
+/// MLX_SERVE_QSA_HISTORY_SHARE=0 restores the end-of-prefill MATERIALIZED copy
+/// of the QSA indexer history (and the two-copy admission bill that priced
+/// it). On (default) the newest SSM checkpoint takes a VIEW of the slot's live
+/// history at COMMIT instead (`handoffQsaHistoryToLatest`): the slot dies
+/// next, so one copy per (slot ∪ entry) is all that ever exists.
+pub fn qsaHistoryShareEnabled() bool {
+    if (qsa_history_share_override) |v| return v;
+    if (qsa_history_share_env_cached) |v| return v;
+    const v = blk: {
+        const raw = std.c.getenv("MLX_SERVE_QSA_HISTORY_SHARE") orelse break :blk true;
+        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
+    };
+    qsa_history_share_env_cached = v;
+    return v;
+}
+
 /// Virtual key index -> cache position for one query's block selection:
 /// the `sel_len` tokens of its sorted blocks, then its own incomplete tail.
 const ATTN_QSA256_KERNEL_HEADER = ATTN256_KERNEL_HEADER ++
@@ -3826,6 +3845,7 @@ pub fn warmQsaEnvCaches() void {
     _ = qsaGatherMinKv();
     _ = qsaGatherBk();
     _ = qsaDecodeGatherEnabled();
+    _ = qsaHistoryShareEnabled();
     _ = qsaVerifyGatherEnabled();
     _ = qsaVerifyGatherMinKv();
     _ = qsaSelectEnabledWarm();
@@ -6094,6 +6114,13 @@ pub const KVCache = struct {
         if (tokens > self.reserve_tokens) self.reserve_tokens = tokens;
     }
 
+    /// Is the up-front reservation on (`MLX_SERVE_KV_RESERVE` != 0)? The
+    /// admission bill reads it: with a reservation a long prefill's history
+    /// buffer grows ONCE, so no old+new pair is ever live to bill.
+    pub fn kvReservationEnabled() bool {
+        return kvReserveEnabled();
+    }
+
     var kv_reserve_cache: ?bool = null;
     fn kvReserveEnabled() bool {
         if (kv_reserve_cache) |v| return v;
@@ -7091,7 +7118,7 @@ pub fn ssmRollbackFromCapture(entry: *SSMCacheEntry, accepted: u32, verify_len: 
         ssmFreeQsaState(entry);
         entry.qsa_pooled = pooled;
         entry.aux_state = owned;
-        try truncatePooled(&entry.qsa_pooled, keep, entry.qsa_ratio, s);
+        try truncatePooled(&entry.qsa_pooled, keep, entry.qsa_ratio, s, true);
     }
     if (entry.spec_state_seq.ctx == null and entry.spec_conv_input.ctx == null) return;
 
@@ -7195,7 +7222,11 @@ test "a PLE rollback leaves no freed-but-non-null QSA handle behind" {
 
 /// Keep the pooled-key rows that are still complete blocks of a key history
 /// truncated to `keep_rows` (the block size is implied by the two shapes).
-fn truncatePooled(pooled: *mlx.mlx_array, keep_rows: c_int, ratio: c_int, s: mlx.mlx_stream) !void {
+/// Cut the pooled bank to the blocks `keep_rows` completes. `materialize`
+/// = a fresh buffer (a LIVE bank whose accelerator will re-seed, a trim that
+/// must FREE); false = a slice VIEW sharing the source buffer (a handoff or a
+/// restore, where the source outlives the cut anyway).
+fn truncatePooled(pooled: *mlx.mlx_array, keep_rows: c_int, ratio: c_int, s: mlx.mlx_stream, materialize: bool) !void {
     if (pooled.ctx == null) return;
     const ps = mlx.getShape(pooled.*);
     const keep_blocks: c_int = @divTrunc(keep_rows, ratio);
@@ -7209,9 +7240,14 @@ fn truncatePooled(pooled: *mlx.mlx_array, keep_rows: c_int, ratio: c_int, s: mlx
     const stop = [_]c_int{ ps[0], keep_blocks, ps[2] };
     const strides = [_]c_int{ 1, 1, 1 };
     var view = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(view);
-    try mlx.check(mlx.mlx_slice(&view, pooled.*, &start, 3, &stop, 3, &strides, 3, s));
-    const owned = try materializedOwnedCopy(s, view);
+    mlx.check(mlx.mlx_slice(&view, pooled.*, &start, 3, &stop, 3, &strides, 3, s)) catch |err| {
+        _ = mlx.mlx_array_free(view);
+        return err;
+    };
+    const owned = if (materialize) blk: {
+        defer _ = mlx.mlx_array_free(view);
+        break :blk try materializedOwnedCopy(s, view);
+    } else view;
     _ = mlx.mlx_array_free(pooled.*);
     pooled.* = owned;
 }
@@ -7517,9 +7553,12 @@ pub fn checkpointHasQsaHistory(cp: *const SSMCheckpoint) bool {
 }
 
 /// One QSA layer's history onto `dst_aux`/`dst_pooled`, sliced to `take` rows
-/// (pooled to `take/ratio` blocks). A full-length copy shares the source
-/// buffer unless `materialize` (the LIVE history is a concat chain that must
-/// be cut). `take <= 0` leaves the destination empty.
+/// (pooled to `take/ratio` blocks). `materialize` = a fresh buffer (the
+/// end-of-prefill copy arm, the byte-budget trim — a trim must FREE the snap
+/// it drops); false = refcount-share the source: a full-length share is the
+/// same handle, a sliced one is an `mlx_slice` VIEW of the source buffer
+/// (the commit handoff of a live capacity buffer, a restore from a resident
+/// entry). `take <= 0` leaves the destination empty.
 fn copyQsaHistorySliced(dst_aux: *mlx.mlx_array, dst_pooled: *mlx.mlx_array, src_aux: mlx.mlx_array, src_pooled: mlx.mlx_array, ratio: c_int, take: c_int, materialize: bool, s: mlx.mlx_stream) !void {
     if (dst_aux.ctx != null) _ = mlx.mlx_array_free(dst_aux.*);
     dst_aux.* = .{ .ctx = null };
@@ -7540,9 +7579,19 @@ fn copyQsaHistorySliced(dst_aux: *mlx.mlx_array, dst_pooled: *mlx.mlx_array, src
         const stop = [_]c_int{ ks[0], take, ks[2] };
         const strides = [_]c_int{ 1, 1, 1 };
         var view = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(view);
-        try mlx.check(mlx.mlx_slice(&view, src_aux, &start, 3, &stop, 3, &strides, 3, s));
-        dst_aux.* = try materializedOwnedCopy(s, view);
+        mlx.check(mlx.mlx_slice(&view, src_aux, &start, 3, &stop, 3, &strides, 3, s)) catch |err| {
+            _ = mlx.mlx_array_free(view);
+            return err;
+        };
+        if (materialize) {
+            defer _ = mlx.mlx_array_free(view);
+            dst_aux.* = try materializedOwnedCopy(s, view);
+        } else {
+            // A prefix slice on the row axis shares the source buffer; the
+            // rows past `take` stay pinned but unread (bounded by the
+            // caller: `qsaHandoffMustMaterialize`).
+            dst_aux.* = view;
+        }
     }
     if (src_pooled.ctx == null) return;
     if (materialize) {
@@ -7551,7 +7600,7 @@ fn copyQsaHistorySliced(dst_aux: *mlx.mlx_array, dst_pooled: *mlx.mlx_array, src
         dst_pooled.* = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_array_set(dst_pooled, src_pooled));
     }
-    if (!full) try truncatePooled(dst_pooled, take, ratio, s);
+    if (!full) try truncatePooled(dst_pooled, take, ratio, s, materialize);
 }
 
 /// Copy QSA aux/pooled from the live entries onto the LATEST checkpoint —
@@ -7559,7 +7608,68 @@ fn copyQsaHistorySliced(dst_aux: *mlx.mlx_array, dst_pooled: *mlx.mlx_array, src
 /// handoff attaches while the live history is ahead of the last stride
 /// snap). Older snaps in `cps` drop any history they carried. No-op when
 /// `cps` is empty or no layer holds QSA history.
+///
+/// This is the `MLX_SERVE_QSA_HISTORY_SHARE=0` arm: the copy is born at the
+/// end of the prefill and coexists with the live buffer for the whole decode
+/// — the second copy `server.statePerTokenBilled` then bills.
 pub fn attachQsaHistoryToLatest(cps: []SSMCheckpoint, live: []const SSMCacheEntry, s: mlx.mlx_stream) !void {
+    return attachQsaHistoryToLatestMode(cps, live, s, .copy);
+}
+
+/// Rows a handed-off history may pin past the checkpoint's position before
+/// the handoff materializes instead. The reservation's generation headroom
+/// (`KVCache.RESERVE_GEN_HEADROOM` 8192) plus one chunk (≤ 8192) always
+/// fits; a long generated tail on the +25% ladder does not — an entry must
+/// never pin a quarter more than `ssmCheckpointBytes` bills (it reads the
+/// VIEW's rows). At 16384 rows the unbilled slack is ≤ 48 MB on qwen4_exp.
+pub const QSA_HANDOFF_MAX_SLACK_ROWS: c_int = 16384;
+
+/// The commit boundary: hand the slot's live QSA history to the LATEST
+/// checkpoint as a slice VIEW of the live capacity buffer — a refcount, no
+/// allocation, no copy kernel — sliced to that checkpoint's position. The
+/// slot dies right after the commit (`Slot.deinit` -> `ssmFreeQsaState`), so
+/// the entry ends up the buffer's only owner: one copy per (slot ∪ entry),
+/// where the prefill-end attach kept two for the whole decode (3,840 B/tok
+/// on qwen4_exp — 3.0 GB at 786k). A buffer with too much slack past the
+/// position (`QSA_HANDOFF_MAX_SLACK_ROWS`) is materialized instead: the
+/// prefill's transients are gone by commit, so that copy is safe where the
+/// prefill-end one had to be billed.
+pub fn handoffQsaHistoryToLatest(cps: []SSMCheckpoint, live: []const SSMCacheEntry, s: mlx.mlx_stream) !void {
+    return attachQsaHistoryToLatestMode(cps, live, s, .share);
+}
+
+/// The cancel handoff and every other "the slot is about to die" seam: share
+/// when the switch is on, copy otherwise. ONE dispatcher so a kill-switch
+/// flip changes every seam together.
+pub fn attachQsaHistoryOnHandoff(cps: []SSMCheckpoint, live: []const SSMCacheEntry, s: mlx.mlx_stream) !void {
+    return if (qsaHistoryShareEnabled())
+        handoffQsaHistoryToLatest(cps, live, s)
+    else
+        attachQsaHistoryToLatest(cps, live, s);
+}
+
+pub const QsaAttachMode = enum { copy, share };
+
+/// PURE: does sharing `buf_rows` rows of capacity for a `keep`-row snap pin
+/// more slack than `QSA_HANDOFF_MAX_SLACK_ROWS`?
+pub fn qsaHandoffExceedsSlack(buf_rows: c_int, keep: c_int) bool {
+    return buf_rows - keep > QSA_HANDOFF_MAX_SLACK_ROWS;
+}
+
+/// The buffer a share of `src` would pin: the capacity buffer when the
+/// accelerator holds one, else the published history itself (a restored
+/// entry's array that no append has re-seeded yet).
+fn qsaHandoffMustMaterialize(src: *const SSMCacheEntry, keep: c_int) bool {
+    const buf_rows: c_int = if (src.qsa_key_buf.ctx != null)
+        mlx.getShape(src.qsa_key_buf)[1]
+    else if (src.aux_state.ctx != null)
+        mlx.getShape(src.aux_state)[1]
+    else
+        0;
+    return qsaHandoffExceedsSlack(buf_rows, keep);
+}
+
+fn attachQsaHistoryToLatestMode(cps: []SSMCheckpoint, live: []const SSMCacheEntry, s: mlx.mlx_stream, mode: QsaAttachMode) !void {
     if (cps.len == 0) return;
     const cp = &cps[cps.len - 1];
     if (cp.layers.len != live.len) return error.SsmCheckpointLayerMismatch;
@@ -7567,7 +7677,11 @@ pub fn attachQsaHistoryToLatest(cps: []SSMCheckpoint, live: []const SSMCacheEntr
     var copied: usize = 0;
     for (cp.layers, live) |*dst, src| {
         if (!ssmAuxIsQsaHistory(&src)) continue;
-        try copyQsaHistorySliced(&dst.aux_state, &dst.qsa_pooled, src.aux_state, src.qsa_pooled, src.qsa_ratio, keep, true, s);
+        const materialize = switch (mode) {
+            .copy => true,
+            .share => qsaHandoffMustMaterialize(&src, keep),
+        };
+        try copyQsaHistorySliced(&dst.aux_state, &dst.qsa_pooled, src.aux_state, src.qsa_pooled, src.qsa_ratio, keep, materialize, s);
         dst.qsa_ratio = src.qsa_ratio;
         copied += 1;
     }
@@ -7634,6 +7748,10 @@ pub fn applyQsaHistoryAt(entries: []SSMCacheEntry, src_cp: *const SSMCheckpoint,
         if (dst.conv_state.ctx != null and mlx.mlx_array_size(dst.conv_state) > 0) continue;
         // A restore replaces the history behind the append accelerator's
         // back: the capacity buffer is valid only for the view it published.
+        // SHARED (a sliced restore is a view of the entry's array): the first
+        // append re-seeds a private buffer from it (`qsaAppendKeys`), and the
+        // materialized slice this used to make was a second transient copy
+        // in that first chunk's graph.
         ssmFreeQsaState(dst);
         try copyQsaHistorySliced(&dst.aux_state, &dst.qsa_pooled, src.aux_state, src.qsa_pooled, src.qsa_ratio, keep, false, s);
         dst.qsa_ratio = src.qsa_ratio;
@@ -7651,9 +7769,28 @@ pub fn sliceQsaHistoryOntoCheckpoint(dst: *SSMCheckpoint, src: *const SSMCheckpo
     for (dst.layers, src.layers) |*d, s_l| {
         if (!snapshotHasQsaHistory(&s_l)) continue;
         if (d.conv_state.ctx != null and mlx.mlx_array_size(d.conv_state) > 0) continue;
-        try copyQsaHistorySliced(&d.aux_state, &d.qsa_pooled, s_l.aux_state, s_l.qsa_pooled, s_l.qsa_ratio, keep, false, s);
+        // MATERIALIZE: the trim drops `src` next, and a view would keep its
+        // whole buffer alive — a trim that frees nothing is the #330 cliff
+        // by another door (`trimmedCopy` is a real copy for the same reason).
+        try copyQsaHistorySliced(&d.aux_state, &d.qsa_pooled, s_l.aux_state, s_l.qsa_pooled, s_l.qsa_ratio, keep, true, s);
         d.qsa_ratio = s_l.qsa_ratio;
     }
+    // Materialize NOW: an unevaluated copy node keeps `src`'s buffer alive
+    // through the graph until someone evaluates it, and the caller frees
+    // `src` next — the trim would free nothing until the next restore.
+    const vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec);
+    var n: usize = 0;
+    for (dst.layers) |*d| {
+        if (!snapshotHasQsaHistory(d)) continue;
+        inline for (.{ d.aux_state, d.qsa_pooled }) |arr| {
+            if (arr.ctx != null) {
+                _ = mlx.mlx_vector_array_append_value(vec, arr);
+                n += 1;
+            }
+        }
+    }
+    if (n > 0) _ = mlx.mlx_eval(vec);
 }
 
 // ── Prompt Cache (snapshot of KV + SSM state for prefix reuse) ──
@@ -15953,7 +16090,7 @@ pub const Transformer = struct {
                 ssmFreeQsaState(&m.entry);
                 m.entry.qsa_pooled = pooled;
                 m.entry.aux_state = owned;
-                try truncatePooled(&m.entry.qsa_pooled, @intCast(len), m.entry.qsa_ratio, self.s);
+                try truncatePooled(&m.entry.qsa_pooled, @intCast(len), m.entry.qsa_ratio, self.s, true);
             }
         }
         m.seq_offset = len;
@@ -31111,6 +31248,190 @@ test "attachQsaHistoryToLatest is one copy; applyQsaHistoryAt slices to pos" {
     defer short[0].deinit(testing.allocator);
     try attachQsaHistoryToLatest(&short, &live_arr, s);
     try testing.expectEqual(@as(c_int, 16), mlx.getShape(short[0].layers[0].aux_state)[1]);
+}
+
+test "handoffQsaHistoryToLatest: the newest snap takes a VIEW of the live buffer — zero allocation, sliced to pos, bytes equal to the copy arm" {
+    // The commit boundary. The prefill-end attach MATERIALIZED a second copy
+    // of the history that lived beside the buffer for the whole decode
+    // (3,840 B/tok on qwen4_exp, 3.0 GB at 786k). The handoff hands the dying
+    // slot's buffer to the entry instead: same rows, same bytes, no allocation.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var t: Transformer = undefined;
+    t.s = s;
+    t.allocator = testing.allocator;
+    const hd: c_int = 16;
+    var prng = std.Random.DefaultPrng.init(0x5A5A_1D0F);
+    const rnd = prng.random();
+
+    var live = [_]SSMCacheEntry{.{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true }};
+    defer ssmFreeQsaState(&live[0]);
+    // A reserved append: the buffer carries slack past the published rows,
+    // like a live slot's at commit (prompt + generation headroom + chunk).
+    live[0].qsa_reserve_rows = 1024;
+    const keys = try attn256RandBf16(rnd, &[_]c_int{ 1, 600, hd }, s);
+    defer _ = mlx.mlx_array_free(keys);
+    try t.qsaAppendKeys(&live[0], keys, 0);
+    const blocks = try attn256RandBf16(rnd, &[_]c_int{ 1, 150, hd }, s);
+    defer _ = mlx.mlx_array_free(blocks);
+    try t.qsaAppendPooled(&live[0], blocks, 0);
+    try mlx.check(mlx.mlx_array_eval(live[0].aux_state));
+    try mlx.check(mlx.mlx_array_eval(live[0].qsa_pooled));
+    try testing.expect(mlx.getShape(live[0].qsa_key_buf)[1] > 600);
+
+    // The reference: the copy arm, on its own snap at the same position.
+    var ref = [_]SSMCheckpoint{try captureSsmCheckpoint(testing.allocator, &live, 512, s)};
+    defer ref[0].deinit(testing.allocator);
+    try attachQsaHistoryToLatest(&ref, &live, s);
+
+    var cps = [_]SSMCheckpoint{
+        try captureSsmCheckpoint(testing.allocator, &live, 32, s),
+        try captureSsmCheckpoint(testing.allocator, &live, 512, s),
+    };
+    defer for (&cps) |*c| c.deinit(testing.allocator);
+    var before: usize = 0;
+    _ = mlx.mlx_synchronize(s);
+    _ = mlx.mlx_get_active_memory(&before);
+    try handoffQsaHistoryToLatest(&cps, &live, s);
+    var after: usize = 0;
+    _ = mlx.mlx_get_active_memory(&after);
+    // A view allocates nothing.
+    // A view allocates nothing (the eval inside may also release the copy
+    // arm's in-flight temporaries, so the bar is no GROWTH).
+    try testing.expect(after <= before);
+    try testing.expect(!checkpointHasQsaHistory(&cps[0]));
+    try testing.expect(checkpointHasQsaHistory(&cps[1]));
+    const got = &cps[1].layers[0];
+    try testing.expectEqual(@as(c_int, 512), mlx.getShape(got.aux_state)[1]);
+    try testing.expectEqual(@as(c_int, 128), mlx.getShape(got.qsa_pooled)[1]);
+    try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(got.aux_state, ref[0].layers[0].aux_state, s));
+    try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(got.qsa_pooled, ref[0].layers[0].qsa_pooled, s));
+    // Billed at the rows the entry restores, exactly like the copy arm.
+    try testing.expectEqual(ssmCheckpointBytes(&ref[0]), ssmCheckpointBytes(&cps[1]));
+    try testing.expectEqual(@as(u64, (512 + 128) * @as(u64, @intCast(hd)) * 2), ssmCheckpointBytes(&cps[1]));
+    // The live entry is untouched (the slot tears down normally)...
+    try testing.expectEqual(@as(c_int, 600), mlx.getShape(live[0].aux_state)[1]);
+    // ...and the snap outlives it: free the slot's handles, the entry still reads.
+    ssmFreeQsaState(&live[0]);
+    try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(got.aux_state, ref[0].layers[0].aux_state, s));
+    try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(got.qsa_pooled, ref[0].layers[0].qsa_pooled, s));
+}
+
+test "handoffQsaHistoryToLatest materializes when the buffer's slack past the snap exceeds QSA_HANDOFF_MAX_SLACK_ROWS" {
+    // An entry must never pin a quarter more than `ssmCheckpointBytes` bills
+    // (it reads the VIEW's rows): past the slack bar the handoff pays the copy
+    // — at commit, where the prefill's transients are gone.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var t: Transformer = undefined;
+    t.s = s;
+    t.allocator = testing.allocator;
+    const hd: c_int = 16;
+    var prng = std.Random.DefaultPrng.init(0x0DD5_1ACC);
+    const rnd = prng.random();
+    // The PURE rule first.
+    try testing.expect(!qsaHandoffExceedsSlack(512 + QSA_HANDOFF_MAX_SLACK_ROWS, 512));
+    try testing.expect(qsaHandoffExceedsSlack(512 + QSA_HANDOFF_MAX_SLACK_ROWS + 1, 512));
+
+    var live = [_]SSMCacheEntry{.{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true }};
+    defer ssmFreeQsaState(&live[0]);
+    live[0].qsa_reserve_rows = @intCast(512 + QSA_HANDOFF_MAX_SLACK_ROWS + 4096);
+    const keys = try attn256RandBf16(rnd, &[_]c_int{ 1, 600, hd }, s);
+    defer _ = mlx.mlx_array_free(keys);
+    try t.qsaAppendKeys(&live[0], keys, 0);
+    try mlx.check(mlx.mlx_array_eval(live[0].aux_state));
+    var ref = [_]SSMCheckpoint{try captureSsmCheckpoint(testing.allocator, &live, 512, s)};
+    defer ref[0].deinit(testing.allocator);
+    try attachQsaHistoryToLatest(&ref, &live, s);
+
+    var cps = [_]SSMCheckpoint{try captureSsmCheckpoint(testing.allocator, &live, 512, s)};
+    defer cps[0].deinit(testing.allocator);
+    var before: usize = 0;
+    _ = mlx.mlx_synchronize(s);
+    _ = mlx.mlx_get_active_memory(&before);
+    try handoffQsaHistoryToLatest(&cps, &live, s);
+    var after: usize = 0;
+    _ = mlx.mlx_get_active_memory(&after);
+    // A real copy of exactly the kept rows, not a view of the oversized buffer.
+    try testing.expect(after >= before + 512 * @as(usize, @intCast(hd)) * 2);
+    try testing.expectEqual(@as(c_int, 512), mlx.getShape(cps[0].layers[0].aux_state)[1]);
+    try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(cps[0].layers[0].aux_state, ref[0].layers[0].aux_state, s));
+    ssmFreeQsaState(&live[0]);
+    try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(cps[0].layers[0].aux_state, ref[0].layers[0].aux_state, s));
+}
+
+test "applyQsaHistoryAt: a sliced restore is a VIEW of the entry's history; the trim's slice is a real copy" {
+    // Restore: the first append re-seeds a private buffer, so the materialized
+    // slice this used to make was a second transient copy in the first warm
+    // chunk's graph. Trim: it drops the source next, so its slice MUST own
+    // its bytes (#330 — a trim that frees nothing is the cliff by another door).
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const n: c_int = 64;
+    const aux_shape = [_]c_int{ 1, n, 8 };
+    var aux = mlx.mlx_array_new();
+    {
+        var flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(flat);
+        try mlx.check(mlx.mlx_arange(&flat, 0.0, @floatFromInt(n * 8), 1.0, .float32, s));
+        try mlx.check(mlx.mlx_reshape(&aux, flat, &aux_shape, 3, s));
+        try mlx.check(mlx.mlx_array_eval(aux));
+    }
+    var live = [_]SSMCacheEntry{.{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .aux_state = aux, .qsa_ratio = 4 }};
+    defer ssmFreeQsaState(&live[0]);
+    var cps = [_]SSMCheckpoint{try captureSsmCheckpoint(testing.allocator, &live, 64, s)};
+    defer cps[0].deinit(testing.allocator);
+    try attachQsaHistoryToLatest(&cps, &live, s);
+
+    var dest = [_]SSMCacheEntry{.{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true }};
+    defer ssmFreeQsaState(&dest[0]);
+    var before: usize = 0;
+    _ = mlx.mlx_synchronize(s);
+    _ = mlx.mlx_get_active_memory(&before);
+    try applyQsaHistoryAt(&dest, &cps[0], 32, s);
+    try mlx.check(mlx.mlx_array_eval(dest[0].aux_state));
+    var after: usize = 0;
+    _ = mlx.mlx_get_active_memory(&after);
+    // A view allocates nothing (the eval inside may also release the copy
+    // arm's in-flight temporaries, so the bar is no GROWTH).
+    try testing.expect(after <= before);
+    try testing.expectEqual(@as(c_int, 32), mlx.getShape(dest[0].aux_state)[1]);
+    {
+        var got = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(got);
+        try mlx.check(mlx.mlx_astype(&got, dest[0].aux_state, .float32, s));
+        try mlx.check(mlx.mlx_array_eval(got));
+        const d = mlx.mlx_array_data_float32(got) orelse return error.TestUnexpectedNullData;
+        try testing.expectEqual(@as(f32, 0), d[0]);
+        try testing.expectEqual(@as(f32, 31.0 * 8.0 + 7.0), d[31 * 8 + 7]);
+    }
+
+    var kept = [_]SSMCheckpoint{try captureSsmCheckpoint(testing.allocator, &live, 32, s)};
+    defer kept[0].deinit(testing.allocator);
+    var before2: usize = 0;
+    _ = mlx.mlx_get_active_memory(&before2);
+    try sliceQsaHistoryOntoCheckpoint(&kept[0], &cps[0], 32, s);
+    _ = mlx.mlx_synchronize(s);
+    var after2: usize = 0;
+    _ = mlx.mlx_get_active_memory(&after2);
+    try testing.expect(after2 >= before2 + 32 * 8 * 4);
+    try testing.expectEqual(@as(c_int, 32), mlx.getShape(kept[0].layers[0].aux_state)[1]);
+}
+
+test "scan: the trim slices the QSA history with a real copy, the restore and the handoff share; the switch is warmed from main" {
+    const src = @embedFile("transformer.zig");
+    const slice_fn = std.mem.indexOf(u8, src, "pub fn sliceQsaHistory" ++ "OntoCheckpoint(").?;
+    const slice_end = std.mem.indexOfPos(u8, src, slice_fn, "\n}\n").?;
+    const slice_body = src[slice_fn..slice_end];
+    try testing.expect(std.mem.indexOf(u8, slice_body, "keep, true, s);") != null);
+    try testing.expect(std.mem.indexOf(u8, slice_body, "keep, false, s);") == null);
+    const apply_fn = std.mem.indexOf(u8, src, "pub fn applyQsaHistory" ++ "At(").?;
+    const apply_end = std.mem.indexOfPos(u8, src, apply_fn, "\n}\n").?;
+    try testing.expect(std.mem.indexOf(u8, src[apply_fn..apply_end], "keep, false, s);") != null);
+    // Every seam that hands a dying slot's history over goes through the ONE
+    // dispatcher, so the kill switch flips them together.
+    const gen = @embedFile("generate.zig");
+    try testing.expect(std.mem.indexOf(u8, gen, "attachQsaHistory" ++ "OnHandoff(ssm_checkpoints.items, ents, xfm.s)") != null);
 }
 
 test "affineParamsFromGeometry: exact per-weight solve for off-config sidecar quants" {

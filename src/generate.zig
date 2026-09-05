@@ -2347,7 +2347,10 @@ pub const Generator = struct {
                             sink.forwarded = ssm_cp_offset + pos;
                             if (ssm_checkpoints.items.len > 0) {
                                 if (ctx.ssm_entries) |ents| {
-                                    transformer_mod.attachQsaHistoryToLatest(ssm_checkpoints.items, ents, xfm.s) catch {};
+                                    // The slot dies with the cancel: share
+                                    // the live history when the switch is
+                                    // on, copy when it is off.
+                                    transformer_mod.attachQsaHistoryOnHandoff(ssm_checkpoints.items, ents, xfm.s) catch {};
                                 }
                                 if (ssm_checkpoints.toOwnedSlice(allocator)) |owned| {
                                     sink.checkpoints = owned;
@@ -2691,8 +2694,14 @@ pub const Generator = struct {
                 }
                 // One copy of the QSA key history on the latest snap. Stride
                 // captures skipped it so a 400k prefill is not 32× the
-                // indexer buffer.
-                if (ssm_checkpoints.items.len > 0) {
+                // indexer buffer. With the share switch on (default) NOTHING
+                // is attached here: the newest snap takes a VIEW of the live
+                // buffer at COMMIT (`scheduler.commitSlotIfApplicable` ->
+                // `handoffQsaHistoryToLatest`), so the decode holds ONE copy
+                // where the materialized attach kept two (3,840 B/tok on
+                // qwen4_exp). `MLX_SERVE_QSA_HISTORY_SHARE=0` restores this
+                // copy — and `server.statePerTokenBilled` bills it again.
+                if (ssm_checkpoints.items.len > 0 and !transformer_mod.qsaHistoryShareEnabled()) {
                     try transformer_mod.attachQsaHistoryToLatest(ssm_checkpoints.items, ctx.ssm_entries.?, xfm.s);
                 }
             }
@@ -15525,4 +15534,22 @@ test "scan: the prefill chunk loop's post-eval order is a contract (B0b + S17)" 
     // is what the write-through then persists — so the check precedes it too.
     const cp = std.mem.indexOfPos(u8, src, clear, "captureSsm" ++ "Checkpoint(").?;
     try std.testing.expect(check < cp);
+}
+
+test "scan: the prefill-end QSA history attach is gated by the share switch; the cancel sink hands off" {
+    // With `MLX_SERVE_QSA_HISTORY_SHARE` on, the prefill must NOT materialize
+    // a second copy of the indexer history — the commit hands the live buffer
+    // over as a view. An ungated attach here re-doubles the decode's
+    // residency behind a bill that says one copy.
+    const src = @embedFile("generate.zig");
+    const gate = "ssm_checkpoints.items.len > 0 and !transformer_mod.qsaHistoryShare" ++ "Enabled()";
+    const gate_at = std.mem.indexOf(u8, src, gate) orelse return error.MissingShareGate;
+    const attach = "transformer_mod.attachQsaHistoryTo" ++ "Latest(ssm_checkpoints.items, ctx.ssm_entries.?, xfm.s)";
+    const attach_at = std.mem.indexOf(u8, src, attach) orelse return error.MissingPrefillEndAttach;
+    // The gate is the condition of the statement the attach sits in.
+    try std.testing.expect(gate_at < attach_at and attach_at - gate_at < 200);
+    // No other prefill-end attach exists: every remaining call is the
+    // dispatcher on the cancel handoff.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "transformer_mod.attachQsaHistoryTo" ++ "Latest("));
+    try std.testing.expect(std.mem.indexOf(u8, src, "transformer_mod.attachQsaHistory" ++ "OnHandoff(ssm_checkpoints.items, ents, xfm.s)") != null);
 }

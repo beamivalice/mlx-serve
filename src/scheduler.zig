@@ -4863,6 +4863,26 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
         // allocator's bookkeeping stays clean.
         gen_ptr.ssm_checkpoint_alloc.?.free(ssm_cps_slice);
     }
+    // qwen4_exp: the newest checkpoint takes the slot's live QSA indexer
+    // history HERE, as a slice VIEW of the capacity buffer — no copy, and the
+    // slot (the buffer's other owner) is torn down right after this commit.
+    // The prefill-end attach used to materialize it, so the whole decode held
+    // two copies (3,840 B/tok). Off (`MLX_SERVE_QSA_HISTORY_SHARE=0`) the
+    // prefill attached already and this is a no-op. Runs on the inference
+    // thread, before `commitWithMediaState` sees the list; a failure commits
+    // the entry history-less, which a QSA arch treats as a miss, never as a
+    // poisoned entry (`qsa_history_required`).
+    if (ssm_cps_opt) |cps| {
+        if (transformer_mod.qsaHistoryShareEnabled() and !transformer_mod.checkpointHasQsaHistory(&cps[cps.len - 1])) {
+            if (slot.ssm_entries) |ents| {
+                if (slot.model.transformer) |xf| {
+                    transformer_mod.handoffQsaHistoryToLatest(cps, ents, xf.s) catch |err| {
+                        log.warn("[hot-cache] QSA history handoff failed: {s} — committing without it\n", .{@errorName(err)});
+                    };
+                }
+            }
+        }
+    }
     // A runtime fallback leaves the dormant assistant context at its last
     // speculative boundary while serial decode continues growing the trunk.
     // Only pair the assistant payload with this prefix when both end at the
@@ -8170,4 +8190,27 @@ test "the re-asked width reaches the request's chunk AND is never capped by the 
     try testing.expect(std.mem.indexOf(u8, cap_call, "\n                0,\n            ));") != null);
     try testing.expect(std.mem.indexOf(u8, cap_call, "pinned_prefill" ++ "_chunk") == null);
     try testing.expect(std.mem.indexOf(u8, cap_call, "PREFILL" ++ "_CHUNK") == null);
+}
+
+test "hot-cache commit hands the live QSA history to the newest checkpoint BEFORE the commit, after the take" {
+    // The one copy per (slot ∪ entry) contract: the checkpoint list is taken
+    // from the generator, the newest snap takes a VIEW of the slot's live
+    // history, and only then does the cache see the list. A handoff after
+    // the commit would hand the view to a list the cache already owns; one
+    // before the take would run on a list the generator still holds.
+    const source = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, source, "fn commitSlotIfApplicable(") orelse return error.MissingCommitSlot;
+    const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn ") orelse return error.MissingEnd;
+    const body = source[start..end];
+    const take = std.mem.indexOf(u8, body, "gen_ptr.takeSsmCheckpoints()") orelse return error.MissingTake;
+    const handoff = std.mem.indexOf(u8, body, "transformer_mod.handoffQsaHistory" ++ "ToLatest(cps, ents, xf.s)") orelse return error.MissingHandoff;
+    const commit = std.mem.indexOf(u8, body, "hc.commitWithMediaState(") orelse return error.MissingCommit;
+    try testing.expect(take < handoff and handoff < commit);
+    // Gated on the switch AND idempotent: a snap that already carries history
+    // (the switch off, the prefill attached) is left alone.
+    const gate = std.mem.indexOf(u8, body, "transformer_mod.qsaHistoryShare" ++ "Enabled() and !transformer_mod.checkpointHasQsaHistory(&cps[cps.len - 1])") orelse return error.MissingGate;
+    try testing.expect(gate < handoff);
+    // The failure arm commits without the history rather than aborting the
+    // commit (a QSA arch treats "no history" as a miss).
+    try testing.expect(std.mem.indexOf(u8, body, "QSA history handoff failed") != null);
 }

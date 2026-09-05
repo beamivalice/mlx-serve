@@ -1873,6 +1873,10 @@ accumulated. Pricing a transient you can delete is the wrong trade.
   is true and the bill is ONE copy. That halving is not cosmetic: at
   `--ctx-size 1048576` on qwen4_exp the doubled bill clamped a requested
   24,576 MB hot cache to 5,703 MB, and the single copy gives most of it back.
+  (Later: the prefill-end checkpoint attach turned out to MATERIALIZE a second
+  copy anyway, so 63cf6bd re-doubled the bill; the commit-time handoff of
+  2026-09-05 removed that copy and the bill is one copy + the f32 score bank —
+  story in `engine-mlx.md`, "HELD twice from prefill end to commit".)
   The flag exists so the two move together — flip it back only if the append
   ever returns to `mlx_concatenate_axis(old, new)`.
 * `HotPrefixCache.evictLruToAdmit` gives memory back rather than refusing: a
