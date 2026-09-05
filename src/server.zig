@@ -3185,6 +3185,11 @@ fn ssdFirstBudgetForLoad(
         ctx_kv,
         transient_reserve,
     );
+    // The RAM-first arm publishes its answer and so must this one: the
+    // auto-context sizer and the ANE gate read `hot_cache_mem_resolved`, and
+    // an SSD-first boot that left it stale would size against a budget the
+    // cache never got.
+    hot_cache_mem_resolved = budget;
     // D1: on this arch `--prefix-cache-mem` is the IDLE allowance, not the
     // whole cache — 0 means "no idle entries", not "use all the headroom".
     // Say so once, naming the flag, so the resolved budget is never a mystery.
@@ -4550,7 +4555,7 @@ pub fn requestPrefillChunkNow(
     return chosen;
 }
 
-pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_override: ?transformer_mod.KVQuantConfig, unchunked_prefill: bool) AdmissionBill {
+pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_override: ?transformer_mod.KVQuantConfig, unchunked_prefill: bool, prompt_tokens: ?[]const u32) AdmissionBill {
     const heads = config.num_attention_heads;
     if (heads == 0) return .{ .needed = 0, .available = std.math.maxInt(u64) };
     const seq: u64 = @intCast(prompt_len);
@@ -4627,7 +4632,7 @@ pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: us
     // switch); the reduction happens under the scheduler's digest lock.
     const reclaimable: u64 = if (global_scheduler) |sch|
         if (prompt_tokens) |toks|
-            sch.reclaimableHotCacheBytesFor(toks)
+            scheduler_mod.reclaimableHotCacheBytesFor(sch, toks)
         else
             sch.reclaimable_hot_cache_bytes.load(.monotonic)
     else

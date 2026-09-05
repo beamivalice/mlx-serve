@@ -4424,6 +4424,8 @@ test "EntryDigest: the published snapshot answers the reclaimable question witho
     // The digest agrees with the direct, cache-side answer.
     try testing.expectEqual(hc.reclaimableBytesFor(&tokens_a), credit_a);
     try testing.expectEqual(hc.reclaimableBytesFor(&tokens_c), both);
+}
+
 test "prefix cache: the trim bill prices only the checkpoints a shed would keep" {
     // `shedCheckpointsToFit` thins the interior the moment an entry lands over
     // the cap, so billing EVERY lower checkpoint at a candidate trim point
