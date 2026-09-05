@@ -1931,14 +1931,19 @@ pub const DiskTier = struct {
         try self.renderMeta(&buf, e);
 
         const final_path = try std.fmt.allocPrint(self.allocator, "{s}/e{d}/meta.json", .{ self.root, e.id });
-        // Owned from here: the `dupe` below can OOM, and the submit takes the
-        // path only on the path where it succeeds. (audit N8)
-        errdefer self.allocator.free(final_path);
+        // ONE owner per branch. The staged branch keeps the path only until
+        // `submit` takes it, so its cleanup is an `errdefer` scoped to that
+        // branch (the `dupe` below can OOM — audit N8). The synchronous branch
+        // never hands the pointer anywhere, so it owns it outright with a
+        // `defer`. A `defer` does NOT cancel an enclosing `errdefer`: with the
+        // errdefer at function scope, ANY error from the synchronous writes
+        // below (ENOSPC, EIO, a missing entry dir) freed this pointer twice.
         if (self.writer) |w| {
             // Mechanism 2: the index rides the SAME FIFO queue as this entry's
             // chunks, so it is the LAST file to land. A kill -9 mid-flush
             // leaves chunks with no meta.json, which `scan` reads as a miss —
             // never a half-indexed entry.
+            errdefer self.allocator.free(final_path);
             const bytes = try self.allocator.dupe(u8, buf.items);
             w.submit(final_path, bytes);
             return;
@@ -4269,4 +4274,69 @@ test "DiskTier: the staged serializer's eval is batched — ONE eval, outside th
     const ee = std.mem.indexOfPos(u8, source, es, "\n    }\n") orelse
         return error.MissingEncoderEnd;
     try testing.expectEqual(@as(usize, 0), std.mem.count(u8, source[es..ee], "_eval("));
+}
+
+test "DiskTier: a failing synchronous writeMeta frees the final path exactly once" {
+    // BL-1. `writeMeta` allocates `final_path`, then forks: the staged branch
+    // hands it to `Writer.submit`, the synchronous branch keeps it to the end.
+    // The audit-N8 cleanup was added as a FUNCTION-scope `errdefer`, and a
+    // `defer` does not cancel an `errdefer` — so on the synchronous branch any
+    // error from `createFileAbsolute` / `writeAll` / `flush` / `renameAbsolute`
+    // ran BOTH, freeing one pointer twice. Not qwen4-gated: this is the legacy
+    // `--prefix-cache-disk` path, i.e. every arch, on any disk write failure
+    // (ENOSPC, EIO, a read-only volume).
+    //
+    // The injection is the cheapest real one: the entry's `e<id>/` directory
+    // does not exist, so `createFileAbsolute` on `<root>/e777/meta.json.tmp`
+    // fails — the first fallible step past the `defer`. On the pre-fix bytes
+    // `std.testing.allocator` aborts here with "Double free detected".
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-writemeta-err", 0, 128);
+    defer tier.deinit();
+    // The synchronous branch is the one under test.
+    try testing.expect(tier.writer == null);
+
+    var toks = [_]u32{ 1, 2, 3 };
+    var cb = [_]u64{64};
+    var no_pos = [_]u32{};
+    var no_sz = [_]u64{};
+    const e = IndexEntry{
+        .id = 777, // no e777/ directory was ever created
+        .tokens = &toks,
+        .kv_len = 3,
+        .has_tools = false,
+        .quant = kv_quant.KVQuantConfig.dense,
+        .bytes = 64,
+        .chunk_bytes = &cb,
+        .ssm_positions = &no_pos,
+        .ssm_bytes = &no_sz,
+        .last_used = 0,
+    };
+    // The write must fail (otherwise the test proves nothing) and must leave
+    // exactly one free behind.
+    if (tier.writeMeta(e)) |_| {
+        return error.WriteMetaUnexpectedlySucceeded;
+    } else |_| {}
+
+    // ...and the same shape must not come back: the cleanup for the staged
+    // branch lives INSIDE it, so the synchronous branch's `defer` is the only
+    // owner it can reach. Scan-pinned on writeMeta's own body — the needle
+    // must never resolve into this test's bytes.
+    const source = @embedFile("kv_disk_cache.zig");
+    const fs = std.mem.indexOf(u8, source, "fn writeMeta(") orelse return error.MissingWriteMeta;
+    const fe = std.mem.indexOfPos(u8, source, fs, "\n    }\n") orelse return error.MissingWriteMetaEnd;
+    const body = source[fs..fe];
+    const fork = std.mem.indexOf(u8, body, "if (self.writer) |w| {") orelse return error.MissingFork;
+    const errd = std.mem.indexOf(u8, body, "errdefer self.allocator.free(final" ++ "_path);") orelse return error.MissingErrdefer;
+    const defr = std.mem.indexOf(u8, body, "defer self.allocator.free(final" ++ "_path);\n        const tmp" ++ "_path") orelse return error.MissingDefer;
+    // Exactly one of each, the errdefer inside the staged branch (after the
+    // fork), the defer on the synchronous side (after the branch returns).
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "errdefer self.allocator.free(final" ++ "_path);"));
+    try testing.expect(fork < errd);
+    try testing.expect(errd < defr);
 }
