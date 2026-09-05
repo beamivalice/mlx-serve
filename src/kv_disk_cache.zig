@@ -272,6 +272,64 @@ pub const SpecCommit = struct {
     head_pos_base: c_int = 0,
 };
 
+/// What a commit actually achieved on disk.
+///
+/// `appendCommit*` used to return a bool that meant "there is nothing more to
+/// write" — and every SILENT SKIP returns that too: a prefix under
+/// `MIN_PERSIST_TOKENS`, a TurboQuant scheme whose rotation state cannot
+/// survive a restore, a layer whose offset does not cover the range, a
+/// non-B1 cache shape, and a `store_declined` volume. `spillIdleEntries` read
+/// it as "the SSD holds this session, drop the RAM copy". On qwen4_exp with
+/// the disk tier on and a disk under ~65 GiB free, that meant EVERY idle
+/// hot-cache entry was thrown away at the end of every request with nothing
+/// whatsoever written in its place.
+///
+/// So the three outcomes are named, and only one of them is a promise.
+pub const PersistOutcome = enum {
+    /// The tier holds the full prefix this commit asked it to persist.
+    /// The ONLY value that may license discarding the RAM copy.
+    persisted,
+    /// Real bytes landed but the entry is not whole yet — a byte-capped flush
+    /// stopped on a chunk boundary, or SSM checkpoints are still pending. The
+    /// next commit resumes; the caller keeps its dirty flag set.
+    partial,
+    /// Nothing was written and nothing is promised. Ineligible state, or the
+    /// volume declined the store.
+    skipped,
+
+    /// "Nothing more for the caller to write", the old bool's meaning. Kept
+    /// for the flush-dirty decision, which really does treat a skip and a
+    /// completion alike — a skip will not become writable by retrying.
+    pub fn nothingPending(self: PersistOutcome) bool {
+        return self != .partial;
+    }
+};
+
+/// The KV extent one commit would persist, in tokens.
+///
+/// On EOS-terminated turns the cache runs 1-2 positions AHEAD of the committed
+/// token record (forwarded terminator tokens that never land in `tokens`), so
+/// the target is clamped to the record. And the extent is the initialized
+/// layers' OFFSET, not `step`: on hybrid archs (qwen3_5/3_6 GDN) `cache.step`
+/// only bumps on layer 0, a GatedDeltaNet layer that never writes KV, so it
+/// stays 0 while the full-attention layers carry the prompt position.
+/// `max(step, max initialized offset)` is right for both.
+///
+/// Pure, and shared by the commit and by `holdsFullPrefix`: the eviction check
+/// must ask for exactly the length the commit was asked to write, or it
+/// approves a prefix nobody promised.
+pub fn persistTargetLen(
+    kv_entries: []const transformer_mod.KVCacheEntry,
+    step: usize,
+    tokens_len: usize,
+) usize {
+    var max_off: usize = 0;
+    for (kv_entries) |*entry| {
+        if (entry.initialized and entry.offset > max_off) max_off = entry.offset;
+    }
+    return @min(@max(step, max_off), tokens_len);
+}
+
 pub const SpecKind = enum { dflash, mtp };
 
 pub const Match = struct {
@@ -933,7 +991,7 @@ pub const DiskTier = struct {
         has_tools: bool,
         ssm_checkpoints: ?[]const transformer_mod.SSMCheckpoint,
         s: mlx.mlx_stream,
-    ) !bool {
+    ) !PersistOutcome {
         return self.appendCommitWithSpec(kv_entries, step, config, tokens, has_tools, ssm_checkpoints, null, null, s);
     }
 
@@ -954,7 +1012,7 @@ pub const DiskTier = struct {
         ssm_checkpoints: ?[]const transformer_mod.SSMCheckpoint,
         s: mlx.mlx_stream,
         flush_bound: u64,
-    ) !bool {
+    ) !PersistOutcome {
         return self.appendCommitWithSpecBounded(kv_entries, step, config, tokens, has_tools, ssm_checkpoints, null, null, s, flush_bound);
     }
 
@@ -972,7 +1030,7 @@ pub const DiskTier = struct {
         dflash_snap: ?SpecCommit,
         mtp_snap: ?SpecCommit,
         s: mlx.mlx_stream,
-    ) !bool {
+    ) !PersistOutcome {
         return self.appendCommitWithSpecBounded(kv_entries, step, config, tokens, has_tools, ssm_checkpoints, dflash_snap, mtp_snap, s, self.max_flush_bytes);
     }
 
@@ -988,7 +1046,7 @@ pub const DiskTier = struct {
         mtp_snap: ?SpecCommit,
         s: mlx.mlx_stream,
         flush_bound: u64,
-    ) !bool {
+    ) !PersistOutcome {
         // On EOS-terminated turns the cache runs 1-2 positions AHEAD of the
         // committed token record (forwarded terminator tokens that never
         // land in `tokens`). Persist the prefix covered by the record —
@@ -999,16 +1057,12 @@ pub const DiskTier = struct {
         // while the full-attention layers carry offset == prompt position.
         // `max(step, max initialized offset)` is correct for both — equal on
         // pure attention, and the layer offset on hybrid.
-        var max_off: usize = 0;
-        for (kv_entries) |*entry| {
-            if (entry.initialized and entry.offset > max_off) max_off = entry.offset;
-        }
-        const kv_target_u: usize = @min(@max(step, max_off), tokens.len);
-        if (kv_target_u < MIN_PERSIST_TOKENS) return true;
+        const kv_target_u: usize = persistTargetLen(kv_entries, step, tokens.len);
+        if (kv_target_u < MIN_PERSIST_TOKENS) return .skipped;
         const kv_target: u32 = @intCast(kv_target_u);
         switch (config.scheme) {
             .off, .affine => {},
-            else => return true, // TurboQuant rotation state doesn't survive restore
+            else => return .skipped, // TurboQuant rotation state doesn't survive restore
         }
         // Every initialized layer must cover the persisted range with B == 1
         // — anything else (mid-spec-decode state, batched cache) is not a
@@ -1017,12 +1071,12 @@ pub const DiskTier = struct {
             if (!entry.initialized) continue;
             if (entry.offset < kv_target_u) {
                 log.debug("  [disk-cache] skip: layer offset {d} < kv_len {d}\n", .{ entry.offset, kv_target_u });
-                return true;
+                return .skipped;
             }
             const shape = mlx.getShape(entry.keys);
             if (shape.len != 4 or shape[0] != 1) {
                 log.debug("  [disk-cache] skip: non-B1 cache shape\n", .{});
-                return true;
+                return .skipped;
             }
         }
 
@@ -1036,7 +1090,7 @@ pub const DiskTier = struct {
         // anyway; only the following commit declined. On the tester's 14 GiB
         // box that is exactly the shape the suite saw — the first commit
         // landed at 640 and the second was refused.
-        if (self.store_declined) return true;
+        if (self.store_declined) return .skipped;
 
         // Superseded check: an existing entry that already covers `tokens`
         // (same key, tokens is a prefix of its tokens, kv already >= ours)
@@ -1055,8 +1109,11 @@ pub const DiskTier = struct {
                         if (!self.ssmWorkPending(e, ssm_checkpoints, e.kv_len) and
                             !specWorkPending(e, dflash_snap, mtp_snap))
                         {
+                            // Superseded: the tier ALREADY holds this prefix
+                            // in full, so the RAM copy really is redundant.
+                            // That is a persisted outcome, not a skip.
                             e.last_used = self.bump();
-                            return true;
+                            return .persisted;
                         }
                         ssm_only_idx = i;
                         break;
@@ -1131,9 +1188,11 @@ pub const DiskTier = struct {
         const chunk_complete = chunks_done == n_chunks;
         const kv_len: u32 = if (chunk_complete) kv_target else chunks_done * self.chunk_tokens;
         if (kv_len <= old_kv) {
-            // Cap so tight nothing new landed — nothing to commit.
+            // Cap so tight nothing new landed — nothing to commit. The
+            // entry on disk is unchanged and still short of `kv_target`, so
+            // this is progress-free, not a completed copy.
             chunk_sizes.deinit(self.allocator);
-            return chunk_complete;
+            return if (chunk_complete) .persisted else .partial;
         }
 
         // Phase 3: persist any SSM checkpoints whose position is within the KV
@@ -1255,7 +1314,49 @@ pub const DiskTier = struct {
         if (complete) {
             log.info("  [disk-cache] e{d} complete on disk: {d} tokens, {d} chunks, {d} ssm-cp\n", .{ id, kv_len, new_entry.chunk_bytes.len, new_entry.ssm_positions.len });
         }
-        return complete;
+        return if (complete) .persisted else .partial;
+    }
+
+    /// Does the INDEX agree that this tier holds a complete, restorable copy
+    /// of `tokens` (a `.persisted` outcome's claim, re-checked against the
+    /// manifest)?
+    ///
+    /// Two bars, both needed before a RAM entry may be discarded:
+    ///   * an entry whose token record covers `tokens` at the same key
+    ///     (tools + quant), with `kv_len` reaching the persist target this
+    ///     commit would have used; and
+    ///   * a `chunk_bytes` array with one non-zero entry per chunk that
+    ///     `kv_len` implies — the same array `scan` clamps against real file
+    ///     sizes after a kill -9, so a truncated tail cannot pass.
+    ///
+    /// `persisted` says the WRITE path believed it finished. This says the
+    /// index it wrote actually describes a whole prefix. Both, or the RAM
+    /// copy stays.
+    pub fn holdsFullPrefix(
+        self: *const DiskTier,
+        kv_entries: []const transformer_mod.KVCacheEntry,
+        step: usize,
+        tokens: []const u32,
+        has_tools: bool,
+        config: kv_quant.KVQuantConfig,
+    ) bool {
+        const target = persistTargetLen(kv_entries, step, tokens.len);
+        if (target == 0) return false;
+        for (self.entries.items) |*e| {
+            if (e.has_tools != has_tools) continue;
+            if (!std.meta.eql(e.quant, config)) continue;
+            if (e.tokens.len < tokens.len) continue;
+            if (!std.mem.eql(u32, e.tokens[0..tokens.len], tokens)) continue;
+            if (e.kv_len < target) continue;
+            const want: usize = (@as(usize, e.kv_len) + self.chunk_tokens - 1) / self.chunk_tokens;
+            if (e.chunk_bytes.len < want) continue;
+            var whole = true;
+            for (e.chunk_bytes[0..want]) |b| {
+                if (b == 0) whole = false;
+            }
+            if (whole) return true;
+        }
+        return false;
     }
 
     /// Sidecar-only append: KV chunks are already fully on disk (superseded
@@ -1270,7 +1371,7 @@ pub const DiskTier = struct {
         dflash_snap: ?SpecCommit,
         mtp_snap: ?SpecCommit,
         s: mlx.mlx_stream,
-    ) !bool {
+    ) !PersistOutcome {
         const dir_rel = try std.fmt.allocPrint(self.allocator, "{s}/e{d}", .{ self.root, self.entries.items[idx].id });
         defer self.allocator.free(dir_rel);
         const e = &self.entries.items[idx];
@@ -1306,7 +1407,9 @@ pub const DiskTier = struct {
         e.last_used = self.bump();
         try self.writeMeta(e.*);
         self.gcToBudget();
-        return ssm_res.complete;
+        // The KV chunks were already whole (that is why this path ran); the
+        // entry is a complete copy iff its checkpoints are now all there.
+        return if (ssm_res.complete) .persisted else .partial;
     }
 
     // ── Spec-snapshot persistence (v4: dflash context / MTP history) ──
@@ -3285,16 +3388,16 @@ test "DiskTier: flush byte cap persists incrementally across commits" {
 
     // First flush: 1 chunk (128 tokens), incomplete.
     const c1 = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
-    try testing.expect(!c1);
+    try testing.expectEqual(PersistOutcome.partial, c1);
     try testing.expectEqual(@as(u32, 128), tier.entries.items[0].kv_len);
     // Second flush continues from where it left off.
     const c2 = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
-    try testing.expect(!c2);
+    try testing.expectEqual(PersistOutcome.partial, c2);
     try testing.expectEqual(@as(u32, 256), tier.entries.items[0].kv_len);
     // Keep flushing until complete; entry must land at the full 600.
     var guard: u32 = 0;
     while (guard < 10) : (guard += 1) {
-        if (try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s)) break;
+        if (try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s) == .persisted) break;
     }
     try testing.expectEqual(@as(u32, 600), tier.entries.items[0].kv_len);
 
@@ -3668,13 +3771,13 @@ test "DiskTier: SSM checkpoints persist incrementally under the flush byte cap" 
 
     // Drive to completion; it must take multiple flushes and only report
     // complete once BOTH checkpoints are on disk.
-    var complete = false;
+    var complete: PersistOutcome = .partial;
     var guard: u32 = 0;
     while (guard < 40) : (guard += 1) {
         complete = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
-        if (complete) break;
+        if (complete == .persisted) break;
     }
-    try testing.expect(complete);
+    try testing.expectEqual(PersistOutcome.persisted, complete);
     const e = &tier.entries.items[0];
     try testing.expectEqual(@as(u32, 600), e.kv_len);
     try testing.expectEqual(@as(usize, 2), e.ssm_positions.len);
@@ -4073,7 +4176,7 @@ test "DiskTier: SSD-first writes a checkpoint beside the chunk that closes it" {
         tier.max_flush_bytes = 1; // bound the flush to one chunk
 
         const complete = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
-        try testing.expect(!complete); // KV is still partial
+        try testing.expectEqual(PersistOutcome.partial, complete); // KV is still partial
         const e = &tier.entries.items[0];
         try testing.expectEqual(@as(u32, 128), e.kv_len);
         try testing.expectEqual(@as(usize, 1), e.ssm_positions.len);
@@ -4140,7 +4243,7 @@ test "DiskTier: SSD-first stages the flush off-thread and indexes LAST" {
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
 
     const complete = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
-    try testing.expect(complete);
+    try testing.expectEqual(PersistOutcome.persisted, complete);
     // The commit RETURNED with everything still staged — no file write ran on
     // this thread.
     try testing.expect(tier.writer.?.pendingBytes() > 0);

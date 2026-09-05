@@ -1926,7 +1926,7 @@ pub const HotPrefixCache = struct {
             // identical across images, so a token-only disk key is ambiguous.
             if (e.vision_key != 0) continue;
             const specs = entrySpecCommits(e);
-            const complete = d.appendCommitWithSpec(
+            const outcome = d.appendCommitWithSpec(
                 e.snapshot.entries,
                 e.snapshot.step,
                 e.snapshot.config,
@@ -1940,8 +1940,23 @@ pub const HotPrefixCache = struct {
                 log.warn("  [hot-cache] idle spill failed: {s} — entry stays resident\n", .{@errorName(err)});
                 continue;
             };
-            // A partial copy is not a copy. Keep the entry until it is whole.
-            if (!complete) continue;
+            // ONLY `.persisted`. The old test was `complete == true`, which the
+            // append path also returns for every SILENT SKIP — a declined
+            // volume, a prefix under `MIN_PERSIST_TOKENS`, TurboQuant, a layer
+            // offset short of the range. On qwen4_exp with the disk tier on and
+            // a disk under ~65 GiB free, that discarded every idle entry from
+            // RAM at the end of every request with nothing written in its place.
+            // A `.partial` copy is not a copy either; its writer may finish it,
+            // and the next pass re-checks.
+            if (outcome != .persisted) continue;
+            // ...and `.persisted` is the WRITE path's claim. The INDEX has to
+            // agree: an entry at this key whose `kv_len` reaches the persist
+            // target and whose chunk array has one non-zero size per chunk that
+            // length implies.
+            if (!d.holdsFullPrefix(e.snapshot.entries, e.snapshot.step, e.tokens, e.has_tools, e.snapshot.config)) {
+                log.warn("  [hot-cache] idle spill: the tier does not hold the full prefix — entry stays resident\n", .{});
+                continue;
+            }
             // ...and a STAGED copy is not a durable one. `appendCommit` reports
             // what it handed the writer, not what reached the disk: the writer
             // logs a failed blob, counts it, and drops it. Discarding RAM on
@@ -2010,7 +2025,10 @@ pub const HotPrefixCache = struct {
                 log.warn("  [disk-cache] persist failed: {s}\n", .{@errorName(err)});
                 return;
             };
-            if (!ok) self.disk_dirty = true;
+            // `.partial` is the only outcome with more to write. A `.skipped`
+            // state does not become writable by retrying, so it must not keep
+            // the dirty flag set — exactly today's behaviour, now said out loud.
+            if (!ok.nothingPending()) self.disk_dirty = true;
             return;
         }
         if (self.entries.items.len == 0) return;
@@ -2045,7 +2063,7 @@ pub const HotPrefixCache = struct {
         };
         // Byte-capped flush: a large entry persists incrementally — keep the
         // dirty flag set so the next finished request continues the write.
-        if (!complete) self.disk_dirty = true;
+        if (!complete.nothingPending()) self.disk_dirty = true;
     }
 
     /// #330 adjacent: when the byte budget is exceeded with the just-updated
@@ -4663,6 +4681,218 @@ test "SSD-first: an idle entry spills to disk and leaves RAM; the active session
         hc.spillIdleEntries(s);
         try testing.expectEqual(@as(usize, 2), hc.entryCount());
     }
+}
+
+test "SSD-first: a silent SKIP is not a durable copy — the idle entry stays resident" {
+    // External review item 2, the real bug. `appendCommitWithSpec` returned
+    // `true` for "nothing more to write", and every SILENT SKIP returns that
+    // too. `spillIdleEntries` read it as "the SSD holds this session" and
+    // called `evictAt`. On qwen4_exp with `--prefix-cache-disk` on and a disk
+    // under ~65 GiB free, EVERY idle entry was discarded from RAM at the end of
+    // EVERY request with nothing whatsoever written in its place.
+    //
+    // Four skip reasons, each a separate arm, each asserting BOTH halves: the
+    // tier holds nothing, and RAM still holds the idle entry.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+
+    var tokens_a: [600]u32 = undefined;
+    for (&tokens_a, 0..) |*t, i| t.* = @intCast(i + 7);
+    var tokens_b: [600]u32 = undefined;
+    for (&tokens_b, 0..) |*t, i| t.* = @intCast(i + 90_000);
+
+    // Arm 1 — the volume declined the store (the reviewer's 14 GiB box).
+    {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var buf: [512]u8 = undefined;
+        const root_len = try tmp.dir.realPath(io, &buf);
+        var cache = try KVCache.init(testing.allocator, 1);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 1, 600);
+
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc.ssd_first = true;
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, buf[0..root_len], "fp-declined", 0, 128);
+        defer hc.deinit();
+        hc.disk.?.ssd_first = true;
+        hc.disk.?.armTestSpace(10 * 1024 * 1024 * 1024, 512 * 1024 * 1024 * 1024);
+
+        try hc.commit(&cache, &tokens_a, false);
+        try hc.commit(&cache, &tokens_b, false);
+        hc.spillIdleEntries(s);
+        try testing.expectEqual(@as(usize, 0), hc.disk.?.entryCount());
+        try testing.expectEqual(@as(usize, 2), hc.entryCount());
+    }
+
+    // Arm 2 — under `MIN_PERSIST_TOKENS`: too short to be worth a file, and
+    // therefore too short to justify losing.
+    {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var buf: [512]u8 = undefined;
+        const root_len = try tmp.dir.realPath(io, &buf);
+        var cache = try KVCache.init(testing.allocator, 1);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 1, 400);
+
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc.ssd_first = true;
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, buf[0..root_len], "fp-short", 0, 128);
+        defer hc.deinit();
+        try hc.commit(&cache, tokens_a[0..400], false);
+        try hc.commit(&cache, tokens_b[0..400], false);
+        hc.spillIdleEntries(s);
+        try testing.expectEqual(@as(usize, 0), hc.disk.?.entryCount());
+        try testing.expectEqual(@as(usize, 2), hc.entryCount());
+    }
+
+    // Arm 3 — TurboQuant: the rotation state does not survive a restore, so
+    // the tier refuses. Losing RAM on that refusal loses the session.
+    {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var buf: [512]u8 = undefined;
+        const root_len = try tmp.dir.realPath(io, &buf);
+        var cache = try KVCache.init(testing.allocator, 1);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 1, 600);
+
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc.ssd_first = true;
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, buf[0..root_len], "fp-tq", 0, 128);
+        defer hc.deinit();
+        try hc.commit(&cache, &tokens_a, false);
+        try hc.commit(&cache, &tokens_b, false);
+        // The scheme is flipped on the COMMITTED snapshot rather than on the
+        // live cache: the arrays stay dense (a real TurboQuant fixture is a
+        // whole cache shape), and the append path's scheme switch is what
+        // this arm is about.
+        for (hc.entries.items) |*e| {
+            if (std.mem.eql(u32, e.tokens, &tokens_a)) e.snapshot.config = .{ .scheme = .turboquant_4, .bits = 4, .group_size = 64 };
+        }
+        hc.spillIdleEntries(s);
+        try testing.expectEqual(@as(usize, 0), hc.disk.?.entryCount());
+        try testing.expectEqual(@as(usize, 2), hc.entryCount());
+    }
+
+    // Arm 4 — a layer offset short of the persist target. Mid-spec-decode and
+    // batched states look like this, and the tier declines them by design.
+    {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var buf: [512]u8 = undefined;
+        const root_len = try tmp.dir.realPath(io, &buf);
+        var cache = try KVCache.init(testing.allocator, 2);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 2, 600);
+
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc.ssd_first = true;
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, buf[0..root_len], "fp-offset", 0, 128);
+        defer hc.deinit();
+        try hc.commit(&cache, &tokens_a, false);
+        try hc.commit(&cache, &tokens_b, false);
+        // The idle entry (A) is the one that is not newest; shorten one of its
+        // layers so the snapshot no longer covers the range it claims.
+        for (hc.entries.items) |*e| {
+            if (std.mem.eql(u32, e.tokens, &tokens_a)) e.snapshot.entries[1].offset = 300;
+        }
+        hc.spillIdleEntries(s);
+        try testing.expectEqual(@as(usize, 0), hc.disk.?.entryCount());
+        try testing.expectEqual(@as(usize, 2), hc.entryCount());
+    }
+}
+
+test "SSD-first: a PARTIAL copy is not a copy — the idle entry stays resident" {
+    // The second half of item 2. A byte-capped flush lands real bytes and
+    // stops on a chunk boundary; the entry on disk is genuinely short. The
+    // old bool said `false` here and the spill did keep the entry — this pins
+    // that the enum did not lose that, and that a partial entry IS indexed
+    // (so a `holdsFullPrefix` bar alone would not have been enough either).
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+
+    var tokens_a: [600]u32 = undefined;
+    for (&tokens_a, 0..) |*t, i| t.* = @intCast(i + 7);
+    var tokens_b: [600]u32 = undefined;
+    for (&tokens_b, 0..) |*t, i| t.* = @intCast(i + 90_000);
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 1, 600);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc.ssd_first = true;
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, buf[0..root_len], "fp-partial", 0, 128);
+    defer hc.deinit();
+    // One byte: the loop writes chunk 0 and stops.
+    hc.disk.?.max_flush_bytes = 1;
+
+    try hc.commit(&cache, &tokens_a, false);
+    try hc.commit(&cache, &tokens_b, false);
+    hc.spillIdleEntries(s);
+    hc.disk.?.drainWriter();
+    // A short entry IS on disk — that is what makes this different from a skip.
+    try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+    try testing.expect(hc.disk.?.entries.items[0].kv_len < 600);
+    // ...and RAM kept both.
+    try testing.expectEqual(@as(usize, 2), hc.entryCount());
+
+    // Lift the cap: the next pass completes the copy and NOW the entry goes.
+    hc.disk.?.max_flush_bytes = 512 * 1024 * 1024;
+    hc.spillIdleEntries(s);
+    try testing.expectEqual(@as(usize, 1), hc.entryCount());
+    try testing.expectEqualSlices(u32, &tokens_b, hc.entries.items[0].tokens);
+    try testing.expectEqual(@as(u32, 600), hc.disk.?.entries.items[0].kv_len);
+}
+
+test "DiskTier.holdsFullPrefix: the INDEX must agree before a RAM copy is discarded" {
+    // `.persisted` is the write path's claim; this is the manifest's. Both,
+    // or the entry stays. The negative arms are the ones that matter: a
+    // truncated chunk (what `scan` leaves after a kill -9 mid-flush) and a
+    // record that does not cover the prefix asked about.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 1, 600);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    var tier = try kv_disk_cache.DiskTier.init(testing.allocator, io, buf[0..root_len], "fp-holds", 0, 128);
+    defer tier.deinit();
+
+    // Nothing stored yet.
+    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config));
+
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
+    tier.drainWriter();
+    try testing.expect(tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config));
+    // A different key is a different entry.
+    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, true, cache.config));
+    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, .{ .scheme = .affine, .bits = 4, .group_size = 64 }));
+
+    // A truncated tail chunk — the shape `scan` records after a kill -9.
+    const cb = tier.entries.items[0].chunk_bytes;
+    const keep = cb[cb.len - 1];
+    cb[cb.len - 1] = 0;
+    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config));
+    cb[cb.len - 1] = keep;
+    try testing.expect(tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config));
+
+    // A shorter persisted extent than the commit would target.
+    tier.entries.items[0].kv_len = 400;
+    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config));
 }
 
 test "SSD-first: one resident session makes reclaimableBytes truthfully ZERO" {
