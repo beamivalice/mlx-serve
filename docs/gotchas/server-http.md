@@ -2383,17 +2383,26 @@ prefill path now asks the width TWICE around the eviction pass:
    them) and never `reclaimable` (a projection).
 4. The re-ask, then `scheduler.postEvictionPrefillChunk(admitted, reasked)`.
 
-**The clamp is an assertion, not a policy.** An eviction only ever RETURNS
-memory, so post-eviction availability is `>=` pre-eviction and `reasked >=
-admitted` by construction — the chooser's ladder is monotone and its fallback
-is the floor. Taking the MAX therefore changes nothing on the expected path and
-catches the one case that would be a real bug: a narrower re-ask, which can only
-mean memory moved between the two reads (a co-tenant slot's decode
-allocations). There the admitted width is the one a bill was actually taken at,
-and the per-chunk adapter — the mechanism that IS allowed to narrow — re-prices
-from it at the first chunk boundary. Both directions log under `[prefill] re-ask:` (a distinct
-prefix from the per-chunk `[prefill] width N -> M at pos P` contract line), the
-widening at info naming the bytes the pass returned.
+**The re-ask is the truth, and the comparison is only a log.** This shipped as
+`@max(admitted, reasked)`, argued as an assertion: an eviction only ever
+RETURNS memory, so post-eviction availability is `>=` pre-eviction, the max
+changes nothing on the expected path, and it "catches" the impossible case. The
+external review of PR #363 turned that argument around. A max is not an
+assertion — it is a clamp, and the ONLY case in which it does anything is the
+case where the invariant broke. There it discards the reading taken after the
+pass against LIVE memory and keeps the pre-eviction one because it is WIDER,
+which is widening onto memory that has already gone to a co-tenant slot's
+decode: the uncatchable Metal OOM, arrived at by way of a safety check. The
+costs are not symmetric and the safe arm is the narrow one, so the second
+reading — taken by the same estimator that admits the request, after the pass,
+against what is actually free — is the width that runs, whichever direction it
+moved. The floor still holds because the CHOOSER holds it: its ladder falls
+through to the floor rung and `postEvictionPrefillChunk` computes no width of
+its own. Both directions log under `[prefill] re-ask:` (a distinct prefix from
+the per-chunk `[prefill] width N -> M at pos P` contract line), the widening at
+info naming the bytes the pass returned, the narrowing at warn naming both
+widths — a narrow re-ask is rare and worth seeing, it is just not worth
+overruling.
 
 The re-asked width has to reach two consumers with different rules, and a
 change that wires one and not the other ships a width nobody runs:
@@ -3277,13 +3286,22 @@ allocator's own before/after reading), never the pre-eviction ESTIMATE
 (`accounted_bytes`/`reclaimable`), which prices what eviction is expected to
 free rather than what it did.
 
-`postEvictionPrefillChunk` asserts `reasked >= admitted` — post-eviction
-available memory can only rise, never fall, so a re-ask that came back
-NARROWER than the original admission would mean memory moved between the two
-readings, which should be structurally impossible on this path. The assertion
-is a canary for that impossible case, not a normal-path clamp: on the expected
-path the max() changes nothing, but catching a violation here is cheaper than
-debugging the OOM it would otherwise cause three requests later. `cap_adapt`,
+`postEvictionPrefillChunk` RUNS THE RE-ASK, in both directions. It shipped as
+`@max(admitted, reasked)`, sold as an assertion that post-eviction available
+memory can only rise — a canary for an impossible case, free on the expected
+path. The external review of PR #363 pointed out that this is backwards: a max
+is not an assertion, and the only case in which it does anything at all is the
+case where the invariant BROKE. Where the invariant holds the max is a no-op;
+where memory moved under us between the two readings (a co-tenant slot's decode
+allocations) it discards the reading taken against live memory and keeps the
+stale, WIDER one — widening onto memory that is gone, which is exactly the
+uncatchable Metal OOM the asymmetry argument above exists to avoid. The narrow
+arm only ever costs throughput. So the second reading is the one that runs, and
+the direction is only LOGGED: `[prefill] re-ask:` at info when the pass bought a
+wider rung, at warn when it came back narrower. The width still never falls
+below the ladder floor, because the CHOOSER cannot produce anything narrower
+(`chooseRequestPrefillChunk` falls through to the floor rung) and this function
+computes no width of its own. `cap_adapt`,
 the per-chunk adaptive ceiling, is built PIN-LESS — via `effectivePrefillChunk(…,
 0)`, a literal zero rung rather than the request's pinned width — specifically
 so it can never be the thing that clips a re-ask back down to the pre-eviction
@@ -3328,8 +3346,10 @@ running below `debug` doesn't pay for a CAS on every request only to discard
 the log line.
 
 Tests: `postEvictionPrefillChunk` (widens after an eviction that freed memory,
-holds the original width when eviction freed nothing, never narrows relative to
-the pre-eviction ask, is a no-op when the two readings are unchanged), the
+holds the single ask when eviction freed nothing, RUNS a narrower re-ask and
+flags it as `moved`, is a no-op when the two readings are unchanged, and hands
+back the ladder floor unmodified), a scan that its body contains no `@max` over
+the pair, the
 composition of the two-ask logic against `chooseRequestPrefillChunk` including
 both the gate-disabled and non-qwen4 arms, a scan of the four-step admit/evict/reask/apply
 order, the `cap_adapt` pin-less-seam scan, `admissionLogLevel`'s

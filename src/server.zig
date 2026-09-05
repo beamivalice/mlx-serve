@@ -4766,12 +4766,15 @@ test "the per-request rung is priced by the SAME estimator that admits it" {
     try t.expect(std.mem.indexOf(u8, serve_body, "scheduler_mod.prefill_request_chunk = &requestPrefillChunk" ++ "Now;") != null);
 }
 
-test "the post-eviction re-ask never narrows, and never runs on an arch that has no per-request width" {
+test "the post-eviction re-ask never exceeds what live memory affords, and never runs on an arch that has no per-request width" {
     // Audit N5, the composition the scheduler runs: `chooseRequestPrefillChunk`
     // is asked once before the eviction pass and once after, and
-    // `scheduler.postEvictionPrefillChunk` clamps the pair. The pure halves are
-    // tested in their own files; this pins that the two compose to the right
-    // answer, including for the archs that never opted in.
+    // `scheduler.postEvictionPrefillChunk` decides which reading runs — the
+    // SECOND one, the one taken against live memory (external review of PR
+    // #363; it shipped taking the max, which widened exactly when the memory
+    // it was widening onto had gone). The pure halves are tested in their own
+    // files; this pins that the two compose to the right answer, including for
+    // the archs that never opted in.
     const t = std.testing;
     const cfg = qwen4RequestTestConfig();
     const kv_bits: u64 = 8;
@@ -4790,10 +4793,15 @@ test "the post-eviction re-ask never narrows, and never runs on an arch that has
     const roomy: u64 = prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, widthForRung(&cfg, seq, 4096), .{});
     const reasked = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, roomy, pin, 0, .{});
     try t.expect(reasked > admitted);
-    try t.expectEqual(reasked, scheduler_mod.postEvictionPrefillChunk(admitted, reasked));
+    try t.expectEqual(reasked, scheduler_mod.postEvictionPrefillChunk(admitted, reasked).width);
 
     // No eviction pass: the single ask stands, whatever it was.
-    try t.expectEqual(admitted, scheduler_mod.postEvictionPrefillChunk(0, admitted));
+    try t.expectEqual(admitted, scheduler_mod.postEvictionPrefillChunk(0, admitted).width);
+
+    // And the reverse reading — memory moved between the two asks, so the
+    // ladder now affords only the floor — runs at the FLOOR, not at the width
+    // admission was billed at. Live memory is what the forward meets.
+    try t.expectEqual(admitted, scheduler_mod.postEvictionPrefillChunk(reasked, admitted).width);
 
     // A non-qwen4 arch is untouched end to end: the chooser returns the
     // load-time pin against ANY availability, so both readings are the pin and
@@ -4804,13 +4812,13 @@ test "the post-eviction re-ask never narrows, and never runs on an arch that has
     const other_post = chooseRequestPrefillChunk(&other, seq, 2048, kv_bits, roomy, pin, 0, .{});
     try t.expectEqual(pin, other_pre);
     try t.expectEqual(pin, other_post);
-    try t.expectEqual(pin, scheduler_mod.postEvictionPrefillChunk(other_pre, other_post));
+    try t.expectEqual(pin, scheduler_mod.postEvictionPrefillChunk(other_pre, other_post).width);
 
     per_request_chunk_override = false;
     defer per_request_chunk_override = null;
     const off_pre = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, 0, pin, 0, .{});
     const off_post = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, roomy, pin, 0, .{});
-    try t.expectEqual(pin, scheduler_mod.postEvictionPrefillChunk(off_pre, off_post));
+    try t.expectEqual(pin, scheduler_mod.postEvictionPrefillChunk(off_pre, off_post).width);
 }
 
 test "admissionLogLevel: free on the first request after a load and at the edge, quiet in the middle" {
