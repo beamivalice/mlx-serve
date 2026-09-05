@@ -225,8 +225,11 @@ fn readEnvUsize(name: [:0]const u8, default: usize) usize {
     return std.fmt.parseInt(usize, slice, 10) catch default;
 }
 
-/// Read a finite, strictly positive float from an environment variable,
-/// falling back to `default` when unset, empty, unparseable or non-finite.
+/// Read a finite, NON-NEGATIVE float from an environment variable, falling
+/// back to `default` when unset, empty, unparseable, negative or non-finite.
+/// (The doc used to say "strictly positive" while the code accepted 0; 0 is a
+/// meaningful setting for every current caller — a zero margin, a zero warm —
+/// so the comment was the wrong half.)
 fn readEnvFloat(name: [:0]const u8, default: f32) f32 {
     const raw = std.c.getenv(name.ptr);
     if (raw == null) return default;
@@ -8249,9 +8252,13 @@ pub const Generator = struct {
     /// That is the right trade: an off switch that costs literally nothing
     /// beats one that keeps a meter warm for the convenience of an A/B.
     var mtp_adaptive_serial_cache: ?bool = null;
+    /// Default ON; only an exact "0" turns it off. First-BYTE matching read
+    /// "01" and "0.5" as off, and the sibling `mtpHeadPersistFromEnv` two
+    /// screens up already uses exact equality — two kill switches in one file
+    /// should not disagree about what "0" means.
     pub fn mtpAdaptiveSerialEnabledFromEnv(raw: ?[]const u8) bool {
         const value = raw orelse return true;
-        return value.len == 0 or value[0] != '0';
+        return !std.mem.eql(u8, value, "0");
     }
 
     fn mtpAdaptiveSerialEnabled() bool {
