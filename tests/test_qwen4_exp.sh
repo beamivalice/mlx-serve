@@ -71,13 +71,24 @@ la=$(curl -s -m 1200 "$U/v1/chat/completions" -H 'content-type: application/json
 echo "  prompt_tokens|answer: $la"
 check "qsa engaged line" "$(grep -c '\[qsa\] sparse attention engaged' "$LOG")" "1"
 check "needle recovered" "$(echo "$la" | grep -c 'PELICAN-42')" "1"
-check "qsa prefill kernel engaged (mask arm of msv_attn_p256)" "$(grep -c '\[qsa-fused\] engaged' "$LOG")" "1"
-check "qsa decode gather engaged (S=1 subset rows)" "$(grep -c '\[qsa-decode-gather\] engaged' "$LOG")" "1"
+# Assert the INVARIANT (some QSA attention arm engaged), never one kernel's
+# name: dispatch priority moves, and a needle for the arm that lost the race
+# reads as a regression on a healthy tree. Prefill (S >= 16): the gather kernel
+# `[qsa-gather] engaged` serves first, the msv_attn_p256 mask arm
+# `[qsa-fused] engaged` is its fallback (MLX_SERVE_QSA_GATHER=0 selects it).
+check "qsa prefill attention arm engaged (gather kernel or msv_attn_p256 mask arm)" "$(grep -cE '\[qsa-gather\] engaged|\[qsa-fused\] engaged' "$LOG" | sed 's/^[1-9][0-9]*$/1/')" "1"
+# Decode (S=1): `[qsa-decode-gather] engaged` serves it, since the fused kernel
+# floors at S=2 — `MLX_SERVE_QSA_ATTN_MIN_S=1` hands the row to `[qsa-attn]`.
+check "qsa decode attention arm engaged (S=1 subset rows)" "$(grep -cE '\[qsa-decode-gather\] engaged|\[qsa-attn\] engaged' "$LOG" | sed 's/^[1-9][0-9]*$/1/')" "1"
 echo "[5b] MTP past the QSA budget (verify rows under the QSA mask)"
 longm=$(echo "$long" | python3 -c "import sys,json; d=json.load(sys.stdin); d['enable_mtp']=True; print(json.dumps(d))")
 lm=$(curl -s -m 1200 "$U/v1/chat/completions" -H 'content-type: application/json' -d "$longm" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['choices'][0]['message']['content'])")
 check "needle recovered under MTP" "$(echo "$lm" | grep -c 'PELICAN-42')" "1"
-check "masked verify split engaged" "$(grep -c 'sdpa-split\] masked arm engaged' "$LOG")" "1"
+# Verify widths (S=2..15): the fused QSA kernel `[qsa-attn] engaged` serves them
+# first; `splitMaskedSdpa256` (`[sdpa-split] masked arm engaged`) is the arm
+# behind it — reached through the verify gather or the dense mask, and selected
+# outright by MLX_SERVE_QSA_ATTN_KERNEL=0. Either satisfies the invariant.
+check "verify-width masked attention arm engaged" "$(grep -cE '\[qsa-attn\] engaged|\[sdpa-split\] masked arm engaged' "$LOG" | sed 's/^[1-9][0-9]*$/1/')" "1"
 echo "[6] MTP head: engagement + greedy equivalence"
 base=$(curl -s -m 600 "$U/v1/chat/completions" -H 'content-type: application/json' -d '{"messages":[{"role":"user","content":"Write a limerick about a cat."}],"max_tokens":80,"temperature":0,"enable_thinking":false,"enable_mtp":false}' | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'])")
 mtp=$(curl -s -m 600 "$U/v1/chat/completions" -H 'content-type: application/json' -d '{"messages":[{"role":"user","content":"Write a limerick about a cat."}],"max_tokens":80,"temperature":0,"enable_thinking":false,"enable_mtp":true}' | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'])")
