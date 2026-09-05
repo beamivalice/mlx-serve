@@ -923,6 +923,41 @@ pub fn effectiveSsmCheckpointStride(base: usize, prefill_chunk: usize) usize {
     return @max(base, prefill_chunk);
 }
 
+/// PURE: tokens of KV capacity this prefill reserves UP FRONT, and the ONE
+/// place the reservation is gated by architecture.
+///
+/// The reservation (#353) removes the grow transient a >32k prefill pays, at
+/// the price of allocating the generation headroom before a single token of it
+/// exists. That trade was measured on qwen4_exp at 100k-1M; on every other
+/// arch it is an unmeasured behaviour change — a request that fits today can
+/// be refused tomorrow because the guard now bills headroom the prompt may
+/// never use. So the reservation is asked for by `ModelConfig.longCtxGated()`
+/// and every other arch keeps the pre-#353 proportional growth
+/// (`KVCache.nextCapacityPolicy`) BYTE for byte: `reserve_tokens` stays 0, and
+/// `nextCapacityReserved` then IS `nextCapacity`.
+///
+/// `MLX_SERVE_KV_RESERVE=0` still turns it off inside the gate, for a
+/// same-boot A/B on the arch that has it.
+///
+/// The admission side of the same gate is `server.prefillRequestTerms`, which
+/// zeroes its per-request terms on the same predicate — the guard and the
+/// allocator must agree about whether a reservation exists at all, not only
+/// about its size.
+pub fn reservedPrefillTokens(
+    config: *const model_mod.ModelConfig,
+    seq: u64,
+    max_tokens: u64,
+    chunk: u64,
+) u64 {
+    if (!config.longCtxGated()) return 0;
+    return transformer_mod.KVCache.reservedTokens(
+        seq,
+        max_tokens,
+        chunk,
+        config.max_position_embeddings,
+    );
+}
+
 /// SSM checkpoints exist to feed prefix-cache reuse, and image-bearing
 /// prompts are excluded from prefix reuse (equal placeholder IDs do not imply
 /// equal images) — so vision prefills skip checkpointing even now that they
@@ -2363,11 +2398,11 @@ pub const Generator = struct {
             // admission guard already bills the FULL prompt length
             // (`server.reservedCacheTokens`), so this also stops the two
             // drifting apart. `total_ctx_for_chunk` is that absolute length.
-            const reserved_tokens = transformer_mod.KVCache.reservedTokens(
+            const reserved_tokens = reservedPrefillTokens(
+                &xfm.config,
                 total_ctx_for_chunk,
                 max_tokens,
                 default_chunk,
-                xfm.config.max_position_embeddings,
             );
             ctx.cache.reserve(@intCast(reserved_tokens));
             // The arch's OWN per-request buffers reserve at the SAME length.
@@ -15946,4 +15981,61 @@ test "mtpSerialProbeUseful: a probe buys the LAST missing input, never the first
     // Once the window is full the probe arms exactly as before.
     try testing.expectEqual(@as(?usize, b), G.mtpSerialProbeArm(&t, b, true, true, true, G.mtpSerialProbeUseful(12.5)));
     try testing.expectEqual(@as(u8, 1), t.serial_probes[b]);
+}
+
+test "reservedPrefillTokens: the KV capacity reservation is qwen4_exp-only; every other arch keeps a93e2c0's growth" {
+    // PR #363 item 1. The reservation pre-buys the prompt + a generation
+    // headroom + a chunk of slack past 32k tokens, and the admission guard
+    // bills it. On qwen4_exp that removes a measured 7.75 GB coexistence
+    // transient at 458k. On a 27B qwen3_5 at 131k it is a pure cost: memory
+    // reserved for a generation that may never happen, on a path nobody
+    // measured. Gated.
+    const t = std.testing;
+    const chunk: u64 = 4096;
+    const seq: u64 = 200_000;
+    const max_tokens: u64 = 2048;
+
+    var qwen4 = model_mod.ModelConfig{ .model_type = "qwen4_exp", .max_position_embeddings = 1_048_576 };
+    // The gated arch reserves exactly what `KVCache.reservedTokens` says — the
+    // guard's own function, so the two cannot drift. Reached through an alias
+    // so the scan pin below still counts exactly ONE direct call site.
+    const KVC = transformer_mod.KVCache;
+    try t.expectEqual(
+        KVC.reservedTokens(seq, max_tokens, chunk, 1_048_576),
+        reservedPrefillTokens(&qwen4, seq, max_tokens, chunk),
+    );
+    try t.expect(reservedPrefillTokens(&qwen4, seq, max_tokens, chunk) > seq);
+
+    // Every other arch: ZERO, which is `KVCache.reserve`'s no-op and leaves
+    // `reserve_tokens` at its default — `nextCapacityReserved` is then
+    // `nextCapacity`, the a93e2c0 policy, byte for byte.
+    for ([_][]const u8{ "qwen3_5", "qwen3_5_moe", "lfm2", "nemotron_h", "bailing_hybrid", "llama" }) |mt| {
+        var cfg = model_mod.ModelConfig{ .model_type = mt, .max_position_embeddings = 262_144 };
+        try t.expectEqual(@as(u64, 0), reservedPrefillTokens(&cfg, seq, max_tokens, chunk));
+    }
+
+    // ... and a reservation of 0 really is the a93e2c0 growth ladder. Pinned
+    // on the pure policy rather than on a live cache: `reserve(0)` never
+    // raises `reserve_tokens`, so `nextCapacityReserved(cap, needed)` reduces
+    // to `nextCapacityPolicy(cap, needed, linear)` at every capacity.
+    var cache = try KVC.init(t.allocator, 4);
+    defer cache.deinit();
+    cache.reserve(0);
+    try t.expectEqual(@as(usize, 0), cache.reserve_tokens);
+}
+
+test "reservedPrefillTokens: the prefill's ONE reservation site asks the gate, not the cache" {
+    // Scan pin. `KVCache.reservedTokens` is ungated by construction (the guard
+    // calls it too), so a call site that reaches it directly re-arms the
+    // reservation on every arch. There is exactly one such call in this file
+    // and it is inside the gated helper.
+    const t = std.testing;
+    const src = @embedFile("generate.zig");
+    const call = "transformer_mod.KVCache.reserved" ++ "Tokens(";
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, src, call));
+    const gate = "pub fn reservedPrefill" ++ "Tokens(";
+    const at = std.mem.indexOf(u8, src, gate) orelse return error.HelperMoved;
+    const body = src[at..@min(src.len, at + 500)];
+    try t.expect(std.mem.indexOf(u8, body, "config.longCtxGated()") != null);
+    try t.expect(std.mem.indexOf(u8, body, call) != null);
 }
