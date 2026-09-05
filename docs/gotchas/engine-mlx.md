@@ -4640,7 +4640,7 @@ It surfaced the only way it could: the fused replacement's first parity run went
 
 **The fused arm.** `msv_qsa_select` (`qsaSelectTopBlocks`, kill switch `MLX_SERVE_QSA_SELECT_KERNEL=0`) replaces the whole composed tail — bias → visibility `-inf` where → `argpartition` → slice → astype → `take_along_axis` → INT_MAX where → `sort` — with ONE dispatch, one threadgroup per query row. An MSD radix select over the score's monotone f32 ordinal (digits 11/11/10, a 2048-bin threadgroup histogram = 8 KiB, early exit the moment a bin's whole count is what is still needed, so the row is read 2-3 times) finds the threshold ordinal `T` and how many `== T` elements to take. Then one ascending compaction pass: an element is selected iff `ord > T`, or `ord == T` and its rank among the equals is below the quota, and its output slot is the number of selected elements with a SMALLER index — two running prefix sums give that directly, so **the row is born sorted and there is no sort pass at all**. The tie rule is exact by construction and independent of magnitude. `nb` rides the input SHAPE, never a template arg: it grows every `ratio` tokens of a generation and a template value would JIT a fresh specialization per decode step.
 
-**Measured (M5 Max, mixed-4-8bit pack, one binary, `MLX_SERVE_QSA_VERIFY_EXACT=0`).**
+**Measured (M5 Max, mixed-4-8bit pack, one binary).** The arm was selected with `MLX_SERVE_QSA_VERIFY_EXACT=0`, a lever that exists only on the parked branch `holtsway/mlx-serve@feat/qwen4-moe-verify-nax` — **so this table is not reproducible on this tree**; it is kept as the record of what was measured, not as a check anyone can re-run here.
 
 Forward µbench, 8 boots, order off/on/on/off per width:
 
