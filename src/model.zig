@@ -940,11 +940,36 @@ pub const ModelConfig = struct {
         return std.mem.eql(u8, self.model_type, "qwen4_exp");
     }
 
+    /// THE long-context blast-radius predicate. ONE definition for every
+    /// mechanism PR #363 introduced, so a non-qwen4_exp arch is byte-identical
+    /// to a93e2c0 on all of them at once.
+    ///
+    /// The PR was measured, tuned and benchmarked on ONE checkpoint
+    /// (Qwen3.8-Flash-Next) at 100k-1M tokens. Every mechanism in it is a
+    /// TRADE — a reservation that pre-buys memory, a pad-waste cap that
+    /// un-batches, a retention policy that moves where a warm turn restores,
+    /// an admission term that refuses earlier, a chunk bar that narrows the
+    /// forward — and none of those trades was measured anywhere else. A trade
+    /// applied to an arch nobody priced it on is a regression waiting for a
+    /// bug report, so the trades are opt-in BY ARCHITECTURE and the fixes
+    /// (double frees, errdefer scopes, the MLX error latch) are not.
+    ///
+    /// Never hand-roll the condition at a call site: a site with its own
+    /// conjunct is a second predicate, and the two drift (the
+    /// `supportsBatchedGdnDecode` story, one file up). Sites that cannot see a
+    /// ModelConfig mirror this ONCE into a field at wiring time
+    /// (`HotPrefixCache.span_preserving_cps`, the `qsa_history_required`
+    /// pattern) and are scan-pinned to it.
+    pub fn longCtxGated(self: *const ModelConfig) bool {
+        return self.isQwen4();
+    }
+
     /// SSD-first prefix cache (`MLX_SERVE_PREFIX_SSD_FIRST`): the ONE arch
     /// predicate every SSD-first mechanism checks. True only for qwen4_exp —
     /// every other arch keeps today's RAM-first behaviour byte-identically.
+    /// Delegates to `longCtxGated` so the blast radius has ONE body.
     pub fn ssdFirstCapable(self: *const ModelConfig) bool {
-        return self.isQwen4();
+        return self.longCtxGated();
     }
 
     /// True when per-request SSM/conv cache entries must exist: hybrid
@@ -6914,4 +6939,57 @@ test "parseConfigFromJson: --config-overrides replaces scalars and arrays, creat
     try testing.expectEqual(@as(u32, 3), clean.ngram_size);
     try testing.expectEqual([3]u32{ 11, 11, 10 }, clean.mrope_section);
     try testing.expect(!clean.rope_yarn);
+}
+
+test "ModelConfig.longCtxGated: the long-context blast radius is ONE predicate, qwen4_exp only" {
+    // PR #363's mechanisms — the KV capacity reservation, the batched
+    // pad-waste cap's kv-length rule, span-preserving checkpoint thinning, the
+    // new admission-bill terms and the prefill chunk's ctx bar — were measured
+    // on qwen4_exp alone. Every one of them asks THIS predicate, so a
+    // non-qwen4 arch is byte-identical to a93e2c0 on all of them at once.
+    const t = std.testing;
+    var qwen4 = ModelConfig{ .model_type = "qwen4_exp" };
+    try t.expect(qwen4.longCtxGated());
+    // ... and the SSD-first predicate is the SAME body, never a second one.
+    try t.expect(qwen4.ssdFirstCapable());
+
+    // The archs the reviewer named: the 27B sidecar-MTP pack (qwen3_5), the
+    // other hybrids that reach every checkpoint/batching site, and a plain
+    // dense attention arch.
+    for ([_][]const u8{
+        "qwen3_5",
+        "qwen3_5_moe",
+        "qwen3_next",
+        "lfm2",
+        "nemotron_h",
+        "bailing_hybrid",
+        "llama",
+        "mistral",
+        "gemma3",
+        "gemma4",
+        "deepseek_v4",
+        "muse_glimmer",
+    }) |mt| {
+        var cfg = ModelConfig{ .model_type = mt };
+        try t.expect(!cfg.longCtxGated());
+        try t.expect(!cfg.ssdFirstCapable());
+    }
+}
+
+test "ModelConfig.longCtxGated: ONE body — ssdFirstCapable delegates, nothing hand-rolls the string" {
+    // Class pin. The failure this prevents is a site growing its own
+    // conjunct: two predicates that agree today and drift at the next arch.
+    const t = std.testing;
+    const src = @embedFile("model.zig");
+    const decl = "pub fn ssdFirstCapable(self: *const ModelConfig) bool {";
+    const at = std.mem.indexOf(u8, src, decl) orelse return error.PredicateMoved;
+    const body = src[at .. at + 200];
+    try t.expect(std.mem.indexOf(u8, body, "self.longCtxGated()") != null);
+
+    // `longCtxGated` itself is the only non-test place the model_type string
+    // is compared for this purpose: `isQwen4` is the string, and the gate
+    // reads it.
+    const gate = "pub fn longCtxGated(self: *const ModelConfig) bool {";
+    const gat = std.mem.indexOf(u8, src, gate) orelse return error.PredicateMoved;
+    try t.expect(std.mem.indexOf(u8, src[gat .. gat + 120], "self.isQwen4()") != null);
 }

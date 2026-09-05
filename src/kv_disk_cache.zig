@@ -409,6 +409,12 @@ pub const DiskTier = struct {
     /// is unrestorable, so budgeting them behind the chunks made the first
     /// flush of a long entry worthless. False = today's shared budget.
     ssd_first: bool = false,
+    /// Checkpoint-retention policy for the persisted position set (PR #363
+    /// item 3). Mirrored from `HotPrefixCache.cp_thin` at wiring, like
+    /// `ssd_first`. The default is a93e2c0's behaviour at `ssmTargetPositions`:
+    /// it kept the highest N by a bulk shift, which is `.oldest` applied
+    /// repeatedly.
+    cp_thin: transformer_mod.ThinPolicy = .oldest,
     /// SSD-first mechanism 2: the background writer. Owned (heap-allocated so
     /// the mutex/condvars survive DiskTier being returned by value from
     /// `init`). Non-null = chunk and index bytes are serialized on the
@@ -1976,7 +1982,7 @@ pub const DiskTier = struct {
         }
         std.mem.sort(u32, set.items, {}, std.sort.asc(u32));
         while (set.items.len > SSM_DISK_MAX_PER_ENTRY) {
-            _ = set.orderedRemove(transformer_mod.positionDropIndex(set.items));
+            _ = set.orderedRemove(transformer_mod.positionDropIndex(set.items, self.cp_thin));
         }
         return set.toOwnedSlice(self.allocator);
     }
@@ -3722,6 +3728,9 @@ test "DiskTier: SSM retention thins the interior, keeping both ends" {
 
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-retain", 0, 128);
     defer tier.deinit();
+    // The span-preserving policy is qwen4_exp's (PR #363 item 3); the tier's
+    // DEFAULT is a93e2c0's drop-oldest, asserted in the ungated arm below.
+    tier.cp_thin = .min_span_recency;
 
     // KV covering 0..(N*100) so every checkpoint position is ≤ kv_len.
     const N = SSM_DISK_MAX_PER_ENTRY + 1; // 9 positions, one over the cap
@@ -4716,6 +4725,8 @@ test "DiskTier: SSM retention spacing is priced against the tier, not just cappe
     const base = try tmpRoot(&tmp, io, &buf);
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-spacing", 0, 128);
     defer tier.deinit();
+    try testing.expectEqual(transformer_mod.ThinPolicy.oldest, tier.cp_thin); // a93e2c0 default
+    tier.cp_thin = .min_span_recency;
 
     const L: u32 = 383_069;
     var positions: [94]u32 = undefined;
@@ -4736,6 +4747,24 @@ test "DiskTier: SSM retention spacing is priced against the tier, not just cappe
     while (i < kept.len) : (i += 1) {
         const gap = kept[i] - kept[i - 1];
         if (gap > max_gap) max_gap = gap;
+    }
+
+    // THE UNGATED ARM (PR #363 item 3). Every other arch keeps a93e2c0's
+    // retention: a bulk shift that kept the HIGHEST N, i.e. `.oldest` applied
+    // repeatedly. Transcribed from `git show a93e2c0:src/kv_disk_cache.zig`
+    // (ssmTargetPositions, line 1180): `copyForwards(set.items[0..len-drop],
+    // set.items[drop..])`.
+    {
+        var legacy = try DiskTier.init(testing.allocator, io, base, "fp-spacing-legacy", 0, 128);
+        defer legacy.deinit();
+        try testing.expectEqual(transformer_mod.ThinPolicy.oldest, legacy.cp_thin);
+        const old_kept = try legacy.ssmTargetPositions(&positions, &[_]transformer_mod.SSMCheckpoint{}, L);
+        defer testing.allocator.free(old_kept);
+        try testing.expectEqual(SSM_DISK_MAX_PER_ENTRY, old_kept.len);
+        // End-anchored: the survivors are the last N of the input, so the
+        // LOWEST is high and an early-diverging restore finds nothing under it.
+        try testing.expectEqualSlices(u32, positions[positions.len - SSM_DISK_MAX_PER_ENTRY ..], old_kept);
+        try testing.expect(old_kept[0] > kept[0]);
     }
     // Two properties, not one. The list is NOT evenly spaced: the newest
     // quarter stays at capture density (a warm turn that edits near the end

@@ -3052,28 +3052,68 @@ const HOT_CACHE_FLOOR_BYTES: u64 = 1024 * 1024 * 1024;
 /// 28.2 GB serving budget, and a rung sized against the quarter share of the
 /// WHOLE budget then spends the remaining 8 GB on one forward and leaves the
 /// cache at the clamp's 1-byte floor.
-pub fn resolvePrefillChunk(
+/// PURE: the byte cap ONE prefill forward's transient may claim, and the ONE
+/// place PR #363's two changes to the chunk sizer are gated by architecture.
+///
+/// a93e2c0 sized the rung against `ceiling - active_mem - hot_cache_ask`, a
+/// quarter share. PR #363 changed BOTH halves for every arch at once:
+///
+///   1. it dropped the hot-cache ASK from the budget (which WIDENS the rung),
+///      because feeding the ask in here closed a loop that was non-monotone in
+///      the ask — a bigger `--prefix-cache-mem` stepped the chunk DOWN, which
+///      shrank the reserve, which handed the cache MORE bytes than a smaller
+///      ask got (live: 10 GB clamped to 3873 MB, 24 GB to 5703 MB, same box);
+///   2. it added the ctx bar, `(budget - ctx_kv) - HOT_CACHE_FLOOR_BYTES`,
+///      which can only ever NARROW, and on a dense model with a large
+///      `--ctx-size` pins chunk 512 for the life of the process.
+///
+/// Both are real, and both were measured on qwen4_exp at 1M context. Neither
+/// was measured on anything else, and together they move the prefill width —
+/// the biggest multiplier in the whole memory bill — on every arch. So they
+/// arrive together, behind `ModelConfig.longCtxGated()`, and every other arch
+/// takes a93e2c0's arithmetic byte for byte. The non-monotone ask loop is a
+/// known defect on the ungated arm; it is the defect a93e2c0 shipped, and
+/// unwinding it belongs to a change that measures the archs it touches.
+///
+/// `MLX_SERVE_PREFILL_CHUNK_CTX_BAR=0` still drops bar 2 inside the gate.
+pub fn prefillChunkCap(
     config: *const model_mod.ModelConfig,
-    kv_bits: u64,
     ceiling: u64,
     active_mem: u64,
     ctx_kv_bytes: u64,
-) u32 {
+    hot_cache_ask: u64,
+) u64 {
+    if (!config.longCtxGated()) {
+        // a93e2c0, verbatim: the ask is spoken for, and a quarter of what is
+        // left is the whole cap.
+        const spoken_for: u64 = active_mem +| hot_cache_ask;
+        return (ceiling -| spoken_for) / PREFILL_RESERVE_BUDGET_SHARE;
+    }
     const serving_budget: u64 = ceiling -| active_mem;
     // Two ask-independent bars, both of which the rung must clear: a share of
     // the serving budget (one forward never trades the whole session for its
     // own speed), and whatever the pinned context leaves, less a cache worth
     // having.
     const share_bar: u64 = serving_budget / PREFILL_RESERVE_BUDGET_SHARE;
-    // The ctx bar is a BEHAVIOUR CHANGE for every arch, not just the one this
-    // work is about, and it can only ever narrow (audit S9). `--ctx-size` is a
-    // CAP, not an allocation — the KV reservation itself deliberately refuses
-    // to pre-buy the whole window — so billing the entire configured context
-    // here can pin chunk 512 for the life of a process on a dense model with a
-    // large `--ctx-size`. `MLX_SERVE_PREFILL_CHUNK_CTX_BAR=0` restores the
-    // share-only cap, and the narrowing is LOGGED rather than silent.
+    // The ctx bar can only ever narrow (audit S9). `--ctx-size` is a CAP, not
+    // an allocation — the KV reservation itself deliberately refuses to
+    // pre-buy the whole window — so billing the entire configured context here
+    // can pin chunk 512 for the life of a process. `MLX_SERVE_PREFILL_CHUNK_-
+    // CTX_BAR=0` restores the share-only cap, and the narrowing is LOGGED
+    // rather than silent.
     const ctx_bar: u64 = if (ctxBarEnabled()) (serving_budget -| ctx_kv_bytes) -| HOT_CACHE_FLOOR_BYTES else share_bar;
-    const cap: u64 = @min(share_bar, ctx_bar);
+    return @min(share_bar, ctx_bar);
+}
+
+pub fn resolvePrefillChunk(
+    config: *const model_mod.ModelConfig,
+    kv_bits: u64,
+    ceiling: u64,
+    active_mem: u64,
+    ctx_kv_bytes: u64,
+    hot_cache_ask: u64,
+) u32 {
+    const cap: u64 = prefillChunkCap(config, ceiling, active_mem, ctx_kv_bytes, hot_cache_ask);
     for (PREFILL_CHUNK_LADDER) |chunk| {
         if (prefillTransientReserve(config, kv_bits, chunk) <= cap) return chunk;
     }
@@ -3117,10 +3157,11 @@ pub fn billedPrefillChunk(
     ceiling: u64,
     active_mem: u64,
     ctx_kv_bytes: u64,
+    hot_cache_ask: u64,
     chunk_override: u32,
 ) u32 {
     if (chunk_override > 0) return chunk_override;
-    return resolvePrefillChunk(config, kv_bits, ceiling, active_mem, ctx_kv_bytes);
+    return resolvePrefillChunk(config, kv_bits, ceiling, active_mem, ctx_kv_bytes, hot_cache_ask);
 }
 
 /// The context KV the chunk sizer must leave standing: the PINNED context's
@@ -3144,19 +3185,27 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
         var active_mem: usize = 0;
         _ = mlx.mlx_get_active_memory(&active_mem);
         const kv_bits: u64 = defaultKvBits();
+        // The hot-cache ASK is the a93e2c0 term, read only on the ungated arm
+        // (`prefillChunkCap`); the gated arm ignores it by construction.
+        // Through the accessor, never the global: at pin time nothing has
+        // published a clamped budget yet so this IS the raw ask (a93e2c0's
+        // `prefix_cache_mem_bytes`), and if a later model pins after a publish
+        // the accessor is the one that knows the switch retired it.
+        const hot_cache_ask = resolvedPrefixCacheMem();
         config.pinned_prefill_chunk = billedPrefillChunk(
             config,
             kv_bits,
             currentGpuMemoryCeiling(active_mem),
             active_mem,
             sizerCtxKvBytes(config, kv_bits),
+            hot_cache_ask,
             explicitPrefillChunk(),
         );
-        // The ctx bar can narrow the rung on ANY arch, so say when it is the
-        // binding one — a chunk pinned at 512 by a large `--ctx-size` is
-        // otherwise indistinguishable from a small box (audit S9).
-        if (ctxBarEnabled() and explicitPrefillChunk() == 0) {
-            const share_only = resolvePrefillChunk(config, kv_bits, currentGpuMemoryCeiling(active_mem), active_mem, 0);
+        // The ctx bar narrows the rung on the GATED arch only, so say when it
+        // is the binding one — a chunk pinned at 512 by a large `--ctx-size`
+        // is otherwise indistinguishable from a small box (audit S9).
+        if (ctxBarEnabled() and config.longCtxGated() and explicitPrefillChunk() == 0) {
+            const share_only = resolvePrefillChunk(config, kv_bits, currentGpuMemoryCeiling(active_mem), active_mem, 0, hot_cache_ask);
             if (share_only > config.pinned_prefill_chunk) {
                 log.info("[prefill] chunk {d} (ctx bar: the --ctx-size KV bill; share-only would allow {d}; MLX_SERVE_PREFILL_CHUNK_CTX_BAR=0 restores)\n", .{ config.pinned_prefill_chunk, share_only });
             }
@@ -3254,7 +3303,7 @@ pub fn planHotCache(
     requested: u64,
     chunk_override: u32,
 ) HotCachePlan {
-    const chunk = billedPrefillChunk(config, kv_bits, ceiling, active_weights, sizer_ctx_kv, chunk_override);
+    const chunk = billedPrefillChunk(config, kv_bits, ceiling, active_weights, sizer_ctx_kv, requested, chunk_override);
     const reserve_chunk = clampReserveWidth(config, chunk);
     const reserve = prefillTransientReserve(config, kv_bits, reserve_chunk);
     const ctx_kv: u64 = (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +|
@@ -3584,8 +3633,15 @@ test "clampedPrefixCacheMem: the budget never exceeds what the weights leave und
 /// and `qsaMaskBytes`) are non-zero. The absolute rung it lands on depends on
 /// the checkpoint's own reserve ladder; every assertion below is an INVARIANT
 /// over that ladder, never a hardcoded width.
+///
+/// It DECLARES `qwen4_exp` (a test config is a checkpoint CLAIM): only that
+/// arch parses the indexer fields this fixture sets, and every #363 mechanism
+/// is gated on `ModelConfig.longCtxGated()`, so a fixture that left the
+/// default `model_type` would silently measure the a93e2c0 arm while claiming
+/// to pin the new one.
 fn longCtxTestConfig() model_mod.ModelConfig {
     var cfg = model_mod.ModelConfig{};
+    cfg.model_type = "qwen4_exp";
     cfg.num_hidden_layers = 40;
     cfg.num_attention_heads = 24;
     cfg.num_key_value_heads = 2;
@@ -3733,10 +3789,10 @@ test "an explicit --prefill-chunk is the chunk that gets BILLED" {
         generate_mod.prefill_chunk_explicit = false;
     }
     try t.expectEqual(@as(u32, 4096), explicitPrefillChunk());
-    const sized = resolvePrefillChunk(&cfg, kv_bits, ceiling, weights, 0);
+    const sized = resolvePrefillChunk(&cfg, kv_bits, ceiling, weights, 0, 0);
     try t.expect(sized < 4096); // the machine would have narrowed it
 
-    const billed = billedPrefillChunk(&cfg, kv_bits, ceiling, weights, 0, explicitPrefillChunk());
+    const billed = billedPrefillChunk(&cfg, kv_bits, ceiling, weights, 0, 0, explicitPrefillChunk());
     try t.expectEqual(@as(u32, 4096), billed);
 
     // The other reader, called with that same pin, agrees — this is the pair
@@ -5435,6 +5491,29 @@ pub fn retainedSsmCheckpointBytes(config: *const model_mod.ModelConfig, seq: u64
 /// eviction decision and the reservation the engine actually makes are the
 /// same arithmetic (the #126 one-estimator discipline).
 pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u64, kv_bits: u64, chunk: u64, warm: WarmPrefix) PrefillRequestTerms {
+    // THE ARCH GATE for every term in this struct (PR #363 item 4). All four
+    // are new bill terms, and all four reach archs nobody measured them on:
+    //
+    //   `reserved_kv_bytes`  -- `KVCache.reservedTokens` has no arch test, so
+    //      every arch past a 32k prompt was billed up to (8192 + chunk) rows of
+    //      headroom. Worse, its ALLOCATOR twin IS gated
+    //      (`generate.reservedPrefillTokens`): off qwen4 the guard billed
+    //      memory the engine then never reserved. A pure over-bill is a 400 on
+    //      a prompt a93e2c0 admitted.
+    //   `checkpoint_bytes`   -- `ModelConfig.ssmCheckpointBytes` keys on
+    //      `linear_num_value_heads`, which is parsed generically: qwen3_5,
+    //      qwen3_5_moe, qwen3_next and bailing_hybrid all bill it (~1.9 GB on a
+    //      36-layer GDN trunk), while lfm2 and nemotron_h bill zero. An
+    //      under-bill fixed unevenly across the hybrids is not a fix.
+    //   `state_bytes`        -- 0 off qwen4 anyway (`statePerTokenBilled`).
+    //   `shared_resident_bytes` -- the warm CREDIT, and the only term that errs
+    //      toward UNDER-billing. Its failure mode is an uncatchable Metal abort,
+    //      so it is the last term that should ship unmeasured.
+    //
+    // Zeroing the struct makes `prefillMemoryNeeded` reduce to a93e2c0's
+    // 13-argument expression exactly: every new term is added into `gross` and
+    // the credit is a saturating subtraction, so `.{}` is the identity.
+    if (!config.longCtxGated()) return .{};
     // `reservedTokens` returns 0 below its length threshold (a short request
     // keeps the proportional growth policy). The prompt's own rows are still
     // billed, so floor the reserved length at `seq`: short prompts then bill
@@ -20827,7 +20906,7 @@ test "resolvePrefillChunk: a squeezed box steps the chunk down; a roomy one keep
 
     const ceiling_16: u64 = 11_918_000_000;
     const weights: u64 = 4_080_000_000;
-    const narrowed = resolvePrefillChunk(&mistral, 16, ceiling_16, weights, 0);
+    const narrowed = resolvePrefillChunk(&mistral, 16, ceiling_16, weights, 0, 0);
     try t.expect(narrowed < 8192);
     try t.expect(narrowed >= 512);
     // It is the WIDEST rung that fits, not simply the floor.
@@ -20839,11 +20918,11 @@ test "resolvePrefillChunk: a squeezed box steps the chunk down; a roomy one keep
     }
 
     // Same model, a machine with room: nothing narrows.
-    try t.expectEqual(@as(u32, 8192), resolvePrefillChunk(&mistral, 16, 95 * GiB, weights, 0));
+    try t.expectEqual(@as(u32, 8192), resolvePrefillChunk(&mistral, 16, 95 * GiB, weights, 0, 0));
 
     // A model that barely fits gets the narrowest rung rather than a wide one
     // it cannot pay for — and never 0, which would read as "not pinned".
-    try t.expectEqual(@as(u32, 512), resolvePrefillChunk(&mistral, 16, weights + 64 * 1024 * 1024, weights, 0));
+    try t.expectEqual(@as(u32, 512), resolvePrefillChunk(&mistral, 16, weights + 64 * 1024 * 1024, weights, 0, 0));
 
     // Every rung is a real ladder entry, descending, floored at generate's own
     // minimum — a chunk generate would refuse is a chunk the bill cannot model.
@@ -20888,8 +20967,8 @@ test "qsaMaskBytes: a qwen4_exp twin bills the QSA mask and steps a rung the qwe
     // A ceiling whose quarter-share sits between the two bills at 8192.
     const weights: u64 = 70_000_000_000;
     const ceiling = weights + (twin_bill + q4_bill) / 2 * 4;
-    try t.expectEqual(@as(u32, 8192), resolvePrefillChunk(&twin, 16, ceiling, weights, 0));
-    try t.expectEqual(@as(u32, 4096), resolvePrefillChunk(&q4, 16, ceiling, weights, 0));
+    try t.expectEqual(@as(u32, 8192), resolvePrefillChunk(&twin, 16, ceiling, weights, 0, 0));
+    try t.expectEqual(@as(u32, 4096), resolvePrefillChunk(&q4, 16, ceiling, weights, 0, 0));
 }
 
 test "resolvePrefillChunk: the sizer and the guard bill the chunk that was pinned" {
@@ -21375,7 +21454,7 @@ test "resolvePrefillChunk: the 16 GB tier gets a working context instead of the 
 
     // The hot-cache budget is no longer an input (see the ask-independence
     // fix); auto-context here means the pinned-context bar is 0 too.
-    const chunk = resolvePrefillChunk(&cfg, 16, ceiling, weights, 0);
+    const chunk = resolvePrefillChunk(&cfg, 16, ceiling, weights, 0, 0);
     const sized = safeContextForBudget(ceiling, weights, 2 * GiB +| prefillTransientReserve(&cfg, 16, chunk), per_tok, 32768);
     try t.expect(sized > 12_000);
 
@@ -23616,4 +23695,117 @@ test "pinnedResidentBytes names the entry a restore would share, and only that" 
     // Saturating: the two numbers are published from different sites and a
     // reader can catch them mid-swap, and a negative pin is not a claim.
     try t.expectEqual(@as(u64, 0), pinnedResidentBytes(.{ .evictable = 1, .reclaimable = 2 }));
+}
+
+test "prefillChunkCap: the chunk sizer's two #363 changes are qwen4_exp-only" {
+    // PR #363 item 5 (the ctx bar) plus the half the reviewer's list did not
+    // name: `resolvePrefillChunk` also DROPPED the hot-cache ask from the
+    // serving budget. Both moved the prefill width — the biggest multiplier in
+    // the memory bill — on every arch, and both were measured on qwen4_exp
+    // alone.
+    //
+    // The ungated arithmetic is a93e2c0's, transcribed from
+    // `git show a93e2c0:src/server.zig` (resolvePrefillChunk, line 2847):
+    //     spoken_for   = active_mem + hot_cache_ask
+    //     serving      = ceiling > spoken_for ? ceiling - spoken_for : 0
+    //     cap          = serving / PREFILL_RESERVE_BUDGET_SHARE
+    const t = std.testing;
+    const GiB: u64 = 1 << 30;
+    const ceiling: u64 = 120 * GiB;
+    const weights: u64 = 69 * GiB;
+    const ask: u64 = 10 * GiB;
+    const ctx_kv: u64 = 20 * GiB;
+
+    // Every other arch: a93e2c0, byte for byte — the ask is spoken for, the
+    // context is NOT, and no HOT_CACHE_FLOOR is subtracted.
+    for ([_][]const u8{ "qwen3_5", "qwen3_5_moe", "lfm2", "nemotron_h", "bailing_hybrid", "llama", "mistral" }) |mt| {
+        var cfg = longCtxTestConfig();
+        cfg.model_type = mt;
+        const baseline: u64 = (ceiling - (weights + ask)) / PREFILL_RESERVE_BUDGET_SHARE;
+        try t.expectEqual(baseline, prefillChunkCap(&cfg, ceiling, weights, ctx_kv, ask));
+        // ... and the ctx bar cannot touch it: a huge pinned context leaves
+        // the cap exactly where it was.
+        try t.expectEqual(baseline, prefillChunkCap(&cfg, ceiling, weights, 48 * GiB, ask));
+        // ... nor does the ask stop mattering.
+        try t.expect(prefillChunkCap(&cfg, ceiling, weights, ctx_kv, 0) > baseline);
+    }
+
+    // qwen4_exp: the ask is ignored, and the ctx bar binds.
+    var q4 = longCtxTestConfig();
+    q4.model_type = "qwen4_exp";
+    const serving: u64 = ceiling - weights;
+    const share_bar: u64 = serving / PREFILL_RESERVE_BUDGET_SHARE;
+    const want: u64 = @min(share_bar, (serving - ctx_kv) -| HOT_CACHE_FLOOR_BYTES);
+    try t.expectEqual(want, prefillChunkCap(&q4, ceiling, weights, ctx_kv, ask));
+    // The ask really is ignored on the gated arm.
+    try t.expectEqual(
+        prefillChunkCap(&q4, ceiling, weights, ctx_kv, 0),
+        prefillChunkCap(&q4, ceiling, weights, ctx_kv, 24 * GiB),
+    );
+    // A pinned context big enough to bind narrows the cap BELOW the share.
+    try t.expect(prefillChunkCap(&q4, ceiling, weights, 48 * GiB, ask) < share_bar);
+
+    // The whole gate is ONE predicate, in ONE function.
+    const src = @embedFile("server.zig");
+    const at = std.mem.indexOf(u8, src, "pub fn prefillChunk" ++ "Cap(") orelse return error.HelperMoved;
+    const body = src[at..@min(src.len, at + 1800)];
+    try t.expect(std.mem.indexOf(u8, body, "config.longCtxGated()") != null);
+    // and the ladder walker holds no arithmetic of its own.
+    const rat = std.mem.indexOf(u8, src, "pub fn resolvePrefill" ++ "Chunk(") orelse return error.HelperMoved;
+    const rbody = src[rat..@min(src.len, rat + 700)];
+    try t.expect(std.mem.indexOf(u8, rbody, "prefillChunk" ++ "Cap(config, ceiling, active_mem, ctx_kv_bytes, hot_cache_ask)") != null);
+    try t.expect(std.mem.indexOf(u8, rbody, "PREFILL_RESERVE_BUDGET_" ++ "SHARE") == null);
+}
+
+test "prefillRequestTerms: the admission bill's new terms are qwen4_exp-only" {
+    // PR #363 item 4, and the clearest policy violation the review found: the
+    // ALLOCATOR side of the reservation is gated (`generate.reservedPrefill-
+    // Tokens`) while the GUARD side was not, so off qwen4_exp the bill charged
+    // headroom the engine would never reserve. A pure over-bill is a 400 on a
+    // prompt a93e2c0 admitted.
+    const t = std.testing;
+    const seq: u64 = 200_000; // well past RESERVE_MIN_TOKENS
+    const chunk: u64 = 4096;
+    const max_tokens: u64 = 8192;
+    const kv_bits: u64 = 8;
+
+    // A 27B-class GatedDeltaNet pack: `linear_num_value_heads` is parsed
+    // generically, so `ssmCheckpointBytes()` is NON-zero here and the
+    // checkpoint term really did bill on this arch.
+    var q35 = qwen4ExpOomConfig();
+    q35.model_type = "qwen3_5_moe";
+    try t.expect(q35.ssmCheckpointBytes() > 0);
+    try t.expect(retainedSsmCheckpointBytes(&q35, seq, chunk) > 0);
+
+    const warm = WarmPrefix{ .matched_tokens = 100_000, .capacity_tokens = 400_000 };
+    for ([_][]const u8{ "qwen3_5", "qwen3_5_moe", "qwen3_next", "bailing_hybrid", "lfm2", "nemotron_h", "llama", "mistral" }) |mt| {
+        var cfg = qwen4ExpOomConfig();
+        cfg.model_type = mt;
+        const terms = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, warm);
+        try t.expectEqual(@as(u64, 0), terms.reserved_kv_bytes);
+        try t.expectEqual(@as(u64, 0), terms.checkpoint_bytes);
+        try t.expectEqual(@as(u64, 0), terms.state_bytes);
+        try t.expectEqual(@as(u64, 0), terms.shared_resident_bytes);
+        // ...which makes the whole bill a93e2c0's 13-argument expression: the
+        // new terms are added into `gross` and the credit is a saturating
+        // subtraction, so `.{}` is the identity.
+        try t.expectEqual(
+            prefillMemoryNeeded(seq, 24, 2, cfg.kvBytesPerToken(), 256, 256, 2560, 9216, kv_bits, chunk, cfg.prefillAttnKeys(seq), prefillStreamBytesPerToken(&cfg), prefillDequantWeightBytes(&cfg), .{}),
+            prefillMemoryNeeded(seq, 24, 2, cfg.kvBytesPerToken(), 256, 256, 2560, 9216, kv_bits, chunk, cfg.prefillAttnKeys(seq), prefillStreamBytesPerToken(&cfg), prefillDequantWeightBytes(&cfg), terms),
+        );
+    }
+
+    // qwen4_exp keeps every term.
+    const q4 = qwen4ExpOomConfig();
+    const gated = prefillRequestTerms(&q4, seq, max_tokens, kv_bits, chunk, warm);
+    try t.expect(gated.reserved_kv_bytes > 0);
+    try t.expect(gated.checkpoint_bytes > 0);
+    try t.expect(gated.state_bytes > 0);
+    try t.expect(gated.shared_resident_bytes > 0);
+
+    // ONE predicate, at the top of the ONE function that builds the struct.
+    const src = @embedFile("server.zig");
+    const at = std.mem.indexOf(u8, src, "pub fn prefillRequest" ++ "Terms(") orelse return error.CallSiteMoved;
+    const body = src[at..@min(src.len, at + 2600)];
+    try t.expect(std.mem.indexOf(u8, body, "if (!config.longCtx" ++ "Gated()) return .{};") != null);
 }
