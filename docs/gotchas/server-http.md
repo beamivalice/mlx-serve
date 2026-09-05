@@ -2383,17 +2383,26 @@ prefill path now asks the width TWICE around the eviction pass:
    them) and never `reclaimable` (a projection).
 4. The re-ask, then `scheduler.postEvictionPrefillChunk(admitted, reasked)`.
 
-**The clamp is an assertion, not a policy.** An eviction only ever RETURNS
-memory, so post-eviction availability is `>=` pre-eviction and `reasked >=
-admitted` by construction — the chooser's ladder is monotone and its fallback
-is the floor. Taking the MAX therefore changes nothing on the expected path and
-catches the one case that would be a real bug: a narrower re-ask, which can only
-mean memory moved between the two reads (a co-tenant slot's decode
-allocations). There the admitted width is the one a bill was actually taken at,
-and the per-chunk adapter — the mechanism that IS allowed to narrow — re-prices
-from it at the first chunk boundary. Both directions log under `[prefill] re-ask:` (a distinct
-prefix from the per-chunk `[prefill] width N -> M at pos P` contract line), the
-widening at info naming the bytes the pass returned.
+**The re-ask is the truth, and the comparison is only a log.** This shipped as
+`@max(admitted, reasked)`, argued as an assertion: an eviction only ever
+RETURNS memory, so post-eviction availability is `>=` pre-eviction, the max
+changes nothing on the expected path, and it "catches" the impossible case. The
+external review of PR #363 turned that argument around. A max is not an
+assertion — it is a clamp, and the ONLY case in which it does anything is the
+case where the invariant broke. There it discards the reading taken after the
+pass against LIVE memory and keeps the pre-eviction one because it is WIDER,
+which is widening onto memory that has already gone to a co-tenant slot's
+decode: the uncatchable Metal OOM, arrived at by way of a safety check. The
+costs are not symmetric and the safe arm is the narrow one, so the second
+reading — taken by the same estimator that admits the request, after the pass,
+against what is actually free — is the width that runs, whichever direction it
+moved. The floor still holds because the CHOOSER holds it: its ladder falls
+through to the floor rung and `postEvictionPrefillChunk` computes no width of
+its own. Both directions log under `[prefill] re-ask:` (a distinct prefix from
+the per-chunk `[prefill] width N -> M at pos P` contract line), the widening at
+info naming the bytes the pass returned, the narrowing at warn naming both
+widths — a narrow re-ask is rare and worth seeing, it is just not worth
+overruling.
 
 The re-asked width has to reach two consumers with different rules, and a
 change that wires one and not the other ships a width nobody runs:
@@ -3277,13 +3286,22 @@ allocator's own before/after reading), never the pre-eviction ESTIMATE
 (`accounted_bytes`/`reclaimable`), which prices what eviction is expected to
 free rather than what it did.
 
-`postEvictionPrefillChunk` asserts `reasked >= admitted` — post-eviction
-available memory can only rise, never fall, so a re-ask that came back
-NARROWER than the original admission would mean memory moved between the two
-readings, which should be structurally impossible on this path. The assertion
-is a canary for that impossible case, not a normal-path clamp: on the expected
-path the max() changes nothing, but catching a violation here is cheaper than
-debugging the OOM it would otherwise cause three requests later. `cap_adapt`,
+`postEvictionPrefillChunk` RUNS THE RE-ASK, in both directions. It shipped as
+`@max(admitted, reasked)`, sold as an assertion that post-eviction available
+memory can only rise — a canary for an impossible case, free on the expected
+path. The external review of PR #363 pointed out that this is backwards: a max
+is not an assertion, and the only case in which it does anything at all is the
+case where the invariant BROKE. Where the invariant holds the max is a no-op;
+where memory moved under us between the two readings (a co-tenant slot's decode
+allocations) it discards the reading taken against live memory and keeps the
+stale, WIDER one — widening onto memory that is gone, which is exactly the
+uncatchable Metal OOM the asymmetry argument above exists to avoid. The narrow
+arm only ever costs throughput. So the second reading is the one that runs, and
+the direction is only LOGGED: `[prefill] re-ask:` at info when the pass bought a
+wider rung, at warn when it came back narrower. The width still never falls
+below the ladder floor, because the CHOOSER cannot produce anything narrower
+(`chooseRequestPrefillChunk` falls through to the floor rung) and this function
+computes no width of its own. `cap_adapt`,
 the per-chunk adaptive ceiling, is built PIN-LESS — via `effectivePrefillChunk(…,
 0)`, a literal zero rung rather than the request's pinned width — specifically
 so it can never be the thing that clips a re-ask back down to the pre-eviction
@@ -3328,8 +3346,10 @@ running below `debug` doesn't pay for a CAS on every request only to discard
 the log line.
 
 Tests: `postEvictionPrefillChunk` (widens after an eviction that freed memory,
-holds the original width when eviction freed nothing, never narrows relative to
-the pre-eviction ask, is a no-op when the two readings are unchanged), the
+holds the single ask when eviction freed nothing, RUNS a narrower re-ask and
+flags it as `moved`, is a no-op when the two readings are unchanged, and hands
+back the ladder floor unmodified), a scan that its body contains no `@max` over
+the pair, the
 composition of the two-ask logic against `chooseRequestPrefillChunk` including
 both the gate-disabled and non-qwen4 arms, a scan of the four-step admit/evict/reask/apply
 order, the `cap_adapt` pin-less-seam scan, `admissionLogLevel`'s
@@ -3688,3 +3708,110 @@ unchanged — it still has no slot, no cache and no capacity reading, so it defe
 Numbers at the pinned scenario are unchanged where the checkout is taken: cold
 24,475 MB, credit 786,676 × 13,056 × 5/4 = 12,244 MB, warm 12,231 MB against
 19,032 MB free. Everywhere else the bill is the cold one again.
+## The 400/503 mapping existed only where nobody was looking (external review of PR #363, item 2, 2026-09-06)
+
+Two named, actionable errors reach a client from the generation path: a memory
+503 when the MLX working-set latch (#353) abandons a request mid-forward, and a
+400 when the admission estimator refuses a prompt that does not fit even with an
+empty hot cache. Both messages name the levers. Both were written four times —
+once per surface — on the NON-STREAMING arm only.
+
+The streaming arms did something else entirely. `/v1/chat/completions` wrote
+`data: {"error":{"message":"Internal server error: GenerationOutOfMemory",
+"type":"server_error"}}`. `/v1/messages` wrote the same string into an
+Anthropic `error` event. `/v1/completions` logged the error and wrote
+**nothing** — the client got a dropped socket mid-stream. `/v1/responses` had no
+`catch` anywhere on its path, streaming or not, so the error propagated to the
+route dispatcher and the socket died there too.
+
+Agents stream. So the surface that carried the actionable message was the one
+almost nobody reached, and the surface everyone reached carried a Zig error name.
+
+The fix is ONE mapping, `server.mapGenerationError`, asked by both paths:
+
+* `error.GenerationOutOfMemory` / `error.OutOfMemory` → 503, `GEN_OOM_MSG`;
+* `error.PrefillDoesNotFit` → 400, `PREFILL_NOFIT_MSG` (a request refused before
+  its first forward is the client's request being too large, not an engine
+  fault, so `invalid_request_error` on BOTH dialects);
+* `error.GenerationFailed` → 500, "generation failed";
+* anything else → 500 keeping the error NAME in the message — the streaming
+  arms' one virtue over the non-streaming ones, which sent it bare.
+
+`sendGenerationError` is the single arm every surface's `catch` calls, and it
+branches on ONE fact: has the SSE response head gone out?
+
+* **Not yet** — the status line is still ours, so the streaming request gets
+  byte-for-byte the response its non-streaming twin would have got. A client
+  should not have to parse a different error shape because it asked for a
+  stream.
+* **Already** — the status is spent, so the same `type` and `message` ride the
+  surface's terminal `error` event: an OpenAI `data:` frame that also carries
+  `choices[0].finish_reason: "error"` (so a client parsing only chunks
+  terminates instead of waiting out a stream that will never deliver another
+  delta) followed by `[DONE]`; an Anthropic `event: error` (which IS the
+  terminator there — no `[DONE]`); a Responses `event: error` with its
+  `sequence_number`, then `[DONE]` on HTTP and nothing extra over the WS bridge.
+
+That fact needs one owner, so `Conn.sse_headers_sent` is set in exactly one
+place — `sendSseHeaders`, which is now the only site in server.zig that spells
+`Content-Type: text/event-stream`. Three of four surfaces setting a flag is the
+same defect one layer down.
+
+Two structural consequences fell out. `/v1/responses` gained a wrapper
+(`handleResponses` around `handleResponsesInner`) purely to have an error arm at
+all, and it owns the SSE sequence counter so the terminal `error` event can
+carry the number the spec requires on every Responses event; the WS transport
+keeps the error instead, because it has its own terminal frame AND
+borrowed-store cleanup to run at the call site (it now maps through the same
+function). And the four inner `catch |err| switch (err)` blocks around
+`nonStreamingViaScheduler` are GONE: they mapped the same three classes a second
+time, which is exactly how the two paths came to disagree. Every class now
+propagates to the surface's one arm.
+
+Tests: `mapGenerationError` per class including the unknown arm; the three SSE
+body builders carrying the mapped type, code and message plus their surface's
+terminator; absent-form scans for every pre-review spelling of a raw error name
+in a client-visible frame; a count of the surfaces routing through the sender;
+and arm [6] of `tests/test_mlx_error_recovery.sh`, which fires
+`MLX_SERVE_MLX_FAULT_STEP` at a STREAMING request and asserts the 503 message
+and `finish_reason: "error"` on the wire, with the raw name absent.
+
+## A finish is not a finish when the last forward failed (external review of PR #363, item 3, 2026-09-06)
+
+S20 already knew that `runSingleDecodeTickInner` can reach `finishSlot` — and
+so the hot-cache commit — on an EOS the FAILING forward itself produced. Metal
+returns ZEROS before it aborts, so a plausible EOS sampled out of buffers it
+never wrote is exactly what that failure looks like, and the tick wrapper's
+`checkErrorDecode` has not run yet. S20's guard (`if (mlx.errorPending())
+return;` inside `commitSlotIfApplicable`) keeps that garbage out of the prefix
+cache.
+
+It does nothing for the client. The same EOS ran on through `finishSlot` to
+`slot.markFinished("stop")`, the connection thread's `waitNext` returned
+`.done`, and the request answered **200 with fabricated text**. The wrapper's
+`markError` a moment later hit `if (self.error_code != null or self.finished)
+return` and was a no-op. The commit was guarded; the response was not.
+
+`finishSlot` now reads the latch BEFORE anything finalizes the request and
+publishes its terminator through `publishSlotTerminator`, the only caller of
+`Slot.markFinished` in the file: latched → `markError(name)`, clean →
+`markFinished(reason)`. The name is `@errorName`'s, so `errorNameIsMemory`
+classifies it exactly as a consumed failure and the client gets the memory 503
+through item 2's mapping — on the streaming surfaces too, which is why the two
+items ship together. The metrics sink is billed `"error"` rather than the reason
+the request never earned.
+
+The read is a PEEK (`mlx.peekErrorName`), never a consume, and that is the
+subtle half. The decode-tick wrapper still owns the latch: on a BATCHED group
+one forward serves every slot, and the wrapper's `checkErrorDecode` is what
+fails all of them. A slot that consumed the latch on its way out would answer
+itself correctly and leave its siblings finishing 200 on the same dead buffers —
+the original bug, minus one victim.
+
+Tests: `publishSlotTerminator` against a stub slot (clean finishes, latched
+never publishes a reason at all, and the published name carries the memory
+class); a scan that the latch read precedes the publish, that the publish is the
+only `markFinished` caller, that `finishSlot` does not CONSUME, and that S20's
+own `errorPending` guard is still on the commit path; and `peekErrorName`'s own
+test in mlx.zig — same name as the consuming path, latch still pending
+afterwards.

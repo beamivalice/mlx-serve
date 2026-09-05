@@ -63,6 +63,20 @@ pub const Layout = enum {
     long,
 };
 
+/// THE resolver: which bucket grid this model's table speaks. Every
+/// `layout =` assignment in the tree goes through here (scan-pinned in
+/// scheduler.zig), because the layout decides the STORE VERSION and therefore
+/// which persisted file a model reads — an arch that resolves `.long` on the
+/// serve path and `.legacy` on the offline `--prompt` path plans MTP from two
+/// different grids for the same checkpoint (audit addendum 3).
+///
+/// `anytype` rather than a `*const ModelConfig`: this module deliberately
+/// imports nothing but std, and the arch question already has exactly one
+/// answer elsewhere (`ModelConfig.isQwen4`) that must not be respelled here.
+pub fn layoutFor(config: anytype) Layout {
+    return if (config.isQwen4()) .long else .legacy;
+}
+
 /// Buckets the layout actually uses. Cells past it are never written and
 /// never active, so every scan over `N_BUCKETS` reads the same as a scan
 /// over this — the array dimension stays the long layout's.
@@ -1331,4 +1345,26 @@ test "round_cost: the long layout warm-starts from a legacy file — no user boo
     // that is what `fromTable()` reads.
     try testing.expect(lifted.active(3));
     try testing.expectEqual(@as(?usize, 3), lifted.bucketToRead(8192));
+}
+
+test "layoutFor is THE round-cost layout resolver" {
+    // audit addendum 3 (non-blocker). `scheduler.doLoadOnInferenceThread`
+    // resolved the layout inline and `main.zig`'s offline `--prompt` path
+    // never resolved it at all, so a qwen4_exp checkpoint served from `serve`
+    // planned on the nine-bucket grid with a serial row while the SAME
+    // checkpoint run offline planned on the six-bucket one.
+    const Stub = struct {
+        qwen4: bool,
+        fn isQwen4(self: *const @This()) bool {
+            return self.qwen4;
+        }
+    };
+    const long = Stub{ .qwen4 = true };
+    const legacy = Stub{ .qwen4 = false };
+    try testing.expectEqual(Layout.long, layoutFor(&long));
+    try testing.expectEqual(Layout.legacy, layoutFor(&legacy));
+    // The layout decides the store version, which is the whole reason ONE
+    // resolver matters: two answers = two files, and the second one reads none
+    // of the first one's measurements.
+    try testing.expect(storeVersion(layoutFor(&long)) != storeVersion(layoutFor(&legacy)));
 }

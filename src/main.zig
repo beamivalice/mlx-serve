@@ -4,6 +4,7 @@ const mlx = @import("mlx.zig");
 const model_mod = @import("model.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const transformer_mod = @import("transformer.zig");
+const round_cost_mod = @import("round_cost.zig");
 const generate_mod = @import("generate.zig");
 const model_discovery = @import("model_discovery.zig");
 const gguf_meta = @import("gguf_meta.zig");
@@ -1398,6 +1399,16 @@ pub fn main(init: std.process.Init) !void {
 
         var xfm = try transformer_mod.Transformer.init(io, allocator, config.*, &weights);
         defer xfm.deinit();
+
+        // The round-cost table's bucket grid is a property of the MODEL, not
+        // of the path that loaded it. The serve path resolves it at load;
+        // without this the offline `--prompt` path kept the struct default and
+        // planned MTP for a qwen4_exp checkpoint on the six-bucket legacy grid
+        // — no serial row, and 62k and 374k folded into one cell — while
+        // `serve` planned the same checkpoint on the nine-bucket one (audit
+        // addendum 3). No cache key here: offline never persists, it only has
+        // to measure into the right grid.
+        xfm.round_cost.layout = round_cost_mod.layoutFor(config);
 
         // Reserved-token suppression, same derivation as the serve path.
         generate_mod.installSuppressMask(&xfm, tok, chat_config.chat_template, config.eosTokenSlice());

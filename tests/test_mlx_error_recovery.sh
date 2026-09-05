@@ -9,7 +9,11 @@
 #
 # `MLX_SERVE_MLX_FAULT_CHUNK=<n>` latches a synthetic Metal OOM at the n-th
 # `mlx.checkError` of the process (the prefill chunk loop's checkpoint) and
-# disarms itself, so one boot exercises both halves.
+# disarms itself, so one boot exercises both halves. `MLX_SERVE_MLX_FAULT_STEP`
+# is its decode-checkpoint twin.
+#
+# Arm [6] is the STREAMING half of the same contract: the mapped 503 and its
+# message reach an SSE client as an `error` event, not a raw Zig error name.
 #
 # Usage: ./tests/test_mlx_error_recovery.sh [model_dir] [port]
 set -u
@@ -99,6 +103,39 @@ if [ "$CODE5" = "200" ] && grep -q '"content"' /tmp/mlxerr_body.json; then
 else
   bad "post-decode-fault request status $CODE5: $(head -c 200 /tmp/mlxerr_body.json)"
 fi
+
+# ── the STREAMING half answers the same mapped error ─────────────────────────
+# External review of PR #363, item 2. The 400/503 mapping lived only on the
+# non-streaming arms; every streaming arm wrote `Internal server error:
+# GenerationOutOfMemory` as a `server_error` into an SSE frame. Agents stream,
+# so the named, actionable error was the one nobody saw. The SSE head is
+# already on the wire when a decode fault lands, so the status is 200 by
+# construction — what is under test is the terminal EVENT.
+echo "[6] a decode-time MLX error on a STREAMING request sends the mapped SSE error"
+kill $SRV 2>/dev/null; wait $SRV 2>/dev/null
+LOG3=$(mktemp -t mlxerr3).log
+MLX_SERVE_MLX_FAULT_STEP=2 ./zig-out/bin/mlx-serve serve --model "$MODEL" \
+  --host 127.0.0.1 --port "$PORT" --log-level info > "$LOG3" 2>&1 &
+SRV=$!
+trap 'kill $SRV 2>/dev/null' EXIT
+for _ in $(seq 1 120); do curl -sf -m 2 "$BASE/health" >/dev/null 2>&1 && break; sleep 1; done
+curl -s -m 300 -N -H 'content-type: application/json' \
+  -d '{"model":"mlx-serve","messages":[{"role":"user","content":"Write one sentence about the sea."}],"max_tokens":32,"temperature":0,"stream":true}' \
+  "$BASE/v1/chat/completions" > /tmp/mlxerr_stream.txt 2>&1
+if grep -q '"finish_reason":"error"' /tmp/mlxerr_stream.txt &&
+   grep -q 'ran out of GPU memory' /tmp/mlxerr_stream.txt &&
+   grep -q '"code":503' /tmp/mlxerr_stream.txt; then
+  ok "streaming decode fault sent the mapped 503 error event"
+else
+  bad "streaming decode fault frame: $(tail -c 300 /tmp/mlxerr_stream.txt)"
+fi
+# The pre-review shape: a raw Zig error name shipped to the client.
+grep -q 'Internal server error: GenerationOutOfMemory' /tmp/mlxerr_stream.txt &&
+  bad "the raw error NAME is still what the streaming client is told"
+# And the same server still serves.
+CODE7=$(req "Say hello.")
+[ "$CODE7" = "200" ] && ok "the request after a streaming decode fault answered 200" ||
+  bad "post-streaming-fault request status $CODE7"
 
 # ── every guard reads the CLAMPED max_tokens ─────────────────────────────────
 # A long prompt with NO max_tokens field: the omitted value is the

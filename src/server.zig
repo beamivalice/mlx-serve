@@ -244,6 +244,14 @@ pub const Conn = struct {
     /// would otherwise be HTTP/SSE is reshaped into WS text frames at the
     /// `sendResponse` / `sendAnthropicEvent` chokepoints.
     ws_mode: ?*WsBridge = null,
+    /// True once this connection has written a `text/event-stream` response
+    /// head. The status line is spent from that moment, so a generation
+    /// failure past it can only be an SSE `error` EVENT — before it, the
+    /// streaming surfaces answer with the same HTTP status a non-streaming
+    /// request would have got (`sendGenerationError`). Set in exactly one
+    /// place (`sendSseHeaders`, scan-pinned); never cleared, because every SSE
+    /// head this server writes carries `Connection: close`.
+    sse_headers_sent: bool = false,
     /// Non-null while an Ollama /api/* handler runs an inner /v1 handler:
     /// every write the inner handler makes is fed to the sink (SSE → NDJSON
     /// re-framing) instead of the socket. The sink writes its translated
@@ -258,6 +266,7 @@ pub const Conn = struct {
         c.read_state = stream.reader(io, &c.read_buf);
         c.ws_mode = null;
         c.ollama_sink = null;
+        c.sse_headers_sent = false;
         c.heartbeat = .{ .last_write_ms = nowMsMonotonic(io) };
     }
 
@@ -4766,12 +4775,15 @@ test "the per-request rung is priced by the SAME estimator that admits it" {
     try t.expect(std.mem.indexOf(u8, serve_body, "scheduler_mod.prefill_request_chunk = &requestPrefillChunk" ++ "Now;") != null);
 }
 
-test "the post-eviction re-ask never narrows, and never runs on an arch that has no per-request width" {
+test "the post-eviction re-ask never exceeds what live memory affords, and never runs on an arch that has no per-request width" {
     // Audit N5, the composition the scheduler runs: `chooseRequestPrefillChunk`
     // is asked once before the eviction pass and once after, and
-    // `scheduler.postEvictionPrefillChunk` clamps the pair. The pure halves are
-    // tested in their own files; this pins that the two compose to the right
-    // answer, including for the archs that never opted in.
+    // `scheduler.postEvictionPrefillChunk` decides which reading runs — the
+    // SECOND one, the one taken against live memory (external review of PR
+    // #363; it shipped taking the max, which widened exactly when the memory
+    // it was widening onto had gone). The pure halves are tested in their own
+    // files; this pins that the two compose to the right answer, including for
+    // the archs that never opted in.
     const t = std.testing;
     const cfg = qwen4RequestTestConfig();
     const kv_bits: u64 = 8;
@@ -4790,10 +4802,15 @@ test "the post-eviction re-ask never narrows, and never runs on an arch that has
     const roomy: u64 = prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, widthForRung(&cfg, seq, 4096), .{});
     const reasked = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, roomy, pin, 0, .{});
     try t.expect(reasked > admitted);
-    try t.expectEqual(reasked, scheduler_mod.postEvictionPrefillChunk(admitted, reasked));
+    try t.expectEqual(reasked, scheduler_mod.postEvictionPrefillChunk(admitted, reasked).width);
 
     // No eviction pass: the single ask stands, whatever it was.
-    try t.expectEqual(admitted, scheduler_mod.postEvictionPrefillChunk(0, admitted));
+    try t.expectEqual(admitted, scheduler_mod.postEvictionPrefillChunk(0, admitted).width);
+
+    // And the reverse reading — memory moved between the two asks, so the
+    // ladder now affords only the floor — runs at the FLOOR, not at the width
+    // admission was billed at. Live memory is what the forward meets.
+    try t.expectEqual(admitted, scheduler_mod.postEvictionPrefillChunk(reasked, admitted).width);
 
     // A non-qwen4 arch is untouched end to end: the chooser returns the
     // load-time pin against ANY availability, so both readings are the pin and
@@ -4804,13 +4821,13 @@ test "the post-eviction re-ask never narrows, and never runs on an arch that has
     const other_post = chooseRequestPrefillChunk(&other, seq, 2048, kv_bits, roomy, pin, 0, .{});
     try t.expectEqual(pin, other_pre);
     try t.expectEqual(pin, other_post);
-    try t.expectEqual(pin, scheduler_mod.postEvictionPrefillChunk(other_pre, other_post));
+    try t.expectEqual(pin, scheduler_mod.postEvictionPrefillChunk(other_pre, other_post).width);
 
     per_request_chunk_override = false;
     defer per_request_chunk_override = null;
     const off_pre = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, 0, pin, 0, .{});
     const off_post = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, roomy, pin, 0, .{});
-    try t.expectEqual(pin, scheduler_mod.postEvictionPrefillChunk(off_pre, off_post));
+    try t.expectEqual(pin, scheduler_mod.postEvictionPrefillChunk(off_pre, off_post).width);
 }
 
 test "admissionLogLevel: free on the first request after a load and at the edge, quiet in the middle" {
@@ -5464,12 +5481,15 @@ fn slotFailure(slot: *scheduler_mod.Slot) anyerror {
     return error.GenerationFailed;
 }
 
-/// The message every `error.GenerationOutOfMemory` arm sends. Names the
-/// condition and the levers; the byte counts live in the server log's `[mlx]`
-/// line, the only place that knows which allocation failed.
+/// The message `error.GenerationOutOfMemory` sends, on every surface and on
+/// both the streaming and non-streaming paths (`mapGenerationError` is the
+/// only reader). Names the condition and the levers; the byte counts live in
+/// the server log's `[mlx]` line, the only place that knows which allocation
+/// failed.
 const GEN_OOM_MSG = "The engine ran out of GPU memory during this request and it was abandoned. The server is still running. Reduce the prompt length, lower --ctx-size, or free memory on the machine.";
 
-/// The message every `error.PrefillDoesNotFit` arm sends. The request was
+/// The message `error.PrefillDoesNotFit` sends (`mapGenerationError`, the one
+/// reader, on every surface and both paths). The request was
 /// refused BEFORE its first forward, by the same estimator the connection
 /// thread's guard uses, re-asked after the hot prefix cache gave back
 /// everything it could — so it is the client's request that is too large, not
@@ -5477,6 +5497,160 @@ const GEN_OOM_MSG = "The engine ran out of GPU memory during this request and it
 /// "refused before prefill" line (the connection thread cannot re-read the
 /// inference thread's live memory to repeat them here honestly).
 const PREFILL_NOFIT_MSG = "This prompt does not fit in GPU memory even after freeing the prefix cache; it was refused before any work started. Reduce the prompt length, lower --ctx-size, or free memory on the machine (the server log quotes the byte counts it compared).";
+
+/// A generation failure as the wire sees it: ONE status, ONE message, and the
+/// two dialects' spelling of the type.
+pub const GenErrorWire = struct {
+    status_line: []const u8,
+    code: u32,
+    /// `error.type` on the OpenAI dialects (chat, completions, responses).
+    openai_type: []const u8,
+    /// `error.type` on `/v1/messages`.
+    anthropic_type: []const u8,
+    message: []const u8,
+};
+
+/// PURE: THE mapping from a failed generation to what the client is told.
+///
+/// External review of PR #363, item 2. This mapping existed only on the
+/// NON-streaming arms; every streaming arm caught the same errors and wrote
+/// `"Internal server error: GenerationOutOfMemory"` as a `server_error` into
+/// an SSE frame, on a connection that had already answered 200. Agents stream,
+/// so the actionable 400/503 — the one that names the lever — was the one
+/// nobody ever saw. Both paths ask this function now, so they cannot answer
+/// differently: before the SSE head goes out the stream sends the same status
+/// and the same JSON body, and past it the same `type` and `message` ride the
+/// surface's terminal `error` event.
+///
+/// The unknown arm keeps the error NAME (the streaming arms' one virtue over
+/// the non-streaming ones, which sent it bare) at a mapped 500. `buf` backs
+/// only that arm; the three named classes return their module constants.
+pub fn mapGenerationError(err: anyerror, buf: []u8) GenErrorWire {
+    return switch (err) {
+        // The MLX working-set latch (#353) — the engine ran out of GPU memory
+        // mid-request and abandoned it. A memory 503, exactly as
+        // `loadErrorFromName` treats the same names on the load path.
+        error.GenerationOutOfMemory, error.OutOfMemory => .{
+            .status_line = "503 Service Unavailable",
+            .code = 503,
+            .openai_type = "server_error",
+            .anthropic_type = "api_error",
+            .message = GEN_OOM_MSG,
+        },
+        // Refused BEFORE the first forward by the same estimator that admits:
+        // the client's request is too large for this machine, not an engine
+        // fault. A named 400 on both dialects.
+        error.PrefillDoesNotFit => .{
+            .status_line = "400 Bad Request",
+            .code = 400,
+            .openai_type = "invalid_request_error",
+            .anthropic_type = "invalid_request_error",
+            .message = PREFILL_NOFIT_MSG,
+        },
+        error.GenerationFailed => .{
+            .status_line = "500 Internal Server Error",
+            .code = 500,
+            .openai_type = "server_error",
+            .anthropic_type = "api_error",
+            .message = "generation failed",
+        },
+        else => .{
+            .status_line = "500 Internal Server Error",
+            .code = 500,
+            .openai_type = "server_error",
+            .anthropic_type = "api_error",
+            .message = std.fmt.bufPrint(buf, "Internal server error: {s}", .{@errorName(err)}) catch
+                "Internal server error",
+        },
+    };
+}
+
+/// The terminal SSE frame for the OpenAI dialects. Carries the mapped error
+/// AND a `choices` entry with `finish_reason: "error"`, so a client that only
+/// parses chunks terminates cleanly instead of waiting out a stream that will
+/// never produce another delta.
+fn buildOpenAiStreamError(allocator: std.mem.Allocator, w: GenErrorWire) ![]u8 {
+    const esc = try jsonEscape(allocator, w.message);
+    defer allocator.free(esc);
+    return std.fmt.allocPrint(allocator,
+        \\data: {{"error":{{"message":{s},"type":"{s}","param":null,"code":{d}}},"choices":[{{"index":0,"delta":{{}},"finish_reason":"error"}}]}}
+    ++ "\n\n", .{ esc, w.openai_type, w.code });
+}
+
+/// The `/v1/messages` terminal `error` event payload (the event NAME is
+/// `error`; `sendAnthropicEvent` writes the framing).
+fn buildAnthropicStreamError(allocator: std.mem.Allocator, w: GenErrorWire) ![]u8 {
+    const esc = try jsonEscape(allocator, w.message);
+    defer allocator.free(esc);
+    return std.fmt.allocPrint(allocator,
+        \\{{"type":"error","error":{{"type":"{s}","message":{s}}}}}
+    , .{ w.anthropic_type, esc });
+}
+
+/// The `/v1/responses` terminal `error` event payload. `sendResponsesEvent`
+/// splices in the `sequence_number` every Responses event must carry.
+fn buildResponsesStreamError(allocator: std.mem.Allocator, w: GenErrorWire) ![]u8 {
+    const esc = try jsonEscape(allocator, w.message);
+    defer allocator.free(esc);
+    return std.fmt.allocPrint(allocator,
+        \\{{"type":"error","code":"{s}","message":{s},"param":null}}
+    , .{ w.openai_type, esc });
+}
+
+/// Which wire dialect a generative surface speaks its errors in. `.responses`
+/// carries the live SSE sequence counter because every Responses event must.
+const ErrorSurface = union(enum) {
+    /// `/v1/chat/completions` and `/v1/completions`.
+    openai,
+    /// `/v1/messages`.
+    anthropic,
+    /// `/v1/responses`.
+    responses: *u64,
+};
+
+/// THE error arm for every generative surface, streaming or not.
+///
+/// Before the SSE head is on the wire the status line is still ours, so a
+/// streaming request gets byte-for-byte the response its non-streaming twin
+/// would have got — which is the whole point: a client cannot be expected to
+/// parse a different error shape because it asked for a stream. Past the head
+/// the status is spent, so the same `type` and `message` ride the surface's
+/// terminal `error` event, followed by the surface's own end-of-stream marker.
+fn sendGenerationError(allocator: std.mem.Allocator, stream: *Conn, err: anyerror, surface: ErrorSurface) !void {
+    var msg_buf: [192]u8 = undefined;
+    const w = mapGenerationError(err, &msg_buf);
+
+    if (!stream.sse_headers_sent) {
+        return switch (surface) {
+            .anthropic => sendAnthropicError(allocator, stream, w.anthropic_type, w.message, w.code),
+            else => sendErrorResponse(allocator, stream, w.status_line, w.openai_type, w.message, w.code),
+        };
+    }
+
+    switch (surface) {
+        .openai => {
+            const body = try buildOpenAiStreamError(allocator, w);
+            defer allocator.free(body);
+            try stream.writeAllNoFlush(body);
+            try stream.writeAll("data: [DONE]\n\n");
+        },
+        .anthropic => {
+            const body = try buildAnthropicStreamError(allocator, w);
+            defer allocator.free(body);
+            // Anthropic streams have no `[DONE]`; the `error` event IS the
+            // terminator.
+            try sendAnthropicEvent(stream, "error", body);
+        },
+        .responses => |seq| {
+            const body = try buildResponsesStreamError(allocator, w);
+            defer allocator.free(body);
+            try sendResponsesEvent(allocator, stream, seq, "error", body);
+            // Same gate as the success path: no `[DONE]` over the WS bridge,
+            // where the per-response boundary is the frame itself.
+            if (stream.ws_mode == null) try stream.writeAll("data: [DONE]\n\n");
+        },
+    }
+}
 
 /// The admission bill and the headroom it is compared against, as ONE number
 /// each. Extracted so the connection thread's guard and the inference
@@ -8622,18 +8796,16 @@ fn handleChatCompletions(
     if (is_stream) {
         handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, sub_ve, vis_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
-            // Send SSE error event so the client gets a proper error instead of a dropped connection
-            const err_chunk = std.fmt.allocPrint(allocator,
-                \\data: {{"error":{{"message":"Internal server error: {s}","type":"server_error"}}}}
-            , .{@errorName(err)}) catch return;
-            defer allocator.free(err_chunk);
-            stream.writeAllNoFlush(err_chunk) catch {};
-            stream.writeAll("\n\ndata: [DONE]\n\n") catch {};
+            // ONE mapping with the non-streaming arm below: a 503 for a memory
+            // abandon, a 400 for a prompt that does not fit, and the same
+            // message either way. Before the SSE head it is an HTTP status;
+            // after it, an SSE `error` event (external review of #363, item 2).
+            sendGenerationError(allocator, stream, err, .openai) catch {};
         };
     } else {
         handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, sub_ve, vis_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
-            log.err("  -> 500 ({s})\n", .{@errorName(err)});
-            sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", @errorName(err), 500) catch {};
+            log.err("  -> {s}\n", .{@errorName(err)});
+            sendGenerationError(allocator, stream, err, .openai) catch {};
         };
     }
 }
@@ -8855,11 +9027,14 @@ fn handleCompletions(
     if (is_stream) {
         handleStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, enable_pld, enable_drafter, enable_mtp, logprobs_n) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
+            // This arm sent NOTHING at all before the review: the client got a
+            // dropped connection mid-stream.
+            sendGenerationError(allocator, stream, err, .openai) catch {};
         };
     } else {
         handleNonStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, enable_pld, enable_drafter, enable_mtp, logprobs_n) catch |err| {
-            log.err("  -> 500 ({s})\n", .{@errorName(err)});
-            sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", @errorName(err), 500) catch {};
+            log.err("  -> {s}\n", .{@errorName(err)});
+            sendGenerationError(allocator, stream, err, .openai) catch {};
         };
     }
 }
@@ -8889,12 +9064,11 @@ fn handleNonStreamingCompletion(
     const use_drafter = !use_mtp and enable_drafter and logprobs_n == 0 and (lm.drafter != null or lm.dflash != null) and sampling.constraint == null;
     const use_pld = !use_mtp and !use_drafter and enable_pld and logprobs_n == 0 and sampling.constraint == null;
 
-    var result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_pld, use_drafter, use_mtp, getTimeoutNs(), null, 0, .{}, logprobs_n, null, null, stream) catch |err| switch (err) {
-        error.GenerationOutOfMemory => return sendErrorResponse(allocator, stream, "503 Service Unavailable", "server_error", GEN_OOM_MSG, 503),
-        error.PrefillDoesNotFit => return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", PREFILL_NOFIT_MSG, 400),
-        error.GenerationFailed => return sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null),
-        else => return err,
-    };
+    // Every failure class propagates to the surface's ONE error arm
+    // (`handleCompletions` -> `sendGenerationError`), which is the same arm
+    // the streaming twin uses. Mapping them a second time here is how the two
+    // paths drifted apart in the first place (external review of #363).
+    var result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_pld, use_drafter, use_mtp, getTimeoutNs(), null, 0, .{}, logprobs_n, null, null, stream);
     _ = &result;
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
@@ -9027,17 +9201,7 @@ fn handleStreamingCompletion(
     defer ts.deinit(allocator);
 
     // SSE headers
-    const header =
-        "HTTP/1.1 200 OK\r\n" ++
-        "Content-Type: text/event-stream\r\n" ++
-        "Cache-Control: no-cache\r\n" ++
-        "Connection: close\r\n" ++
-        "Access-Control-Allow-Origin: *\r\n" ++
-        "Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n" ++
-        "Access-Control-Allow-Headers: Content-Type, Authorization\r\n" ++
-        "\r\n";
-    try stream.writeAll(header);
-    logHttpStreamStart("completions");
+    try sendSseHeaders(stream, "completions", SSE_ALLOW_HEADERS_DEFAULT);
 
     var text_buf = std.ArrayList(u8).empty;
     defer text_buf.deinit(allocator);
@@ -9372,21 +9536,9 @@ fn handleNonStreamingGeneration(
         ve_local = null;
         break :blk v;
     };
-    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, vision_key, mrope, logprobs_n, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
-        error.GenerationOutOfMemory => {
-            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "server_error", GEN_OOM_MSG, 503);
-            return;
-        },
-        error.PrefillDoesNotFit => {
-            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", PREFILL_NOFIT_MSG, 400);
-            return;
-        },
-        error.GenerationFailed => {
-            try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null);
-            return;
-        },
-        else => return err,
-    };
+    // Propagates to `handleChatCompletions`' ONE error arm, shared with the
+    // streaming twin (external review of #363).
+    const result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, vision_key, mrope, logprobs_n, kv_quant_override, kv_attn_explicit, stream);
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
     defer if (result.logprobs) |lps| {
@@ -10032,17 +10184,7 @@ fn handleStreamingGeneration(
     defer ts.deinit(allocator);
 
     // Send SSE headers (no Content-Length — we stream until done)
-    const header =
-        "HTTP/1.1 200 OK\r\n" ++
-        "Content-Type: text/event-stream\r\n" ++
-        "Cache-Control: no-cache\r\n" ++
-        "Connection: close\r\n" ++
-        "Access-Control-Allow-Origin: *\r\n" ++
-        "Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n" ++
-        "Access-Control-Allow-Headers: Content-Type, Authorization\r\n" ++
-        "\r\n";
-    try stream.writeAll(header);
-    logHttpStreamStart("chat.completions");
+    try sendSseHeaders(stream, "chat.completions", SSE_ALLOW_HEADERS_DEFAULT);
 
     // Logprobs ride the chunks beside their deltas. Requesting them already
     // forced this stream off every speculative path (see `pickStreamMode`), so
@@ -11112,6 +11254,31 @@ fn logHttpResponse(status: []const u8, content_type: []const u8, body: []const u
     if (!log.isDebug()) return;
     log.debug("[http] <- {s} {s} body={d}b\n", .{ status, content_type, body.len });
     logHttpBody("[http] response body", body);
+}
+
+/// The `Access-Control-Allow-Headers` value each SSE surface advertises. The
+/// Anthropic surface accepts two extra request headers; nothing else differs.
+const SSE_ALLOW_HEADERS_DEFAULT = "Content-Type, Authorization";
+const SSE_ALLOW_HEADERS_ANTHROPIC = "Content-Type, Authorization, x-api-key, anthropic-version";
+
+/// THE one place a `text/event-stream` response head is written, so
+/// `Conn.sse_headers_sent` cannot be set by three of four surfaces. Past this
+/// call the status line is spent and a generation failure is an SSE `error`
+/// EVENT; before it, the streaming surfaces answer with the same status and
+/// body their non-streaming twins do (`sendGenerationError`). Scan-pinned:
+/// no other site in this file may spell the content type.
+fn sendSseHeaders(stream: *Conn, kind: []const u8, allow_headers: []const u8) !void {
+    try stream.writeAllNoFlush("HTTP/1.1 200 OK\r\n" ++
+        "Content-Type: text/event-stream\r\n" ++
+        "Cache-Control: no-cache\r\n" ++
+        "Connection: close\r\n" ++
+        "Access-Control-Allow-Origin: *\r\n" ++
+        "Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n" ++
+        "Access-Control-Allow-Headers: ");
+    try stream.writeAllNoFlush(allow_headers);
+    try stream.writeAll("\r\n\r\n");
+    stream.sse_headers_sent = true;
+    logHttpStreamStart(kind);
 }
 
 fn logHttpStreamStart(kind: []const u8) void {
@@ -14997,16 +15164,12 @@ fn handleAnthropicMessages(
     if (is_stream) {
         handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, sub_ve, vis_key, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
-            const err_data = std.fmt.allocPrint(allocator,
-                \\{{"type":"error","error":{{"type":"api_error","message":"Internal server error: {s}"}}}}
-            , .{@errorName(err)}) catch return;
-            defer allocator.free(err_data);
-            sendAnthropicEvent(stream, "error", err_data) catch {};
+            sendGenerationError(allocator, stream, err, .anthropic) catch {};
         };
     } else {
         handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, sub_ve, vis_key, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
-            log.err("  -> 500 ({s})\n", .{@errorName(err)});
-            sendAnthropicError(allocator, stream, "api_error", @errorName(err), 500) catch {};
+            log.err("  -> {s}\n", .{@errorName(err)});
+            sendGenerationError(allocator, stream, err, .anthropic) catch {};
         };
     }
 }
@@ -15072,12 +15235,9 @@ fn handleAnthropicNonStreaming(
     // M-RoPE: Anthropic path uses scalar-RoPE fallback for now (faithful M-RoPE
     // wired for /v1/chat/completions; see computeQwenMrope). Qwen image requests
     // still decode correctly — M-RoPE refines spatial grounding only.
-    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, vision_key, .{}, 0, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
-        error.GenerationOutOfMemory => return sendAnthropicError(allocator, stream, "api_error", GEN_OOM_MSG, 503),
-        error.PrefillDoesNotFit => return sendAnthropicError(allocator, stream, "invalid_request_error", PREFILL_NOFIT_MSG, 400),
-        error.GenerationFailed => return sendAnthropicError(allocator, stream, "api_error", "generation failed", 500),
-        else => return err,
-    };
+    // Propagates to `handleAnthropicMessages`' ONE error arm, shared with the
+    // streaming twin (external review of #363).
+    const result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, vision_key, .{}, 0, kv_quant_override, kv_attn_explicit, stream);
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
 
@@ -15341,17 +15501,7 @@ fn handleAnthropicStreaming(
     defer ts.deinit(allocator);
 
     // SSE headers
-    const header =
-        "HTTP/1.1 200 OK\r\n" ++
-        "Content-Type: text/event-stream\r\n" ++
-        "Cache-Control: no-cache\r\n" ++
-        "Connection: close\r\n" ++
-        "Access-Control-Allow-Origin: *\r\n" ++
-        "Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n" ++
-        "Access-Control-Allow-Headers: Content-Type, Authorization, x-api-key, anthropic-version\r\n" ++
-        "\r\n";
-    try stream.writeAll(header);
-    logHttpStreamStart("anthropic.messages");
+    try sendSseHeaders(stream, "anthropic.messages", SSE_ALLOW_HEADERS_ANTHROPIC);
 
     // message_start
     {
@@ -16264,11 +16414,36 @@ fn handleResponsesCompact(
     try sendResponse(stream, "200 OK", "application/json", out);
 }
 
+/// Route entry for `/v1/responses`. It exists only to give the handler an
+/// error arm: this was the ONE generative surface with no `catch` anywhere on
+/// its path, streaming or not — a failed generation propagated to the route
+/// dispatcher and the client got a dropped socket (external review of #363,
+/// item 2). The SSE sequence counter lives here so the terminal `error` event
+/// can carry the number the spec requires on every Responses event.
 fn handleResponses(
     allocator: std.mem.Allocator,
     stream: *Conn,
     body: []const u8,
     lm: *LoadedModel,
+) !void {
+    var seq_num: u64 = 0;
+    handleResponsesInner(allocator, stream, body, lm, &seq_num) catch |err| {
+        // The WS transport keeps its error: it has its own terminal frame AND
+        // borrowed-store cleanup to run at the call site.
+        if (stream.ws_mode != null) return err;
+        log.err("  -> responses error: {s}\n", .{@errorName(err)});
+        sendGenerationError(allocator, stream, err, .{ .responses = &seq_num }) catch {};
+    };
+}
+
+fn handleResponsesInner(
+    allocator: std.mem.Allocator,
+    stream: *Conn,
+    body: []const u8,
+    lm: *LoadedModel,
+    /// Owned by `handleResponses` so its error arm can number the terminal
+    /// `error` event after everything this function emitted.
+    seq_num: *u64,
 ) !void {
     // No `lm.transformer.?` — engine-backed (GGUF/ds4) models have a null
     // transformer; the only gates below use `config.has_hybrid_layers`.
@@ -16643,23 +16818,13 @@ fn handleResponses(
         .max_tool_calls = max_tool_calls_echo,
     };
 
-    // SSE event sequence counter (required field on every Responses streaming event).
-    var seq_num: u64 = 0;
+    // SSE event sequence counter (required field on every Responses streaming
+    // event) — owned by the wrapper, see `handleResponses`.
 
     // ── streaming: send SSE headers + response.created + response.in_progress ──
     if (is_stream) {
         if (stream.ws_mode == null) {
-            const sse_headers =
-                "HTTP/1.1 200 OK\r\n" ++
-                "Content-Type: text/event-stream\r\n" ++
-                "Cache-Control: no-cache\r\n" ++
-                "Connection: close\r\n" ++
-                "Access-Control-Allow-Origin: *\r\n" ++
-                "Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n" ++
-                "Access-Control-Allow-Headers: Content-Type, Authorization\r\n" ++
-                "\r\n";
-            try stream.writeAll(sse_headers);
-            logHttpStreamStart("responses");
+            try sendSseHeaders(stream, "responses", SSE_ALLOW_HEADERS_DEFAULT);
         }
 
         // Skeleton envelope (status:in_progress, output:[])
@@ -16689,10 +16854,10 @@ fn handleResponses(
         defer allocator.free(skel);
         const created_payload = try std.fmt.allocPrint(allocator, "{{\"type\":\"response.created\",\"response\":{s}}}", .{skel});
         defer allocator.free(created_payload);
-        try sendResponsesEvent(allocator, stream, &seq_num, "response.created", created_payload);
+        try sendResponsesEvent(allocator, stream, seq_num, "response.created", created_payload);
         const ip_payload = try std.fmt.allocPrint(allocator, "{{\"type\":\"response.in_progress\",\"response\":{s}}}", .{skel});
         defer allocator.free(ip_payload);
-        try sendResponsesEvent(allocator, stream, &seq_num, "response.in_progress", ip_payload);
+        try sendResponsesEvent(allocator, stream, seq_num, "response.in_progress", ip_payload);
     }
 
     // ── generate (streaming path: emit deltas live; non-streaming: existing) ──
@@ -16972,10 +17137,10 @@ fn handleResponses(
                         if (!streamed_reasoning_started) {
                             streamed_reasoning_id = try responses_mod.makeId(stream.io, allocator, "rs");
                             streamed_reasoning_index = live_output_index;
-                            try emitResponsesReasoningStart(allocator, stream, &seq_num, streamed_reasoning_index, streamed_reasoning_id.?);
+                            try emitResponsesReasoningStart(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?);
                             streamed_reasoning_started = true;
                         }
-                        try emitResponsesReasoningDelta(allocator, stream, &seq_num, streamed_reasoning_index, streamed_reasoning_id.?, before);
+                        try emitResponsesReasoningDelta(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?, before);
                     }
                     if (streamed_reasoning_started) live_output_index += 1;
 
@@ -16994,10 +17159,10 @@ fn handleResponses(
                         if (!streamed_message_started) {
                             streamed_message_id = try responses_mod.makeId(stream.io, allocator, "msg");
                             streamed_message_index = live_output_index;
-                            try emitResponsesMessageStart(allocator, stream, &seq_num, streamed_message_index, streamed_message_id.?);
+                            try emitResponsesMessageStart(allocator, stream, seq_num, streamed_message_index, streamed_message_id.?);
                             streamed_message_started = true;
                         }
-                        try emitResponsesMessageDelta(allocator, stream, &seq_num, streamed_message_index, streamed_message_id.?, content_after);
+                        try emitResponsesMessageDelta(allocator, stream, seq_num, streamed_message_index, streamed_message_id.?, content_after);
                     }
                     think_buf.clearRetainingCapacity();
                     in_think_block = false;
@@ -17010,10 +17175,10 @@ fn handleResponses(
                         if (!streamed_reasoning_started) {
                             streamed_reasoning_id = try responses_mod.makeId(stream.io, allocator, "rs");
                             streamed_reasoning_index = live_output_index;
-                            try emitResponsesReasoningStart(allocator, stream, &seq_num, streamed_reasoning_index, streamed_reasoning_id.?);
+                            try emitResponsesReasoningStart(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?);
                             streamed_reasoning_started = true;
                         }
-                        try emitResponsesReasoningDelta(allocator, stream, &seq_num, streamed_reasoning_index, streamed_reasoning_id.?, think_buf.items[0..safe_len]);
+                        try emitResponsesReasoningDelta(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?, think_buf.items[0..safe_len]);
                         const remaining = try allocator.dupe(u8, think_buf.items[safe_len..]);
                         think_buf.clearRetainingCapacity();
                         try think_buf.appendSlice(allocator, remaining);
@@ -17026,10 +17191,10 @@ fn handleResponses(
                 if (!streamed_message_started) {
                     streamed_message_id = try responses_mod.makeId(stream.io, allocator, "msg");
                     streamed_message_index = live_output_index;
-                    try emitResponsesMessageStart(allocator, stream, &seq_num, streamed_message_index, streamed_message_id.?);
+                    try emitResponsesMessageStart(allocator, stream, seq_num, streamed_message_index, streamed_message_id.?);
                     streamed_message_started = true;
                 }
-                try emitResponsesMessageDelta(allocator, stream, &seq_num, streamed_message_index, streamed_message_id.?, token_text);
+                try emitResponsesMessageDelta(allocator, stream, seq_num, streamed_message_index, streamed_message_id.?, token_text);
             }
         }
 
@@ -17038,10 +17203,10 @@ fn handleResponses(
             if (!streamed_reasoning_started) {
                 streamed_reasoning_id = try responses_mod.makeId(stream.io, allocator, "rs");
                 streamed_reasoning_index = live_output_index;
-                try emitResponsesReasoningStart(allocator, stream, &seq_num, streamed_reasoning_index, streamed_reasoning_id.?);
+                try emitResponsesReasoningStart(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?);
                 streamed_reasoning_started = true;
             }
-            try emitResponsesReasoningDelta(allocator, stream, &seq_num, streamed_reasoning_index, streamed_reasoning_id.?, think_buf.items);
+            try emitResponsesReasoningDelta(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?, think_buf.items);
         }
 
         ts.finalize();
@@ -17075,12 +17240,9 @@ fn handleResponses(
             local_ve = null;
             break :blk v;
         };
-        result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve_ns, vis_key, .{}, 0, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
-            error.GenerationOutOfMemory => return sendErrorResponse(allocator, stream, "503 Service Unavailable", "server_error", GEN_OOM_MSG, 503),
-            error.PrefillDoesNotFit => return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", PREFILL_NOFIT_MSG, 400),
-            error.GenerationFailed => return sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null),
-            else => return err,
-        };
+        // Propagates to `handleResponses`' ONE error arm, which is also the
+        // streaming half's (external review of #363).
+        result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve_ns, vis_key, .{}, 0, kv_quant_override, kv_attn_explicit, stream);
     }
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
@@ -17142,13 +17304,13 @@ fn handleResponses(
             // Live deltas already streamed; emit just the closing events with
             // the canonical reasoning text from splitThinkBlock.
             try responses_mod.appendReasoningItem(allocator, &out_buf, streamed_reasoning_id.?, rt);
-            try emitResponsesReasoningEnd(allocator, stream, &seq_num, streamed_reasoning_index, streamed_reasoning_id.?, rt);
+            try emitResponsesReasoningEnd(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?, rt);
         } else {
             const rid = try responses_mod.makeId(stream.io, allocator, "rs");
             defer allocator.free(rid);
             try responses_mod.appendReasoningItem(allocator, &out_buf, rid, rt);
             if (is_stream) {
-                try emitResponsesReasoningEvents(allocator, stream, &seq_num, output_index, rid, rt);
+                try emitResponsesReasoningEvents(allocator, stream, seq_num, output_index, rid, rt);
             }
         }
         emitted += 1;
@@ -17178,7 +17340,7 @@ fn handleResponses(
             try responses_mod.appendFunctionCallItem(allocator, &out_buf, fc_id, call_id, tc.name, tc.arguments);
             emitted += 1;
             if (is_stream) {
-                try emitResponsesFunctionCallEvents(allocator, stream, &seq_num, output_index, fc_id, call_id, tc.name, tc.arguments);
+                try emitResponsesFunctionCallEvents(allocator, stream, seq_num, output_index, fc_id, call_id, tc.name, tc.arguments);
             }
             output_index += 1;
         }
@@ -17190,13 +17352,13 @@ fn handleResponses(
         if (is_stream and streamed_message_started) {
             // Live deltas already streamed; emit just the closing events.
             try responses_mod.appendOutputTextMessage(allocator, &out_buf, streamed_message_id.?, visible_text);
-            try emitResponsesMessageEnd(allocator, stream, &seq_num, streamed_message_index, streamed_message_id.?, visible_text);
+            try emitResponsesMessageEnd(allocator, stream, seq_num, streamed_message_index, streamed_message_id.?, visible_text);
         } else {
             const mid = try responses_mod.makeId(stream.io, allocator, "msg");
             defer allocator.free(mid);
             try responses_mod.appendOutputTextMessage(allocator, &out_buf, mid, visible_text);
             if (is_stream) {
-                try emitResponsesMessageEvents(allocator, stream, &seq_num, output_index, mid, visible_text);
+                try emitResponsesMessageEvents(allocator, stream, seq_num, output_index, mid, visible_text);
             }
         }
         emitted += 1;
@@ -17250,7 +17412,7 @@ fn handleResponses(
     if (is_stream) {
         const completed_payload = try std.fmt.allocPrint(allocator, "{{\"type\":\"response.completed\",\"response\":{s}}}", .{envelope});
         defer allocator.free(completed_payload);
-        try sendResponsesEvent(allocator, stream, &seq_num, "response.completed", completed_payload);
+        try sendResponsesEvent(allocator, stream, seq_num, "response.completed", completed_payload);
         // OpenAI terminates the Responses HTTP SSE stream with the same
         // `data: [DONE]` sentinel as chat completions; generic SSE middleware
         // keys stream end off it. The WS transport must NOT get one — its
@@ -17519,8 +17681,12 @@ fn handleResponsesWebSocket(
         bridge.reset();
         handleResponses(allocator, stream, body, lm) catch |err| {
             log.warn("WS handleResponses error: {s}\n", .{@errorName(err)});
-            // Best-effort error frame; connection may already be torn.
-            wsSendErrorTurn(allocator, &ws_conn, 500, "server_error", @errorName(err)) catch {};
+            // Best-effort error frame; connection may already be torn. Same
+            // mapping as every HTTP surface — a WS client is owed the memory
+            // 503 and the too-large 400 as much as an SSE one is.
+            var ws_err_buf: [192]u8 = undefined;
+            const ws_wire = mapGenerationError(err, &ws_err_buf);
+            wsSendErrorTurn(allocator, &ws_conn, ws_wire.code, ws_wire.openai_type, ws_wire.message) catch {};
             // Restore borrowed prev entry back to local cache on failure.
             if (did_borrow_to_global and prev_id_owned != null) {
                 const store = getOrInitResponseStore(stream.io, allocator);
@@ -21407,6 +21573,97 @@ test "the out-of-memory 503 names the cap's flag and never blames concurrency" {
     const needle = "\"out_of_memory\", not_enough_memory" ++ "_message,";
     while (std.mem.indexOfPos(u8, src, i, needle)) |p| : (i = p + needle.len) n += 1;
     try testing.expectEqual(@as(usize, 2), n);
+}
+
+test "a streaming fault answers with the SAME mapped error a non-streaming one does" {
+    // External review of PR #363, item 2. The 400/503 mapping — `GEN_OOM_MSG`
+    // as a 503, `PREFILL_NOFIT_MSG` as a 400 — existed ONLY on the
+    // non-streaming arms. Every streaming arm caught the same errors and wrote
+    // `"Internal server error: GenerationOutOfMemory"` with `type` "server_error"
+    // into an SSE frame with a 200 already on the wire. Agents stream, so the
+    // named, actionable error was the one nobody saw.
+    const t = std.testing;
+    const a = t.allocator;
+
+    // ONE mapping, asked once per class, and the message is the same constant
+    // the non-streaming arms already sent.
+    var buf: [192]u8 = undefined;
+    {
+        const w = mapGenerationError(error.GenerationOutOfMemory, &buf);
+        try t.expectEqual(@as(u32, 503), w.code);
+        try t.expectEqualStrings("503 Service Unavailable", w.status_line);
+        try t.expectEqualStrings(GEN_OOM_MSG, w.message);
+        try t.expectEqualStrings("server_error", w.openai_type);
+        try t.expectEqualStrings("api_error", w.anthropic_type);
+    }
+    {
+        const w = mapGenerationError(error.PrefillDoesNotFit, &buf);
+        try t.expectEqual(@as(u32, 400), w.code);
+        try t.expectEqualStrings(PREFILL_NOFIT_MSG, w.message);
+        // A request refused before its first forward is the CLIENT's request
+        // being too large, on both dialects.
+        try t.expectEqualStrings("invalid_request_error", w.openai_type);
+        try t.expectEqualStrings("invalid_request_error", w.anthropic_type);
+    }
+    {
+        const w = mapGenerationError(error.GenerationFailed, &buf);
+        try t.expectEqual(@as(u32, 500), w.code);
+        try t.expectEqualStrings("generation failed", w.message);
+    }
+    {
+        // Anything else keeps its NAME in the message — the streaming arms'
+        // one virtue — but at a mapped status, and identically on both paths.
+        const w = mapGenerationError(error.WriteFailed, &buf);
+        try t.expectEqual(@as(u32, 500), w.code);
+        try t.expectEqualStrings("Internal server error: WriteFailed", w.message);
+    }
+
+    // The SSE bodies carry that same type and message, plus the surface's own
+    // terminal marker. A client that only reads `choices` still terminates.
+    {
+        const w = mapGenerationError(error.GenerationOutOfMemory, &buf);
+        const body = try buildOpenAiStreamError(a, w);
+        defer a.free(body);
+        try t.expect(std.mem.indexOf(u8, body, "\"type\":\"server_error\"") != null);
+        try t.expect(std.mem.indexOf(u8, body, "\"code\":503") != null);
+        try t.expect(std.mem.indexOf(u8, body, GEN_OOM_MSG) != null);
+        try t.expect(std.mem.indexOf(u8, body, "\"finish_reason\":\"error\"") != null);
+
+        const anth = try buildAnthropicStreamError(a, w);
+        defer a.free(anth);
+        try t.expect(std.mem.indexOf(u8, anth, "\"type\":\"error\"") != null);
+        try t.expect(std.mem.indexOf(u8, anth, "\"type\":\"api_error\"") != null);
+        try t.expect(std.mem.indexOf(u8, anth, GEN_OOM_MSG) != null);
+
+        const resp = try buildResponsesStreamError(a, w);
+        defer a.free(resp);
+        try t.expect(std.mem.indexOf(u8, resp, "\"type\":\"error\"") != null);
+        try t.expect(std.mem.indexOf(u8, resp, "\"code\":\"server_error\"") != null);
+        try t.expect(std.mem.indexOf(u8, resp, GEN_OOM_MSG) != null);
+    }
+
+    // And no surface may hand-format a raw error NAME into a client-visible
+    // frame any more: that is the bug, and it is what a revert restores.
+    // Needles ++-split so this test's own source cannot satisfy them.
+    const src = @embedFile("server.zig");
+    try t.expect(std.mem.indexOf(u8, src, "Internal server error: {s}" ++ "\",\"type\":\"server_error\"") == null);
+    try t.expect(std.mem.indexOf(u8, src, "\"message\":\"Internal server error: {s}" ++ "\"") == null);
+    try t.expect(std.mem.indexOf(u8, src, "sendAnthropicError(allocator, stream, \"api_error\", @errorName" ++ "(err), 500)") == null);
+    try t.expect(std.mem.indexOf(u8, src, "\"server_error\", @errorName" ++ "(err), 500)") == null);
+
+    // All four generative surfaces route their catch through the one sender:
+    // chat stream + non-stream, completions stream + non-stream, messages
+    // stream + non-stream, and `/v1/responses` (one wrapper covering both
+    // modes, since it is the surface that had no arm at all). EXACT, and the
+    // needle is ++-split so this test's own source is not one of them —
+    // counting itself is how a `>=` guard survives losing a surface.
+    var senders: usize = 0;
+    var at: usize = 0;
+    while (std.mem.indexOfPos(u8, src, at, "sendGeneration" ++ "Error(allocator, stream, err,")) |hit| {
+        senders += 1;
+        at = hit + 1;
+    }
+    try t.expectEqual(@as(usize, 7), senders);
 }
 
 test "contextOverflowMessage: the 400 names both counts so a client can act on it" {

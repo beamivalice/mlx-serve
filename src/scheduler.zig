@@ -321,6 +321,19 @@ pub var prefill_admission_fits: ?*const fn (*const model_mod.ModelConfig, usize,
 /// exactly the behaviour every arch but qwen4_exp gets anyway.
 pub var prefill_request_chunk: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool) u32 = null;
 
+/// What the two readings around the eviction pass decided, and which of the
+/// two directions the call site logs.
+pub const PostEvictionWidth = struct {
+    /// The width the prefill RUNS at. Always the re-ask.
+    width: u32,
+    /// The pass returned enough for a wider rung than admission was billed
+    /// at — the whole point of asking twice.
+    widened: bool,
+    /// The re-ask came back NARROWER than the admitted width: memory moved
+    /// between the two reads. Rare, and worth a line.
+    moved: bool,
+};
+
 /// PURE: the prefill width to RUN, given the width the admission bill was
 /// taken at BEFORE the eviction pass (`admitted`) and the width re-asked
 /// against live memory AFTER it (`reasked`).
@@ -332,23 +345,36 @@ pub var prefill_request_chunk: ?*const fn (*const model_mod.ModelConfig, usize, 
 /// the floor anyway. Re-asking after the pass is the whole fix — and it is a
 /// re-ask against memory that was ACTUALLY RETURNED (`EvictionReport.bytes`,
 /// the live allocator delta), never against `reclaimable`, which is a
-/// projection. The unsafe order is widening on a promise; this is the safe
-/// one.
+/// projection.
 ///
-/// `admitted == 0` means no eviction pass ran — nothing was returned, so there
-/// is no second reading and the re-ask IS the only ask. The request keeps the
-/// width it was admitted at.
+/// THE RE-ASK IS THE TRUTH, in BOTH directions (external review of PR #363).
+/// It shipped as `@max(admitted, reasked)`, sold as "an eviction only ever
+/// returns memory, so the clamp is the assertion". It is not an assertion, it
+/// is a clamp, and it clamps the wrong way: when the invariant holds the max
+/// is a no-op, and the only case where it does anything is the case where the
+/// invariant BROKE — memory moved under us between the two reads — where it
+/// picks the WIDER of two widths, one of which is known to be stale. That is
+/// widening on memory that is gone, the exact uncatchable Metal OOM this
+/// family exists to avoid; the narrow arm only ever costs throughput. The
+/// re-ask ran after the pass, against live memory, through the same estimator
+/// that admits the request — it is the reading to trust.
 ///
-/// INVARIANT: an eviction only ever RETURNS memory, so post-eviction
-/// availability is >= pre-eviction and `reasked >= admitted`. The clamp is the
-/// assertion: take the MAX, never narrow. A narrower re-ask means memory moved
-/// under us between the two reads (a co-tenant slot's decode allocations), and
-/// the admitted width is the one a bill was actually taken at — the per-chunk
-/// adapter re-prices from there at the first boundary, which is the mechanism
-/// that is allowed to narrow.
-pub fn postEvictionPrefillChunk(admitted: u32, reasked: u32) u32 {
-    if (admitted == 0) return reasked;
-    return @max(admitted, reasked);
+/// `admitted == 0` means no eviction pass ran (or the pin is 0 = unpinned):
+/// nothing was returned, there is no second reading to compare against, and
+/// the re-ask is simply the only ask. Same answer, no special case.
+///
+/// The width never falls below the ladder floor because the CHOOSER cannot
+/// return anything narrower: `server.chooseRequestPrefillChunk` walks
+/// `PREFILL_CHUNK_LADDER` and falls through to the floor rung when nothing
+/// fits (pinned by "chooseRequestPrefillChunk: WIDEST that fits, at the
+/// boundary"). Nothing here may invent a width the ladder cannot produce, so
+/// nothing here computes one.
+pub fn postEvictionPrefillChunk(admitted: u32, reasked: u32) PostEvictionWidth {
+    return .{
+        .width = reasked,
+        .widened = admitted != 0 and reasked > admitted,
+        .moved = admitted != 0 and reasked < admitted,
+    };
 }
 
 /// Fourth of the family, and the only one the PREFILL LOOP asks rather than
@@ -3726,7 +3752,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         // other arch keeps the six-bucket `rc1` table 26.9.1 wrote, so an
         // upgrading user boots WARM and the EV plan keeps pricing extension
         // from measurements instead of the always-open prior valve.
-        const rc_layout: round_cost_mod.Layout = if (params.config.isQwen4()) .long else .legacy;
+        const rc_layout: round_cost_mod.Layout = round_cost_mod.layoutFor(params.config);
         xfm_ptr.round_cost.layout = rc_layout;
         const rc_key = round_cost_mod.cacheKey(&xfm_ptr.round_cost_key_buf, ane_mod.chipBrand(), params.model_dir, quant, os_build, rc_layout);
         xfm_ptr.round_cost_key_len = @intCast(rc_key.len);
@@ -5104,6 +5130,32 @@ pub fn loopTrimEnabled() bool {
     return enabled;
 }
 
+/// THE terminator a finishing slot publishes, and the ONLY caller of
+/// `Slot.markFinished` in this file.
+///
+/// External review of PR #363, item 3. `runSingleDecodeTickInner` reaches
+/// `finishSlot` on an EOS the FAILING forward itself produced — Metal returns
+/// ZEROS before it aborts, so a plausible EOS sampled out of buffers it never
+/// wrote is exactly what that failure looks like — and it gets there BEFORE
+/// the tick wrapper's `checkErrorDecode` reads the latch and stamps
+/// `error_code`. S20 stopped the hot-cache COMMIT from swallowing that
+/// garbage. The CLIENT RESPONSE was not guarded at all: the request finished
+/// 200, `finish_reason` "stop", with fabricated text, and the wrapper's
+/// `markError` a moment later hit `if (... or self.finished) return` and did
+/// nothing.
+///
+/// `latched` is a PEEK (`mlx.peekErrorName`), never a consume: the wrapper
+/// still owns the latch, and on a batched group that is what fails every other
+/// slot that shared the failed forward. Generic over the slot so the decision
+/// is provable without an mlx-backed `Slot`.
+fn publishSlotTerminator(slot: anytype, reason: []const u8, latched: ?[]const u8) void {
+    if (latched) |name| {
+        slot.markError(name);
+        return;
+    }
+    slot.markFinished(reason);
+}
+
 fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // Emit the `[spec-stats]` summary (no-op for non-speculative slots).
     // The legacy generate() path logs this itself; scheduler-driven slots
@@ -5115,6 +5167,15 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
         // legacy/CLI path) makes it dead on every served request.
         g.logQsaArms();
         g.persistRoundCost();
+    }
+    // The last forward's failure, read BEFORE anything finalizes this request
+    // (external review of PR #363, item 3). A PEEK: `commitSlotIfApplicable`
+    // below still asks `mlx.errorPending()` for S20's own guard, and the
+    // decode-tick wrapper still consumes the latch and still fails the rest of
+    // a batched group with it.
+    const latched: ?[]const u8 = mlx.peekErrorName();
+    if (latched) |name| {
+        log.err("[scheduler] finish suppressed: the last forward failed ({s}) but produced a \"{s}\" — failing this request rather than answering 200 with what Metal never wrote\n", .{ name, reason });
     }
     commitSlotIfApplicable(sch, slot);
     // RESTORE BY MOVE: whatever the commit above did or did not do, this slot
@@ -5143,7 +5204,9 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // e2e = first_token_ns + decode_ns.
     if (sch.metrics) |m| {
         m.recordRequest(
-            reason,
+            // A poisoned finish is an error, not a "stop": billing it under
+            // the reason it never earned is the same lie one layer down.
+            if (latched != null) "error" else reason,
             slot.first_token_ns,
             slot.prefill_ns,
             slot.decode_ns,
@@ -5152,7 +5215,7 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
             slot.cached_tokens,
         );
     }
-    slot.markFinished(reason);
+    publishSlotTerminator(slot, reason, latched);
     if (hc_opt) |hc| {
         if (stream_opt) |s| {
             hc.flushPendingDisk(s);
@@ -6095,19 +6158,18 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             slot.cache.residentCapacityTokens(),
             hot_checked_out,
         );
-        // Audit N5. Without an eviction pass this is the only ask and the
-        // request keeps its width; with one it is the SECOND ask, taken
-        // against the memory the pass really returned, and the clamp asserts
-        // the direction (an eviction cannot take memory away).
-        const width = postEvictionPrefillChunk(admitted_prefill_chunk, reasked);
-        if (admitted_prefill_chunk != 0) {
-            if (reasked > admitted_prefill_chunk) {
-                log.info("[prefill] re-ask: width {d} -> {d} after the eviction pass returned {d} MB\n", .{ admitted_prefill_chunk, reasked, evicted_live_bytes >> 20 });
-            } else if (reasked < admitted_prefill_chunk) {
-                log.warn("[prefill] re-ask: width {d} is NARROWER than the admitted {d} after the eviction pass returned {d} MB — memory moved between the two reads; keeping the admitted width (the per-chunk adapter narrows from there)\n", .{ reasked, admitted_prefill_chunk, evicted_live_bytes >> 20 });
-            }
+        // Audit N5. Without an eviction pass this is the only ask; with one it
+        // is the SECOND ask, taken against the memory the pass really
+        // returned. Either way it is the reading taken against LIVE memory and
+        // therefore the one that runs — in both directions (see
+        // `postEvictionPrefillChunk`).
+        const decision = postEvictionPrefillChunk(admitted_prefill_chunk, reasked);
+        if (decision.widened) {
+            log.info("[prefill] re-ask: width {d} -> {d} after the eviction pass returned {d} MB\n", .{ admitted_prefill_chunk, decision.width, evicted_live_bytes >> 20 });
+        } else if (decision.moved) {
+            log.warn("[prefill] re-ask: width {d} is NARROWER than the admitted {d} after the eviction pass returned {d} MB — memory moved between the two reads; the re-ask is the live reading, so it runs\n", .{ decision.width, admitted_prefill_chunk, evicted_live_bytes >> 20 });
         }
-        break :blk width;
+        break :blk decision.width;
     } else 0;
 
     // Chunk-boundary decode yields: the hook advances already-decoding
@@ -6724,6 +6786,91 @@ test "DFlash cache payload is committed only when it spans the trunk prefix" {
     const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn finishSlot(") orelse return error.MissingFinishSlot;
     const body = source[start..end];
     try testing.expect(std.mem.indexOf(u8, body, "dflashContextCoversPrefix(dc.absLen(), total_len)") != null);
+}
+
+test "a finish over a latched MLX failure ends the request as an ERROR, never a 200" {
+    // External review of PR #363, item 3. A decode forward that failed can
+    // still hand back an EOS — Metal returns ZEROS before it aborts, and a
+    // plausible EOS sampled out of buffers it never wrote is what that looks
+    // like. `runSingleDecodeTickInner` finishes the slot on that EOS BEFORE
+    // the tick wrapper reads the latch, so the request answered 200 with
+    // fabricated text and `finish_reason` "stop", and the wrapper's later
+    // `markError` was a no-op against an already-finished slot. S20 guarded
+    // the hot-cache COMMIT against exactly this; the client response was not
+    // guarded at all.
+    //
+    // Stubbed rather than run against a real Slot: the decision is which
+    // terminator gets published, and that needs no mlx.
+    const Stub = struct {
+        finished: ?[]const u8 = null,
+        errored: ?[]const u8 = null,
+        fn markFinished(self: *@This(), reason: []const u8) void {
+            self.finished = reason;
+        }
+        fn markError(self: *@This(), name: []const u8) void {
+            self.errored = name;
+        }
+    };
+
+    // Nothing latched: the ordinary finish, unchanged.
+    var clean = Stub{};
+    publishSlotTerminator(&clean, "stop", null);
+    try testing.expectEqualStrings("stop", clean.finished.?);
+    try testing.expect(clean.errored == null);
+
+    // Latched: no "stop" is published at all. Reverting to an unconditional
+    // `markFinished` turns this red.
+    var poisoned = Stub{};
+    publishSlotTerminator(&poisoned, "stop", "OutOfMemory");
+    try testing.expect(poisoned.finished == null);
+    try testing.expectEqualStrings("OutOfMemory", poisoned.errored.?);
+    // ...and the name carries the CLASS, so the surface answers the memory
+    // 503 rather than a generic engine fault.
+    try testing.expect(Slot.errorNameIsMemory(poisoned.errored.?));
+
+    // A shape bug mid-decode is still a failed request, just not a 503.
+    var shape = Stub{};
+    publishSlotTerminator(&shape, "length", "MlxFailure");
+    try testing.expect(shape.finished == null);
+    try testing.expectEqualStrings("MlxFailure", shape.errored.?);
+    try testing.expect(!Slot.errorNameIsMemory(shape.errored.?));
+}
+
+test "the slot terminator reads the MLX latch BEFORE it publishes, and is the only publisher" {
+    // Two halves, both load-bearing. (a) The latch is read before the
+    // response is finalized — a read after `markFinished` is the defect, since
+    // `markError` declines an already-finished slot. (b) The read is a PEEK:
+    // consuming it here would answer THIS slot and let every sibling in a
+    // batched group finish 200 on the same failed forward, because the tick
+    // wrapper would find the latch already clear.
+    const whole = @embedFile("scheduler.zig");
+    const self_test = "\ntest \"the slot terminator reads the MLX latch BEFORE it publishes";
+    const src = whole[0 .. std.mem.indexOf(u8, whole, self_test) orelse whole.len];
+
+    // ONE publisher, and it is the guarded one.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "slot.markFinished" ++ "("));
+    const pub_at = std.mem.indexOf(u8, src, "fn publishSlot" ++ "Terminator(") orelse
+        return error.MissingPublisher;
+    const pub_end = std.mem.indexOfPos(u8, src, pub_at, "\n}\n") orelse return error.MissingPublisherEnd;
+    const pub_body = src[pub_at..pub_end];
+    try testing.expect(std.mem.indexOf(u8, pub_body, "slot.markFinished" ++ "(reason);") != null);
+    try testing.expect(std.mem.indexOf(u8, pub_body, "slot.markError" ++ "(name);") != null);
+
+    const start = std.mem.indexOf(u8, src, "fn finishSlot(") orelse return error.MissingFinishSlot;
+    const end = std.mem.indexOfPos(u8, src, start + 1, "\nfn ") orelse return error.MissingFinishSlotEnd;
+    const body = src[start..end];
+    const peek = std.mem.indexOf(u8, body, "mlx.peekError" ++ "Name();") orelse
+        return error.FinishSlotDoesNotReadTheLatch;
+    const publish = std.mem.indexOf(u8, body, "publishSlot" ++ "Terminator(slot, reason, latched);") orelse
+        return error.FinishSlotDoesNotPublishThroughTheGuard;
+    try testing.expect(peek < publish);
+    // A CONSUME here would take the latch away from the tick wrapper.
+    try testing.expect(std.mem.indexOf(u8, body, "mlx.checkError" ++ "Decode()") == null);
+    // S20's own guard still reads the (unconsumed) latch on the commit path.
+    const commit_at = std.mem.indexOf(u8, src, "fn commitSlotIfApplicable(") orelse
+        return error.MissingCommitSlot;
+    const commit_end = std.mem.indexOfPos(u8, src, commit_at, "\nfn ") orelse return error.MissingCommitEnd;
+    try testing.expect(std.mem.indexOf(u8, src[commit_at..commit_end], "mlx.errorPending" ++ "()") != null);
 }
 
 test "every slot-end path releases a checked-out hot-cache entry" {
@@ -8254,7 +8401,7 @@ test "the digest snapshot is freed AFTER the inference thread is joined" {
     try testing.expect(std.mem.indexOf(u8, rest, "self.allocator.free(self.hot_cache" ++ "_digests);") == null);
 }
 
-test "postEvictionPrefillChunk: the width is re-asked after the eviction pass, never narrowed by it" {
+test "postEvictionPrefillChunk: the re-asked width is the one that runs, in BOTH directions" {
     // Audit N5. `chooseRequestPrefillChunk` prices the ladder against what is
     // FREE, and until this the free memory it saw was the memory before the
     // hot cache gave anything back: a 383k prompt was admitted at the ladder
@@ -8262,44 +8409,74 @@ test "postEvictionPrefillChunk: the width is re-asked after the eviction pass, n
     // the floor for its whole length.
 
     // 1. Admitted at 1024, affords 4096 once the pass has returned memory —
-    //    the request runs at 4096. This is the whole point of the fix.
-    try testing.expectEqual(@as(u32, 4096), postEvictionPrefillChunk(1024, 4096));
-    try testing.expectEqual(@as(u32, 8192), postEvictionPrefillChunk(512, 8192));
+    //    the request runs at 4096, and the call site logs the widen.
+    {
+        const d = postEvictionPrefillChunk(1024, 4096);
+        try testing.expectEqual(@as(u32, 4096), d.width);
+        try testing.expect(d.widened);
+        try testing.expect(!d.moved);
+    }
+    try testing.expectEqual(@as(u32, 8192), postEvictionPrefillChunk(512, 8192).width);
 
-    // 2. No eviction pass ran (`admitted == 0`): nothing was returned, so
-    //    there is no second reading and the request keeps the width its one
-    //    and only ask produced. A resident cache still narrows the width here
-    //    — deliberately. Widening on memory that was never freed is the
-    //    unsafe order, and the failure costs are not symmetric: a narrow
-    //    width costs throughput, a width justified by absent memory costs an
-    //    uncatchable Metal OOM.
-    try testing.expectEqual(@as(u32, 1024), postEvictionPrefillChunk(0, 1024));
-    try testing.expectEqual(@as(u32, 512), postEvictionPrefillChunk(0, 512));
+    // 2. No eviction pass ran (`admitted == 0`, which is also the unpinned
+    //    `pinned_prefill_chunk`): nothing was returned, so there is no second
+    //    reading to compare against and the re-ask is simply the only ask.
+    //    Neither direction is reportable.
+    {
+        const d = postEvictionPrefillChunk(0, 1024);
+        try testing.expectEqual(@as(u32, 1024), d.width);
+        try testing.expect(!d.widened);
+        try testing.expect(!d.moved);
+    }
+    try testing.expectEqual(@as(u32, 512), postEvictionPrefillChunk(0, 512).width);
+    try testing.expectEqual(@as(u32, 0), postEvictionPrefillChunk(0, 0).width);
 
-    // 3. THE INVARIANT, asserted rather than assumed: an eviction only ever
-    //    RETURNS memory, so post-eviction availability is >= pre-eviction and
-    //    the re-ask cannot legitimately come back narrower. If it does,
-    //    memory moved between the two reads (a co-tenant slot's decode) — keep
-    //    the width a bill was actually taken at and let the per-chunk adapter,
-    //    the mechanism that is allowed to narrow, re-price at the first
-    //    boundary.
-    try testing.expectEqual(@as(u32, 4096), postEvictionPrefillChunk(4096, 1024));
-    try testing.expectEqual(@as(u32, 2048), postEvictionPrefillChunk(2048, 512));
+    // 3. THE BAR (external review of PR #363): a NARROWER re-ask still wins.
+    //    It shipped as `@max(admitted, reasked)`, sold as an assertion of "an
+    //    eviction only ever returns memory". A max is not an assertion: where
+    //    the invariant holds it is a no-op, and the only case where it does
+    //    anything is the case where the invariant BROKE — memory moved between
+    //    the two reads — where it picks the WIDER of two widths, the one that
+    //    is known to be stale. The re-ask was taken after the pass against
+    //    live memory by the estimator that admits the request; it is what the
+    //    machine affords right now. Widening past that is the uncatchable
+    //    Metal OOM; narrowing only costs throughput. Reverting to `@max` turns
+    //    these two red.
+    {
+        const d = postEvictionPrefillChunk(4096, 1024);
+        try testing.expectEqual(@as(u32, 1024), d.width);
+        try testing.expect(d.moved);
+        try testing.expect(!d.widened);
+    }
+    try testing.expectEqual(@as(u32, 512), postEvictionPrefillChunk(2048, 512).width);
 
     // 4. Unchanged memory is a no-op in both directions — the gate-off arm
     //    (`requestPrefillChunkNow` hands back the load-time pin for every
     //    non-per-request arch and under an explicit `--prefill-chunk`) reaches
-    //    this with the SAME number twice and must be byte-identical.
+    //    this with the SAME number twice and must be byte-identical, with
+    //    nothing to log.
     inline for (.{ 512, 1024, 2048, 4096, 8192 }) |w| {
-        try testing.expectEqual(@as(u32, w), postEvictionPrefillChunk(w, w));
+        const d = postEvictionPrefillChunk(w, w);
+        try testing.expectEqual(@as(u32, w), d.width);
+        try testing.expect(!d.widened and !d.moved);
+    }
+
+    // 5. NEVER BELOW THE LADDER FLOOR — a property of the CHOOSER, kept by
+    //    this function refusing to compute a width of its own. Whatever the
+    //    ladder's floor rung produces is what comes back out, unmodified; the
+    //    floor itself is pinned in server.zig ("chooseRequestPrefillChunk:
+    //    WIDEST that fits, at the boundary"), which is the only place that
+    //    knows the ladder.
+    inline for (.{ 512, 1024, 2048, 4096, 8192 }) |floor| {
+        try testing.expectEqual(@as(u32, floor), postEvictionPrefillChunk(8192, floor).width);
     }
 }
 
 test "the per-request width is asked TWICE around the eviction pass, and the pass's live delta is what pays for it" {
     // The order is the fix: capture the admitted width BEFORE `evictLruToAdmit`,
-    // re-ask AFTER it, clamp to the max. A re-ask that runs before the pass —
-    // or a clamp fed a projection instead of the live delta — is the bug back.
-    // Needles ++-split so this test's own source cannot satisfy the scan.
+    // re-ask AFTER it, and RUN the re-ask. A re-ask that runs before the pass —
+    // or a decision fed a projection instead of the live delta — is the bug
+    // back. Needles ++-split so this test's own source cannot satisfy the scan.
     const src = @embedFile("scheduler.zig");
 
     const capture = "admitted_prefill_chunk = pick_pre(cfg, slot.full_" ++ "prompt.len";
@@ -8312,7 +8489,7 @@ test "the per-request width is asked TWICE around the eviction pass, and the pas
     const i_returned = std.mem.indexOf(u8, src, returned) orelse return error.CallSiteMoved;
     const i_clamp = std.mem.indexOf(u8, src, clamp) orelse return error.CallSiteMoved;
 
-    // capture -> evict -> record what came back -> re-ask and clamp.
+    // capture -> evict -> record what came back -> re-ask and decide.
     try testing.expect(i_capture < i_evict);
     try testing.expect(i_evict < i_returned);
     try testing.expect(i_returned < i_clamp);
@@ -8323,13 +8500,24 @@ test "the per-request width is asked TWICE around the eviction pass, and the pas
     try testing.expect(std.mem.indexOf(u8, src, "evicted_live_bytes = report" ++ ".accounted_bytes") == null);
     try testing.expect(std.mem.indexOf(u8, src, "evicted_live_bytes = report" ++ ".reclaimable") == null);
 
-    // ONE definition of the clamp — a second one is a second rule.
+    // ONE definition of the decision — a second one is a second rule.
     var defs: usize = 0;
     var lines = std.mem.splitScalar(u8, src, '\n');
     while (lines.next()) |line| {
         if (std.mem.startsWith(u8, line, "pub fn postEviction" ++ "PrefillChunk(")) defs += 1;
     }
     try testing.expectEqual(@as(usize, 1), defs);
+
+    // And it decides by taking the RE-ASK, never a max over the pair: the max
+    // is a no-op wherever the eviction invariant holds and picks the stale
+    // width wherever it broke (external review of PR #363). Reintroducing it
+    // turns this red without touching the behaviour tests.
+    const decide_at = std.mem.indexOf(u8, src, "pub fn postEviction" ++ "PrefillChunk(") orelse
+        return error.CallSiteMoved;
+    const decide_end = std.mem.indexOfPos(u8, src, decide_at, "\n}\n") orelse return error.CallSiteMoved;
+    const body = src[decide_at..decide_end];
+    try testing.expect(std.mem.indexOf(u8, body, "@max(") == null);
+    try testing.expect(std.mem.indexOf(u8, body, ".width = re" ++ "asked,") != null);
 }
 
 test "the re-asked width reaches the request's chunk AND is never capped by the adapter" {
@@ -8353,8 +8541,9 @@ test "the re-asked width reaches the request's chunk AND is never capped by the 
 
     // 1. The scheduler's width is what init is given.
     try testing.expect(std.mem.indexOf(u8, sched, ".pinned_prefill_chunk = req_prefill" ++ "_chunk,") != null);
-    // ...and it is the CLAMPED width, not the raw re-ask.
-    try testing.expect(std.mem.indexOf(u8, sched, "break :blk " ++ "width;") != null);
+    // ...and it is the width the post-eviction decision returned, never a
+    // number the call site recomputed beside it.
+    try testing.expect(std.mem.indexOf(u8, sched, "break :blk decision" ++ ".width;") != null);
     // ...which the prefill loop resolves into the width it forwards.
     try testing.expect(std.mem.indexOf(u8, gen, "options.pinned_prefill" ++ "_chunk,") != null);
     try testing.expect(std.mem.indexOf(u8, gen, "const default_chunk = if (has_vision and !vision_chunked) loop_end else PREFILL" ++ "_CHUNK;") != null);
@@ -8391,4 +8580,39 @@ test "hot-cache commit hands the live QSA history to the newest checkpoint BEFOR
     // The failure arm commits without the history rather than aborting the
     // commit (a QSA arch treats "no history" as a miss).
     try testing.expect(std.mem.indexOf(u8, body, "QSA history handoff failed") != null);
+}
+
+
+test "every round-cost layout assignment routes through the ONE resolver" {
+    // audit addendum 3 (non-blocker). Two sites own a Transformer at load: the
+    // inference thread's loader here, and `main.zig`'s offline `--prompt`
+    // path. The first spelled the arch conditional inline; the second never
+    // resolved a layout at all and kept the struct default, so the same
+    // qwen4_exp checkpoint planned MTP on the nine-bucket grid under `serve`
+    // and on the six-bucket legacy one offline — different bucket EDGES and no
+    // serial row, from the same weights.
+    //
+    // Scanned in the PRODUCTION WINDOW of each site (`productionDeclSource`),
+    // never the whole file: a test in either file may legitimately build a
+    // table at a chosen layout. Needles ++-split so this test's own source
+    // cannot satisfy them.
+    const Site = struct { src: []const u8, decl: []const u8 };
+    const sites = [_]Site{
+        .{ .src = @embedFile("scheduler.zig"), .decl = "fn doLoadOnInferenceThread(" },
+        .{ .src = @embedFile("main.zig"), .decl = "pub fn main(" },
+    };
+    for (sites) |site| {
+        const window = generate_mod.productionDeclSource(site.src, site.decl) orelse
+            return error.LoadSiteMoved;
+        try testing.expect(generate_mod.windowHasNoTestBlock(window));
+        // The window assigns a layout, and the value is the resolver's.
+        const assign = std.mem.indexOf(u8, window, "round_cost" ++ "_mod.layoutFor(") orelse
+            return error.LoadSiteBypassesTheResolver;
+        _ = assign;
+        // ...and nothing in it spells a Layout tag by hand, which is how the
+        // two paths came to disagree.
+        try testing.expect(std.mem.indexOf(u8, window, "layout" ++ " = .long") == null);
+        try testing.expect(std.mem.indexOf(u8, window, "layout" ++ " = .legacy") == null);
+        try testing.expect(std.mem.indexOf(u8, window, "Layout = if (") == null);
+    }
 }
