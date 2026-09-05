@@ -4955,3 +4955,53 @@ test "prefix cache: the trim's row price is the entry's own bytes divided by its
         try testing.expectEqual(2 * per_layer, row_bytes);
     }
 }
+
+test "HotPrefixCache: a bounded disk flush leaves disk_dirty set and later flushes complete the entry — never a whole-entry claim in between" {
+    // The write-through hook writes ONE chunk per boundary and the SSD-first
+    // end-of-request flush is bounded too, so a long entry reaches the tier
+    // in pieces. Each piece is a valid SHORTER entry (meta.json's kv_len is
+    // the chunk-complete length, restore is clamped to it), `disk_dirty`
+    // stays set until the tier reports complete, and the next
+    // `flushPendingDisk` — the scheduler's post-finish call — extends it.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    const base = buf[0..root_len];
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-partial", 0, 128);
+    defer hc.deinit();
+    hc.disk.?.max_flush_bytes = 1; // one chunk per flush: the bounded shape
+
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 2, 600);
+    try hc.commit(&cache, &tokens, false);
+    try testing.expect(hc.disk_dirty);
+
+    // 600 tokens at 128/chunk = 5 chunks; each flush lands one.
+    var flushes: usize = 0;
+    var last_kv: u32 = 0;
+    while (hc.disk_dirty and flushes < 10) : (flushes += 1) {
+        hc.flushPendingDisk(s);
+        const d = &hc.disk.?;
+        try testing.expectEqual(@as(usize, 1), d.entryCount());
+        const kv = d.entries.items[0].kv_len;
+        // Monotone, chunk-aligned while partial, and what a lookup would
+        // restore — never the whole entry before its chunks are there.
+        try testing.expect(kv >= last_kv);
+        if (hc.disk_dirty) try testing.expectEqual(@as(u32, 0), kv % 128);
+        const m = d.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
+        try testing.expectEqual(kv, m.usable);
+        last_kv = kv;
+    }
+    try testing.expect(!hc.disk_dirty);
+    try testing.expectEqual(@as(usize, 5), flushes);
+    try testing.expectEqual(@as(u32, 600), hc.disk.?.entries.items[0].kv_len);
+}

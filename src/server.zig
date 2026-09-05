@@ -4030,20 +4030,27 @@ test "an auto boot advertises the session the SSD-first budget floor was billed 
     // The defect, as the number it was: sizing the session against a reserve of
     // its own hands back a BIGGER session than the box will ever be asked to
     // serve, so the floor holds KV for tokens nobody can send.
-    const old_billed = resolvedContextForLoad(0, 0, ceiling, active, 0, transient, per_tok, cfg.contextCap());
-    try t.expect(old_billed > billed);
+    // Under the one-copy history bill this box fits the checkpoint's whole
+    // context cap on BOTH arms (old and new both clamp to 1,048,576), so the
+    // disagreement is shown on a TIGHTER box where the cap does not bind —
+    // the arithmetic is the same, only the ceiling moves.
+    const tight: u64 = active + 24_000 * MiB;
+    const billed_t = ssdFirstSessionTokensNow(&cfg, kv_bits, tight, active, chunk);
+    const old_billed = resolvedContextForLoad(0, 0, tight, active, 0, transient, per_tok, cfg.contextCap());
+    try t.expect(old_billed > billed_t);
     // Both are real contexts — this is a disagreement, not a collapse, which is
     // why it survived: neither number looks wrong on its own.
     try t.expect(billed > 500_000);
+    try t.expect(billed_t > 300_000);
 
     // ...and what the disagreement costs, in the one place it lands: the budget
     // floor is one session's KV, so an over-billed session over-reserves RAM
     // for a context the server never advertises.
     const idle: u64 = 4 * 1024 * MiB;
-    const floor_now = ssdFirstPrefixCacheMem(idle, ceiling, active, per_tok *| @as(u64, billed), transient);
-    const floor_old = ssdFirstPrefixCacheMem(idle, ceiling, active, per_tok *| @as(u64, old_billed), transient);
+    const floor_now = ssdFirstPrefixCacheMem(idle, tight, active, per_tok *| @as(u64, billed_t), transient);
+    const floor_old = ssdFirstPrefixCacheMem(idle, tight, active, per_tok *| @as(u64, old_billed), transient);
     try t.expect(floor_old > floor_now);
-    try t.expectEqual(per_tok *| @as(u64, old_billed - billed), floor_old - floor_now);
+    try t.expectEqual(per_tok *| @as(u64, old_billed - billed_t), floor_old - floor_now);
 }
 
 test "an explicit --ctx-size boot never consults the session reserve" {

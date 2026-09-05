@@ -1208,6 +1208,16 @@ pub const DiskTier = struct {
             @as(f64, @floatFromInt(self.total_bytes)) / (1024.0 * 1024.0),
             self.entries.items.len,
         });
+        // The ONE completion marker: every chunk AND every wanted checkpoint
+        // of this commit is staged (the manifest rides the same writer queue,
+        // last). A flush bounded by `flush_bound` leaves this line out and
+        // `HotPrefixCache.disk_dirty` set; the next `flushPendingDisk` (after
+        // the next request finishes) extends the entry until it appears.
+        // Harnesses assert on THIS line, not on `persisted N/M` — a bounded
+        // flush prints N < M and is not a defect.
+        if (complete) {
+            log.info("  [disk-cache] e{d} complete on disk: {d} tokens, {d} chunks, {d} ssm-cp\n", .{ id, kv_len, new_entry.chunk_bytes.len, new_entry.ssm_positions.len });
+        }
         return complete;
     }
 
