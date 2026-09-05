@@ -4277,10 +4277,14 @@ test "every post-load hot-cache reserve reads the RESOLVED budget, not the ask" 
     }
 
     // And the two reserves that used to read it now go through the accessor.
-    for ([_][]const u8{ "pub fn aneGateHeadroom(", "fn computeMemoryContext(" }) |decl| {
-        const body = declBody(src, decl) orelse return error.CallSiteMoved;
-        try t.expect(std.mem.indexOf(u8, body, accessor) != null);
-    }
+    // The ANE gate still reads the RESOLVED budget — it is asking what the
+    // cache will actually hold. `computeMemoryContext` deliberately does NOT
+    // (audit S6): the context must not move with the budget, or the two
+    // passes form a loop. Different questions, different sources.
+    const gate = declBody(src, "pub fn aneGateHeadroom(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, gate, accessor) != null);
+    const sizer = declBody(src, "fn computeMemoryContext(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, sizer, accessor) == null);
     // The load site publishes it — otherwise the accessor is a synonym for the ask.
     try t.expect(std.mem.indexOf(u8, src, "publishResolvedPrefix" ++ "CacheMem(plan.budget);") != null);
 }
@@ -4322,7 +4326,24 @@ fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
         active_mem,
         // The hot prefix cache fills to this cap over a session, and a prefill
         // has to land on top of whatever context we report — reserve both.
-        resolvedPrefixCacheMem() +| prefillTransientReserve(config, kv_bits, chunk),
+        // CTX_SIZING_CACHE_RESERVE, not the resolved budget and not the ask.
+        //
+        // This is the root of live check #6 and of audit S6, and the two are
+        // the same bug seen from opposite ends. Reading the ASK let a big
+        // `--prefix-cache-mem` starve the context (60GB ask -> 870-token
+        // advertised context). Reading the RESOLVED budget — the earlier fix —
+        // made that number smaller but turned the pair into a one-step loop
+        // that moves the unsafe way: the clamp bills a context computed
+        // against one reserve, publishes a budget, and this then computes a
+        // BIGGER context against the smaller budget, so the budget was
+        // justified against a session the box no longer serves.
+        //
+        // A CONSTANT closes both: the context is ask-independent, and the two
+        // passes agree by construction because neither depends on the other.
+        // Context is the primary claimant and the cache is the residual — the
+        // same order the prefill chunk follows. It is the server's own
+        // `--prefix-cache-mem` default, so a default boot is unchanged.
+        CTX_SIZING_CACHE_RESERVE +| prefillTransientReserve(config, kv_bits, chunk),
         per_tok,
         // 0 = do NOT clamp to the checkpoint's max here. The caller applies that
         // cap AFTER the safety margin, so a model whose own max is the binding
@@ -20078,7 +20099,9 @@ test "checkAttentionMemory wires the CONFIG's key bound, not a dense seq" {
     // Reads the RESOLVED budget, not the ask: the sizer must reserve what the
     // cache was actually given (`prefixCacheMemForLoad` publishes it), or a
     // clamped-down cache keeps a reserve nobody will ever use.
-    try t.expect(std.mem.indexOf(u8, src, "resolvedPrefixCacheMem() +| prefillTransientReserve(config, kv_bits, chunk)") != null);
+    // UPDATED (audit S6): the sizer now reserves the CONSTANT, not the
+    // resolved budget — reading either dynamic budget is the one-step loop.
+    try t.expect(std.mem.indexOf(u8, src, "CTX_SIZING_CACHE_RESERVE +| prefillTransientReserve(config, kv_bits, chunk)") != null);
 }
 
 test "the chunk the guard BILLS is the chunk the forward will RUN" {
@@ -21618,3 +21641,49 @@ test "resolvedContextForLoad: an auto boot bills the session it will serve, not 
     // The checkpoint's own cap still binds on a roomy box.
     try t.expectEqual(cap, resolvedContextForLoad(0, 0, active + 900_000 * MiB, active, 0, transient, per_tok, cap));
 }
+
+test "the advertised context does not move with the cache ask (live check #6 / audit S6)" {
+    // Two bugs, one root. Sizing the context against the ASK let a big
+    // `--prefix-cache-mem` collapse it (measured: 60GB ask -> 870 tokens
+    // advertised, where the default ask gave 1,048,576). Sizing it against the
+    // RESOLVED budget instead made the number smaller but left a one-step loop
+    // -- clamp bills context A, publishes budget B, sizer then computes
+    // context C > A against B -- so the budget was justified against a session
+    // the box no longer serves.
+    //
+    // A CONSTANT reserve closes both: ask-independent, and the two passes
+    // cannot disagree because neither reads the other.
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const MiB: u64 = 1 << 20;
+    const active: u64 = 69_827 * MiB;
+    const live_ceiling: u64 = 109_395 * MiB;
+    const per_tok: u64 = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(&cfg);
+    const transient: u64 = prefillTransientReserve(&cfg, kv_bits, 4096);
+
+    // What the sizer now does, for any ask.
+    const ctx = safeContextForBudget(live_ceiling, active, CTX_SIZING_CACHE_RESERVE +| transient, per_tok, cfg.contextCap());
+    try t.expect(ctx > 900_000);
+
+    // The two defect spellings, both of which this replaces.
+    const vs_ask = safeContextForBudget(live_ceiling, active, 60 * 1024 * MiB +| transient, per_tok, cfg.contextCap());
+    const vs_resolved = safeContextForBudget(live_ceiling, active, 48_673 * MiB +| transient, per_tok, cfg.contextCap());
+    try t.expect(vs_ask <= 1024);
+    try t.expect(vs_resolved <= 1024);
+
+    // And the pair AGREES: the clamp's context and the sizer's context are the
+    // same call with the same constant, so there is no second pass to drift.
+    const clamp_ctx = resolvedContextForLoad(0, 0, live_ceiling, active, CTX_SIZING_CACHE_RESERVE, transient, per_tok, cfg.contextCap());
+    try t.expectEqual(ctx, clamp_ctx);
+}
+
+test "the sizer's cache reserve is a constant, not the ask or the resolved budget" {
+    // Scan (audit S6): `computeMemoryContext` must not read either dynamic
+    // budget, or the loop comes back. Needles split.
+    const t = std.testing;
+    const src = @embedFile("server.zig");
+    const body = declBody(src, "fn computeMemoryContext(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, body, "CTX_SIZING_CACHE_" ++ "RESERVE") != null);
+    try t.expect(std.mem.indexOf(u8, body, "resolvedPrefixCache" ++ "Mem()") == null);
+    try t.expect(std.mem.indexOf(u8, body, "prefix_cache_mem_" ++ "bytes") == null);}
