@@ -1573,11 +1573,23 @@ pub const HotPrefixCache = struct {
     /// `fits` is re-asked after every eviction rather than compared against a
     /// precomputed shortfall: freeing an entry moves live MLX memory, and the
     /// one estimator that knows the bill is the one that must answer (#126).
-    /// An eviction that returns less than this to the allocator freed nothing
-    /// worth having: its buffers are refcount-SHARED with a live generator, so
-    /// dropping the entry only cost us the hit. One such eviction ends the
-    /// pass — the rest of the cache is no more likely to be free.
-    const FUTILE_EVICTION_BYTES: u64 = 1 << 20;
+    /// Smallest eviction whose live/billed RATIO is meaningful. Below this the
+    /// allocator's page rounding and the graph's own scratch swamp the signal,
+    /// so a small entry is never judged — it is simply evicted and the pass
+    /// continues.
+    pub const SHARED_RATIO_MIN_BYTES: u64 = 1 << 20;
+
+    /// An eviction that returns less than 1/Nth of what the entry was BILLED
+    /// gave the allocator nothing: its buffers are refcount-SHARED with a live
+    /// cache, so dropping it only cost us the hit.
+    ///
+    /// A RATIO, not an absolute floor. The floor was the first shape of this
+    /// check and it conflated "shared" with "small": a 200-token prefix
+    /// returns well under a megabyte when it is exclusively ours, so a pass
+    /// that hit one aborted with entries still evictable and refused a request
+    /// the machine could serve — the exact failure the eviction exists to
+    /// prevent.
+    pub const SHARED_RETURN_DIVISOR: u64 = 4;
 
     pub fn evictLruToAdmit(
         self: *HotPrefixCache,
@@ -1605,8 +1617,14 @@ pub const HotPrefixCache = struct {
             const freed_live: u64 = @as(u64, live_before) -| @as(u64, live_after);
             report.entries += 1;
             report.bytes += freed_live;
-            report.accounted_bytes += acct_before -| self.current_kv_bytes;
-            if (freed_live < FUTILE_EVICTION_BYTES) {
+            const acct_delta = acct_before -| self.current_kv_bytes;
+            report.accounted_bytes += acct_delta;
+            // Judge only entries big enough for the ratio to mean something,
+            // and judge them by what they RETURNED against what they were
+            // billed — never by an absolute number of bytes.
+            if (acct_delta >= SHARED_RATIO_MIN_BYTES and
+                freed_live * SHARED_RETURN_DIVISOR < acct_delta)
+            {
                 report.shared_stop = true;
                 break;
             }
@@ -3296,9 +3314,22 @@ test "evictLruToAdmit: oldest first, never the entry THIS request restored, and 
         var cache = try KVCache.init(testing.allocator, 8);
         defer cache.deinit();
         try testFillCache(&cache, s, 8, 4096);
+        // MATERIALIZE before committing. `update` builds `mlx_zeros` +
+        // `slice_update` graph nodes and MLX is lazy, so an unevaluated cache
+        // owns no Metal buffer at all: this test measured 1,920 bytes of
+        // active memory in total and every eviction "returned" 640 of them.
+        // A live-memory assertion over lazy arrays asserts nothing.
+        for (cache.entries) |*e| {
+            if (e.keys.ctx != null) _ = mlx.mlx_array_eval(e.keys);
+            if (e.values.ctx != null) _ = mlx.mlx_array_eval(e.values);
+        }
         try hc.commit(&cache, toks, false);
     }
     try testing.expectEqual(@as(usize, 3), hc.entryCount());
+    // The premise of everything below: the entries are real allocations.
+    var live_resident: usize = 0;
+    _ = mlx.mlx_get_active_memory(&live_resident);
+    try testing.expect(live_resident > 4 * 1024 * 1024);
 
     // THIS request restores B — the middle entry, so "most recently used"
     // and "restored" are only the same by luck. The target cache stays alive
@@ -3327,9 +3358,14 @@ test "evictLruToAdmit: oldest first, never the entry THIS request restored, and 
     var off2: usize = 0;
     const still_b = try hc.lookupAndRestore(&probe_cache, &off2, null, s, &toks_b, false, 0, null, null);
     try testing.expect(still_b.full_match);
-    // Evicting entries nothing else holds returns REAL memory.
+    // Evicting entries nothing else holds returns REAL memory — at least the
+    // share the pass demands before it calls an entry shared. NOT `bytes <=
+    // accounted_bytes`: the billed figure is the LOGICAL KV payload, while
+    // the buffers freed carry `nextCapacity`'s rounding and growth headroom,
+    // so an exclusive eviction legitimately returns MORE than it was billed.
     try testing.expect(rep.bytes > 0);
-    try testing.expect(rep.accounted_bytes >= rep.bytes);
+    try testing.expect(rep.bytes * HotPrefixCache.SHARED_RETURN_DIVISOR >= rep.accounted_bytes);
+    try testing.expect(!rep.shared_stop);
 
     // Unprotected, B goes too — and because two live caches still hold its
     // buffers, the allocator gets ~nothing back, which the pass NOTICES
@@ -3338,6 +3374,6 @@ test "evictLruToAdmit: oldest first, never the entry THIS request restored, and 
     try testing.expect(!rest.admitted);
     try testing.expectEqual(@as(usize, 0), hc.entryCount());
     try testing.expect(rest.accounted_bytes > 0);
-    try testing.expect(rest.bytes < rest.accounted_bytes);
+    try testing.expect(rest.bytes * HotPrefixCache.SHARED_RETURN_DIVISOR < rest.accounted_bytes);
     try testing.expect(rest.shared_stop);
 }
