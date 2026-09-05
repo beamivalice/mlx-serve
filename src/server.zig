@@ -3186,10 +3186,18 @@ fn ssdFirstBudgetForLoad(
         transient_reserve,
     );
     // The RAM-first arm publishes its answer and so must this one: the
-    // auto-context sizer and the ANE gate read `hot_cache_mem_resolved`, and
-    // an SSD-first boot that left it stale would size against a budget the
-    // cache never got.
-    hot_cache_mem_resolved = budget;
+    // auto-context sizer and the ANE gate read `hot_cache_mem_resolved`, and an
+    // SSD-first boot that left it stale would size against a budget the cache
+    // never got.
+    //
+    // What is published is the cache's cost BEYOND the live session, not the
+    // whole budget. Under one-session semantics `budget` INCLUDES `ctx_kv` —
+    // the very bytes the live KV already accounts for — and
+    // `computeMemoryContext` subtracts the published figure before dividing by
+    // the per-token cost. Publishing `budget` would bill that session twice and
+    // roughly halve the auto-context. The RETURN value stays `budget`: that is
+    // the cache's byte cap, and `initWithMem` needs the whole of it.
+    hot_cache_mem_resolved = budget -| ctx_kv;
     // D1: on this arch `--prefix-cache-mem` is the IDLE allowance, not the
     // whole cache — 0 means "no idle entries", not "use all the headroom".
     // Say so once, naming the flag, so the resolved budget is never a mystery.
@@ -20611,12 +20619,12 @@ test "every text surface clamps max_tokens BEFORE it bills the memory guard" {
     // guard. Needles are split so this test's own source never matches.
     const t = std.testing;
     const src = @embedFile("server.zig");
-    const guard = "checkAttention" ++ "Memory(allocator, stream, prompt_ids.len, effective_max_tokens,";
+    const guard = "checkAttention" ++ "Memory(allocator, stream, prompt_ids, effective_max_tokens,";
     const clamp = "const effective_max_tokens = clamp" ++ "MaxTokens(max_tokens, prompt_ids.len, effective_ctx);";
     try t.expectEqual(@as(usize, 4), std.mem.count(u8, src, guard));
     try t.expectEqual(@as(usize, 4), std.mem.count(u8, src, clamp));
     // No surface may pass the RAW value.
-    try t.expectEqual(@as(usize, 0), std.mem.count(u8, src, "checkAttention" ++ "Memory(allocator, stream, prompt_ids.len, max_tokens,"));
+    try t.expectEqual(@as(usize, 0), std.mem.count(u8, src, "checkAttention" ++ "Memory(allocator, stream, prompt_ids, max_tokens,"));
     // …and every guard call is PRECEDED by its own clamp: walk the four in
     // order and require a clamp between each guard and the one before it.
     var at: usize = 0;
@@ -20656,7 +20664,7 @@ test "the admission probe bills the request's OWN kv-quant and chunking, not the
 
     // The probe is a pure forward of its inputs into that one estimator.
     const src = @embedFile("server.zig");
-    const fwd = "return prefillAdmission" ++ "Bill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill).fits();";
+    const fwd = "return prefillAdmission" ++ "Bill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null).fits();";
     // The needle is assembled with `++`, so this test's own source does NOT
     // contain it: the call site is the only occurrence.
     try t.expectEqual(@as(usize, 1), std.mem.count(u8, src, fwd));
@@ -20728,7 +20736,7 @@ test "the admission guard reads a PUBLISHED hot-cache residency, never the infer
     // reads the digest SNAPSHOT through the scheduler; the reduction happens
     // under the digest lock and only a scalar comes back, so no pointer into
     // cache-owned memory ever reaches this file.
-    try t.expect(std.mem.indexOf(u8, src, "sch.reclaimableHotCacheBytesFor(toks)") != null);
+    try t.expect(std.mem.indexOf(u8, src, "reclaimableHotCacheBytesFor(sch, toks)") != null);
     try t.expectEqual(@as(usize, 0), std.mem.count(u8, src, "hot_cache" ++ "_digests"));
     // The snapshot is republished from the same one place the scalars are, and
     // the superseded slice is freed by the publisher — never by a reader.
@@ -20790,4 +20798,27 @@ test "both hot-cache budget arms publish hot_cache_mem_resolved" {
             return err;
         };
     }
+
+    // The two arms publish DIFFERENT quantities, and the difference is the bug
+    // that made this worth pinning. `computeMemoryContext` subtracts the
+    // published figure and divides the rest by the per-token cost, so the
+    // number has to be the cache's cost BEYOND the live session. Under
+    // one-session semantics the SSD-first budget INCLUDES `ctx_kv` — the same
+    // bytes the live KV already accounts for — so publishing the whole budget
+    // billed that session twice and roughly halved the auto-context.
+    const ssd_start = std.mem.indexOf(u8, src, "fn ssdFirstBudgetForLoad(").?;
+    const ssd_end = ssd_start + (std.mem.indexOf(u8, src[ssd_start..], "\n}\n") orelse 0);
+    try std.testing.expect(std.mem.indexOf(u8, src[ssd_start..ssd_end], needle ++ "budget -| ctx_kv;") != null);
+
+    // ...and the arithmetic that makes it so: an idle allowance of 0 floors the
+    // budget at exactly one session, so the cache costs NOTHING beyond it.
+    const GB: u64 = 1 << 30;
+    const ctx_kv: u64 = 12 * GB;
+    const only_session = ssdFirstPrefixCacheMem(0, 120 * GB, 70 * GB, ctx_kv, 4 * GB);
+    try std.testing.expectEqual(ctx_kv, only_session);
+    try std.testing.expectEqual(@as(u64, 0), only_session -| ctx_kv);
+    // A real idle allowance is published in full: it is cache the session does
+    // not already own.
+    const with_idle = ssdFirstPrefixCacheMem(4 * GB, 120 * GB, 70 * GB, ctx_kv, 4 * GB);
+    try std.testing.expectEqual(@as(u64, 4 * GB), with_idle -| ctx_kv);
 }
