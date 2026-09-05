@@ -385,6 +385,14 @@ pub const DiskTier = struct {
         if (self.writer) |w| w.drain();
     }
 
+    /// Host bytes staged for the writer and not yet written — a real claim on
+    /// unified memory that no bill currently sees. Zero when the writer is not
+    /// armed. Bounded by the permit (~1 GiB). (audit S11)
+    pub fn stagedHostBytes(self: *DiskTier) u64 {
+        const w = self.writer orelse return 0;
+        return w.pendingBytes();
+    }
+
     /// Background write failures so far. A caller about to DISCARD the RAM copy
     /// must consult this: the writer counts errors and drops the blob, so a
     /// "complete" commit can still have left nothing on disk. (audit S3)

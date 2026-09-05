@@ -212,6 +212,16 @@ var ssd_first_env_cached: ?bool = null;
 /// Test/bench override for `ssdFirstEnabled()`. Null = read the environment.
 pub var ssd_first_override: ?bool = null;
 
+/// Resolve this module's lazily-cached env reads ONCE, from the main thread,
+/// before any other thread exists — the same discipline (and the same reason)
+/// as `transformer.warmQsaEnvCaches`: `ssd_first_env_cached` is a `?bool`
+/// filled on first touch, and a non-atomic optional written from two threads
+/// is UB. Only the inference thread touches it today; this is what keeps that
+/// true when a second caller appears. Called from `main()`. (audit N7)
+pub fn warmEnvCaches() void {
+    _ = ssdFirstEnabled();
+}
+
 /// SSD-first prefix cache mode. `MLX_SERVE_PREFIX_SSD_FIRST=0` restores the
 /// RAM-first behaviour every other arch already has; the mode is armed only
 /// where `ModelConfig.ssdFirstCapable()` is also true (qwen4_exp today), so
@@ -2102,6 +2112,19 @@ pub const HotPrefixCache = struct {
     /// thread's admission guard (it may race a commit by one entry); the
     /// decision that MATTERS is made on the inference thread by
     /// `evictLruToAdmit`, which re-reads live memory after every eviction.
+    /// Host bytes this cache's SSD writer is holding for files it has not
+    /// written yet. On unified memory those compete with the Metal working
+    /// set, so a headroom that reads only `mlx_get_active_memory` is optimistic
+    /// by up to the writer's permit (~1 GiB) — and the moment they peak is a
+    /// long prefill's chunk boundary, which is exactly when the adaptive width
+    /// probe runs. INFERENCE THREAD ONLY: reaches the disk tier directly.
+    /// (audit S11 — the subtraction in `prefillHeadroomNow` belongs to the
+    /// adaptive owner; this is the number to subtract.)
+    pub fn stagedHostBytes(self: *HotPrefixCache) u64 {
+        const d = if (self.disk) |*dd| dd else return 0;
+        return d.stagedHostBytes();
+    }
+
     pub fn residentBytes(self: *const HotPrefixCache) u64 {
         return self.current_kv_bytes;
     }

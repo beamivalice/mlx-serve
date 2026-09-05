@@ -375,6 +375,8 @@ pub fn main(init: std.process.Init) !void {
     // `?bool`/`?c_int` cache from two threads is a non-atomic race, and these
     // are process constants.
     @import("transformer.zig").warmQsaEnvCaches();
+    // Same discipline, prefix-cache module (audit N7).
+    @import("prefix_cache.zig").warmEnvCaches();
 
     // And make an MLX failure an ERROR rather than the end of the process.
     // mlx-c's default handler prints and calls exit(-1), so a Metal
