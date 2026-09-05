@@ -4862,14 +4862,21 @@ const MOE_PREFILL_COEXIST: u64 = 4;
 /// What a WARM turn ALREADY holds, and the one input that tells the admission
 /// bill a restored prefix from a cold one.
 ///
-/// A RAM hot-cache restore rebinds the entry's MLX handles by refcount: the
-/// matched rows are already inside `mlx_get_active_memory`, so `available` is
-/// already net of them and billing them a second time invents a copy nobody
-/// allocates. That is what refused a 786,707-token warm turn whose own
-/// 786,676-token entry was resident (live 2026-09-05): `needed` was 25,866 MB
-/// against 19,032 MB free, of which ~14.5 GB was the entry the restore was
-/// about to SHARE — bytes that are neither to be allocated nor, since eviction
-/// protects them, to be reclaimed.
+/// A RAM hot-cache restore hands the slot the entry's KV buffers without
+/// allocating another copy of them: the matched rows are already inside
+/// `mlx_get_active_memory`, so `available` is already net of them and billing
+/// them a second time invents a copy nobody allocates. That is what refused a
+/// 786,707-token warm turn whose own 786,676-token entry was resident (live
+/// 2026-09-05): `needed` was 25,866 MB against 19,032 MB free, of which
+/// ~14.5 GB was KV the restore was about to hand over — bytes that are neither
+/// to be allocated nor, since eviction protects the entry, to be reclaimed.
+///
+/// KV ONLY. The QSA indexer history travels with the restore but is
+/// PRIVATISED on arrival (`restoreQsaHistory` -> `seedCapBuf`, a
+/// `materializedOwnedCopy` or a slice_update into fresh `mlx_zeros`), so the
+/// slot allocates its own and no byte of it is shared. Crediting it was audit
+/// W-2: against the one-copy `statePerTokenBilled` this tree ships, the
+/// history term cancelled outright — ~3.0 GB under-billed at 786k.
 ///
 /// The credit is gated on CAPACITY, not on the match alone. Past the
 /// destination buffer's capacity the prefill grows, and a grow allocates the
@@ -4887,9 +4894,9 @@ pub const WarmPrefix = struct {
     /// warm decision to the inference thread instead (`checkAttentionMemory`).
     capacity_tokens: u64 = 0,
 
-    /// PURE: rows this request will NOT allocate because they are resident and
-    /// refcount-shared. All-or-nothing on the capacity gate, and never more
-    /// than the reservation itself.
+    /// PURE: rows of KV this request will NOT allocate, because the restore
+    /// already handed it the buffer holding them. All-or-nothing on the
+    /// capacity gate, and never more than the reservation itself.
     pub fn creditedRows(self: WarmPrefix, reserved: u64) u64 {
         if (self.matched_tokens == 0) return 0;
         if (reserved > self.capacity_tokens) return 0;
@@ -4918,12 +4925,13 @@ pub const PrefillRequestTerms = struct {
     /// SSM checkpoints the prefill has TAKEN and is still holding when it
     /// reaches its last chunk (`retainedSsmCheckpointBytes`).
     checkpoint_bytes: u64 = 0,
-    /// Bytes of the terms above that are ALREADY resident and refcount-shared
-    /// with the hot-cache entry this request restored from (`WarmPrefix`), so
-    /// `mlx_get_active_memory` — and therefore `available` — already counts
-    /// them. Subtracted ONCE, at the one site in `prefillMemoryNeeded`
-    /// (scan-pinned): the other failure mode of this rule is crediting the
-    /// same prefix twice, once here and once as reclaimable cache.
+    /// Bytes of the KV terms above that are ALREADY resident in the buffer the
+    /// restore handed this slot (`WarmPrefix`), so `mlx_get_active_memory` —
+    /// and therefore `available` — already counts them. KV only: `state_bytes`
+    /// is re-allocated on a warm turn (audit W-2), so it is never credited.
+    /// Subtracted ONCE, at the one site in `prefillMemoryNeeded` (scan-pinned):
+    /// the other failure mode of this rule is crediting the same prefix twice,
+    /// once here and once as reclaimable cache.
     shared_resident_bytes: u64 = 0,
 };
 
@@ -5150,11 +5158,19 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
     // Only the HEADROOM is new here: `prefillMemoryNeeded` already bills
     // `seq * kv_per_tok` for the prompt's own rows.
     const kv_per_tok = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);
-    // Rows the restore refcount-SHARED and this prefill will reuse in place.
-    // Credited for their KV and for ONE copy of the indexer history: the
-    // second copy `statePerTokenBilled` bills is the end-of-prefill checkpoint
-    // attach, which materializes a fresh array on a warm turn exactly as it
-    // does on a cold one.
+    // Rows the restore hands over without allocating another copy, and this
+    // prefill reuses in place. KV ONLY — never the indexer history.
+    //
+    // AUDIT W-2. The restore does NOT share the history: `restoreQsaHistory`
+    // privatises it immediately through `seedCapBuf`, which is a
+    // `materializedOwnedCopy` when the reservation already fits and a
+    // slice_update into a fresh `mlx_zeros` when it does not. Either way the
+    // slot ends up holding its own array, so every byte of history the prompt
+    // covers is allocated again on a warm turn exactly as on a cold one.
+    // Crediting one copy of it read as a harmless conservatism and was not:
+    // folded with the one-copy `statePerTokenBilled` this tree now ships, the
+    // history term CANCELS — a ~3.0 GB under-bill at 786k, on a path where the
+    // failure is an uncatchable Metal abort rather than a 400.
     const credited = warm.creditedRows(reserved);
     return .{
         .reserved_kv_bytes = (reserved -| seq) * kv_per_tok,
@@ -5162,7 +5178,7 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
         // (one copy + the score bank; two copies with a lever off).
         .state_bytes = reserved * statePerTokenBilled(config),
         .checkpoint_bytes = retainedSsmCheckpointBytes(config, seq, chunk),
-        .shared_resident_bytes = credited *| (kv_per_tok +| config.qsaHistoryBytesPerToken()),
+        .shared_resident_bytes = credited *| kv_per_tok,
     };
 }
 
@@ -22646,12 +22662,12 @@ test "a WARM turn is not billed for the prefix it is about to SHARE (786,707 @ 1
     //   [scheduler] prefill refused: 786707 tokens do not fit even with an
     //     empty hot cache
     //
-    // The restore rebinds the entry's MLX handles by REFCOUNT, so those
-    // ~14.5 GB were already inside `mlx_get_active_memory` — already netted
-    // out of the 19,032 MB — and `needed` billed every one of them a second
-    // time as if the prompt were cold. The same request served on 5c4b4bc
-    // only because the box had more slack; the blindness is older than the
-    // fix round.
+    // The restore hands the slot the entry's KV buffers without allocating a
+    // second copy, so those ~14.5 GB were already inside
+    // `mlx_get_active_memory` — already netted out of the 19,032 MB — and
+    // `needed` billed every one of them again as if the prompt were cold. The
+    // same request served on 5c4b4bc only because the box had more slack; the
+    // blindness is older than the fix round.
     const cfg = qwen4ExpOomConfig();
     const seq: u64 = 786_707;
     const chunk: u64 = 512; // the width the ladder came down to that evening
@@ -22665,9 +22681,10 @@ test "a WARM turn is not billed for the prefix it is about to SHARE (786,707 @ 1
     // indexer history per token. The history is billed at ONE copy since the
     // commit handoff (qsa-history-bill), plus the 1,536 B/tok f32 score bank
     // — 5,376 B/tok, where this test was first written against 7,680 (two
-    // copies, no bank). The CREDIT below is unaffected: it prices what a
-    // restore SHARES, which is one live history whatever the bill's
-    // multiplier is.
+    // copies, no bank). The CREDIT below prices KV and nothing else: the
+    // history is PRIVATISED on restore (`seedCapBuf`), so none of it is
+    // shared and crediting a copy of it under a one-copy bill cancelled the
+    // term outright (audit W-2).
     const kv_per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits);
     try t.expectEqual(@as(u64, 13_056), kv_per_tok);
     try t.expectEqual(@as(u64, 3_840), cfg.qsaHistoryBytesPerToken());
@@ -22702,22 +22719,28 @@ test "a WARM turn is not billed for the prefix it is about to SHARE (786,707 @ 1
     const warm_prefix = WarmPrefix{ .matched_tokens = matched, .capacity_tokens = capacity };
     try t.expectEqual(matched, warm_prefix.creditedRows(reserved));
 
-    // The CONTRACT, stated as arithmetic: the credit is the shared rows at
-    // this arch's KV width plus ONE copy of its indexer history, and it comes
-    // off inside the 5/4 margin — so the warm bill is the cold bill less
-    // exactly 5/4 of it, and nothing else moves.
-    const credit = matched * (kv_per_tok + cfg.qsaHistoryBytesPerToken());
-    try t.expectEqual(@as(u64, 786_676 * 16_896), credit);
+    // The CONTRACT, stated as arithmetic: the credit is the handed-over rows
+    // at this arch's KV width and NOTHING else, and it comes off inside the
+    // 5/4 margin — so the warm bill is the cold bill less exactly 5/4 of it,
+    // and nothing else moves. Independent of `statePerTokenBilled`: a change
+    // to how many copies of the history the BILL charges must not move the
+    // credit, because the credit describes what the restore hands over.
+    const credit = matched * kv_per_tok;
+    try t.expectEqual(@as(u64, 786_676 * 13_056), credit);
+    try t.expect(credit < matched * (kv_per_tok + cfg.qsaHistoryBytesPerToken()));
     const warm = prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, warm_prefix);
     try t.expectEqual(cold - credit * 5 / 4, warm);
 
-    // And the verdict flips: ~8.4 GB against 19,032 MB free, so the request is
-    // ADMITTED outright — no eviction pass, and the other session's
-    // 523,887-token entry survives. The credit is UNCHANGED by the one-copy
-    // bill (it prices one live history either way), so warm falls with cold:
-    // 24,475 - 15,844 = 8,630, against ~10.0 GB when this was written.
+    // And the verdict flips: ~11.9 GB against 19,032 MB free, so the request
+    // is ADMITTED outright — no eviction pass, and the other session's
+    // 523,887-token entry survives. KV-only makes the credit SMALLER than the
+    // 15,844 MB the fold executor measured with the history in it:
+    // 786,676 x 13,056 x 5/4 = 12,244 MB, so warm is 24,475 - 12,244 = 12,231
+    // rather than 8,630. Under-crediting is the safe direction and the verdict
+    // is the same; the 3.0 GB difference is history this turn really does
+    // allocate.
     try t.expect(warm < available);
-    try t.expect(warm / mb > 8_000 and warm / mb < 9_500);
+    try t.expect(warm / mb > 11_500 and warm / mb < 13_000);
 
     // A COLD 786,707-token prompt on the same box keeps the old refusal: the
     // credit is a property of what is resident, never of the prompt length.
@@ -22766,7 +22789,7 @@ test "a chain extension that OUTGROWS the resident entry is credited nothing" {
     // not prompt length.
     const roomy = WarmPrefix{ .matched_tokens = 786_707, .capacity_tokens = 1_048_576 };
     try t.expectEqual(@as(u64, 786_707), roomy.creditedRows(reserved));
-    const credit = 786_707 * (kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) + cfg.qsaHistoryBytesPerToken());
+    const credit = 786_707 * kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits);
     try t.expectEqual(
         prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, .{}) - credit * 5 / 4,
         prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, roomy),
@@ -22787,6 +22810,19 @@ test "the shared prefix is subtracted EXACTLY once, and never by the thread that
     const field = "shared_resident" ++ "_bytes";
 
     try t.expectEqual(@as(usize, 1), std.mem.count(u8, src, "        .shared_resident" ++ "_bytes = credited *| "));
+    // AUDIT W-2: the credit is KV and NOTHING else. The QSA history rides the
+    // restore but `seedCapBuf` privatises it on arrival, so the slot allocates
+    // its own copy and none of it is shared. Crediting one copy of it against
+    // the one-copy `statePerTokenBilled` this tree ships cancelled the history
+    // term to zero — ~3.0 GB under-billed at 786k, on a path whose failure is
+    // an uncatchable Metal abort. Pinned at the SITE, because the wrong
+    // version passed every arithmetic bar this file had.
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, src, "_bytes = credited *| kv_per" ++ "_tok,"));
+    const terms_body = declBody(src, "pub fn prefillRequestTerms(") orelse return error.CallSiteMoved;
+    const credit_at = std.mem.indexOf(u8, terms_body, "_bytes = credited").?;
+    const credit_line = terms_body[credit_at..][0..@min(120, terms_body.len - credit_at)];
+    try t.expect(std.mem.indexOf(u8, credit_line, "qsaHistoryBytes") == null);
+    try t.expect(std.mem.indexOf(u8, credit_line, "statePerToken") == null);
     try t.expectEqual(@as(usize, 1), std.mem.count(u8, src, "(gross -| req.shared_resident" ++ "_bytes) * 5 / 4"));
     // ...and nothing else reads the field to bill with. ONE, not two: every
     // needle in this scan is split across a `++` so the scan's own source

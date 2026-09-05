@@ -3504,9 +3504,33 @@ off the 1M bill directly (33.2 GB -> ~30.2 GB against 31,717 MB free), so the
 rung may admit without either lever. The re-judge is what decides that, not this
 arithmetic.
 
-One seam between the two changes, since they touch the same terms: the credit
-here is `credited *| (kv_per_tok +| config.qsaHistoryBytesPerToken())` — ONE
-copy of the history, spelled with the per-token helper and deliberately NOT with
-`statePerTokenBilled`. A change to how many copies the bill charges therefore
-does not have to be mirrored in the credit: the credit is what a restore SHARES,
-which is one live history whatever the bill's multiplier is.
+One seam between the two changes, since they touch the same terms — and the
+first version of this paragraph got it wrong, which is why the rule is now
+spelled at the site. The credit is `credited *| kv_per_tok`: **KV only**. The
+QSA history travels with the restore but is PRIVATISED on arrival
+(`restoreQsaHistory` -> `seedCapBuf`, a `materializedOwnedCopy` when the
+reservation already fits, a slice_update into fresh `mlx_zeros` when it does
+not), so the slot allocates its own and not one byte of it is shared. Crediting
+one copy of it read as a harmless conservatism; folded with the one-copy
+`statePerTokenBilled` this tree now ships, the history term CANCELLED — ~3.0 GB
+under-billed at 786k, on a path whose failure mode is an uncatchable Metal
+abort rather than a 400 (audit W-2).
+
+The rule that survives is narrower than "the credit is what a restore shares":
+**the credit is what the restore hands over WITHOUT allocating**. A buffer
+handed to the slot qualifies; a view copied on arrival does not. A change to
+how many copies the bill charges must therefore not move the credit at all, and
+a scan pins the credit expression against ever naming `qsaHistoryBytesPerToken`
+or `statePerTokenBilled` again.
+
+The capacity gate has the same shape and was got wrong the same way (audit
+W-1). `KVCache.entries` is allocated at `num_hidden_layers`, but on a GDN trunk
+only the ATTENTION layers ever call `update` — 12 of 48 on qwen4_exp — so 36
+entries are `initialized == false` forever. The first `residentCapacityTokens`
+vetoed on the first of those (`if (!e.initialized) return 0;`), which made the
+capacity 0 on every qwen4_exp request and the whole warm credit unreachable on
+the one arch it was written for: the `kvLenForBatching` class, a guard reading a
+value that is zero forever on a linear-layer trunk. The fold now SKIPS an
+uninitialized entry and takes the minimum over those that hold a buffer, 0 when
+none does — which is also the safe direction, since a caching layer with no rows
+yet can only happen while the whole cache is cold.

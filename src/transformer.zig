@@ -6463,31 +6463,59 @@ pub const KVCache = struct {
         return @intCast(shape[2]);
     }
 
-    /// Tokens of capacity every caching layer's buffer ALREADY holds.
+    /// PURE half of `residentCapacityTokens`: the minimum capacity across the
+    /// entries that HOLD one, and 0 when none does.
     ///
-    /// The WARM bill's one gate. A prefix-cache restore rebinds the entry's
-    /// buffers by REFCOUNT — those bytes are already inside
-    /// `mlx_get_active_memory` and the request allocates none of them again —
-    /// but only for as long as the buffer is reused IN PLACE. Past this
-    /// capacity `nextCapacityReserved` allocates the whole new capacity beside
-    /// the old one (`growQuantBuf` slice_updates the old into the new and both
-    /// live until the eval), and the old copy is the hot entry's, which
-    /// eviction protects: so a grow really does cost a second full buffer and
-    /// nothing may be credited against it.
+    /// A fold rather than a slice argument because the impure half must own no
+    /// arithmetic of its own — the rule this encodes was got wrong once
+    /// already by writing it twice.
     ///
-    /// The MINIMUM across layers, and 0 as soon as one layer is uninitialized:
-    /// the credit must be provable for every buffer the prefill writes, and a
-    /// maximum would credit rows the narrowest layer is about to reallocate.
-    /// Linear layers hold no KV entry and are not part of the question.
-    pub fn residentCapacityTokens(self: *const KVCache) usize {
-        var cap: usize = std.math.maxInt(usize);
-        var seen: usize = 0;
-        for (self.entries) |*e| {
-            if (!e.initialized) return 0;
-            seen += 1;
-            cap = @min(cap, bufferCapacity(e.keys));
+    /// An uninitialized entry is SKIPPED, never a veto. `KVCache.entries` is
+    /// allocated at `num_hidden_layers` (`scheduler.zig`, `slot_kv_layers`),
+    /// but on a hybrid trunk only the ATTENTION layers ever call `update` —
+    /// 12 of 48 on qwen4_exp — so 36 entries are uninitialized for the life of
+    /// the slot. A `return 0` on the first of those made the warm credit
+    /// unreachable on the exact arch it was written for (audit W-1, the
+    /// `kvLenForBatching` class: a length that is zero forever on a
+    /// linear-layer trunk). Skipping is also the SAFE direction to be wrong
+    /// in: a caching layer that genuinely has no rows yet can only happen
+    /// while the whole cache is cold, and then nothing is initialized and the
+    /// fold reports 0 anyway.
+    pub const CapacityFold = struct {
+        cap: usize = std.math.maxInt(usize),
+        seen: usize = 0,
+
+        /// `null` = this layer holds no buffer (a linear layer, or a cold
+        /// cache). Anything else is a real capacity and enters the minimum.
+        pub fn add(self: *CapacityFold, entry_cap: ?usize) void {
+            const v = entry_cap orelse return;
+            self.seen += 1;
+            self.cap = @min(self.cap, v);
         }
-        return if (seen == 0) 0 else cap;
+
+        pub fn result(self: CapacityFold) usize {
+            return if (self.seen == 0) 0 else self.cap;
+        }
+    };
+
+    /// Tokens of capacity every CACHING layer's buffer ALREADY holds.
+    ///
+    /// The WARM bill's one gate. A prefix-cache restore hands the slot the
+    /// entry's KV buffers without allocating another copy of them — those
+    /// bytes are already inside `mlx_get_active_memory` and `available` is
+    /// already net of them — but only for as long as the buffer is reused IN
+    /// PLACE. Past this capacity `nextCapacityReserved` allocates the whole
+    /// new capacity beside the old one (`growQuantBuf` slice_updates the old
+    /// into the new and both live until the eval), so a grow really does cost
+    /// a second full buffer and nothing may be credited against it.
+    ///
+    /// The MINIMUM across the layers that hold a buffer: the credit must be
+    /// provable for every buffer the prefill writes, and a maximum would
+    /// credit rows the narrowest layer is about to reallocate.
+    pub fn residentCapacityTokens(self: *const KVCache) usize {
+        var fold = CapacityFold{};
+        for (self.entries) |*e| fold.add(if (e.initialized) bufferCapacity(e.keys) else null);
+        return fold.result();
     }
 
     /// Buffer-grow / slice-update / view-build, parameterized over the
@@ -47140,4 +47168,73 @@ test "qsa history: a restore-shaped re-seed lands AT the reservation, so the app
         try t.qsaAppendKeys(entry, chunk, held + 30);
     }
     try testing.expectEqual(@as(usize, 1), qsa_cap_buf_allocs - grows2);
+}
+
+test "the warm-credit capacity gate survives a hybrid trunk's uninitialized layers (W-1)" {
+    const t = std.testing;
+    // AUDIT W-1. `KVCache.entries` is allocated at `num_hidden_layers`
+    // (`scheduler.zig`: `slot_kv_layers = config.num_hidden_layers`), but on a
+    // GatedDeltaNet trunk only the ATTENTION layers ever reach `update`. On
+    // qwen4_exp that is 12 of 48 — every fourth layer — so 36 entries are
+    // `initialized == false` for the life of the slot.
+    //
+    // The first shape of this helper vetoed on the first such entry
+    // (`if (!e.initialized) return 0;`), which made the capacity 0 on EVERY
+    // qwen4_exp request and the warm credit unreachable on the one arch it
+    // was written for. Same class as `kvLenForBatching` reading a length that
+    // is zero forever on a linear-layer-0 trunk: a guard that only ever runs
+    // on the shape it cannot see.
+    const Fold = KVCache.CapacityFold;
+    const layers: usize = 48;
+    const interval: usize = 4; // full_attention_interval — layer 3, 7, 11, …
+    const cap: usize = 787_456;
+
+    var fold = Fold{};
+    var attention_layers: usize = 0;
+    for (0..layers) |i| {
+        const is_attention = (i % interval) == interval - 1;
+        if (is_attention) attention_layers += 1;
+        fold.add(if (is_attention) cap else null);
+    }
+    try t.expectEqual(@as(usize, 12), attention_layers);
+    // RED on the vetoing shape, which reported 0 here.
+    try t.expectEqual(cap, fold.result());
+
+    // The MINIMUM still governs among the layers that DO hold a buffer: a
+    // narrower one is about to reallocate and the credit must be provable for
+    // every buffer the prefill writes.
+    var ragged = Fold{};
+    ragged.add(cap);
+    ragged.add(null);
+    ragged.add(cap - 4096);
+    ragged.add(null);
+    try t.expectEqual(cap - 4096, ragged.result());
+
+    // A COLD cache initializes nothing, so nothing is credited — the veto's
+    // one correct answer, reached by counting instead of by bailing.
+    var cold = Fold{};
+    for (0..layers) |_| cold.add(null);
+    try t.expectEqual(@as(usize, 0), cold.result());
+    const empty = Fold{};
+    try t.expectEqual(@as(usize, 0), empty.result());
+
+    // And a dense trunk, where every layer caches, is unchanged.
+    var dense = Fold{};
+    for (0..32) |_| dense.add(cap);
+    try t.expectEqual(cap, dense.result());
+}
+
+test "residentCapacityTokens owns no arithmetic of its own (W-1 class pin)" {
+    const t = std.testing;
+    // The rule above was got wrong by being written twice. The impure half
+    // must be a fold over `CapacityFold` and nothing else — in particular it
+    // may not re-introduce an early return on an uninitialized entry.
+    const src = @embedFile("transformer.zig");
+    const body = "        var fold = CapacityFold{};\n" ++
+        "        for (self.entries) |*e| fold.add(if (e.initialized) bufferCapacity(e.keys) else null);\n" ++
+        "        return fold.result();\n";
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, src, body));
+    const decl = std.mem.indexOf(u8, src, "pub fn residentCapacity" ++ "Tokens(self: *const KVCache) usize {") orelse return error.CallSiteMoved;
+    const end = std.mem.indexOfPos(u8, src, decl, "\n    }\n") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, src[decl..end], "return 0;") == null);
 }
