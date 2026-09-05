@@ -4708,7 +4708,7 @@ It surfaced the only way it could: the fused replacement's first parity run went
 
 **The fused arm.** `msv_qsa_select` (`qsaSelectTopBlocks`, kill switch `MLX_SERVE_QSA_SELECT_KERNEL=0`) replaces the whole composed tail — bias → visibility `-inf` where → `argpartition` → slice → astype → `take_along_axis` → INT_MAX where → `sort` — with ONE dispatch, one threadgroup per query row. An MSD radix select over the score's monotone f32 ordinal (digits 11/11/10, a 2048-bin threadgroup histogram = 8 KiB, early exit the moment a bin's whole count is what is still needed, so the row is read 2-3 times) finds the threshold ordinal `T` and how many `== T` elements to take. Then one ascending compaction pass: an element is selected iff `ord > T`, or `ord == T` and its rank among the equals is below the quota, and its output slot is the number of selected elements with a SMALLER index — two running prefix sums give that directly, so **the row is born sorted and there is no sort pass at all**. The tie rule is exact by construction and independent of magnitude. `nb` rides the input SHAPE, never a template arg: it grows every `ratio` tokens of a generation and a template value would JIT a fresh specialization per decode step.
 
-**Measured (M5 Max, mixed-4-8bit pack, one binary, `MLX_SERVE_QSA_VERIFY_EXACT=0`).**
+**Measured (M5 Max, mixed-4-8bit pack, one binary).** The arm was selected with `MLX_SERVE_QSA_VERIFY_EXACT=0`, a lever that exists only on the parked branch `holtsway/mlx-serve@feat/qwen4-moe-verify-nax` — **so this table is not reproducible on this tree**; it is kept as the record of what was measured, not as a check anyone can re-run here.
 
 Forward µbench, 8 boots, order off/on/on/off per width:
 
@@ -5440,3 +5440,112 @@ must not be live in one process, and the fused select is the reference arm (the
 bias chain rounds away from `torch.topk`'s lower-index-wins past |score| ~ 0.84).
 **So the bar for any arm on this branch is within-tree MTP against its OWN
 serial. A cross-tree byte comparison here measures M12, not the kernel.**
+
+## The batched pad-waste cap priced every hybrid slot at kv_len 0 (2026-09-05)
+
+`KVCache.step` only advances on the arch's first attention layer. On a pure-attention
+trunk that is layer 0, so `step` is a fine proxy for "how far has this slot decoded."
+On every arch whose GLOBAL layer 0 is a linear/recurrent layer instead —
+GDN trunks (qwen3_5, qwen4_exp), lfm2 and lfm2_moe, nemotron_h, bailing_hybrid's
+KDA layers — layer 0 never touches `KVCache.update`, so `step` sits at 0 for the
+entire request. The batched-decode pad-waste cap (`batchedKvKeepCount`,
+`MAX_PAD_WASTE`) sorts slots by kv length and keeps the largest prefix under the
+waste bar, falling the rest to serial. Fed `step` directly, every slot in a
+hybrid-arch batch reported kv_len 0: the sort saw N identical zeros, the waste
+ratio computed to 1.0 regardless of true prompt lengths, and the cap never
+tripped — a batch of wildly different kv lengths rode together with the padding
+cost UNBILLED, silently defeating the mechanism `MAX_PAD_WASTE` exists to
+enforce.
+
+The fix is `KVCache.kvLenForBatching()`: if entry 0 is initialized (a
+pure-attention or MLA trunk), return `step` as before; otherwise walk forward to
+the first `.attention` entry (present in every hybrid — KDA/GDN/conv layers are
+interleaved with real attention layers on a cadence) and return ITS offset,
+which advances correctly because attention layers do call `KVCache.update`.
+`Slot.batchKvLen` is fed by this ONE helper, and both the sort key and the waste
+ratio read `batchKvLen` — never `step` directly — so there is no way for a second
+call site to reintroduce the bug by reading the raw field. Engagement logs as
+`[batched] pad-waste cap: kept K of N slots (waste Wx, kv_len lo..hi), rest
+serial` so a live boot shows the cap actually discriminating between slots
+instead of always keeping every slot (or always falling everything to serial,
+the failure mode's opposite face on a differently-shaped batch). An integration
+arm, `MLX_SERVE_PADWASTE_ARM=1`, forces a batch with a deliberately wide
+kv-length spread so the cap's keep/drop decision is exercised even when the
+organic request mix would not otherwise trigger it.
+
+Guard: a two-slot batch on a hybrid arch (one short prompt, one long) where the
+short slot must be excluded once its padding waste crosses `MAX_PAD_WASTE` —
+byte-identical to the N=1 forward for the kept slot, and the excluded slot must
+observably fall to serial (present in the `[batched]` log line's "rest serial"
+count) rather than silently riding along.
+
+## S21: a module-owned MTP head is handed back when the adaptive switch leaves it (2026-09-05)
+
+`MtpAdaptive`'s serial/MTP switch decides per bucket whether a round is worth
+running. For a KV-only sidecar head that decision is cheap to reverse — the next
+round just re-arms. For a MODULE-OWNED head (qwen4's, per `MtpHeadRef.moduleOwned()`)
+it is not: `slotExclusiveDecode` holds the one slot driving that head exclusive
+for as long as it might resume, which starves every other request wanting the
+same head. Before S21, a `to_serial` switch left the slot holding the head
+forever, on the chance MTP might resume — a correctness-neutral but throughput-hostile
+default once a model settles into serial for the rest of a long request.
+
+The fix is a STICKY latch, `MtpAdaptive.sticky_serial`, that lives on the SLOT
+(never the model — the trunk's `ownsModuleDecodeState()` bit is a property of
+the model and nothing in a request can hand that back). Once a `to_serial` vote
+fires on a module-owned head, the latch sets and every subsequent re-arm path
+refuses: `round()`, `serialTick()`, the adaptive re-entry check, the deferred
+history-stash apply, and the bounded serial probe all key on ONE predicate,
+`mtpAdaptiveHeadMayResume()`, which returns false first thing once sticky. With
+every resumption path closed, `slotExclusiveDecode` releases the head.
+
+Two places load-bear on exactly where the release lands and what it must not
+race:
+
+**Release timing.** The release does NOT happen at the `to_serial` vote itself —
+that vote is read while a round is being planned, and the round it decided
+against still runs to completion (its own log line says so). Releasing at the
+vote would hand a second slot the head while the first is still mid-round on
+it. The release call lives in `nextMtp`'s serial branch, AFTER `mtpDetachHead`
+has dropped the pre-draft and the stash — that is the true block boundary where
+the slot is done touching the head for this round.
+
+**The batched-tick gap.** A sticky slot becomes batchable the instant it sets
+`spec_disabled_runtime`, but the batched tick never calls `nextMtp` — it has its
+own dispatch path. Without a guard, a plain neighbour on the same model arriving
+in the very next tick would pull the sticky slot into a batched group before the
+release call ever ran, and the release would never land: the head would stay
+reserved to the end of the request, the same throughput limit S21 exists to fix,
+now silent instead of logged. `batchable` therefore holds a slot that still
+OWES the release out of any group for the one tick that lands it
+(`mtpReleasePending`), so the release always executes on a solo tick before the
+slot is allowed to batch.
+
+A third hazard falls out of the interaction with the prefix-cache commit path:
+that commit TRUNCATES the head's cache before snapshotting it, and on this arm
+the cache belongs to the model, potentially mid-generation on another slot. A
+released slot must not commit a head history it no longer owns — the commit
+site checks `gen_ptr.mtpModuleHeadReleased()` and skips the head commit (`break
+:blk null`) when set, before the truncate ever runs. A released slot's head
+history also simply stopped growing at the switch, so skipping its commit loses
+nothing live.
+
+Sidecar (KV-only) heads are untouched: they were never exclusive in the first
+place (`headExclusiveFor` returns false whenever the head is not module-owned,
+regardless of the release flag), so S21's latch and release logic apply only to
+the module-owned case. `MLX_SERVE_MTP_ADAPTIVE_SERIAL=0` (the flag that disables
+adaptive switching entirely) bypasses S21 along with the rest of the adaptive
+machinery, since a model that never switches to serial never needs to hand
+anything back.
+
+Guard: a truth table over `headExclusiveFor(model_owned, head_present,
+has_head, head_released)` covering all eight combinations — including the
+invariant that `head_released` must never affect the MODEL-level bit (dsv4's
+`ownsModuleDecodeState()`), only the per-request module-head case — plus a
+round-start-site enumeration scan confirming every re-arm path reads
+`mtpAdaptiveHeadMayResume()`, a release-site scan confirming there is exactly
+ONE call site and it is ordered detach → release → serial tick, a batched-group
+scan confirming `slotReleasePending` gates the one admission point, and a
+prefix-commit guard scan. Implemented on `fix-round/g1` as commit `3d28ff2`
+(uncompiled at commit time — `COMPILE OK` outstanding before `zig build
+-Doptimize=ReleaseFast` / `zig build test`).

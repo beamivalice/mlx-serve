@@ -2888,6 +2888,38 @@ negative arm therefore cannot be "reserve more than the donor" (that also
 counts zero, which is why the first version of the test failed); it has to be a
 write that genuinely runs past the donor's capacity.
 
+### The JSON grammar's token->bytes table was a process singleton (relocated from CLAUDE.md, 2026-09-05)
+
+The table is derived from a MODEL's vocabulary, but it was built once per process. A second model
+loaded into the same server then masked with a foreign vocab — the grammar was right and the bytes
+it matched belonged to someone else. It lives on `LoadedModel` now (`grammarTokenBytes`), which is
+the general rule: a cache derived from a model is per-model, never per-process.
+
+### Three audit findings that stayed stories (2026-09-05)
+
+These three came out of the bundle audit. They are rules in spirit, but CLAUDE.md was at its
+byte floor when they landed, and the growth policy's own answer to that is a story here rather
+than a symbol dropped there. Named so the next reader can find them.
+
+**A published snapshot is freed by the PUBLISHER, below the join** (`hot_cache_digests`, audit
+B0). The inference thread publishes an immutable digest slice and frees the one it supersedes,
+once per request. A `deinit` that frees it *above* `t.join()` therefore races the publisher: either
+a double free, or a connection thread reading a slice that has already gone. The ordering is the
+invariant — the free belongs below the join, in the same thread that publishes — and it is
+scan-pinned, because the wrong order compiles and serves correctly until the one interleaving.
+
+**A "complete" disk commit is STAGED, not durable** (audit S3). The background writer logs a failed
+blob, counts it and drops it; the entry is still "committed" from the caller's point of view. So
+anything that discards the RAM copy on the strength of a disk commit must first drain the writer
+and re-read `writeErrors()`. Treating the commit itself as durability is how a cache entry that
+exists in neither tier gets created.
+
+**An index-less entry directory is another process's flush in progress until proven old** (audit
+S4). Meta lands last by design, so a directory without it is indistinguishable from a partial
+write — and our epoch fence is per-process, so it cannot tell a *second* server's in-flight flush
+from our own debris. The sweep therefore only reclaims past `STRAY_MIN_AGE_NS`, and treats
+unreadable as young rather than as garbage.
+
 ## The prefill width, re-chosen per chunk (2026-09-05)
 
 The per-request width above answers "how wide may this prompt prefill?" once,
@@ -3059,3 +3091,87 @@ rung and is a no-op at 4096 and 8192.
   regression.
 - A probe taken where the transient has just been freed cannot see the
   transient. Pay for that with a second reading, not with a bigger margin.
+
+## N5: the prefill width is re-asked after the eviction pass, and admission logs on the admit path too (2026-09-05)
+
+The per-request prefill width is a function of what memory is FREE at the
+moment it is chosen. A request whose bill only fit at the ladder's narrowest
+rung was admitted at that floor — correctly, given what was free at admission
+time — but if admission then ran an eviction pass that returned gigabytes back
+to the pool, the prefill ran at the floor width for its ENTIRE length, never
+re-pricing against the memory eviction had just freed.
+
+The fix is a second look, not a wider bill up front: crediting `reclaimable` or
+`accounted_bytes` to the chooser ahead of eviction would justify a width against
+memory the allocator has not actually returned yet, and the failure costs are
+asymmetric — a needlessly narrow width only costs throughput, while a width
+justified by memory that turns out not to be free is an uncatchable Metal OOM.
+So `scheduler.postEvictionPrefillChunk` asks the width chooser TWICE around the
+eviction pass: once before (the same hook, the same inputs, the same live
+memory reading as the probe that just failed to admit at a wider rung — and
+only on the path that actually runs eviction), then again after, crediting only
+the LIVE delta the allocator actually reports (`EvictionReport.bytes` — the
+allocator's own before/after reading), never the pre-eviction ESTIMATE
+(`accounted_bytes`/`reclaimable`), which prices what eviction is expected to
+free rather than what it did.
+
+`postEvictionPrefillChunk` asserts `reasked >= admitted` — post-eviction
+available memory can only rise, never fall, so a re-ask that came back
+NARROWER than the original admission would mean memory moved between the two
+readings, which should be structurally impossible on this path. The assertion
+is a canary for that impossible case, not a normal-path clamp: on the expected
+path the max() changes nothing, but catching a violation here is cheaper than
+debugging the OOM it would otherwise cause three requests later. `cap_adapt`,
+the per-chunk adaptive ceiling, is built PIN-LESS — via `effectivePrefillChunk(…,
+0)`, a literal zero rung rather than the request's pinned width — specifically
+so it can never be the thing that clips a re-ask back down to the pre-eviction
+number.
+
+The width reaches its consumers through one chain: `req_prefill_chunk` ->
+`InitOptions.pinned_prefill_chunk` -> the runtime `PREFILL_CHUNK` constant ->
+`cur_chunk`. Both that chain and the `cap_adapt` seam are scan-pinned so a
+future refactor cannot quietly reintroduce a second, narrower source of truth
+for the chunk width.
+
+**The second half of N5** closes a related visibility gap: the admission path
+only ever logged when a request was REFUSED, so the numbers that explained a
+refusal only ever appeared after the fact — there was no way to see, on a
+request that succeeded, how close it had come to the ceiling. `server.checkAttentionMemory`
+(or the equivalent admission chokepoint) now emits exactly ONE line per
+request, on every request, regardless of outcome:
+
+```
+[admission] needed=<bytes> available=<bytes> reclaimable=<bytes> width=<chunk> verdict=admit|evict|refuse
+```
+
+The line is built from the SAME `AdmissionBill` value the three admission arms
+(admit outright, evict-then-admit, refuse) already act on and that a refusal
+already quotes — this is not a second estimator call, which would reproduce the
+class of bug #126 documents (a gate computing its own answer instead of reading
+the one that runs the actual decision). `admissionVerdict` derives the verdict
+string from the bill using the arms' own two predicates, so the logged verdict
+and the actual decision cannot diverge.
+
+Logging on every admitted request unconditionally would be too noisy at
+sustained load, so `admissionLogLevel` picks the level BEFORE any string is
+formatted (so a `debug`-level line that the configured level would drop is
+never built at all): `info` on the first request after a model load
+(`model_registry.load_generation`, consumed by one compare-and-swap so
+concurrent racing request threads produce exactly ONE `info` line, not one per
+thread) or whenever `needed` exceeds 0.9x `available` (the request is close
+enough to the ceiling that an operator watching info-level logs should see it
+land); `debug` otherwise. The load-generation token is checked for
+consume-ability before the level decision short-circuits, so an operator
+running below `debug` doesn't pay for a CAS on every request only to discard
+the log line.
+
+Tests: `postEvictionPrefillChunk` (widens after an eviction that freed memory,
+holds the original width when eviction freed nothing, never narrows relative to
+the pre-eviction ask, is a no-op when the two readings are unchanged), the
+composition of the two-ask logic against `chooseRequestPrefillChunk` including
+both the gate-disabled and non-qwen4 arms, a scan of the four-step admit/evict/reask/apply
+order, the `cap_adapt` pin-less-seam scan, `admissionLogLevel`'s
+load-generation and 0.9x-threshold branches, `admissionVerdict` against the
+arms' own predicates, a same-bill scan proving the admit and refuse arms format
+from one shared value, the post-load single-CAS arming scan, and
+`log.enabled`/`log.atLevel` gating.
