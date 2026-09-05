@@ -1966,6 +1966,11 @@ cap = min( serving / PREFILL_RESERVE_BUDGET_SHARE,
            (serving - ctx_kv) - HOT_CACHE_FLOOR_BYTES )
 ```
 
+`HOT_CACHE_FLOOR_BYTES` is 1 GiB. That is a PICK, not a measurement: one
+agentic prefix on a large model is order-GB of KV, so below it the cache cannot
+retain a single turn and the feature is dead weight. It is the only tunable
+this fix introduced.
+
 `ctx_kv` here is `sizerCtxKvBytes` — the PINNED context's bill under an
 explicit `--ctx-size`, and **0** while the context is auto. Auto-context is
 derived FROM the chunk (`pinAutoContext` pins the chunk first, deliberately),
@@ -2011,6 +2016,30 @@ context against a budget the hot cache shares with the live KV, so at 1M
 context 20.7 GB is subtracted from the cache's headroom for KV that only exists
 once a request is that long. That is being removed arch-gated on the SSD-first
 branch. This fix makes the default sane with that bill still in place.
+
+**That bill is also why the rung is narrow, and removing it is what widens it:**
+with the full-context term gone the cache's headroom on this box goes
+8,173 -> 28,909 MiB and the sizer's `sizerCtxKvBytes` bar goes with it, so
+reserve(4096) at ~15.3 GiB sits inside 28.9 GiB and rung 4096 leaves ~13 GB of
+hot cache with no flags at all.
+
+One caveat survives that removal, and it is worth stating because it is the
+last gate: `PREFILL_RESERVE_BUDGET_SHARE` still bars any rung claiming more
+than a QUARTER of the serving budget — 7.2 GiB here — so a 15.3 GiB reserve
+clears the residual bar but NOT the share. Neither term is a place to shave:
+the judge at chunk 4096 peaked 90.3 GB of a ~93 GiB ceiling at 384k, so the
+reserve estimator is not loose, and the share is what stops one forward from
+trading the whole session for its own speed. Widening the rung on this box is a
+decision about the share, taken deliberately, not a side effect of this fix.
+
+**One ordering wrinkle, deliberately left standing.**
+`prefixCacheMemForLoad` calls `getEffectiveContextLength`, which on an
+un-pinned auto-context computes through `resolvedPrefixCacheMem()` — i.e. the
+PREVIOUS model's resolved value, or the raw ask on a first load. So on an
+auto-context boot the clamp's ctx term and the context that eventually gets
+pinned can differ by one iteration. It predates this fix, the direction is
+bounded, and it is moot once the SSD-first branch removes the full-context bill
+from the clamp entirely — at which point there is no ctx term to be stale.
 
 ### Rules this produced
 
