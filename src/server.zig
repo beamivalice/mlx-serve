@@ -3385,7 +3385,12 @@ fn ssdFirstBudgetForLoad(
     transient_reserve: u64,
     idle_out: *u64,
 ) ?u64 {
-    if (!config.ssdFirstCapable() or !prefix_cache_mod.ssdFirstEnabled()) return null;
+    // THE predicate, shared with the spill site. `--prefix-cache-disk` is OFF
+    // by default, and without a tier none of this mode's machinery can run —
+    // so granting its "one full-context session + idle" floor (~20 GB plus the
+    // whole ask at 1M) would be RAM the server cannot use. Disk off means the
+    // RAM arm below, byte for byte. (external review item 4)
+    if (!prefix_cache_mod.ssdFirstActive(config, prefix_cache_disk_bytes > 0)) return null;
     const budget = ssdFirstPrefixCacheMem(
         requested,
         ceiling,
@@ -3977,6 +3982,95 @@ test "the clamp bills the context that will be SERVED, not the placeholder" {
     try t.expect(placeholder.ctx_kv < 30 * MiB);
     try t.expect(real.ctx_kv > 18_000 * MiB);
     try t.expect(real.budget > 0);
+}
+
+test "SSD-first is gated on a DISK TIER: with --prefix-cache-disk off, qwen4_exp takes the RAM arm" {
+    // External review item 4. `ssdFirstEnabled()` never checked that a tier
+    // exists, and `--prefix-cache-disk` is OFF by default — so out of the box
+    // qwen4_exp got the mode's "one full-context session + idle" budget floor
+    // (~20 GB, plus the whole ask at 1M) with none of the spill machinery
+    // under it. A budget sized for a tier that does not exist is RAM the
+    // server cannot use.
+    const t = std.testing;
+    var cfg = qwen4RequestTestConfig();
+
+    const orig_disk = prefix_cache_disk_bytes;
+    defer prefix_cache_disk_bytes = orig_disk;
+    // `prefixCacheMemForLoad` PUBLISHES its answer into a process global that
+    // the auto-context sizer and the ANE gate both read, so a test that calls
+    // it must put the global back. Leaving it set made
+    // `aneGateHeadroom: reserves a usable context...` fail depending on test
+    // ORDER — green alone, red in the suite.
+    defer clearResolvedPrefixCacheMem();
+    const orig_over = prefix_cache_mod.ssd_first_override;
+    defer prefix_cache_mod.ssd_first_override = orig_over;
+    prefix_cache_mod.ssd_first_override = true; // the env switch is not what is on trial
+
+    // The predicate itself: three conjuncts, and the disk is one of them.
+    try t.expect(!prefix_cache_mod.ssdFirstActive(&cfg, false));
+    try t.expect(prefix_cache_mod.ssdFirstActive(&cfg, true));
+    var dense = model_mod.ModelConfig{};
+    dense.model_type = "qwen3";
+    try t.expect(!prefix_cache_mod.ssdFirstActive(&dense, true));
+    prefix_cache_mod.ssd_first_override = false;
+    try t.expect(!prefix_cache_mod.ssdFirstActive(&cfg, true));
+    prefix_cache_mod.ssd_first_override = true;
+
+    // ...and the budget arm follows it. Both arms are computed from the SAME
+    // live numbers, so the comparison is between the two formulas and not
+    // between two instants: the SSD arm FLOORS at one session's KV, the RAM
+    // arm is a residual bounded by the ask. A 4 GiB ask against a 1M context
+    // separates them by orders of magnitude.
+    const orig_ctx = server_config.max_context_size;
+    defer server_config.max_context_size = orig_ctx;
+    server_config.max_context_size = 1_048_576; // explicit: no auto-sizing in the way
+    cfg.pinned_context = 0;
+    const ask: u64 = 4 * 1024 * 1024 * 1024;
+
+    prefix_cache_disk_bytes = 0;
+    var idle_off: u64 = 12345;
+    const ram_arm = prefixCacheMemForLoad(&cfg, ask, &idle_off);
+    // The RAM arm publishes no idle allowance — the concept does not exist
+    // there, and `spillIdleEntries` never runs.
+    try t.expectEqual(@as(u64, 0), idle_off);
+    try t.expect(ram_arm <= ask);
+
+    prefix_cache_disk_bytes = 64 * 1024 * 1024 * 1024;
+    var idle_on: u64 = 0;
+    const ssd_arm = prefixCacheMemForLoad(&cfg, ask, &idle_on);
+    // One session at 1M on this pack is tens of GB; the floor makes the SSD
+    // arm's budget larger than the whole ask, which the RAM arm can never be.
+    try t.expect(ssd_arm > ask);
+    try t.expect(ssd_arm > ram_arm);
+    // The idle allowance is the ask clamped to what is left; on any box with
+    // headroom for a 4 GiB cache that is the ask itself, and it is never more.
+    try t.expect(idle_on > 0 and idle_on <= ask);
+    try t.expect(ssd_arm -| idle_on > ask); // the one-session floor
+}
+
+test "ONE SSD-first predicate: both the budget site and the spill site ask it" {
+    // Scan, across both files. The mode used to be spelled out at each site
+    // (`ssdFirstCapable() and ssdFirstEnabled()`), which is exactly how the
+    // disk conjunct came to be missing from one of them. Needles split so
+    // this test's own source cannot satisfy them.
+    const t = std.testing;
+    const pred = "ssdFirst" ++ "Active(";
+    const old_form = "ssdFirst" ++ "Enabled()";
+
+    const srv = @embedFile("server.zig");
+    const budget = declBody(srv, "fn ssdFirstBudgetForLoad(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, budget, pred) != null);
+    try t.expect(std.mem.indexOf(u8, budget, old_form) == null);
+
+    const sch = @embedFile("scheduler.zig");
+    try t.expect(std.mem.indexOf(u8, sch, "ssd_first = prefix_cache_mod." ++ pred) != null);
+    // The raw env reader survives only inside the predicate itself and the
+    // warm-up call; no OTHER site may spell the mode out by hand.
+    const pc = @embedFile("prefix_cache.zig");
+    const decl = declBody(pc, "pub fn ssdFirstActive(") orelse return error.PredicateMoved;
+    try t.expect(std.mem.indexOf(u8, decl, "ssdFirstCapable()") != null);
+    try t.expect(std.mem.indexOf(u8, decl, old_form) != null);
+    try t.expect(std.mem.indexOf(u8, decl, "has_disk") != null);
 }
 
 test "an auto boot advertises the session the SSD-first budget floor was billed for" {

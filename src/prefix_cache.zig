@@ -272,6 +272,32 @@ pub fn restoreMoveEnabled() bool {
     return v;
 }
 
+/// THE SSD-first predicate. Arch, env switch, AND a disk tier.
+///
+/// `ssdFirstEnabled()` alone is only two thirds of the answer, and the missing
+/// third is the default: `--prefix-cache-disk` is OFF out of the box, so on
+/// qwen4_exp the mode used to arm with no tier underneath it. That handed the
+/// budget arm its "one full-context session + idle" floor — ~20 GB plus the
+/// whole ask at 1M — while none of the spill machinery could run, because
+/// every mechanism needs somewhere to write. A budget sized for a tier that
+/// does not exist is just RAM the server cannot use.
+///
+/// Called at BOTH sites (the load-time budget and the arming), so with the
+/// disk off qwen4_exp takes the RAM arm byte for byte, exactly like every
+/// other arch. Scan-pinned in `scheduler.zig` and `server.zig`.
+///
+/// The two sites answer `has_disk` from what they can see, and they are not
+/// identical: the budget resolver runs BEFORE the tier is built, so it asks
+/// `--prefix-cache-disk > 0` (the operator's ask), while the arming asks
+/// `disk != null` (the tier that exists). A boot that asks for a tier and
+/// fails to build one therefore gets the SSD budget with the RAM mode for
+/// that boot — one log line explains both, and it is a strictly rarer and
+/// smaller inconsistency than the default it replaces (the mode armed with no
+/// tier at all). (external review item 4)
+pub fn ssdFirstActive(config: *const model_mod.ModelConfig, has_disk: bool) bool {
+    return has_disk and config.ssdFirstCapable() and ssdFirstEnabled();
+}
+
 /// SSD-first mechanism 1: what the LIVE cache held at commit time, captured
 /// BEFORE the RAM byte-budget trim. The disk tier is the capacity tier here,
 /// so it must receive the full prefix even when the RAM entry keeps a trimmed
