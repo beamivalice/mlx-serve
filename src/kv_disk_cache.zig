@@ -102,6 +102,14 @@ pub const DEFAULT_CHUNK_TOKENS: u32 = 1024;
 /// by the average.
 pub const SSM_DISK_MAX_PER_ENTRY: usize = 16;
 
+/// What a93e2c0 kept, and what every arch OUTSIDE the long-context gate still
+/// keeps. Raising the cap to 16 doubles the persisted checkpoint footprint per
+/// entry and changes `gcToBudget` pressure for the whole tier: it was sized
+/// against the live 383k qwen4_exp shape (93 stride captures at stride 4096,
+/// ~25,500-token gaps at 61% of a 100 GB tier) and against nothing else. A
+/// hybrid on a smaller tier pays the doubling and gets no measurement for it.
+pub const SSM_DISK_MAX_PER_ENTRY_LEGACY: usize = 8;
+
 /// SSD-first per-flush READBACK bound (mechanism 2). Bounds only the
 /// device→host copy the inference thread performs; the file write is off
 /// thread. At kv8 this is ~160k positions per flush — with per-chunk
@@ -415,6 +423,9 @@ pub const DiskTier = struct {
     /// it kept the highest N by a bulk shift, which is `.oldest` applied
     /// repeatedly.
     cp_thin: transformer_mod.ThinPolicy = .oldest,
+    /// How many checkpoint positions ONE entry may keep on disk. Mirrored from
+    /// the same predicate as `cp_thin` at wiring; the default is a93e2c0's.
+    ssm_max_per_entry: usize = SSM_DISK_MAX_PER_ENTRY_LEGACY,
     /// SSD-first mechanism 2: the background writer. Owned (heap-allocated so
     /// the mutex/condvars survive DiskTier being returned by value from
     /// `init`). Non-null = chunk and index bytes are serialized on the
@@ -1990,7 +2001,7 @@ pub const DiskTier = struct {
             if (std.mem.indexOfScalar(u32, set.items, p) == null) try set.append(self.allocator, p);
         }
         std.mem.sort(u32, set.items, {}, std.sort.asc(u32));
-        while (set.items.len > SSM_DISK_MAX_PER_ENTRY) {
+        while (set.items.len > self.ssm_max_per_entry) {
             _ = set.orderedRemove(transformer_mod.positionDropIndex(set.items, self.cp_thin));
         }
         return set.toOwnedSlice(self.allocator);
@@ -2386,14 +2397,37 @@ pub const DiskTier = struct {
         try std.Io.Dir.renameAbsolute(tmp_path, final_path, self.io);
     }
 
+    /// The LOWEST manifest version that actually describes this entry.
+    ///
+    /// The version is a COMPATIBILITY CLAIM, not a build stamp, and stamping
+    /// the newest unconditionally is a one-way door: a93e2c0's reader accepts
+    /// only 2, 3 and 4 (`if (version != 2 and version != 3 and version != 4)
+    /// return null`), so a v6 on every entry means downgrading the binary
+    /// silently discards the ENTIRE persisted tier — including entries that
+    /// use nothing a v4 reader lacks.
+    ///
+    /// The two newer features are both observable in the entry itself:
+    ///   v6 — leading chunk files are hard links into a donor's directory
+    ///        (SSD-first chunk sharing). `inherited_chunks > 0`.
+    ///   v5 — the MTP sidecar carries the head's QSA half beside its KV.
+    /// Everything else is v4's shape, which is what a93e2c0 wrote: the spec
+    /// sidecar is optional and absent-safe, and `inherited_chunks: 0` is an
+    /// unknown key an older reader ignores.
+    fn metaVersionFor(e: IndexEntry) u8 {
+        if (e.inherited_chunks > 0) return 6;
+        if (e.spec_mtp) |m| if (m.head != null) return 5;
+        return 4;
+    }
+
     /// The meta.json body. One renderer for both the synchronous and the
     /// staged path — the two must never drift.
     fn renderMeta(self: *DiskTier, out: *std.ArrayList(u8), e: IndexEntry) !void {
         const a = self.allocator;
         try out.print(
             a,
-            "{{\"v\":6,\"kv_len\":{d},\"tokens\":{d},\"has_tools\":{},\"scheme\":\"{s}\",\"bits\":{d},\"group_size\":{d},\"chunk_tokens\":{d},\"inherited_chunks\":{d},\"bytes\":{d},\"chunk_bytes\":[",
+            "{{\"v\":{d},\"kv_len\":{d},\"tokens\":{d},\"has_tools\":{},\"scheme\":\"{s}\",\"bits\":{d},\"group_size\":{d},\"chunk_tokens\":{d},\"inherited_chunks\":{d},\"bytes\":{d},\"chunk_bytes\":[",
             .{
+                metaVersionFor(e),
                 e.kv_len,
                 e.tokens.len,
                 e.has_tools,
@@ -3740,6 +3774,7 @@ test "DiskTier: SSM retention thins the interior, keeping both ends" {
     // The span-preserving policy is qwen4_exp's (PR #363 item 3); the tier's
     // DEFAULT is a93e2c0's drop-oldest, asserted in the ungated arm below.
     tier.cp_thin = .min_span_recency;
+    tier.ssm_max_per_entry = SSM_DISK_MAX_PER_ENTRY;
 
     // KV covering 0..(N*100) so every checkpoint position is ≤ kv_len.
     const N = SSM_DISK_MAX_PER_ENTRY + 1; // 9 positions, one over the cap
@@ -4009,7 +4044,12 @@ test "DiskTier: v4 spec snapshots round-trip; geometry mismatches decline; v3 re
         defer rewritten.deinit(testing.allocator);
         try rewritten.appendSlice(testing.allocator, content[0..spec_at]);
         try rewritten.append(testing.allocator, '}');
+        // The manifest stamps the LOWEST version that describes the entry
+        // (`metaVersionFor`), so this simulation rewrites from whichever it
+        // carries rather than assuming the newest.
         _ = std.mem.replace(u8, rewritten.items, "\"v\":6", "\"v\":3", rewritten.items);
+        _ = std.mem.replace(u8, rewritten.items, "\"v\":5", "\"v\":3", rewritten.items);
+        _ = std.mem.replace(u8, rewritten.items, "\"v\":4", "\"v\":3", rewritten.items);
         const f = try std.Io.Dir.createFileAbsolute(io, meta_path, .{});
         defer f.close(io);
         var wb: [4096]u8 = undefined;
@@ -4629,11 +4669,14 @@ test "DiskTier: entries cross the SSD-first boundary in BOTH directions (SSD-fir
         for ([_]u32{ 0, 1, 2 }) |li| for ([_]u32{ 0, 127, 128, 599 }) |pos| {
             try testing.expectEqual(try cacheValueAt(&cache, li, pos, 3, s), try cacheValueAt(&out, li, pos, 3, s));
         };
-        // The manifest version is the one BOTH arms write (v6, chunk
-        // sharing's `inherited_chunks`) — no bump rode in with SSD-first.
+        // No bump rode in with SSD-first: this entry inherits no chunks and
+        // carries no MTP head, so it stamps v4 — the version a93e2c0 wrote and
+        // the only one a93e2c0's reader accepts. Downgrading the binary keeps
+        // the tier readable instead of discarding it (`metaVersionFor`).
         const meta = try tmp.dir.readFileAlloc(io, "fp-x-ssd/e1/meta.json", testing.allocator, .limited(1 << 20));
         defer testing.allocator.free(meta);
-        try testing.expect(std.mem.indexOf(u8, meta, "\"v\":6") != null);
+        try testing.expect(std.mem.indexOf(u8, meta, "\"v\":4") != null);
+        try testing.expect(std.mem.indexOf(u8, meta, "\"v\":6") == null);
     }
 }
 
@@ -4734,8 +4777,11 @@ test "DiskTier: SSM retention spacing is priced against the tier, not just cappe
     const base = try tmpRoot(&tmp, io, &buf);
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-spacing", 0, 128);
     defer tier.deinit();
-    try testing.expectEqual(transformer_mod.ThinPolicy.oldest, tier.cp_thin); // a93e2c0 default
+    // a93e2c0 defaults, both halves — the gate arms them together.
+    try testing.expectEqual(transformer_mod.ThinPolicy.oldest, tier.cp_thin);
+    try testing.expectEqual(SSM_DISK_MAX_PER_ENTRY_LEGACY, tier.ssm_max_per_entry);
     tier.cp_thin = .min_span_recency;
+    tier.ssm_max_per_entry = SSM_DISK_MAX_PER_ENTRY;
 
     const L: u32 = 383_069;
     var positions: [94]u32 = undefined;
@@ -4767,12 +4813,15 @@ test "DiskTier: SSM retention spacing is priced against the tier, not just cappe
         var legacy = try DiskTier.init(testing.allocator, io, base, "fp-spacing-legacy", 0, 128);
         defer legacy.deinit();
         try testing.expectEqual(transformer_mod.ThinPolicy.oldest, legacy.cp_thin);
+        try testing.expectEqual(SSM_DISK_MAX_PER_ENTRY_LEGACY, legacy.ssm_max_per_entry);
         const old_kept = try legacy.ssmTargetPositions(&positions, &[_]transformer_mod.SSMCheckpoint{}, L);
         defer testing.allocator.free(old_kept);
-        try testing.expectEqual(SSM_DISK_MAX_PER_ENTRY, old_kept.len);
+        // a93e2c0 kept 8, not 16: the cap is half the gated one, so the
+        // ungated tier's persisted footprint per entry is unchanged.
+        try testing.expectEqual(SSM_DISK_MAX_PER_ENTRY_LEGACY, old_kept.len);
         // End-anchored: the survivors are the last N of the input, so the
         // LOWEST is high and an early-diverging restore finds nothing under it.
-        try testing.expectEqualSlices(u32, positions[positions.len - SSM_DISK_MAX_PER_ENTRY ..], old_kept);
+        try testing.expectEqualSlices(u32, positions[positions.len - SSM_DISK_MAX_PER_ENTRY_LEGACY ..], old_kept);
         try testing.expect(old_kept[0] > kept[0]);
     }
     // Two properties, not one. The list is NOT evenly spaced: the newest
@@ -5575,4 +5624,122 @@ test "DiskTier: an ssm/spec-only append bills the SPEC sidecar's byte delta" {
     defer rescanned.deinit();
     try testing.expectEqual(@as(usize, 1), rescanned.entryCount());
     try testing.expectEqual(tier.total_bytes, rescanned.total_bytes);
+}
+
+test "DiskTier: the manifest stamps the LOWEST version that describes the entry" {
+    // PR #363, ledger row "meta.json v4 -> v6 written unconditionally".
+    //
+    // The version is a COMPATIBILITY CLAIM, not a build stamp. a93e2c0's
+    // reader accepts 2, 3 and 4 only:
+    //     if (version != 2 and version != 3 and version != 4) return null;
+    // (`git show a93e2c0:src/kv_disk_cache.zig:1534`), so stamping v6 on every
+    // entry means a binary downgrade silently discards the ENTIRE persisted
+    // tier — including entries using nothing a v4 reader lacks. Forward
+    // compatible, not backward, and the tier is exactly the thing a user
+    // rolling back most wants to keep.
+    //
+    // PURE: `metaVersionFor` decides from the entry alone, so the contract is
+    // pinned without writing a tier per case.
+    const t = std.testing;
+
+    // Plain entry: v4 — a93e2c0's own shape. `inherited_chunks: 0` is an
+    // unknown key an older reader ignores, and the spec sidecar is optional.
+    var toks = [_]u32{ 1, 2, 3 };
+    var cbytes = [_]u64{4096};
+    var spos = [_]u32{};
+    var sbytes = [_]u64{};
+    const kv_only = SpecMeta{ .base = 0, .step = 600, .layers = 2, .quant = kv_quant.KVQuantConfig.dense };
+    const with_head = SpecMeta{
+        .base = 0,
+        .step = 600,
+        .layers = 1,
+        .quant = kv_quant.KVQuantConfig.dense,
+        .head = .{ .pos_base = 1, .ratio = 4, .pooled = true },
+    };
+
+    var e = IndexEntry{
+        .id = 1,
+        .tokens = &toks,
+        .kv_len = 600,
+        .has_tools = false,
+        .quant = kv_quant.KVQuantConfig.dense,
+        .bytes = 4096,
+        .chunk_bytes = &cbytes,
+        .ssm_positions = &spos,
+        .ssm_bytes = &sbytes,
+        .last_used = 1,
+    };
+    try t.expectEqual(@as(u8, 4), DiskTier.metaVersionFor(e));
+
+    // A dflash sidecar is v4 shape too — v4 is where spec snapshots arrived.
+    e.spec_bytes = 4096;
+    e.spec_dflash = kv_only;
+    try t.expectEqual(@as(u8, 4), DiskTier.metaVersionFor(e));
+
+    // A KV-only MTP snap is still v4; the qwen4_exp head's QSA half is what
+    // v5 added, so only THAT lifts it.
+    e.spec_mtp = kv_only;
+    try t.expectEqual(@as(u8, 4), DiskTier.metaVersionFor(e));
+    e.spec_mtp = with_head;
+    try t.expectEqual(@as(u8, 5), DiskTier.metaVersionFor(e));
+
+    // Inherited (hard-linked) chunks are the v6 feature: an older reader that
+    // ignores `inherited_chunks` would bill and delete a donor's files, so
+    // this entry MUST claim v6 and be refused rather than misread.
+    e.inherited_chunks = 4;
+    try t.expectEqual(@as(u8, 6), DiskTier.metaVersionFor(e));
+    e.spec_mtp = null;
+    try t.expectEqual(@as(u8, 6), DiskTier.metaVersionFor(e));
+
+    // The renderer takes it from here, never a literal.
+    const src = @embedFile("kv_disk_cache.zig");
+    const at = std.mem.indexOf(u8, src, "fn renderMeta(") orelse return error.RendererMoved;
+    const body = src[at..@min(src.len, at + 900)];
+    try t.expect(std.mem.indexOf(u8, body, "metaVersion" ++ "For(e)") != null);
+    try t.expect(std.mem.indexOf(u8, body, "\\\"v\\\":6") == null);
+}
+
+test "DiskTier: the per-entry checkpoint cap is gated; a legacy tier keeps a93e2c0's 8" {
+    // PR #363 raised `SSM_DISK_MAX_PER_ENTRY` from 8 to 16 for every arch.
+    // That doubles the persisted checkpoint footprint per entry and changes
+    // `gcToBudget` pressure for the whole tier, and it was sized against the
+    // live 383k qwen4_exp shape alone (93 stride captures at stride 4096, at
+    // 61% of a 100 GB tier). A hybrid on a smaller tier pays the doubling and
+    // gets no measurement for it.
+    const t = std.testing;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    // The DEFAULT is a93e2c0's, so a tier nobody wires keeps the old cap.
+    var legacy = try DiskTier.init(testing.allocator, io, base, "fp-cap-legacy", 0, 128);
+    defer legacy.deinit();
+    try t.expectEqual(@as(usize, 8), SSM_DISK_MAX_PER_ENTRY_LEGACY);
+    try t.expectEqual(SSM_DISK_MAX_PER_ENTRY_LEGACY, legacy.ssm_max_per_entry);
+
+    var positions: [40]u32 = undefined;
+    for (&positions, 0..) |*p, i| p.* = @intCast((i + 1) * 4096);
+    const L: u32 = 40 * 4096;
+
+    const old_kept = try legacy.ssmTargetPositions(&positions, &[_]transformer_mod.SSMCheckpoint{}, L);
+    defer testing.allocator.free(old_kept);
+    try t.expectEqual(SSM_DISK_MAX_PER_ENTRY_LEGACY, old_kept.len);
+
+    // The gated tier keeps twice as many.
+    var gated = try DiskTier.init(testing.allocator, io, base, "fp-cap-gated", 0, 128);
+    defer gated.deinit();
+    gated.cp_thin = .min_span_recency;
+    gated.ssm_max_per_entry = SSM_DISK_MAX_PER_ENTRY;
+    const new_kept = try gated.ssmTargetPositions(&positions, &[_]transformer_mod.SSMCheckpoint{}, L);
+    defer testing.allocator.free(new_kept);
+    try t.expectEqual(SSM_DISK_MAX_PER_ENTRY, new_kept.len);
+    try t.expectEqual(@as(usize, 2 * SSM_DISK_MAX_PER_ENTRY_LEGACY), new_kept.len);
+
+    // Both halves of the disk gate are mirrored at the SAME wiring site from
+    // the SAME predicate — a tier with the new cap and the old policy (or the
+    // reverse) is a shape nobody measured.
+    const sch = @embedFile("scheduler.zig");
+    try t.expect(std.mem.indexOf(u8, sch, "disk.?.ssm_max_per_entry = if (params.config.longCtx" ++ "Gated())") != null);
 }

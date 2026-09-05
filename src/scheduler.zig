@@ -4134,9 +4134,13 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 break :attach;
             };
             // Same gate, mirrored onto the tier. a93e2c0's disk retention kept
-            // the highest N, which `.oldest` reproduces exactly.
+            // the highest N, which `.oldest` reproduces exactly, at a cap of 8.
             entry.prefix_cache.?.disk.?.cp_thin =
                 if (params.config.longCtxGated()) .min_span_recency else .oldest;
+            entry.prefix_cache.?.disk.?.ssm_max_per_entry = if (params.config.longCtxGated())
+                kv_disk_cache.SSM_DISK_MAX_PER_ENTRY
+            else
+                kv_disk_cache.SSM_DISK_MAX_PER_ENTRY_LEGACY;
         }
         // SSD-first prefix cache: ONE predicate, checked here — arch, env
         // switch, AND a live disk tier. It runs BELOW the attach because the
