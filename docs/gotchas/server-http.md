@@ -2051,3 +2051,88 @@ from the clamp entirely — at which point there is no ctx term to be stale.
   PAIR of readers. Pin it with a test that calls both.
 - A clamp's "never return 0" floor is not a guarantee that anything useful
   survives; the floor has to be defended by whoever spends first.
+
+---
+
+## The prefill width is a property of the REQUEST, not of the boot
+
+`--ctx-size 1048576`, no other flags. The load-time sizer does its job
+correctly and the result is still wrong for almost every request the server
+then serves.
+
+### Why load-time sizing cannot win here
+
+`resolvePrefillChunk` runs once, with the weights resident and nothing else
+known. The only context it can reserve for is the one the operator configured,
+and at 1M that context's own KV is 20,736 MiB of a 28,909 MiB serving budget.
+Whatever is left has to hold both the prefill transient and the hot cache, so
+the widest affordable rung is 1024 — and every prompt for the rest of the boot
+prefills at 1024, including the 4k ones.
+
+But a 4k prompt does not hold a 1M-token cache. Neither does a 384k one: the
+judge ran 384k prompts at chunk 4096 well inside the ceiling (peak 90.3 GB of
+~93 GiB). The width the machine can afford is a function of THIS request's KV,
+and the estimator that already knows THIS request's KV is the admission bill.
+
+So the decision moved to where the information is:
+
+```
+scheduler prefill: admit -> evict -> CHOOSE WIDTH -> InitOptions.pinned_prefill_chunk
+```
+
+`chooseRequestPrefillChunk` walks `PREFILL_CHUNK_LADDER` and takes the widest
+rung whose bill fits the memory that is free right now. Post-eviction is
+load-bearing: it is the first moment the free memory is the memory the prefill
+will actually run in.
+
+### It is priced by the estimator that admits it, or it is a second bill
+
+A chooser with its own arithmetic is #126 ("a gate that runs BEFORE the
+estimator that knows better IS the estimator") with the biggest term — the
+chunk — as the difference. So `prefillNeededAtChunk` was factored out of
+`prefillAdmissionBill`, and both go through it; a source scan pins that there
+is exactly one definition and that both callers reach it. Whatever the chooser
+picks, `needed(picked) <= available` by construction, so the forward is billed
+and fits.
+
+### Two details that are easy to get wrong
+
+**Price the WIDTH, not the rung, and return the width.**
+`generate.effectivePrefillChunk` still caps by arch — a hd-256 MoE never
+forwards wider than 4096 — so rungs 8192 and 4096 are the same forward.
+Pricing the raw rung would over-bill the top of the ladder and then pick it for
+the wrong reason, and pinning 8192 would describe a width that never runs.
+Candidates are priced at `effectivePrefillChunk(rung)` and the chooser returns
+that width, which makes the pin a fixpoint of the resolver.
+
+**The connection thread admits on the load-time pin, and that is fine.** Its
+bill uses the narrower width, so it admits requests the wide path might not
+fit — but the scheduler's choice is bounded by live memory, so a request that
+only fits at 512 gets 512. The dangerous direction (admit narrow, run wide) is
+closed by the chooser never returning a width whose bill exceeds `available`.
+
+### Scope
+
+Gated to `qwen4_exp` (`ModelConfig.perRequestPrefillChunk`) and killable with
+`MLX_SERVE_PREFILL_CHUNK_PER_REQUEST=0`. It is the arch with a 1M advertised
+context and the QSA terms that make the load-time bill lopsided; every other
+arch keeps the load-time pin, unmeasured. An explicit `--prefill-chunk` still
+wins outright and is billed as-is. The `<- N+M tokens` accounting is untouched
+— this changes a width, not a token count.
+
+One line per request at debug, because a narrowed prefill reads as an
+unexplained slowdown and a widened one as an unexplained peak:
+
+```
+[prefill] chunk 4096 for this request (reserve 15667 MB beside KV 6075 MB)
+```
+
+### Rules this produced
+
+- A resource decision made at load can only reserve for the configured worst
+  case. If the per-request estimator knows better, that is where the decision
+  belongs.
+- Two estimators for the same quantity is one estimator and one bug. Factor the
+  shared function and scan-pin that both callers reach it.
+- Price a candidate at the value that will actually be used, not at the knob
+  you turned — a capped resolver makes those different numbers.

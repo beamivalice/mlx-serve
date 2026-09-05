@@ -305,6 +305,13 @@ pub const SubmitParams = struct {
 /// evict-to-admit path entirely (behaviour identical to before #353).
 pub var prefill_admission_fits: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool) bool = null;
 
+/// Third of the same family: the prefill WIDTH this request should run at,
+/// chosen against live post-eviction memory by the estimator that admits it
+/// (`server.requestPrefillChunkNow`). Null in unit tests and wherever the
+/// HTTP server is not installed, which keeps the model's load-time pin —
+/// exactly the behaviour every arch but qwen4_exp gets anyway.
+pub var prefill_request_chunk: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool) u32 = null;
+
 /// Twin of the above for the REFUSAL: logs the numbers the estimator
 /// compared, from the module that owns them. A refusal quotes the number it
 /// compared, and the scheduler cannot format a bill it has no estimator for.
@@ -5533,6 +5540,23 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         }
     }
 
+    // The prefill WIDTH for THIS request, chosen HERE and not at load: the
+    // admission pass above has just finished evicting, so this is the first
+    // moment the free memory is the memory the prefill will actually run in.
+    // Falls back to the model's load-time pin when the hook is not installed
+    // or the arch does not opt in (`ModelConfig.perRequestPrefillChunk`).
+    const req_prefill_chunk: u32 = if (slot.model.config) |cfg| blk: {
+        const pin = cfg.pinned_prefill_chunk;
+        const pick = prefill_request_chunk orelse break :blk pin;
+        break :blk pick(
+            cfg,
+            slot.full_prompt.len,
+            slot.max_tokens,
+            slot.cache.config,
+            generate_mod.visionPrefillUnchunked(slot.vision_embeddings != null),
+        );
+    } else 0;
+
     // Chunk-boundary decode yields: the hook advances already-decoding
     // streams between this prefill's chunks. Ticks hosted here are billed
     // out of prefill_ns below (the decoding slots got the time).
@@ -5596,11 +5620,13 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 generate_mod.countSpliceRows(@ptrCast(slot.full_prompt[0..hot_matched]), xfm_ptr.config.image_token_id, xfm_ptr.config.audio_token_id, xfm_ptr.config.video_token_id)
             else
                 0,
-            // The prefill width the admission guard billed for THIS model.
-            // Straight off `slot.model.config` — the same object
-            // `server.pinPrefillChunk` writes and `checkAttentionMemory`
-            // reads, so the forward can never run wider than the bill.
-            .pinned_prefill_chunk = if (slot.model.config) |c| c.pinned_prefill_chunk else 0,
+            // The prefill width the admission guard billed for THIS REQUEST
+            // (`req_prefill_chunk`, chosen above against live post-eviction
+            // memory by the same estimator that admits). It is the model's
+            // load-time pin off `slot.model.config` on every arch that does
+            // not opt in, and whenever the hook is absent — so the forward can
+            // never run wider than something that was billed.
+            .pinned_prefill_chunk = req_prefill_chunk,
             .dflash_ctx_restored = dflash_pass,
             .mtp_cache_restored = mtp_pass,
             // Abandoned-prefill abort: the conn thread sets slot.cancelled

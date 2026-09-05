@@ -774,6 +774,23 @@ pub const ModelConfig = struct {
     /// at all, and MLA's key (nope+rope) is WIDER than its value. Every
     /// memory estimate that sizes a KV cache reads this one helper so the
     /// auto-context sizer and the prefill admission guard cannot disagree.
+    /// Whether this arch resolves its prefill chunk PER REQUEST instead of
+    /// once at load. Load-time sizing has to reserve for the WHOLE configured
+    /// session — at `--ctx-size 1048576` the context's own KV is 20.7 GB of a
+    /// 28.2 GB serving budget, so the widest affordable rung is 1024 and every
+    /// ordinary prompt prefills at that width for the rest of the boot. But an
+    /// ordinary prompt does not hold a 1M-token cache: the same box ran 384k
+    /// prompts at chunk 4096 inside the ceiling (peak 90.3 GB of ~93 GiB). The
+    /// bill that knows the difference is the ADMISSION bill, which is per
+    /// request, so that is where the width belongs.
+    ///
+    /// qwen4_exp only, on purpose. It is the arch with a 1M advertised context
+    /// and the QSA terms that make the load-time bill so lopsided; every other
+    /// arch keeps the load-time pin exactly, unmeasured.
+    pub fn perRequestPrefillChunk(self: *const ModelConfig) bool {
+        return std.mem.eql(u8, self.model_type, "qwen4_exp");
+    }
+
     pub fn kvBytesPerToken(self: *const ModelConfig) u64 {
         const widths: u64 = if (self.isMla())
             @as(u64, self.mlaQkHeadDim()) + @as(u64, self.mla_v_head_dim)
