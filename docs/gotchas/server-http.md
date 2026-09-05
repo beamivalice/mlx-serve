@@ -2335,3 +2335,104 @@ unexplained slowdown and a widened one as an unexplained peak:
   shared function and scan-pin that both callers reach it.
 - Price a candidate at the value that will actually be used, not at the knob
   you turned — a capped resolver makes those different numbers.
+## SSD-first prefix cache (qwen4_exp) — the disk tier only ever got what RAM kept (2026-09-05)
+
+At 1M context on the M5 Max the arithmetic does not close for a RAM-first
+cache. The weights are ~70 GB resident, one session's entry is ~24 GB
+(~24 KB/token: 12.3 KB of 8-bit KV, 3.8 KB of QSA indexer history, the SSM
+checkpoints, the pooled block banks) and the prefill transients are 3–7 GB,
+against a ~107.5 GB ceiling. There is room for the model plus *one* session
+and nothing else — so the SSD has to be the capacity tier, not a nice-to-have.
+
+Five things stood between the code and that, and every one of them was a place
+where the disk tier was treated as a junior copy of RAM rather than as the tier
+that holds everything RAM cannot.
+
+**1. The flush read the RAM entry.** `flushPendingDisk` took the snapshot the
+commit had just stored, and the commit trims an oversized candidate to the byte
+budget (#330). So the disk copy was capped by the *RAM* budget: past the budget
+a long prefix trimmed in RAM and persisted trimmed, and the tier that was
+supposed to be the deep one never held more than the shallow one. The fix is a
+`PendingDiskFlush` captured in `commitWithMediaState` *before* the trim, holding
+the live snapshot, the FULL token record, this turn's checkpoints and the spec
+snaps. Everything in it is refcount-SHARED with the live KV, so the record costs
+bookkeeping and not GPU bytes; it is consumed once by the flush and dropped on
+invalidation.
+
+**2. `max_flush_bytes` bounded a stall by truncating the entry.** The 512 MB
+per-commit cap existed because the write ran synchronously on the inference
+thread — the sole mlx caller — and a 4 GB write measurably stalled the next
+request. At 8-bit KV that cap is 41,984 tokens per finished request, so a 374k
+session needed ~9 turns to land whole and a restart before that re-prefilled
+~340k (~8 minutes). A byte cap is the wrong instrument: it bounds the stall by
+making the *data* wrong.
+
+The split that works: the inference thread keeps the device→host readback (mlx
+arrays are inference-thread-owned, frees included) and hands ONE writer thread a
+plain host byte buffer per file. Only bytes cross. `serializeSafetensors`
+reproduces mlx's own image byte for byte — 8-byte little-endian header length,
+a JSON header carrying `__metadata__` and each tensor's dtype/shape/data_offsets,
+then the tensors' bytes in header order — so `mlx_load_safetensors` reads back
+what we wrote without knowing a Zig writer produced it. Two bounds keep the
+writer honest: a ~1 GiB host-byte permit, so `submit` blocks rather than trading
+GPU memory for an unbounded host queue, and an epoch fence at the tier's ONE
+directory-removal site.
+
+The fence is prefix-scoped, and that is load-bearing rather than tidy: a global
+fence would have thrown away the bytes an `appendCommit` had just staged for the
+entry it was writing, because the same call can evict an LRU entry on its way
+out. Only the doomed directory's blobs go.
+
+Durability comes from the queue being FIFO. An entry's `meta.json` is submitted
+after its chunks, so it is the last file to land; a kill -9 mid-flush leaves
+chunks with no index, which `scan` already reads as a miss. Every file is
+written `.tmp` then renamed, so a crash can leave a `.tmp` but never a truncated
+file under its real name.
+
+**3. Nothing persisted until the request finished.** A 1M prefill that was
+cancelled — or killed — threw away every chunk it had forwarded, and the
+end-of-request flush had the whole entry in front of it. But a chunk's bytes are
+final the moment it is evaluated. `Generator.WriteThroughHook` fires at each
+completed prefill chunk with the absolute KV position and the checkpoints so
+far, and the scheduler hands the tier `full_prompt[0..abs_pos]` — a genuine
+prefix of this turn's prompt, which is exactly the shape `appendCommit` already
+recognises as an EXTEND. Chunks `[0, kv_len/chunk)` are kept as written, so a
+1M session writes each chunk once and not once per turn, and the end-of-request
+flush is only the tail.
+
+**4. A checkpoint was budgeted behind the chunks it makes usable.** The SSM
+checkpoints shared the per-flush byte budget with the KV and were written after
+it, so the first flush of a long hybrid entry landed KV with zero recurrent
+state — and KV without recurrent state is not restorable on a GDN trunk. The
+entry was dead weight until a later turn topped it up. Checkpoints now ride
+outside the byte budget, beside the chunk that closes their position, and an
+entry restores from its first flush.
+
+**5. The budget counted the active session's KV twice.** `clampedPrefixCacheMem`
+treats the hot cache as what is left over after the live session's
+full-context KV reserve. But a restore refcount-shares the entry's buffers with
+the slot's cache: the resident entry for the session being served costs nothing
+beyond the reserve already billed. At 1M that clamp cut the budget to ~10 GB —
+less than half an entry — so the entry could not stay resident and every warm
+turn cold-prefilled while the cap "held". `ssdFirstPrefixCacheMem` floors the
+budget at one entry at the working context and gives `--prefix-cache-mem` to
+IDLE entries on top of it; 0 means none idle, which is the mode's whole point.
+
+The disk side gets the reciprocal treatment: the budget is
+`min(operator cap, free - min(64 GiB, 10% of the volume))` with a 1 GiB store
+floor, re-read from the volume before every store, because free space moves
+under us and a cache must never fill a user's disk. Below the floor no NEW
+entry persists and what is already there stays restorable — evicting a
+restorable 1M entry to free a gigabyte is a bad trade. `volumeSpace` hand-
+declares darwin's `struct statfs` (std has no binding in this Zig) with a
+generous tail and a plausibility check — `f_bsize` a power of two in
+[512 B, 1 MiB], available never past total — so a wrong layout fails SAFE back
+to the operator cap instead of inventing a budget.
+
+**Blast radius.** Every one of these is gated on `ModelConfig.ssdFirstCapable()`
+(`model_type == "qwen4_exp"`) AND `MLX_SERVE_PREFIX_SSD_FIRST`, read at exactly
+one place — the scheduler's disk-tier attach — into `HotPrefixCache.ssd_first`
+and mirrored onto `DiskTier.ssd_first` and the writer arm. Every mechanism reads
+that field; none reads a model_type. A source scan pins the single arming site,
+and each mechanism's test carries an arm B asserting the legacy path is what
+runs when the predicate is false.
