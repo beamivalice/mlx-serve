@@ -155,7 +155,7 @@ pub const LoadParams = struct {
     /// Clamp the hot-cache byte budget against live post-load headroom
     /// (`server.prefixCacheMemForLoad`) — a pointer because the scheduler
     /// deliberately has no server.zig import. Null = no clamp (tests).
-    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64) u64 = null,
+    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, *u64) u64 = null,
     /// SSD tier byte budget for the hot prefix cache (`--prefix-cache-disk`).
     /// 0 disables persistence. Attached per model at load for pure-attention
     /// archs; entries live under `~/.mlx-serve/kv-cache/<fingerprint>`.
@@ -1167,7 +1167,7 @@ pub const LoadRequest = struct {
     kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.dense,
     prefix_cache_capacity: u32 = 1,
     prefix_cache_mem_bytes: u64 = 0,
-    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64) u64 = null,
+    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, *u64) u64 = null,
     /// SSD tier byte budget (mirrors `LoadParams.prefix_cache_disk_bytes`).
     prefix_cache_disk_bytes: u64 = 0,
     /// Phase 1 (perf-plan): SSM/conv state snapshot stride during prefill.
@@ -1291,7 +1291,7 @@ pub const Scheduler = struct {
     /// every model switch.
     prefix_cache_capacity: u32,
     prefix_cache_mem_bytes: u64,
-    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64) u64,
+    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, *u64) u64,
     prefix_cache_disk_bytes: u64,
     ssm_checkpoint_stride: u32,
     ssm_checkpoint_max: u32,
@@ -4035,8 +4035,12 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         // The weights are resident here, so the resolver's active-memory read
         // is honest; the raw launch budget never reaches initWithMem (a 40 GB
         // cap beside a ~70 GB pack was the 2026-08-30 uncatchable Metal OOM).
+        // The RAM allowance for IDLE entries on the SSD-first arm — 0 on
+        // every other arch, and 0 when the resolver is absent (unit tests).
+        // `spillIdleEntries` enforces it; see `HotPrefixCache.ssd_idle_mem`.
+        var ssd_idle_mem: u64 = 0;
         const clamped_prefix_mem: u64 = if (params.prefix_cache_mem_resolver) |resolve|
-            resolve(params.config, params.prefix_cache_mem_bytes)
+            resolve(params.config, params.prefix_cache_mem_bytes, &ssd_idle_mem)
         else
             params.prefix_cache_mem_bytes;
         entry.prefix_cache = prefix_cache_mod.HotPrefixCache.initWithMem(
@@ -4045,6 +4049,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             clamped_prefix_mem,
         );
         entry.prefix_cache.?.qsa_history_required = params.config.indexer_budget != 0;
+        entry.prefix_cache.?.ssd_idle_mem = ssd_idle_mem;
         // SSD-first prefix cache: ONE arch predicate, checked here. Every
         // mechanism reads `HotPrefixCache.ssd_first`, so a non-qwen4_exp model
         // (or `MLX_SERVE_PREFIX_SSD_FIRST=0`) keeps today's paths exactly.

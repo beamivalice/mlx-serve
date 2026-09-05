@@ -3383,6 +3383,7 @@ fn ssdFirstBudgetForLoad(
     active_mem: usize,
     ctx_kv: u64,
     transient_reserve: u64,
+    idle_out: *u64,
 ) ?u64 {
     if (!config.ssdFirstCapable() or !prefix_cache_mod.ssdFirstEnabled()) return null;
     const budget = ssdFirstPrefixCacheMem(
@@ -3405,6 +3406,12 @@ fn ssdFirstBudgetForLoad(
     // roughly halve the auto-context. The RETURN value stays `budget`: that is
     // the cache's byte cap, and `initWithMem` needs the whole of it.
     publishResolvedPrefixCacheMem(budget -| ctx_kv);
+    // ...and the same quantity, handed to the CACHE. On this arm
+    // `--prefix-cache-mem` is the RAM allowance for IDLE entries, and
+    // `spillIdleEntries` is what enforces it — without the number the spill
+    // had no cap to work against and evicted every non-active entry on every
+    // finished request (external review item 3).
+    idle_out.* = budget -| ctx_kv;
     // D1: on this arch `--prefix-cache-mem` is the IDLE allowance, not the
     // whole cache — 0 means "no idle entries", not "use all the headroom".
     // Say so once, naming the flag, so the resolved budget is never a mystery.
@@ -3464,7 +3471,10 @@ fn ramFirstContextForLoad(config: *const model_mod.ModelConfig, kv_bits: u64, ac
     );
 }
 
-pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64) u64 {
+pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, idle_out: *u64) u64 {
+    // RAM-first default: this arch has no idle allowance, because it has no
+    // SSD to spill to. Written FIRST so every early return carries it.
+    idle_out.* = 0;
     var active_mem: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_mem);
     const kv_bits: u64 = defaultKvBits();
@@ -3487,7 +3497,7 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64) u64
     // plan on qwen4_exp, so a live ceiling here BYPASSED the reproducibility fix
     // on the only arch the gates are about. The callee takes the ceiling as a
     // parameter and no longer derives one. (audit S1)
-    if (ssdFirstBudgetForLoad(config, requested, staticGpuMemoryCeiling(), active_mem, ssd_ctx_kv, prefillTransientReserve(config, kv_bits, ssd_chunk))) |b| return b;
+    if (ssdFirstBudgetForLoad(config, requested, staticGpuMemoryCeiling(), active_mem, ssd_ctx_kv, prefillTransientReserve(config, kv_bits, ssd_chunk), idle_out)) |b| return b;
     // Pin first, then hand the pinned width in as the override: the plan must
     // bill the width `generate.effectivePrefillChunk` will resolve to, and the
     // pin is that width (it already folded in an explicit `--prefill-chunk`).
