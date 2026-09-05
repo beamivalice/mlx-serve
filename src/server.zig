@@ -5447,6 +5447,29 @@ pub fn retainedSsmCheckpointBytes(config: *const model_mod.ModelConfig, seq: u64
 /// eviction decision and the reservation the engine actually makes are the
 /// same arithmetic (the #126 one-estimator discipline).
 pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u64, kv_bits: u64, chunk: u64, warm: WarmPrefix) PrefillRequestTerms {
+    // THE ARCH GATE for every term in this struct (PR #363 item 4). All four
+    // are new bill terms, and all four reach archs nobody measured them on:
+    //
+    //   `reserved_kv_bytes`  -- `KVCache.reservedTokens` has no arch test, so
+    //      every arch past a 32k prompt was billed up to (8192 + chunk) rows of
+    //      headroom. Worse, its ALLOCATOR twin IS gated
+    //      (`generate.reservedPrefillTokens`): off qwen4 the guard billed
+    //      memory the engine then never reserved. A pure over-bill is a 400 on
+    //      a prompt a93e2c0 admitted.
+    //   `checkpoint_bytes`   -- `ModelConfig.ssmCheckpointBytes` keys on
+    //      `linear_num_value_heads`, which is parsed generically: qwen3_5,
+    //      qwen3_5_moe, qwen3_next and bailing_hybrid all bill it (~1.9 GB on a
+    //      36-layer GDN trunk), while lfm2 and nemotron_h bill zero. An
+    //      under-bill fixed unevenly across the hybrids is not a fix.
+    //   `state_bytes`        -- 0 off qwen4 anyway (`statePerTokenBilled`).
+    //   `shared_resident_bytes` -- the warm CREDIT, and the only term that errs
+    //      toward UNDER-billing. Its failure mode is an uncatchable Metal abort,
+    //      so it is the last term that should ship unmeasured.
+    //
+    // Zeroing the struct makes `prefillMemoryNeeded` reduce to a93e2c0's
+    // 13-argument expression exactly: every new term is added into `gross` and
+    // the credit is a saturating subtraction, so `.{}` is the identity.
+    if (!config.longCtxGated()) return .{};
     // `reservedTokens` returns 0 below its length threshold (a short request
     // keeps the proportional growth policy). The prompt's own rows are still
     // billed, so floor the reserved length at `seq`: short prompts then bill

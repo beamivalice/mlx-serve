@@ -4068,6 +4068,13 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             clamped_prefix_mem,
         );
         entry.prefix_cache.?.qsa_history_required = params.config.indexer_budget != 0;
+        // THE checkpoint-retention arch gate, mirrored ONCE from the ONE
+        // predicate (PR #363 item 3). `HotPrefixCache`/`DiskTier` never see a
+        // ModelConfig, so the answer is stored, not re-derived — the
+        // `qsa_history_required` pattern. The ungated value NAMES a93e2c0's
+        // behaviour at each site: min-span-no-recency in RAM, drop-oldest
+        // (= keep the highest N) on disk.
+        entry.prefix_cache.?.cp_thin = if (params.config.longCtxGated()) .min_span_recency else .min_span;
         entry.prefix_cache.?.ssd_idle_mem = ssd_idle_mem;
         // SSD tier (`--prefix-cache-disk`). Phase 3 persists hybrid recurrent
         // state too: the disk tier is allowed whenever the RAM tier accepted
@@ -4097,6 +4104,10 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 log.warn("[disk-cache] init failed: {s} — persistence off for this model\n", .{@errorName(err)});
                 break :attach;
             };
+            // Same gate, mirrored onto the tier. a93e2c0's disk retention kept
+            // the highest N, which `.oldest` reproduces exactly.
+            entry.prefix_cache.?.disk.?.cp_thin =
+                if (params.config.longCtxGated()) .min_span_recency else .oldest;
         }
         // SSD-first prefix cache: ONE predicate, checked here — arch, env
         // switch, AND a live disk tier. It runs BELOW the attach because the

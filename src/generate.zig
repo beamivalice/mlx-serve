@@ -2398,6 +2398,15 @@ pub const Generator = struct {
             // admission guard already bills the FULL prompt length
             // (`server.reservedCacheTokens`), so this also stops the two
             // drifting apart. `total_ctx_for_chunk` is that absolute length.
+            // ARCH GATE for checkpoint retention (PR #363 item 3). a93e2c0
+            // dropped the OLDEST at both capture sites; the span-preserving
+            // thin moves where every warm turn restores from, on every hybrid
+            // (lfm2, nemotron_h, qwen3_5*, qwen3_next, bailing_hybrid,
+            // inkling), and was measured on the 383k qwen4_exp shape alone.
+            // The enum names the a93e2c0 policy of THIS site.
+            const cp_thin: transformer_mod.ThinPolicy =
+                if (xfm.config.longCtxGated()) .min_span_recency else .oldest;
+
             const reserved_tokens = reservedPrefillTokens(
                 &xfm.config,
                 total_ctx_for_chunk,
@@ -2632,7 +2641,7 @@ pub const Generator = struct {
                         ssm_checkpoints.items.len > options.ssm_checkpoint_max)
                     {
                         var dropped = ssm_checkpoints.orderedRemove(
-                            transformer_mod.ssmCheckpointDropIndex(ssm_checkpoints.items),
+                            transformer_mod.ssmCheckpointDropIndex(ssm_checkpoints.items, cp_thin),
                         );
                         dropped.deinit(allocator);
                     }
@@ -2772,7 +2781,7 @@ pub const Generator = struct {
                     {
                         // Same span-preserving thin as the stride capture.
                         var dropped = ssm_checkpoints.orderedRemove(
-                            transformer_mod.ssmCheckpointDropIndex(ssm_checkpoints.items),
+                            transformer_mod.ssmCheckpointDropIndex(ssm_checkpoints.items, cp_thin),
                         );
                         dropped.deinit(allocator);
                     }

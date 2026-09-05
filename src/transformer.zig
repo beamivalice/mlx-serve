@@ -7574,6 +7574,31 @@ pub fn ssmCheckpointBytes(cp: *const SSMCheckpoint) u64 {
     return total;
 }
 
+/// WHICH retention policy a checkpoint list is thinned with. PR #363 item 3.
+///
+/// The span-preserving thin (and the dense newest quarter on top of it) is a
+/// TRADE about where a warm turn can restore from, and it was measured on the
+/// live 383k qwen4_exp shape at K=32. On every other hybrid it silently moves
+/// the restore point of every multi-turn conversation, with no symptom but
+/// throughput. So the policy is chosen by `ModelConfig.longCtxGated()` at each
+/// retention site, and the ungated value NAMES the a93e2c0 behaviour of THAT
+/// site (there were two, which is why this is an enum and not a bool):
+///
+///   `.oldest`           -- drop index 0. a93e2c0 at the two prefill-capture
+///                          sites (`ssm_checkpoints.orderedRemove(0)`) and,
+///                          applied repeatedly, at the disk tier's
+///                          `ssmTargetPositions` (which bulk-kept the highest N).
+///   `.min_span`         -- thin the whole interior by smallest span, keeping
+///                          both ends. a93e2c0 at `mergeCheckpointLists` and
+///                          `shedCheckpointsToFit`, which already did this
+///                          inline, WITHOUT any recency reservation.
+///   `.min_span_recency` -- `.min_span` plus the dense newest quarter. This
+///                          PR, qwen4_exp only.
+///
+/// The ARCH is one predicate; the ungated value is a per-site CONSTANT
+/// recording what a93e2c0 did there, not a second predicate.
+pub const ThinPolicy = enum { oldest, min_span, min_span_recency };
+
 /// The checkpoint index to DROP when a retention list is over its cap: the
 /// interior position whose removal widens the coverage gap least. Index 0 (a
 /// prompt that diverges early restores only there) and the last (where warm
@@ -7587,10 +7612,12 @@ pub fn spanPreservingDropIndex(
     comptime T: type,
     items: []const T,
     comptime posOf: fn (*const T) usize,
+    policy: ThinPolicy,
 ) usize {
     // Callers all guard this; the assert pins it rather than silently
     // returning an index into an empty list.
     std.debug.assert(items.len > 0);
+    if (policy == .oldest) return 0;
     if (items.len < 3) return 0;
     // RECENCY BIAS. An even spread is the wrong shape at the END of a long
     // prompt: a warm turn that edits near the end restores from the highest
@@ -7603,7 +7630,7 @@ pub fn spanPreservingDropIndex(
     // the widest gap grows 16,384 -> 20,480, i.e. ~9 s bought at the end for
     // ~4.5 s given up in the middle (900 tok/s). Below `RECENCY_DENSE_MIN`
     // there is no room to reserve a quarter, so the whole interior is scanned.
-    const scan_end = if (items.len >= RECENCY_DENSE_MIN)
+    const scan_end = if (policy == .min_span_recency and items.len >= RECENCY_DENSE_MIN)
         items.len - items.len / 4
     else
         items.len;
@@ -7637,18 +7664,18 @@ fn usizePosOf(p: *const usize) usize {
 }
 
 /// `spanPreservingDropIndex` over a checkpoint list.
-pub fn ssmCheckpointDropIndex(cps: []const SSMCheckpoint) usize {
-    return spanPreservingDropIndex(SSMCheckpoint, cps, checkpointPosOf);
+pub fn ssmCheckpointDropIndex(cps: []const SSMCheckpoint, policy: ThinPolicy) usize {
+    return spanPreservingDropIndex(SSMCheckpoint, cps, checkpointPosOf, policy);
 }
 
 /// `spanPreservingDropIndex` over a bare ascending position list (the disk
 /// tier's persisted positions, and the hot cache's shed simulation).
-pub fn positionDropIndex(positions: []const u32) usize {
-    return spanPreservingDropIndex(u32, positions, u32PosOf);
+pub fn positionDropIndex(positions: []const u32, policy: ThinPolicy) usize {
+    return spanPreservingDropIndex(u32, positions, u32PosOf, policy);
 }
 
-pub fn positionDropIndexUsize(positions: []const usize) usize {
-    return spanPreservingDropIndex(usize, positions, usizePosOf);
+pub fn positionDropIndexUsize(positions: []const usize, policy: ThinPolicy) usize {
+    return spanPreservingDropIndex(usize, positions, usizePosOf, policy);
 }
 
 /// QSA indexer key history lives on full-attention layers: `aux_state` is
@@ -47055,7 +47082,7 @@ test "ssm retention: the span-preserving thin keeps both ends and spreads the su
     for (&positions, 0..) |*p, i| p.* = (i + 1) * 4096;
     var n: usize = positions.len;
     while (n > 16) {
-        const drop = positionDropIndexUsize(positions[0..n]);
+        const drop = positionDropIndexUsize(positions[0..n], .min_span_recency);
         // Never the lowest, never the newest.
         try t.expect(drop != 0);
         try t.expect(drop + 1 != n);
@@ -47079,12 +47106,38 @@ test "ssm retention: the span-preserving thin keeps both ends and spreads the su
     // lowest capture, and the gap above it is many strides wide.
     try t.expect(positions[1] - positions[0] > 4 * 4096);
     // Under three there is no interior — the oldest goes.
-    try t.expectEqual(@as(usize, 0), positionDropIndexUsize(positions[0..2]));
-    try t.expectEqual(@as(usize, 0), positionDropIndexUsize(positions[0..1]));
+    try t.expectEqual(@as(usize, 0), positionDropIndexUsize(positions[0..2], .min_span_recency));
+    try t.expectEqual(@as(usize, 0), positionDropIndexUsize(positions[0..1], .min_span_recency));
     // The closest pair of NEIGHBOURS decides: dropping index 2 widens the gap
     // to 1000, dropping index 1 would widen it to 1010.
     const clustered = [_]u32{ 0, 1000, 1010, 2000 };
-    try t.expectEqual(@as(usize, 2), positionDropIndex(&clustered));
+    try t.expectEqual(@as(usize, 2), positionDropIndex(&clustered, .min_span_recency));
+
+    // THE ARCH GATE (PR #363 item 3). Every other arch keeps the a93e2c0
+    // policy of ITS OWN site, and the enum names which:
+    //
+    //  `.oldest` -- the two prefill-capture sites and the disk tier. Applied
+    //  repeatedly it keeps the highest N, which is exactly what the disk
+    //  tier's bulk `copyForwards` did.
+    try t.expectEqual(@as(usize, 0), positionDropIndex(&clustered, .oldest));
+    try t.expectEqual(@as(usize, 0), positionDropIndexUsize(positions[0..n], .oldest));
+    //
+    //  `.min_span` -- the two hot-cache sites, which already thinned the
+    //  interior inline but reserved NO recency quarter. It differs from the
+    //  gated policy exactly where the quarter binds: a list of 8+ whose
+    //  narrowest span sits in the newest quarter.
+    {
+        // 12 entries; the tightest pair is at index 10 (inside the newest
+        // quarter, which starts at 12 - 12/4 = 9).
+        var pos12: [12]usize = .{ 0, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 9010, 10_000 };
+        try t.expectEqual(@as(usize, 10), positionDropIndexUsize(&pos12, .min_span));
+        try t.expect(positionDropIndexUsize(&pos12, .min_span_recency) < 9);
+        // Under RECENCY_DENSE_MIN the two agree — the quarter is not reserved.
+        try t.expectEqual(
+            positionDropIndexUsize(pos12[0..7], .min_span),
+            positionDropIndexUsize(pos12[0..7], .min_span_recency),
+        );
+    }
 }
 
 test "qsa history: a restore-shaped re-seed lands AT the reservation, so the append never grows" {
