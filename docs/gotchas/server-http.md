@@ -1933,6 +1933,24 @@ cache MORE bytes. The ask was on both sides of the equation with opposite
 signs, so the composed function was not monotone in it — and the operator's
 lever pointed the wrong way over part of its range.
 
+A later probe swept the ask further and found the inversion is not confined to
+the low end. Same pack, quiet box, `--prefill-chunk 4096` pinned, wired 120000:
+
+| ask | resolved | `max_safe_context` |
+|---|---|---|
+| 10 GB | 9,765 MB | 1.03M |
+| 24 GB | 13,244 MB | 565k |
+| 40 GB | **15,917 MB** | 34k |
+| 60 GB | **15,830 MB** | 1,024 |
+| 10 GB (repeat) | 9,562 MB | 1.02M |
+
+Two more things fall out of that table. **40 GB buys more cache than 60 GB** —
+a second inversion, at the top of the range, where the extra ask pushes the
+sizer across a rung boundary and the wider reserve costs more than the ask
+gains. And the 10 GB repeat differs from the first 10 GB boot by 2.1% (9,765 vs
+9,562) with nothing changed but the minute — that is the free-RAM term in the
+ceiling, which the static-ceiling fix further down removes.
+
 ### The fix is an ORDER, not a formula
 
 The clamp already subtracts the chunk's reserve from the cache's headroom.
@@ -2002,6 +2020,34 @@ rather than an overwrite of the ask: the ask is the launch flag, and
 re-clamping an already-clamped value on the next model load would ratchet the
 budget toward 1 byte across a model swap. A line scan over `server.zig` pins
 that no code path reads the ask directly except the accessor's own fallback.
+
+**The damage was worse than a mis-sized reserve: it floored the ADVERTISED
+context.** Right-hand column of the probe table above — `max_safe_context` goes
+1.03M -> 565k -> 34k -> **1,024** as the ask grows 10 -> 24 -> 40 -> 60 GB.
+`computeMemoryContext` subtracted the whole RAW ask from the serving budget, so
+a 60 GB ask reserved 60 GB of cache the clamp had already refused to grant, and
+the context sizer had nothing left to report.
+
+Which surface that reaches depends on one flag, and the distinction is worth
+keeping straight:
+
+- **`/props` `max_safe_context`** comes from `computeMaxSafeContext`, called on
+  every boot with no `--ctx-size` early-out. It misreports either way — but it
+  is a diagnostic, so the cost is a misleading number.
+- **The ADVERTISED context** — `/v1/models` `context_length`, which agent CLIs
+  read ONCE and budget their own `max_tokens` against for the rest of the
+  session — comes from `getEffectiveContextLength`, and both it and
+  `pinAutoContext` return `server_config.max_context_size` immediately when
+  `--ctx-size` is set. So **a manual `--ctx-size` boot is protected**: the
+  advertised value is the operator's own number and never routes through
+  `computeMemoryContext`.
+
+The bite is therefore on **AUTO-context boots** — no `--ctx-size`, which is the
+default. There `pinAutoContext` -> `autoContextFor` -> `computeMemoryContext`,
+and a generous `--prefix-cache-mem` silently pins a 1,024-token advertised
+context for the life of the process. The operator's lever for "hold more cache"
+was quietly also the lever for "advertise almost no context", on exactly the
+configuration where nothing pins it back.
 
 The log line names what it billed, so the next report is one grep:
 
