@@ -23777,7 +23777,13 @@ test "prefillRequestTerms: the admission bill's new terms are qwen4_exp-only" {
     try t.expect(q35.ssmCheckpointBytes() > 0);
     try t.expect(retainedSsmCheckpointBytes(&q35, seq, chunk) > 0);
 
-    const warm = WarmPrefix{ .matched_tokens = 100_000, .capacity_tokens = 400_000 };
+    // `will_donate` is warm-bill-b3's B-A3 field (audit): the KV credit fires
+    // ONLY where the restore CHECKS OUT its entry, so a WarmPrefix that leaves
+    // it false credits nothing and `shared_resident_bytes` is 0 on EVERY arch —
+    // which would make the qwen4_exp assertion below unfalsifiable rather than
+    // true. This test is about the ARCH gate, so it supplies the donating case
+    // and lets the gate decide; the ungated loop still reads 0 through `.{}`.
+    const warm = WarmPrefix{ .matched_tokens = 100_000, .capacity_tokens = 400_000, .will_donate = true };
     for ([_][]const u8{ "qwen3_5", "qwen3_5_moe", "qwen3_next", "bailing_hybrid", "lfm2", "nemotron_h", "llama", "mistral" }) |mt| {
         var cfg = qwen4ExpOomConfig();
         cfg.model_type = mt;
