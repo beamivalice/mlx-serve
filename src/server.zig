@@ -4619,8 +4619,17 @@ pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: us
         sch.resident_hot_cache_bytes.load(.monotonic)
     else
         0;
+    // Prompt-aware when the caller has the ids: an entry this prompt could
+    // NOT restore from is genuinely evictable, and the prompt-blind scalar
+    // withholds the largest entry unconditionally — which under SSD-first's
+    // one-resident-session steady state is the whole cache. Still a published
+    // snapshot, never the cache pointer (`hot_prefix_cache` is freed on model
+    // switch); the reduction happens under the scheduler's digest lock.
     const reclaimable: u64 = if (global_scheduler) |sch|
-        sch.reclaimable_hot_cache_bytes.load(.monotonic)
+        if (prompt_tokens) |toks|
+            sch.reclaimableHotCacheBytesFor(toks)
+        else
+            sch.reclaimable_hot_cache_bytes.load(.monotonic)
     else
         0;
     return .{ .needed = needed, .available = available, .evictable = evictable, .reclaimable = reclaimable, .chunk = chunk };
@@ -4638,7 +4647,7 @@ pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: us
 /// that did not need to go and refusing by name a request the connection
 /// thread had already admitted. One estimator means one set of INPUTS too.
 pub fn prefillFitsNow(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, unchunked_prefill: bool) bool {
-    return prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill).fits();
+    return prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null).fits();
 }
 
 /// The inference thread's refusal, quoting the numbers it COMPARED — the same
@@ -4646,17 +4655,18 @@ pub fn prefillFitsNow(config: *const model_mod.ModelConfig, prompt_len: usize, m
 /// The scheduler calls this through `prefill_admission_refused_log`; it cannot
 /// format a bill it has no estimator for.
 pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, unchunked_prefill: bool) void {
-    const bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill);
+    const bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null);
     const mb = 1024 * 1024;
     log.warn("  prompt {d} tokens needs ~{d}MB at prefill chunk {d} (the narrowest width tried), ~{d}MB available after evicting ~{d}MB of hot cache — refused before prefill\n", .{
         prompt_len, bill.needed / mb, bill.chunk, bill.available / mb, bill.evictable / mb,
     });
 }
 
-fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_len: usize, max_tokens: u32, config: *const model_mod.ModelConfig, is_anthropic: bool, kv_override: ?transformer_mod.KVQuantConfig, lm: *const LoadedModel, unchunked_prefill: bool) !bool {
+fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids: []const u32, max_tokens: u32, config: *const model_mod.ModelConfig, is_anthropic: bool, kv_override: ?transformer_mod.KVQuantConfig, lm: *const LoadedModel, unchunked_prefill: bool) !bool {
+    const prompt_len: usize = prompt_ids.len;
     if (!mlxMemoryGuardApplies(lm.ds4_engine != null, lm.llama_engine != null)) return true;
     if (config.num_attention_heads == 0) return true; // unknown architecture, skip check
-    const bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_override, unchunked_prefill);
+    const bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_override, unchunked_prefill, prompt_ids);
     const needed = bill.needed;
     const available = bill.available;
     // LIMIT THE CACHE WHILE MEMORY IS LEFT (issue #353). A resident hot-cache
@@ -4680,7 +4690,16 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_len:
         // because the operator's first question is "why didn't it just drop a
         // cache entry?" and the honest answer here is that there was nothing
         // left to drop (issue #353).
-        const msg = try std.fmt.allocPrint(allocator, "Prompt ({d} tokens) requires ~{d}MB GPU memory but only ~{d}MB is available and the hot prefix cache holds ~{d}MB more, of which ~{d}MB can be reclaimed (the entry a restore would share is not evictable), which is not enough. Reduce prompt size, lower --ctx-size, or use a smaller model.", .{ prompt_len, needed_mb, avail_mb, bill.evictable / (1024 * 1024), bill.reclaimable / (1024 * 1024) });
+        // "not evictable" is only true when an entry this prompt would restore
+        // FROM is holding the difference. With the prompt in hand the guard
+        // knows which case it is, and must not claim a share that no restore
+        // was going to make.
+        const withheld = bill.evictable -| bill.reclaimable;
+        const why = if (withheld > 0)
+            " (the entry a restore would share is not evictable)"
+        else
+            " (all of it evictable — the shortfall is elsewhere)";
+        const msg = try std.fmt.allocPrint(allocator, "Prompt ({d} tokens) requires ~{d}MB GPU memory but only ~{d}MB is available and the hot prefix cache holds ~{d}MB more, of which ~{d}MB can be reclaimed{s}, which is not enough. Reduce prompt size, lower --ctx-size, or use a smaller model.", .{ prompt_len, needed_mb, avail_mb, bill.evictable / (1024 * 1024), bill.reclaimable / (1024 * 1024), why });
         defer allocator.free(msg);
         if (is_anthropic) {
             try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
@@ -7021,7 +7040,7 @@ fn handleChatCompletions(
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
 
     // Check if attention computation would exceed GPU memory.
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, effective_max_tokens, config, false, kv_quant_override, lm, generate_mod.visionPrefillUnchunked(local_ve != null))) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, lm, generate_mod.visionPrefillUnchunked(local_ve != null))) return;
 
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
 
@@ -7306,7 +7325,7 @@ fn handleCompletions(
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
 
     // Check if attention computation would exceed GPU memory.
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, effective_max_tokens, config, false, null, lm, false)) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, null, lm, false)) return;
 
 
     // Adaptive spec-decode gate (mirrors chat-completions): novel prompts
@@ -13448,7 +13467,7 @@ fn handleAnthropicMessages(
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
 
     // Check if attention computation would exceed GPU memory.
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, effective_max_tokens, config, true, kv_quant_override, lm, generate_mod.visionPrefillUnchunked(local_ve != null))) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, true, kv_quant_override, lm, generate_mod.visionPrefillUnchunked(local_ve != null))) return;
 
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
 
@@ -15063,7 +15082,7 @@ fn handleResponses(
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
 
     // Check if attention computation would exceed GPU memory.
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, effective_max_tokens, config, false, kv_quant_override, lm, generate_mod.visionPrefillUnchunked(local_ve != null))) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, lm, generate_mod.visionPrefillUnchunked(local_ve != null))) return;
 
     // ── sampling ──
     var sampling = generate_mod.SamplingParams{
@@ -20622,9 +20641,9 @@ test "the admission probe bills the request's OWN kv-quant and chunking, not the
     const seq: usize = 200_000;
     const q4 = transformer_mod.KVQuantConfig.affine(4);
     const q8 = transformer_mod.KVQuantConfig.affine(8);
-    const bill4 = prefillAdmissionBill(&cfg, seq, 2048, q4, false);
-    const bill8 = prefillAdmissionBill(&cfg, seq, 2048, q8, false);
-    const bill16 = prefillAdmissionBill(&cfg, seq, 2048, transformer_mod.KVQuantConfig.dense, false);
+    const bill4 = prefillAdmissionBill(&cfg, seq, 2048, q4, false, null);
+    const bill8 = prefillAdmissionBill(&cfg, seq, 2048, q8, false, null);
+    const bill16 = prefillAdmissionBill(&cfg, seq, 2048, transformer_mod.KVQuantConfig.dense, false, null);
     // The three widths must be three different numbers, or the override is
     // being dropped somewhere between the parameter and the estimator.
     try t.expect(bill4.needed < bill8.needed);
@@ -20685,7 +20704,10 @@ test "the admission guard reads a PUBLISHED hot-cache residency, never the infer
     // freed memory. Class guard: the pointer is never read outside the
     // scheduler, and every site that changes residency republishes.
     const t = std.testing;
-    const src = @embedFile("server.zig");
+    const whole = @embedFile("server.zig");
+    // Scan the CODE, not this test's own literals — an assertion that matches
+    // itself proves nothing.
+    const src = whole[0 .. std.mem.indexOf(u8, whole, "test \"the admission guard reads a PUBLISHED") orelse whole.len];
     try t.expectEqual(@as(usize, 0), std.mem.count(u8, src, "sch.hot_prefix" ++ "_cache"));
 
     const sched = @embedFile("scheduler.zig");
@@ -20696,6 +20718,21 @@ test "the admission guard reads a PUBLISHED hot-cache residency, never the infer
     const publishes = std.mem.count(u8, sched, "publishHotCache" ++ "Residency(");
     // the fn itself + every set/clear + both commits + the admission eviction
     try t.expect(publishes >= sets + 3);
+
+    // The prompt-aware credit does not weaken the rule. The connection thread
+    // reads the digest SNAPSHOT through the scheduler; the reduction happens
+    // under the digest lock and only a scalar comes back, so no pointer into
+    // cache-owned memory ever reaches this file.
+    try t.expect(std.mem.indexOf(u8, src, "sch.reclaimableHotCacheBytesFor(toks)") != null);
+    try t.expectEqual(@as(usize, 0), std.mem.count(u8, src, "hot_cache" ++ "_digests"));
+    // The snapshot is republished from the same one place the scalars are, and
+    // the superseded slice is freed by the publisher — never by a reader.
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, sched, "publishHotCache" ++ "Digests(sch);"));
+    const pub_start = std.mem.indexOf(u8, sched, "fn publishHotCache" ++ "Digests(").?;
+    const pub_end = std.mem.indexOfPos(u8, sched, pub_start, "\n}\n").?;
+    const body = sched[pub_start..pub_end];
+    try t.expect(std.mem.indexOf(u8, body, "digest_mu.lockUncancelable") != null);
+    try t.expect(std.mem.indexOf(u8, body, "allocator.free(old)") != null);
 }
 
 test "ssdFirstPrefixCacheMem: the active session's KV is billed ONCE and is the floor" {

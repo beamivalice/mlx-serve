@@ -2505,26 +2505,44 @@ nothing else. The inference thread can in fact evict it: `last_restored_used` is
 cleared at the start of every lookup and only set by a restore, so a
 non-matching prompt protects nothing and `evictLruToAdmit` will take it.
 
-**But the connection thread cannot see that, and that is a gap worth naming.**
+**The connection thread could not see that — so it was given a way to.**
 `reclaimableBytes` subtracts the largest entry because the guard cannot know
 WHICH entry a prompt will match, only that a restore pins at most one. With one
-resident entry that rule always subtracts the whole cache, so a wide request for
-a different session is judged as if a fully-flushed 24 GB entry were immovable:
-it must fit beside the resident session, step down the ladder, or be refused by
-name — even though the eviction it needed was available all along. The refusal
-text ("the entry a restore would share is not evictable") is actively
-misleading in this case, because no restore would have shared it.
+resident entry that always subtracts the whole cache, so a wide request for a
+different session was judged as if a fully-flushed 24 GB entry were immovable,
+and refused by name while the eviction it needed was available all along. The
+refusal even said "the entry a restore would share is not evictable" when no
+restore would have shared it.
 
-The obvious repair is not obviously right. Crediting residency outright is wrong:
-for a MATCHING prompt the shared buffers really do return nothing, and a complete
-disk copy does not change that — durability is not liveness. Crediting the entry
-only when the incoming prompt does not match it is the correct rule, but the
-guard runs on the connection thread and would have to do a prefix comparison to
-know. So this ships as a known asymmetry: the mechanism to reclaim exists, and
-the admission guard is blind to it in exactly the state SSD-first makes normal.
-What bounds the damage is that the refusal is by NAME and the request is not
-lost — and that a session switch spills the idle entry at the END of the
-switching request, so the pessimism lasts one request, not a session.
+The obvious repair is wrong: crediting residency outright fails the MATCHING
+case, where the shared buffers genuinely return nothing however complete the
+disk copy is — durability is not liveness. The correct rule needs the PROMPT,
+and the guard runs on a connection thread that may never touch
+`hot_prefix_cache` (inference-thread state, freed on every model switch).
+
+So the prompt meets the cache through a published snapshot instead. At every
+site that already republishes the residency scalars, the inference thread also
+builds an immutable `[]EntryDigest` — `{fingerprint, len, kv_bytes}`, where the
+fingerprint hashes the entry's first `MIN_CANCELLED_COMMIT_TOKENS` ids — and
+swaps it under a small mutex, freeing the superseded slice afterwards. The
+connection thread hashes the same prefix of the incoming prompt, and under that
+lock reduces to a scalar: residency minus the largest entry whose fingerprint
+matches. No pointer into cache-owned memory ever leaves.
+
+Two details are load-bearing. An entry shorter than the restore floor gets no
+digest at all — nothing can pin it, so omitting it correctly credits its bytes.
+And the pin test is the fingerprint match ALONE, deliberately not also
+`len <= prompt_len`: an entry whose record is LONGER than the prompt still
+shares the floor-width prefix and `restore` clamps to the shorter of the two, so
+it really can be restored from. Excluding it would credit bytes about to be
+pinned, and over-crediting is the unsafe direction — the guard promises, the
+inference thread then evicts nothing, and the request is refused after being
+admitted. The refusal text is conditional now too: it claims a restore would
+share the difference only when something actually withheld it.
+
+An allocation failure leaves the PREVIOUS snapshot standing rather than clearing
+it. A stale digest is a hint; an empty one is a claim that the cache holds
+nothing, and that is a lie that credits bytes which exist.
 
 **What SSD-first cannot do: serve a 1M prompt on this box.** The live KV must
 be resident — that is the one thing no tier can move — so the longest prompt

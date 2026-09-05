@@ -1266,6 +1266,15 @@ pub const Scheduler = struct {
     /// request gets promised and then refused (guards run 2026-09-05).
     reclaimable_hot_cache_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
+    /// The published per-entry digest snapshot the connection-thread guard
+    /// reads INSTEAD of the cache. Owned here; replaced under `digest_mu` by
+    /// the inference thread, which frees the superseded slice after the swap.
+    /// A connection thread COPIES what it needs while holding the lock — no
+    /// pointer to this ever escapes, which is the whole point: the cache
+    /// itself is freed on every model switch.
+    hot_cache_digests: []prefix_cache_mod.HotPrefixCache.EntryDigest = &.{},
+    digest_mu: std.Io.Mutex = .init,
+
     max_concurrent: u32,
     /// Phase A7 test hook: when true, `runDecodeTick` forces the batched
     /// kernel even at `active.len == 1`. Set via the `MLX_SERVE_FORCE_BATCHED`
@@ -1481,6 +1490,10 @@ pub const Scheduler = struct {
     }
 
     pub fn deinit(self: *Scheduler) void {
+        if (self.hot_cache_digests.len > 0) {
+            self.allocator.free(self.hot_cache_digests);
+            self.hot_cache_digests = &.{};
+        }
         self.shutdown.store(true, .release);
         // Wake inference thread if it's waiting on queue_cond.
         self.queue_mu.lockUncancelable(self.io);
@@ -3947,6 +3960,42 @@ pub fn publishHotCacheResidency(sch: *Scheduler) void {
     sch.resident_hot_cache_bytes.store(bytes, .monotonic);
     const reclaimable: u64 = if (sch.hot_prefix_cache) |hc| hc.reclaimableBytes() else 0;
     sch.reclaimable_hot_cache_bytes.store(reclaimable, .monotonic);
+    publishHotCacheDigests(sch);
+}
+
+/// Swap in a fresh digest snapshot and free the one it supersedes. Runs on the
+/// inference thread only, from the same sites as the scalars above (commit,
+/// eviction, invalidation, model switch), so the guard's view is stale by at
+/// most one entry — which is all a HINT has to be.
+///
+/// An allocation failure leaves the PREVIOUS snapshot in place rather than
+/// clearing it: a stale digest is a hint, an empty one is a claim that the
+/// cache holds nothing, and the second is a lie that credits bytes that exist.
+fn publishHotCacheDigests(sch: *Scheduler) void {
+    const fresh: []prefix_cache_mod.HotPrefixCache.EntryDigest = if (sch.hot_prefix_cache) |hc|
+        (hc.digestsAlloc(sch.allocator) catch return)
+    else
+        &.{};
+    sch.digest_mu.lockUncancelable(sch.io);
+    const old = sch.hot_cache_digests;
+    sch.hot_cache_digests = fresh;
+    sch.digest_mu.unlock(sch.io);
+    if (old.len > 0) sch.allocator.free(old);
+}
+
+/// CONNECTION-THREAD entry point: what an eviction pass can prove it will get
+/// back for THIS prompt. Copies nothing out — the reduction happens under the
+/// lock and only a scalar leaves.
+pub fn reclaimableHotCacheBytesFor(sch: *Scheduler, prompt_tokens: []const u32) u64 {
+    const residency = sch.resident_hot_cache_bytes.load(.monotonic);
+    const fp = prefix_cache_mod.HotPrefixCache.prefixFingerprint(prompt_tokens);
+    sch.digest_mu.lockUncancelable(sch.io);
+    defer sch.digest_mu.unlock(sch.io);
+    return prefix_cache_mod.HotPrefixCache.reclaimableFromDigests(
+        sch.hot_cache_digests,
+        residency,
+        fp,
+    );
 }
 
 /// Caller holds `queue_mu`. Shared with the wait condition below.

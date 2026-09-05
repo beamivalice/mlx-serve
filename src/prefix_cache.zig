@@ -1902,6 +1902,82 @@ pub const HotPrefixCache = struct {
         return self.current_kv_bytes -| largest;
     }
 
+    /// One resident entry, reduced to what a CONNECTION thread is allowed to
+    /// know about it. `hot_prefix_cache` is inference-thread state — nulled and
+    /// freed on every model switch — so the guard may never dereference it; it
+    /// reads a published, immutable snapshot of these instead.
+    ///
+    /// `fingerprint` hashes the entry's first `DIGEST_PREFIX_TOKENS` token ids.
+    /// That width is the restore FLOOR (`MIN_CANCELLED_COMMIT_TOKENS`): below
+    /// it the lookup reports a cold miss and restores nothing, so an entry that
+    /// short can never be pinned by any prompt and gets no digest at all.
+    pub const EntryDigest = struct {
+        fingerprint: u64,
+        len: u32,
+        kv_bytes: u64,
+    };
+
+    pub const DIGEST_PREFIX_TOKENS: usize = MIN_CANCELLED_COMMIT_TOKENS;
+
+    /// FNV-1a over the first `DIGEST_PREFIX_TOKENS` ids. Null when the record
+    /// is shorter than the restore floor — "cannot be restored from", which is
+    /// a different answer from "hashes to something".
+    pub fn prefixFingerprint(tokens: []const u32) ?u64 {
+        if (tokens.len < DIGEST_PREFIX_TOKENS) return null;
+        var h: u64 = 0xcbf29ce484222325;
+        for (tokens[0..DIGEST_PREFIX_TOKENS]) |t| {
+            h ^= t;
+            h *%= 0x100000001b3;
+        }
+        return h;
+    }
+
+    /// Snapshot the resident entries for publication. Caller owns the slice.
+    /// Entries under the restore floor are omitted: nothing can pin them, so
+    /// leaving them out only ever CREDITS their bytes, which is correct.
+    pub fn digestsAlloc(self: *const HotPrefixCache, allocator: std.mem.Allocator) ![]EntryDigest {
+        var out = std.ArrayList(EntryDigest).empty;
+        errdefer out.deinit(allocator);
+        for (self.entries.items) |*e| {
+            const fp = prefixFingerprint(e.tokens) orelse continue;
+            try out.append(allocator, .{
+                .fingerprint = fp,
+                .len = @intCast(@min(e.tokens.len, std.math.maxInt(u32))),
+                .kv_bytes = e.kv_bytes,
+            });
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    /// PURE, and the connection thread's half of the rule: residency minus the
+    /// LARGEST entry this prompt could restore from.
+    ///
+    /// The pin condition is the fingerprint match ALONE. It deliberately does
+    /// NOT also require `digest.len <= prompt_len`: an entry whose record is
+    /// LONGER than the prompt still shares the floor-width prefix, and
+    /// `restore` clamps to the shorter of the two — so such an entry really can
+    /// be restored from, and excluding it would credit bytes that are about to
+    /// be pinned. Over-crediting is the unsafe direction here (the inference
+    /// thread then evicts nothing and the request is refused after being
+    /// promised), so the length ordering is not part of the test.
+    ///
+    /// Same conservatism as `reclaimableBytesFor`: the LARGEST match is
+    /// withheld, not the longest-matching one, because the real lookup ranks by
+    /// restorable position and may pick a different entry than a prefix hash
+    /// would. Never smaller than the prompt-blind scalar.
+    pub fn reclaimableFromDigests(
+        digests: []const EntryDigest,
+        residency: u64,
+        prompt_fingerprint: ?u64,
+    ) u64 {
+        const fp = prompt_fingerprint orelse return residency;
+        var pinned: u64 = 0;
+        for (digests) |d| {
+            if (d.fingerprint == fp) pinned = @max(pinned, d.kv_bytes);
+        }
+        return residency -| pinned;
+    }
+
     /// The same question asked with the PROMPT in hand: bytes an eviction pass
     /// can prove it will get back, given that only an entry this prompt could
     /// actually restore from is unevictable.
@@ -4182,4 +4258,64 @@ test "reclaimableBytesFor: only an entry the PROMPT could restore from is unevic
     try testing.expect(credit_a > 0 and credit_a < both);
     // Never larger than the truth, never smaller than the prompt-blind rule.
     try testing.expect(credit_a >= hc.reclaimableBytes());
+}
+
+test "EntryDigest: the published snapshot answers the reclaimable question without the cache" {
+    // The connection thread may never dereference `hot_prefix_cache` (it is
+    // inference-thread state, freed on model switch), so the guard reads a
+    // published snapshot of these digests instead. This pins the reduction the
+    // guard performs, and the ownership contract around the snapshot.
+    const s = mlx.gpuStream();
+    const A = testing.allocator;
+
+    var tokens_a: [600]u32 = undefined;
+    for (&tokens_a, 0..) |*t, i| t.* = @intCast(i + 7);
+    var tokens_b: [600]u32 = undefined;
+    for (&tokens_b, 0..) |*t, i| t.* = @intCast(i + 90_000);
+    var short: [64]u32 = undefined;
+    for (&short, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    var cache = try KVCache.init(A, 1);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 1, 600);
+
+    var hc = HotPrefixCache.initWithMem(A, 4, 0);
+    hc.ssd_first = true;
+    defer hc.deinit();
+    try hc.commit(&cache, &tokens_a, false);
+    const resident = hc.residentBytes();
+
+    // Publish, then REPLACE — the superseded slice is the caller's to free,
+    // which is what the inference thread does after the swap.
+    var d1 = try hc.digestsAlloc(A);
+    try testing.expectEqual(@as(usize, 1), d1.len);
+    try testing.expectEqual(resident, d1[0].kv_bytes);
+    try hc.commit(&cache, &tokens_b, false);
+    const d2 = try hc.digestsAlloc(A);
+    A.free(d1);
+    d1 = d2;
+    defer A.free(d1);
+    try testing.expectEqual(@as(usize, 2), d1.len);
+
+    // A prompt that extends session A withholds A's entry and nothing else.
+    const fp_a = HotPrefixCache.prefixFingerprint(&tokens_a).?;
+    const both = hc.residentBytes();
+    const credit_a = HotPrefixCache.reclaimableFromDigests(d1, both, fp_a);
+    try testing.expect(credit_a > 0 and credit_a < both);
+
+    // A prompt matching NEITHER session credits the whole residency — the case
+    // the prompt-blind scalar gets wrong under one-session-resident.
+    var tokens_c: [600]u32 = undefined;
+    for (&tokens_c, 0..) |*t, i| t.* = @intCast(i + 500_000);
+    const fp_c = HotPrefixCache.prefixFingerprint(&tokens_c);
+    try testing.expectEqual(both, HotPrefixCache.reclaimableFromDigests(d1, both, fp_c));
+
+    // A prompt under the restore floor cannot restore from anything, so it
+    // pins nothing — and hashes to null rather than to "something".
+    try testing.expectEqual(@as(?u64, null), HotPrefixCache.prefixFingerprint(&short));
+    try testing.expectEqual(both, HotPrefixCache.reclaimableFromDigests(d1, both, null));
+
+    // The digest agrees with the direct, cache-side answer.
+    try testing.expectEqual(hc.reclaimableBytesFor(&tokens_a), credit_a);
+    try testing.expectEqual(hc.reclaimableBytesFor(&tokens_c), both);
 }
