@@ -922,6 +922,13 @@ pub const ModelConfig = struct {
         return std.mem.eql(u8, self.model_type, "qwen4_exp");
     }
 
+    /// SSD-first prefix cache (`MLX_SERVE_PREFIX_SSD_FIRST`): the ONE arch
+    /// predicate every SSD-first mechanism checks. True only for qwen4_exp —
+    /// every other arch keeps today's RAM-first behaviour byte-identically.
+    pub fn ssdFirstCapable(self: *const ModelConfig) bool {
+        return self.isQwen4();
+    }
+
     /// True when per-request SSM/conv cache entries must exist: hybrid
     /// recurrence (LFM2/Nemotron/GDN) or Inkling's four per-layer short
     /// convolutions. Shared by Transformer.init and the scheduler's per-slot

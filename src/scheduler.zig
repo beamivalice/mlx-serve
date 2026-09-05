@@ -3838,6 +3838,11 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             clamped_prefix_mem,
         );
         entry.prefix_cache.?.qsa_history_required = params.config.indexer_budget != 0;
+        // SSD-first prefix cache: ONE arch predicate, checked here. Every
+        // mechanism reads `HotPrefixCache.ssd_first`, so a non-qwen4_exp model
+        // (or `MLX_SERVE_PREFIX_SSD_FIRST=0`) keeps today's paths exactly.
+        entry.prefix_cache.?.ssd_first = params.config.ssdFirstCapable() and
+            prefix_cache_mod.ssdFirstEnabled();
         // SSD tier (`--prefix-cache-disk`). Phase 3 persists hybrid recurrent
         // state too: the disk tier is allowed whenever the RAM tier accepted
         // the arch — i.e. pure-attention always, hybrid iff SSM checkpoints

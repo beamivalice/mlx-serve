@@ -188,6 +188,50 @@ pub fn specAdoptPlan(base_pos: usize, snap_step: usize, matched: usize, has_head
     return .{ .head = want };
 }
 
+var ssd_first_env_cached: ?bool = null;
+/// Test/bench override for `ssdFirstEnabled()`. Null = read the environment.
+pub var ssd_first_override: ?bool = null;
+
+/// SSD-first prefix cache mode. `MLX_SERVE_PREFIX_SSD_FIRST=0` restores the
+/// RAM-first behaviour every other arch already has; the mode is armed only
+/// where `ModelConfig.ssdFirstCapable()` is also true (qwen4_exp today), so
+/// no other architecture's prefix-cache path changes.
+pub fn ssdFirstEnabled() bool {
+    if (ssd_first_override) |v| return v;
+    if (ssd_first_env_cached) |v| return v;
+    const v = blk: {
+        const raw = std.c.getenv("MLX_SERVE_PREFIX_SSD_FIRST") orelse break :blk true;
+        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
+    };
+    ssd_first_env_cached = v;
+    return v;
+}
+
+/// SSD-first mechanism 1: what the LIVE cache held at commit time, captured
+/// BEFORE the RAM byte-budget trim. The disk tier is the capacity tier here,
+/// so it must receive the full prefix even when the RAM entry keeps a trimmed
+/// one (or keeps nothing at all). Every handle is refcount-SHARED with the
+/// live KV, so the record costs bookkeeping, not GPU bytes.
+const PendingDiskFlush = struct {
+    snapshot: KVCacheSnapshot,
+    tokens: []u32,
+    has_tools: bool,
+    ssm_cps: ?[]SSMCheckpoint = null,
+    dflash: ?DflashSnap = null,
+    mtp: ?DflashSnap = null,
+
+    fn deinit(self: *PendingDiskFlush, allocator: std.mem.Allocator) void {
+        self.snapshot.deinit();
+        allocator.free(self.tokens);
+        if (self.ssm_cps) |cps| {
+            for (cps) |*cp| cp.deinit(allocator);
+            allocator.free(cps);
+        }
+        if (self.dflash) |*d| d.deinit();
+        if (self.mtp) |*m| m.deinit();
+    }
+};
+
 /// A committed speculative-side cache: the snapshot plus the absolute trunk
 /// position its index 0 represents (nonzero when the committing request was
 /// itself a cache hit). Shared by the DFlash assistant context and the MTP
@@ -288,6 +332,12 @@ pub const HotPrefixCache = struct {
     /// A restore that leaves the live entries without it cannot prefill —
     /// `qsaMaskFromQk` errors on every turn on that prefix — so it is a MISS.
     qsa_history_required: bool = false,
+    /// SSD-first mode (`ModelConfig.ssdFirstCapable()` and the env switch).
+    /// Set by the scheduler at load; false keeps every legacy path.
+    ssd_first: bool = false,
+    /// SSD-first mechanism 1: the live-cache state of the most recent commit,
+    /// flushed instead of the (possibly trimmed) RAM entry.
+    pending_disk: ?PendingDiskFlush = null,
 
     pub fn init(allocator: std.mem.Allocator, max_entries: u32) HotPrefixCache {
         return initWithMem(allocator, max_entries, 0);
@@ -308,6 +358,8 @@ pub const HotPrefixCache = struct {
             freeEntryOwnedState(self.allocator, e);
         }
         self.entries.deinit(self.allocator);
+        if (self.pending_disk) |*p| p.deinit(self.allocator);
+        self.pending_disk = null;
         if (self.disk) |*d| d.deinit();
         self.disk = null;
     }
@@ -986,6 +1038,14 @@ pub const HotPrefixCache = struct {
     ) !void {
         const quant_config = source_cache.config;
 
+        // SSD-first mechanism 1: record what the LIVE cache holds NOW, before
+        // any byte-budget trim below shortens what RAM retains. `flushPendingDisk`
+        // prefers this record, so the disk entry's kv_len is the full prompt even
+        // when the RAM entry keeps a trimmed prefix (or declines outright).
+        if (self.ssd_first and self.disk != null and vision_key == 0) {
+            self.capturePendingDisk(source_cache, tokens, has_tools, ssm_cps, dflash, mtp);
+        }
+
         var replace_idx: ?usize = null;
         for (self.entries.items, 0..) |*e, i| {
             if (e.has_tools != has_tools) continue;
@@ -1335,6 +1395,57 @@ pub const HotPrefixCache = struct {
         self.logResident();
     }
 
+    /// SSD-first mechanism 1: snapshot the live cache (refcount-shared, so no
+    /// GPU bytes) plus the full token record and this turn's checkpoints. Best
+    /// effort throughout — a failure costs the disk copy, never the RAM commit.
+    /// The caller still owns `ssm_cps`/`dflash`/`mtp`: everything here is a
+    /// SHARE.
+    fn capturePendingDisk(
+        self: *HotPrefixCache,
+        source_cache: *const KVCache,
+        tokens: []const u32,
+        has_tools: bool,
+        ssm_cps: ?[]SSMCheckpoint,
+        dflash: ?DflashCommit,
+        mtp: ?DflashCommit,
+    ) void {
+        if (self.pending_disk) |*old| {
+            old.deinit(self.allocator);
+            self.pending_disk = null;
+        }
+        var snap = source_cache.snapshot() catch |err| {
+            log.warn("  [disk-cache] live snapshot failed: {s} — flushing the RAM entry instead\n", .{@errorName(err)});
+            return;
+        };
+        var rec: PendingDiskFlush = .{
+            .snapshot = snap,
+            .tokens = self.allocator.dupe(u32, tokens) catch {
+                snap.deinit();
+                return;
+            },
+            .has_tools = has_tools,
+        };
+        if (ssm_cps) |cps| {
+            rec.ssm_cps = cloneCheckpointsUpTo(self.allocator, cps, std.math.maxInt(usize), null) catch null;
+        }
+        if (dflash) |d| {
+            if (d.cache.snapshot()) |ds| {
+                rec.dflash = .{ .snapshot = ds, .base_pos = d.base_pos };
+            } else |_| {}
+        }
+        if (mtp) |m2| {
+            if (m2.cache.snapshot()) |ms| {
+                rec.mtp = .{
+                    .snapshot = ms,
+                    .base_pos = m2.base_pos,
+                    .head_aux = if (m2.head) |h| transformer_mod.ssmSnapshot(h) else null,
+                    .head_pos_base = m2.head_pos_base,
+                };
+            } else |_| {}
+        }
+        self.pending_disk = rec;
+    }
+
     /// Flush the most recent commit to the SSD tier. Called by the scheduler
     /// AFTER `markFinished` (the client already has its response) — the
     /// chunk-append is bounded (partial tail + new chunks) but synchronous on
@@ -1344,6 +1455,46 @@ pub const HotPrefixCache = struct {
         if (!self.disk_dirty) return;
         self.disk_dirty = false;
         const d = if (self.disk) |*dd| dd else return;
+        // SSD-first mechanism 1: flush the LIVE state captured at commit, not
+        // whatever the RAM entry retained after its byte-budget trim. Consumed
+        // once; an incomplete write leaves `disk_dirty` set and the next
+        // commit's record resumes the extend.
+        if (self.pending_disk) |*pending| {
+            defer {
+                pending.deinit(self.allocator);
+                self.pending_disk = null;
+            }
+            const p_dflash: ?kv_disk_cache.SpecCommit = if (pending.dflash) |*df| .{
+                .entries = df.snapshot.entries,
+                .step = df.snapshot.step,
+                .config = df.snapshot.config,
+                .base_pos = df.base_pos,
+            } else null;
+            const p_mtp: ?kv_disk_cache.SpecCommit = if (pending.mtp) |*mm| .{
+                .entries = mm.snapshot.entries,
+                .step = mm.snapshot.step,
+                .config = mm.snapshot.config,
+                .base_pos = mm.base_pos,
+                .head_aux = if (mm.head_aux) |*a| a else null,
+                .head_pos_base = mm.head_pos_base,
+            } else null;
+            const ok = d.appendCommitWithSpec(
+                pending.snapshot.entries,
+                pending.snapshot.step,
+                pending.snapshot.config,
+                pending.tokens,
+                pending.has_tools,
+                pending.ssm_cps,
+                p_dflash,
+                p_mtp,
+                s,
+            ) catch |err| {
+                log.warn("  [disk-cache] persist failed: {s}\n", .{@errorName(err)});
+                return;
+            };
+            if (!ok) self.disk_dirty = true;
+            return;
+        }
         if (self.entries.items.len == 0) return;
         var newest: *Entry = &self.entries.items[0];
         for (self.entries.items[1..]) |*e| {
@@ -1802,6 +1953,10 @@ pub const HotPrefixCache = struct {
         // survives on disk would be immortal across restarts.
         if (self.disk) |*d| d.invalidateAll();
         self.disk_dirty = false;
+        if (self.pending_disk) |*p| {
+            p.deinit(self.allocator);
+            self.pending_disk = null;
+        }
         if (self.entries.items.len == 0) return;
         log.info("  [hot-cache] invalidating all {d} entries: {s}\n", .{ self.entries.items.len, reason });
         for (self.entries.items) |*e| {
@@ -1818,6 +1973,10 @@ pub const HotPrefixCache = struct {
     pub fn invalidateLatest(self: *HotPrefixCache, reason: []const u8) void {
         if (self.disk) |*d| d.invalidateNewest();
         self.disk_dirty = false;
+        if (self.pending_disk) |*p| {
+            p.deinit(self.allocator);
+            self.pending_disk = null;
+        }
         if (self.entries.items.len == 0) return;
         var newest_idx: usize = 0;
         var newest_used: u64 = 0;
@@ -3620,4 +3779,63 @@ test "spec snap bytes: the qwen4 head's QSA half is billed into the entry" {
     snap.head_aux = transformer_mod.ssmSnapshot(&entry);
     const with_head = HotPrefixCache.specSnapBytes(&snap);
     try testing.expectEqual(kv_only + 16 * 128 * 2, with_head);
+}
+
+test "SSD-first: the disk flush carries the full prefix while RAM keeps a trim" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+
+    var tokens: [1200]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 1, 1200);
+    var probe = try cache.snapshot();
+    const row_bytes = HotPrefixCache.snapshotRowBytes(&probe);
+    probe.deinit();
+    try testing.expect(row_bytes > 0);
+    // Holds roughly 768 of the 1200 positions — the commit must trim.
+    const budget: u64 = row_bytes * 768;
+
+    // Arm A (ssd_first ON): RAM trims, the DISK entry covers the full prompt.
+    {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var buf: [512]u8 = undefined;
+        const root_len = try tmp.dir.realPath(io, &buf);
+
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, budget);
+        hc.ssd_first = true;
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, buf[0..root_len], "fp-ssd-on", 0, 128);
+        defer hc.deinit();
+
+        try hc.commit(&cache, &tokens, false);
+        try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
+        try testing.expect(hc.entries.items[0].tokens.len < tokens.len);
+        hc.flushPendingDisk(s);
+        try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+        try testing.expectEqual(@as(u32, tokens.len), hc.disk.?.entries.items[0].kv_len);
+        try testing.expectEqual(@as(usize, tokens.len), hc.disk.?.entries.items[0].tokens.len);
+        try testing.expect(hc.pending_disk == null);
+    }
+
+    // Arm B (ssd_first OFF — every other arch): unchanged, the disk copy is
+    // exactly what RAM retained. Red-on-revert bar for arm A.
+    {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var buf: [512]u8 = undefined;
+        const root_len = try tmp.dir.realPath(io, &buf);
+
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, budget);
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, buf[0..root_len], "fp-ssd-off", 0, 128);
+        defer hc.deinit();
+
+        try hc.commit(&cache, &tokens, false);
+        hc.flushPendingDisk(s);
+        try testing.expect(hc.pending_disk == null);
+        try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+        try testing.expect(hc.disk.?.entries.items[0].kv_len < tokens.len);
+    }
 }
