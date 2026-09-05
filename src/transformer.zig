@@ -6009,6 +6009,7 @@ pub const KVCache = struct {
         self.step = snap.step;
     }
 
+
     const chunk_step = 256;
 
     /// Cap on the slack a single growth event adds, in tokens. Keeps the
@@ -6660,6 +6661,31 @@ pub const KVCacheSnapshot = struct {
         self.allocator.free(self.entries);
     }
 
+    /// Give up every array handle this snapshot holds, leaving it EMPTY but
+    /// still a valid (deinit-able) snapshot.
+    ///
+    /// This is the second half of RESTORE BY MOVE. `KVCache.restore` binds
+    /// through `mlx_array_set` — a C++ `array` copy-assign in mlx-c — so after
+    /// a restore the snapshot keeps a SECOND reference to every buffer for the
+    /// whole request. mlx's `is_donatable()` is `array_desc_.use_count() == 1
+    /// && data.use_count() == 1` (`mlx/array.h`), so that second reference is
+    /// exactly what makes the first `writeAtOffset` fail donation: its
+    /// `mlx_slice_update` falls through to `copy_gpu` and privatises the whole
+    /// prefix (measured 5.13 GB / ~110 ms at 393k tokens on qwen4_exp — 45% of
+    /// the warm TTFT). Releasing here leaves the restored slot the SOLE owner,
+    /// the append donates in place, and the copy disappears rather than moving.
+    ///
+    /// The price is ownership: the snapshot no longer holds the prefix, so
+    /// whoever owns it must be replaced by the grown buffers or dropped.
+    /// `HotPrefixCache`'s checkout does both — see `Entry.checked_out_by`.
+    pub fn releaseHandles(self: *KVCacheSnapshot) void {
+        for (self.entries) |*e| {
+            freeKVEntry(e);
+            e.* = newEmptyKVEntry();
+        }
+        self.step = 0;
+    }
+
     /// Issue #330: a materialized copy of the first `len` tokens (sequence
     /// axis 2). `KVCache.truncate` is offset-only — the views shrink but a
     /// refcount-shared snapshot keeps the full buffer alive and
@@ -6841,6 +6867,12 @@ fn qsaKeyAppendPlan(rows: usize, cap: usize, add: usize, reserve: usize) QsaKeyA
 /// must move this exactly ONCE per buffer, which is the whole point.
 pub var qsa_cap_buf_allocs: usize = 0;
 
+/// How many times a QSA history accelerator was RE-SEEDED from its authority
+/// (`seedCapBuf`) — a restore, a rollback trim, a checkpoint apply. A seed
+/// taken at the reservation leaves `qsa_cap_buf_allocs` alone; a tight one
+/// makes the very next append grow, which is the two-full-passes defect.
+pub var qsa_history_seeds: usize = 0;
+
 /// Ask every live entry's QSA history to hold `tokens` rows up front.
 /// Monotone and idempotent like `KVCache.reserve`, and off under the same
 /// kill switch — one reservation decision, one lever (`MLX_SERVE_KV_RESERVE=0`).
@@ -6860,6 +6892,50 @@ pub fn reserveQsaHistory(entries: ?[]SSMCacheEntry, tokens: usize) void {
 /// The published view is dropped FIRST: while it lives it holds a reference
 /// to the buffer's memory, and mlx would then copy the whole buffer instead
 /// of donating it into the update — exactly the copy this pattern removes.
+/// Materialize `src` straight into a capacity buffer already `reserve` rows
+/// long on `axis` — the seed half of `capBufAppend`, done ONCE.
+///
+/// The re-seed path used to call `materializedOwnedCopy(src)`, producing a
+/// TIGHT `held`-row buffer, and `capBufAppend` then grew it one line later:
+/// `mlx_zeros` of the reservation plus a `slice_update` of the whole history.
+/// Two full passes over the prefix where one does (measured: 3,072 B/tok of
+/// raw QSA keys + 768 B/tok pooled, ~81 ms at 393k on qwen4_exp).
+///
+/// BYTE-IDENTICAL to the pair it replaces: `capBufAppend`'s grow builds
+/// exactly this array — `mlx_zeros(reservation)` with the held rows
+/// slice_updated at offset 0 — and its `new_cap` for the very next append is
+/// then already satisfied, so the grow it would have done is a no-op rather
+/// than a skipped step. Lazy, like `materializedOwnedCopy` itself.
+fn seedCapBuf(s: mlx.mlx_stream, src: mlx.mlx_array, axis: usize, reserve: usize) !mlx.mlx_array {
+    const sh = mlx.getShape(src);
+    const nd: usize = sh.len;
+    std.debug.assert(nd <= 4 and axis < nd);
+    const held: usize = @intCast(sh[axis]);
+    // No reservation (or one the history already exceeds): the tight copy IS
+    // the right buffer, and `capBufAppend` takes the proportional policy.
+    if (reserve <= held) return materializedOwnedCopy(s, src);
+    var shape = [_]c_int{ 0, 0, 0, 0 };
+    var stop = [_]c_int{ 0, 0, 0, 0 };
+    for (sh, 0..) |d, i| {
+        shape[i] = d;
+        stop[i] = d;
+    }
+    shape[axis] = @intCast(reserve);
+    const start = [_]c_int{ 0, 0, 0, 0 };
+    const strides = [_]c_int{ 1, 1, 1, 1 };
+    var grown = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(grown);
+    try mlx.check(mlx.mlx_zeros(&grown, &shape, nd, mlx.mlx_array_dtype(src), s));
+    var seeded = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(seeded);
+    try mlx.check(mlx.mlx_slice_update(&seeded, grown, src, &start, nd, &stop, nd, &strides, nd, s));
+    // Deliberately NOT counted in `qsa_cap_buf_allocs`: that counter means
+    // "capBufAppend had to grow", and the whole point here is that it no
+    // longer does. A seed that leaves a grow behind is the bug.
+    qsa_history_seeds += 1;
+    return seeded;
+}
+
 fn capBufAppend(s: mlx.mlx_stream, buf: *mlx.mlx_array, view: *mlx.mlx_array, count: *c_int, chunk: mlx.mlx_array, axis: usize, reserve: usize) !void {
     const csh = mlx.getShape(chunk);
     const nd: usize = csh.len;
@@ -15336,7 +15412,10 @@ pub const Transformer = struct {
             entry.qsa_key_buf = .{ .ctx = null };
             entry.qsa_key_rows = 0;
             if (held > 0) {
-                entry.qsa_key_buf = try materializedOwnedCopy(s, entry.aux_state);
+                // Seed AT the reservation: `capBufAppend` grows one line
+                // below, and a tight seed makes that a second full pass over
+                // the history (`seedCapBuf`).
+                entry.qsa_key_buf = try seedCapBuf(s, entry.aux_state, 1, entry.qsa_reserve_rows);
                 entry.qsa_key_rows = held;
             }
         }
@@ -15355,7 +15434,10 @@ pub const Transformer = struct {
             entry.qsa_pooled_buf = .{ .ctx = null };
             entry.qsa_pooled_blocks = 0;
             if (nb_cached > 0 and entry.qsa_pooled.ctx != null) {
-                entry.qsa_pooled_buf = try materializedOwnedCopy(s, entry.qsa_pooled);
+                // Same seed-at-the-reservation rule as the raw-key bank; the
+                // pooled reservation is the row one divided by the ratio.
+                const seed_ratio: usize = @max(@as(usize, @intCast(entry.qsa_ratio)), 1);
+                entry.qsa_pooled_buf = try seedCapBuf(s, entry.qsa_pooled, 1, entry.qsa_reserve_rows / seed_ratio);
                 entry.qsa_pooled_blocks = nb_cached;
             }
         }
@@ -46954,4 +47036,81 @@ test "ssm retention: the span-preserving thin keeps both ends and spreads the su
     // to 1000, dropping index 1 would widen it to 1010.
     const clustered = [_]u32{ 0, 1000, 1010, 2000 };
     try t.expectEqual(@as(usize, 2), positionDropIndex(&clustered));
+}
+
+test "qsa history: a restore-shaped re-seed lands AT the reservation, so the append never grows" {
+    // The warm-turn shape (WARM_TTFT_384k.md §4, phases 6/6b). A prefix-cache
+    // restore republishes `aux_state` but leaves the append ACCELERATOR empty,
+    // so `qsaAppendKeys` re-seeds — and the re-seed used to produce a TIGHT
+    // `held`-row buffer that `capBufAppend` grew one line later: `mlx_zeros` of
+    // the whole reservation plus a `slice_update` of the entire history. Two
+    // full passes over 392,935 rows of raw index keys (3,072 B/tok) and the
+    // pooled bank (768 B/tok) — ~81 ms at 384k, inside TTFT.
+    //
+    // RED before `seedCapBuf`: one grow here, and a buffer sized to `held`
+    // rather than to the reservation.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const ta = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x5EED_5EED);
+    const rnd = prng.random();
+    const hd: c_int = 128;
+    const held: c_int = 4096;
+    const reserve: usize = 8192;
+
+    var t: Transformer = undefined;
+    t.s = s;
+    t.allocator = ta;
+    var entries = [_]SSMCacheEntry{.{ .ssm_state = mlx.mlx_array_new(), .conv_state = mlx.mlx_array_new(), .initialized = false }};
+    const entry = &entries[0];
+    defer {
+        ssmFreeQsaState(entry);
+        _ = mlx.mlx_array_free(entry.ssm_state);
+        _ = mlx.mlx_array_free(entry.conv_state);
+    }
+    reserveQsaHistory(entries[0..], reserve);
+
+    // Turn 1 builds the history.
+    {
+        const chunk = try attn256RandBf16(rnd, &[_]c_int{ 1, held, hd }, s);
+        defer _ = mlx.mlx_array_free(chunk);
+        try t.qsaAppendKeys(entry, chunk, 0);
+    }
+    // A RESTORE: `aux_state` is the authority and survives; the accelerator
+    // does not. Exactly what `applyQsaHistoryAt` leaves behind.
+    var authority = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_array_set(&authority, entry.aux_state));
+    _ = mlx.mlx_array_free(entry.qsa_key_buf);
+    entry.qsa_key_buf = .{ .ctx = null };
+    entry.qsa_key_rows = 0;
+    _ = mlx.mlx_array_free(entry.aux_state);
+    entry.aux_state = authority;
+
+    // Turn 2 appends a short diverged tail.
+    const grows_before = qsa_cap_buf_allocs;
+    const seeds_before = qsa_history_seeds;
+    {
+        const chunk = try attn256RandBf16(rnd, &[_]c_int{ 1, 30, hd }, s);
+        defer _ = mlx.mlx_array_free(chunk);
+        try t.qsaAppendKeys(entry, chunk, held);
+    }
+    // ONE seed, and NO grow behind it: the history is copied once, not twice.
+    try testing.expectEqual(@as(usize, 1), qsa_history_seeds - seeds_before);
+    try testing.expectEqual(@as(usize, 0), qsa_cap_buf_allocs - grows_before);
+    try testing.expectEqual(@as(c_int, @intCast(reserve)), mlx.getShape(entry.qsa_key_buf)[1]);
+    try testing.expectEqual(@as(c_int, held + 30), mlx.getShape(entry.aux_state)[1]);
+
+    // With NO reservation the seed stays tight and the grow is the append's,
+    // exactly as before — the fix adds a path, it does not change that one.
+    entry.qsa_reserve_rows = 0;
+    _ = mlx.mlx_array_free(entry.qsa_key_buf);
+    entry.qsa_key_buf = .{ .ctx = null };
+    entry.qsa_key_rows = 0;
+    const grows2 = qsa_cap_buf_allocs;
+    {
+        const chunk = try attn256RandBf16(rnd, &[_]c_int{ 1, 30, hd }, s);
+        defer _ = mlx.mlx_array_free(chunk);
+        try t.qsaAppendKeys(entry, chunk, held + 30);
+    }
+    try testing.expectEqual(@as(usize, 1), qsa_cap_buf_allocs - grows2);
 }

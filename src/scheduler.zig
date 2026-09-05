@@ -4279,6 +4279,13 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                     if (s.model.transformer) |xf| hc.flushPendingDisk(xf.s);
                 }
             }
+            // RESTORE BY MOVE: the SECOND slot-end path, and the one that
+            // matters most — a decode-phase cancel never reaches finishSlot,
+            // and `s.deinit()` on the next line frees the KV buffers this
+            // slot took ownership of. Unconditional, OUTSIDE the commit
+            // guard above: an errored or already-finished slot can hold a
+            // checkout too, and the record must not outlive the bytes.
+            if (s.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(s), "slot cleanup");
             s.deinit();
         }
         if (vision_n > 0 or embed_n > 0) {
@@ -5062,6 +5069,15 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
         g.persistRoundCost();
     }
     commitSlotIfApplicable(sch, slot);
+    // RESTORE BY MOVE: whatever the commit above did or did not do, this slot
+    // is over. A commit that landed on the checked-out entry already cleared
+    // the mark (the replace path installed the grown buffers); anything still
+    // marked belongs to a slot that ended WITHOUT committing — cancelled,
+    // errored, refused, pad-poisoned, oversized-and-declined — and its record
+    // now describes bytes that die with `slot.cache`. Drop it and say so.
+    // Unconditional and above every early return, because "the commit ran" is
+    // exactly the fact this cannot be allowed to depend on.
+    if (slot.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(slot), reason);
     // SSD flush runs AFTER markFinished so the client never waits on the
     // chunk-append — but everything it needs must be captured BEFORE the
     // broadcast: the conn thread may complete()+free the slot immediately.
@@ -5819,7 +5835,12 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             // target names the Transformer too and the adoption is
             // all-or-nothing inside `restoreSpecSnap`.
             const mtp_head: ?*Transformer = if (mtp_target) |*mc| mc.head() else null;
-            const lookup = hc.lookupAndRestoreWithMedia(
+            // RESTORE BY MOVE: the slot names itself, which opts this
+            // restore into the checkout (`Entry.checked_out_by`). The promise
+            // it makes is that `finishSlot` runs `releaseCheckout` on EVERY
+            // path that ends the slot — pinned by
+            // `test "every slot-end path releases a checked-out hot-cache entry"`.
+            const lookup = hc.lookupAndRestoreForSlot(
                 &slot.cache,
                 &slot.moe_seq_offset,
                 slot.ssm_entries,
@@ -5830,6 +5851,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 slot.media_start,
                 if (dfl_target) |*dc| .{ .cache = &dc.cache, .base_pos = &dfl_base } else null,
                 if (mtp_kv) |k| .{ .cache = k, .base_pos = &mtp_base, .head = mtp_head } else null,
+                @intFromPtr(slot),
             ) catch |err| blk: {
                 log.warn("[hot-cache] lookup failed: {s} — proceeding with cold prefill\n", .{@errorName(err)});
                 break :blk prefix_cache_mod.LookupResult{ .matched = 0, .full_match = false };
@@ -6623,6 +6645,64 @@ test "DFlash cache payload is committed only when it spans the trunk prefix" {
     const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn finishSlot(") orelse return error.MissingFinishSlot;
     const body = source[start..end];
     try testing.expect(std.mem.indexOf(u8, body, "dflashContextCoversPrefix(dc.absLen(), total_len)") != null);
+}
+
+test "every slot-end path releases a checked-out hot-cache entry" {
+    // RESTORE BY MOVE hands a slot OWNERSHIP of a hot-cache entry's KV
+    // buffers, so the record outlives its bytes unless every path that ends a
+    // slot releases the checkout. There are exactly TWO such paths and they do
+    // not chain: `finishSlot` (normal finish, stop, loop cut, refusal) and the
+    // inference loop's cleanup drain (a decode-phase cancel that `complete()`
+    // pulled straight into the cleanup queue and which NEVER reaches
+    // finishSlot — the same seam the commit-in-the-drain guard exists for).
+    //
+    // Both releases must be UNCONDITIONAL: "the commit ran" is exactly the
+    // fact this cannot be allowed to depend on, since a pad-only, errored,
+    // oversized-and-declined or refused slot ends without one. In the drain
+    // the release must also sit BEFORE `s.deinit()`, which frees the very
+    // buffers the entry would otherwise still claim.
+    const whole = @embedFile("scheduler.zig");
+    // Everything above this test — the call sites, never this test's own
+    // mentions of them (`@embedFile` reads the file it is written in).
+    // Anchored at a line start: the runPrefill comment NAMES this test, and an
+    // unanchored needle finds that mention first and truncates the source
+    // above every call site it is supposed to count.
+    const self_test = "\ntest \"every slot-end path releases a checked-out hot-cache entry\"";
+    const source = whole[0 .. std.mem.indexOf(u8, whole, self_test) orelse whole.len];
+    try testing.expectEqual(
+        @as(usize, 2),
+        std.mem.count(u8, source, "hc.releaseCheckout(@intFromPtr("),
+    );
+
+    {
+        const start = std.mem.indexOf(u8, source, "fn finishSlot(") orelse return error.MissingFinishSlot;
+        const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn ") orelse return error.MissingFinishSlotEnd;
+        const body = source[start..end];
+        const commit = std.mem.indexOf(u8, body, "commitSlotIfApplicable(sch, slot);") orelse
+            return error.FinishSlotDoesNotCommit;
+        const release = std.mem.indexOf(u8, body, "hc.releaseCheckout(@intFromPtr(slot)") orelse
+            return error.FinishSlotDoesNotRelease;
+        // After the commit (which clears the mark when it reclaims the entry),
+        // so the drop only fires on a slot that ended WITHOUT committing.
+        try testing.expect(commit < release);
+    }
+
+    {
+        const start = std.mem.indexOf(u8, source, "for (cleanup_batch[0..cleanup_n])") orelse
+            return error.MissingCleanupDrain;
+        const region = source[start..@min(start + 2400, source.len)];
+        const release = std.mem.indexOf(u8, region, "hc.releaseCheckout(@intFromPtr(s)") orelse
+            return error.DrainDoesNotRelease;
+        const deinit_pos = std.mem.indexOf(u8, region, "s.deinit();") orelse return error.MissingDeinit;
+        try testing.expect(release < deinit_pos);
+    }
+
+    // The checkout is only ever TAKEN by the slot-named entry point, so a
+    // future caller cannot opt in without making the release promise.
+    try testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, source, "hc.lookupAndRestoreForSlot("),
+    );
 }
 
 test "firstMediaPlaceholder finds every dynamic media kind and ignores disabled ids" {

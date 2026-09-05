@@ -181,6 +181,15 @@ const Entry = struct {
     mtp: ?DflashSnap = null,
     /// Bytes resident in `mtp`, folded into `kv_bytes` like `ssm_bytes`.
     mtp_bytes: u64 = 0,
+    /// RESTORE BY MOVE: the slot that took OWNERSHIP of this entry's KV
+    /// buffers (`KVCache.adopt`), identified by its address. While set, the
+    /// entry's `snapshot` holds EMPTY handles — the bytes live in that slot's
+    /// cache and nowhere else — so the entry is invisible to every other
+    /// reader: restore, eviction, the byte-budget shed, the SSD spill, and
+    /// both reclaimable/digest publications. Cleared by the commit that
+    /// replaces it with the grown buffers; an entry still holding it at slot
+    /// end is DROPPED (`releaseCheckout`).
+    checked_out_by: ?usize = null,
 };
 
 /// What a spec-snap adoption may do, decided BEFORE any mlx call so the whole
@@ -220,6 +229,7 @@ pub var ssd_first_override: ?bool = null;
 /// true when a second caller appears. Called from `main()`. (audit N7)
 pub fn warmEnvCaches() void {
     _ = ssdFirstEnabled();
+    _ = restoreMoveEnabled();
 }
 
 /// SSD-first prefix cache mode. `MLX_SERVE_PREFIX_SSD_FIRST=0` restores the
@@ -234,6 +244,25 @@ pub fn ssdFirstEnabled() bool {
         break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
     };
     ssd_first_env_cached = v;
+    return v;
+}
+
+var restore_move_env_cached: ?bool = null;
+/// Test/bench override for `restoreMoveEnabled()`. Null = read the environment.
+pub var restore_move_override: ?bool = null;
+
+/// RESTORE BY MOVE. `MLX_SERVE_RESTORE_MOVE=0` restores the refcount-SHARE
+/// every restore did before — the arm whose first append copies the whole
+/// prefix. Armed only where `HotPrefixCache.ssd_first` is (qwen4_exp plus the
+/// SSD-first env switch), so no other architecture's restore changes.
+pub fn restoreMoveEnabled() bool {
+    if (restore_move_override) |v| return v;
+    if (restore_move_env_cached) |v| return v;
+    const v = blk: {
+        const raw = std.c.getenv("MLX_SERVE_RESTORE_MOVE") orelse break :blk true;
+        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
+    };
+    restore_move_env_cached = v;
     return v;
 }
 
@@ -879,6 +908,11 @@ pub const HotPrefixCache = struct {
         var best_shared: usize = 0;
         var best_effective: usize = 0;
         for (self.entries.items, 0..) |*e, i| {
+            // A checked-out entry's buffers belong to another slot; its
+            // snapshot is empty. Restoring from it would hand this request an
+            // uninitialized cache, so it is not a candidate at all — and it is
+            // not counted in `probe` either: it cannot explain a miss.
+            if (e.checked_out_by != null) continue;
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant_config, quant_config)) continue;
 
@@ -958,6 +992,38 @@ pub const HotPrefixCache = struct {
             null,
             dflash_target,
             mtp_target,
+            null,
+        );
+    }
+
+    /// The checkout-capable entry point: `slot_id` names the slot that will
+    /// own the restored buffers. Every other overload passes null.
+    pub fn lookupAndRestoreForSlot(
+        self: *HotPrefixCache,
+        target_cache: *KVCache,
+        target_moe_seq_offset: *usize,
+        target_ssm_entries: ?[]SSMCacheEntry,
+        s: mlx.mlx_stream,
+        prompt_ids: []const u32,
+        has_tools: bool,
+        vision_key: u64,
+        media_start: ?usize,
+        dflash_target: ?DflashTarget,
+        mtp_target: ?DflashTarget,
+        slot_id: usize,
+    ) !LookupResult {
+        return self.lookupAndRestoreWithMedia(
+            target_cache,
+            target_moe_seq_offset,
+            target_ssm_entries,
+            s,
+            prompt_ids,
+            has_tools,
+            vision_key,
+            media_start,
+            dflash_target,
+            mtp_target,
+            slot_id,
         );
     }
 
@@ -973,6 +1039,11 @@ pub const HotPrefixCache = struct {
         media_start: ?usize,
         dflash_target: ?DflashTarget,
         mtp_target: ?DflashTarget,
+        /// RESTORE BY MOVE: identity of the slot asking. Non-null opts this
+        /// request into the checkout — the caller is promising to run
+        /// `releaseCheckout` on EVERY path that ends the slot. Null keeps the
+        /// refcount-share for every caller that makes no such promise.
+        slot_id: ?usize,
     ) !LookupResult {
         // A previous request's restored-entry marker must never protect an
         // entry from THIS request's eviction pass.
@@ -1171,12 +1242,92 @@ pub const HotPrefixCache = struct {
         }
 
         log.info("  [hot-cache] reused {d}/{d} tokens (matched {d}; entry {d}/{d})\n", .{ effective_matched, prompt_ids.len, m.shared, m.idx + 1, self.entries.items.len });
-        return .{
+        const res: LookupResult = .{
             .matched = effective_matched,
             .full_match = full_match,
             .dflash_base = restoreDflash(e, dflash_target, effective_matched, s),
             .mtp_base = restoreMtp(e, mtp_target, effective_matched, s),
         };
+        self.checkoutIfEligible(m.idx, m.shared, prompt_ids.len, slot_id);
+        return res;
+    }
+
+    /// RESTORE BY MOVE, the decision. PURE so the policy is testable without
+    /// mlx: the checkout is taken only on a FULL-PREFIX hit — the entry's
+    /// whole token record is a prefix of this prompt, which is what makes the
+    /// commit's replace path land on this same entry — and only when the
+    /// request has something to append (otherwise nothing would donate and the
+    /// entry would be dropped for no gain).
+    ///
+    /// A PARTIAL hit keeps the refcount-share: the entry still describes a
+    /// prefix this request diverged from, it is worth keeping for the next
+    /// one, and the commit would land as a NEW entry beside it.
+    pub fn checkoutEligible(
+        ssd_first: bool,
+        move_enabled: bool,
+        pending_disk: bool,
+        entry_tokens: usize,
+        shared: usize,
+        prompt_len: usize,
+        has_slot: bool,
+    ) bool {
+        if (!ssd_first or !move_enabled or !has_slot) return false;
+        // The pending disk record refcount-SHARES the same buffers, so a
+        // checkout taken over it cannot donate anyway (mlx's own use_count
+        // test declines) — and reasoning about a flush that reads buffers a
+        // slot is appending into is not worth the microseconds. It is
+        // consumed by `flushPendingDisk` at the previous slot's end, so this
+        // is a guard, not a common path.
+        if (pending_disk) return false;
+        if (entry_tokens == 0 or shared != entry_tokens) return false;
+        return prompt_len > shared;
+    }
+
+    /// Take the checkout: hand the entry's KV buffers to the slot outright by
+    /// RELEASING the entry's own handles. The slot already holds refcount-
+    /// shared handles from `restore`, so this drops the buffers' use_count to
+    /// one and the slot's first `writeAtOffset` donates instead of copying.
+    fn checkoutIfEligible(self: *HotPrefixCache, idx: usize, shared: usize, prompt_len: usize, slot_id: ?usize) void {
+        const e = &self.entries.items[idx];
+        if (!checkoutEligible(
+            self.ssd_first,
+            restoreMoveEnabled(),
+            self.pending_disk != null,
+            e.tokens.len,
+            shared,
+            prompt_len,
+            slot_id != null,
+        )) return;
+        e.snapshot.releaseHandles();
+        e.checked_out_by = slot_id;
+        log.info("  [hot-cache] checked out {d}-token entry to the slot (restore by move; the append donates in place)\n", .{e.tokens.len});
+    }
+
+    /// End of a slot's life: any entry that slot still holds is DROPPED.
+    ///
+    /// The bytes are the slot's KV buffers and die with them, so the record
+    /// describes a prefix nothing can restore — leaving it in the cache would
+    /// hand the next matching request an empty snapshot. The commit path
+    /// clears the mark first when it replaces the entry with the grown
+    /// buffers, so reaching here with a mark set means this slot ended
+    /// WITHOUT committing: cancelled, errored, or refused.
+    ///
+    /// Idempotent, and safe when the entry was already removed by an
+    /// invalidate.
+    pub fn releaseCheckout(self: *HotPrefixCache, slot_id: usize, reason: []const u8) void {
+        var i: usize = self.entries.items.len;
+        while (i > 0) {
+            i -= 1;
+            const e = &self.entries.items[i];
+            if (e.checked_out_by != slot_id) continue;
+            const tokens_len = e.tokens.len;
+            // Clear the mark BEFORE `evictAt` so its LRU bookkeeping (and any
+            // log it emits) sees an ordinary entry; the snapshot is already
+            // empty, so the free returns nothing and bills nothing.
+            e.checked_out_by = null;
+            self.evictAt(i, "checked-out entry dropped");
+            log.info("  [hot-cache] checked-out entry dropped: {s} ({d} tokens; its KV died with the slot)\n", .{ reason, tokens_len });
+        }
     }
 
     /// Commit the current `source_cache` state under the given key. Updates
@@ -1338,7 +1489,13 @@ pub const HotPrefixCache = struct {
                 // target is budget-derived and stable, so replacing would
                 // re-copy an identical multi-GB prefix every turn.
                 if (replace_idx) |idx| {
-                    if (self.entries.items[idx].tokens.len >= tl) {
+                    // ...unless the entry is CHECKED OUT: it retains nothing
+                    // (its snapshot is empty), so "keep the resident prefix"
+                    // would keep a record with no bytes behind it and discard
+                    // the only copy. Fall through to the trim/replace.
+                    if (self.entries.items[idx].checked_out_by == null and
+                        self.entries.items[idx].tokens.len >= tl)
+                    {
                         var discarded = new_snap;
                         discarded.deinit();
                         if (new_dflash) |*d| d.deinit();
@@ -1571,6 +1728,11 @@ pub const HotPrefixCache = struct {
             e.dflash_bytes = new_dflash_bytes;
             e.mtp = new_mtp;
             e.mtp_bytes = new_mtp_bytes;
+            // RESTORE BY MOVE: this is the replacement the checkout promised.
+            // `e.snapshot` was empty (the slot owned the buffers) and has just
+            // been overwritten with the GROWN ones — the same allocation, now
+            // longer — so the entry is whole again and visible to everyone.
+            e.checked_out_by = null;
             e.last_used = self.bumpCounter();
             self.current_kv_bytes += e.kv_bytes;
             // Inherited SSM checkpoints can make a replacement larger than
@@ -1755,6 +1917,11 @@ pub const HotPrefixCache = struct {
             i -= 1;
             const e = &self.entries.items[i];
             if (e.last_used == newest_used) continue; // the active session
+            // Checked out: the bytes are the slot's, the snapshot is empty,
+            // and there is nothing here to write. (The spill runs on the
+            // inference thread at another slot's `finishSlot`, so it can meet
+            // a checkout that is still open.)
+            if (e.checked_out_by != null) continue;
             // Vision entries never spill: an image placeholder token is
             // identical across images, so a token-only disk key is ambiguous.
             if (e.vision_key != 0) continue;
@@ -2161,8 +2328,20 @@ pub const HotPrefixCache = struct {
     /// thread had promised (guards run 2026-09-05, issue #353 follow-up).
     pub fn reclaimableBytes(self: *const HotPrefixCache) u64 {
         var largest: u64 = 0;
-        for (self.entries.items) |*e| largest = @max(largest, e.kv_bytes);
-        return self.current_kv_bytes -| largest;
+        // A checked-out entry is neither restorable NOR evictable: its bytes
+        // are a live slot's KV. They still count in `current_kv_bytes` (they
+        // really are resident), so they come off the base here — crediting
+        // them would be the unsafe direction, the one where the connection
+        // thread promises a request the inference thread then refuses.
+        var checked_out: u64 = 0;
+        for (self.entries.items) |*e| {
+            if (e.checked_out_by != null) {
+                checked_out += e.kv_bytes;
+                continue;
+            }
+            largest = @max(largest, e.kv_bytes);
+        }
+        return self.current_kv_bytes -| checked_out -| largest;
     }
 
     /// One resident entry, reduced to what a CONNECTION thread is allowed to
@@ -2202,6 +2381,10 @@ pub const HotPrefixCache = struct {
         var out = std.ArrayList(EntryDigest).empty;
         errdefer out.deinit(allocator);
         for (self.entries.items) |*e| {
+            // Checked out: no resident bytes to describe, and no prompt can
+            // restore from it — publishing it would make the connection
+            // thread withhold bytes that are already the slot's.
+            if (e.checked_out_by != null) continue;
             const fp = prefixFingerprint(e.tokens) orelse continue;
             try out.append(allocator, .{
                 .fingerprint = fp,
@@ -2265,7 +2448,12 @@ pub const HotPrefixCache = struct {
     /// `reclaimableBytes()` — it degenerates to it when every entry matches.
     pub fn reclaimableBytesFor(self: *const HotPrefixCache, prompt_tokens: []const u32) u64 {
         var pinned: u64 = 0;
+        var checked_out: u64 = 0;
         for (self.entries.items) |*e| {
+            if (e.checked_out_by != null) {
+                checked_out += e.kv_bytes;
+                continue;
+            }
             const max_shared = @min(e.tokens.len, prompt_tokens.len);
             var shared: usize = 0;
             while (shared < max_shared and e.tokens[shared] == prompt_tokens[shared]) shared += 1;
@@ -2274,7 +2462,7 @@ pub const HotPrefixCache = struct {
             if (shared < MIN_CANCELLED_COMMIT_TOKENS) continue;
             pinned = @max(pinned, e.kv_bytes);
         }
-        return self.current_kv_bytes -| pinned;
+        return self.current_kv_bytes -| checked_out -| pinned;
     }
 
     /// LIMIT THE CACHE WHILE MEMORY IS LEFT. Evict least-recently-used
@@ -2370,6 +2558,12 @@ pub const HotPrefixCache = struct {
         var best: ?usize = null;
         var best_used: u64 = std.math.maxInt(u64);
         for (self.entries.items, 0..) |*e, i| {
+            // Held by a live slot that owns its buffers: evicting it frees
+            // NOTHING (the snapshot is empty) and would silently discard the
+            // record the slot's commit is about to replace. Same class as
+            // `protect_restored`, one degree stronger — this one is not a
+            // heuristic about sharing, it is ownership.
+            if (e.checked_out_by != null) continue;
             if (protect) |p| {
                 if (e.last_used == p) continue;
             }
@@ -3128,6 +3322,7 @@ test "HotPrefixCache: hybrid lookup reuses only the prefix before changed media"
         false,
         0x2222,
         media_start,
+        null,
         null,
         null,
     );
@@ -5004,4 +5199,307 @@ test "HotPrefixCache: a bounded disk flush leaves disk_dirty set and later flush
     try testing.expect(!hc.disk_dirty);
     try testing.expectEqual(@as(usize, 5), flushes);
     try testing.expectEqual(@as(u32, 600), hc.disk.?.entries.items[0].kv_len);
+}
+
+// ── RESTORE BY MOVE (checkout) ───────────────────────────────────────────────
+
+/// Data pointer of a KV layer's key buffer, after an eval. Buffer IDENTITY is
+/// the only in-process observable of mlx's donation: `mlx_slice_update` donates
+/// its input when `is_donatable()` holds (`use_count() == 1` on both the
+/// descriptor and the data) and otherwise falls through to `copy_gpu`, which
+/// allocates. So "the appended buffer sits at the address the prefix already
+/// occupied" IS "no copy happened", and the copy arm cannot fake it: its donor
+/// is still alive in the entry, so the allocator cannot hand the copy that same
+/// address.
+fn testKeyDataPtr(cache: *KVCache, layer: usize) usize {
+    cache.evalState();
+    const p = mlx.mlx_array_data_float32(cache.entries[layer].keys);
+    return @intFromPtr(p);
+}
+
+fn testCheckoutCache(hc: *HotPrefixCache, s: mlx.mlx_stream, tokens: []const u32, reserve: usize) !void {
+    var donor = try KVCache.init(testing.allocator, 1);
+    defer donor.deinit();
+    donor.reserve(reserve);
+    try testFillCache(&donor, s, 1, @intCast(tokens.len));
+    try hc.commit(&donor, tokens, false);
+}
+
+test "restore by move: a full-prefix hit checks the entry out and the append donates in place" {
+    // The finding (WARM_TTFT_384k.md §4): `KVCache.restore` binds through
+    // `mlx_array_set`, so the hot-cache entry keeps a SECOND reference to every
+    // KV buffer for the whole request. mlx's `is_donatable()` wants
+    // `use_count() == 1`, so the first `writeAtOffset` cannot donate and
+    // `copy_gpu` privatises the entire prefix — 5.13 GB / ~110 ms at 393k
+    // tokens on qwen4_exp, 45% of the warm TTFT. Releasing the entry's handles
+    // at restore (the checkout) makes the slot the sole owner and the copy
+    // disappears rather than moving.
+    const s = mlx.gpuStream();
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    // The prompt EXTENDS the entry — that is what makes this a full-prefix hit
+    // whose commit will replace this same entry.
+    var prompt: [608]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    var moved_bytes: [64]f32 = undefined;
+    var copied_bytes: [64]f32 = undefined;
+
+    // ── Arm A: the move.
+    {
+        restore_move_override = true;
+        defer restore_move_override = null;
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc.ssd_first = true;
+        defer hc.deinit();
+        try testCheckoutCache(&hc, s, &tokens, 4096);
+
+        var slot = try KVCache.init(testing.allocator, 1);
+        defer slot.deinit();
+        var moe_off: usize = 0;
+        const res = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &prompt, false, 0, null, null, null, 0xA11CE);
+        try testing.expectEqual(@as(usize, 600), res.matched);
+
+        // The entry gave the buffers up: its handles are EMPTY and it names
+        // the slot that holds them.
+        const e = &hc.entries.items[0];
+        try testing.expectEqual(@as(?usize, 0xA11CE), e.checked_out_by);
+        try testing.expect(e.snapshot.entries[0].keys.ctx == null);
+        try testing.expect(e.snapshot.entries[0].values.ctx == null);
+
+        // ...and the append lands in that same buffer.
+        const before = testKeyDataPtr(&slot, 0);
+        try testWriteCacheLayer(&slot, s, 0, 600, 8);
+        const after = testKeyDataPtr(&slot, 0);
+        try testing.expectEqual(before, after);
+        try testReadKeyRows(&slot, 0, 596, &moved_bytes);
+    }
+
+    // ── Arm B: the kill switch. `MLX_SERVE_RESTORE_MOVE=0` is today's
+    // refcount-share, and it must produce the SAME BYTES by a different
+    // buffer — the copy the move removes.
+    {
+        restore_move_override = false;
+        defer restore_move_override = null;
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc.ssd_first = true;
+        defer hc.deinit();
+        try testCheckoutCache(&hc, s, &tokens, 4096);
+
+        var slot = try KVCache.init(testing.allocator, 1);
+        defer slot.deinit();
+        var moe_off: usize = 0;
+        const res = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &prompt, false, 0, null, null, null, 0xA11CE);
+        try testing.expectEqual(@as(usize, 600), res.matched);
+        const e = &hc.entries.items[0];
+        try testing.expectEqual(@as(?usize, null), e.checked_out_by);
+        try testing.expect(e.snapshot.entries[0].keys.ctx != null);
+
+        const before = testKeyDataPtr(&slot, 0);
+        try testWriteCacheLayer(&slot, s, 0, 600, 8);
+        const after = testKeyDataPtr(&slot, 0);
+        // The entry still holds the donor, so the append HAD to copy.
+        try testing.expect(before != after);
+        try testReadKeyRows(&slot, 0, 596, &copied_bytes);
+    }
+
+    // Byte-for-byte: the arms differ in ownership, never in output.
+    try testing.expectEqualSlices(f32, &copied_bytes, &moved_bytes);
+}
+
+/// Read 64 f32 elements starting at row `row` of a layer's key buffer.
+fn testReadKeyRows(cache: *KVCache, layer: usize, row: usize, out: []f32) !void {
+    cache.evalState();
+    const p = mlx.mlx_array_data_float32(cache.entries[layer].keys) orelse return error.NotEvaluated;
+    // The fixture writes [1, 1, T, 8].
+    for (out, 0..) |*v, i| v.* = p[row * 8 + i];
+}
+
+test "restore by move: a partial-prefix hit keeps the refcount-share" {
+    // The checkout is the promise "the commit replaces this entry". A prompt
+    // that DIVERGES from the entry does not make that promise: its commit
+    // lands as a new entry beside this one, which stays worth keeping.
+    const s = mlx.gpuStream();
+    restore_move_override = true;
+    defer restore_move_override = null;
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var prompt: [600]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast(i + 7);
+    prompt[500] = 999_999; // diverge
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc.ssd_first = true;
+    defer hc.deinit();
+    try testCheckoutCache(&hc, s, &tokens, 4096);
+
+    var slot = try KVCache.init(testing.allocator, 1);
+    defer slot.deinit();
+    var moe_off: usize = 0;
+    const res = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &prompt, false, 0, null, null, null, 7);
+    try testing.expectEqual(@as(usize, 500), res.matched);
+    try testing.expectEqual(@as(?usize, null), hc.entries.items[0].checked_out_by);
+    try testing.expect(hc.entries.items[0].snapshot.entries[0].keys.ctx != null);
+}
+
+test "restore by move: a slot that ends without committing DROPS its checked-out entry" {
+    // The bytes are the slot's KV buffers and die with them. Leaving the record
+    // resident would hand the next matching request an EMPTY snapshot — which
+    // is why `finishSlot` releases unconditionally rather than trusting that a
+    // commit ran. `testing.allocator` is the free-exactly-once bar.
+    const s = mlx.gpuStream();
+    restore_move_override = true;
+    defer restore_move_override = null;
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var prompt: [608]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc.ssd_first = true;
+    defer hc.deinit();
+    try testCheckoutCache(&hc, s, &tokens, 4096);
+    const billed_before = hc.current_kv_bytes;
+    try testing.expect(billed_before > 0);
+
+    var slot = try KVCache.init(testing.allocator, 1);
+    var moe_off: usize = 0;
+    _ = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &prompt, false, 0, null, null, null, 42);
+    try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
+
+    // The slot is cancelled: no commit, so the record has no bytes behind it.
+    hc.releaseCheckout(42, "cancelled");
+    try testing.expectEqual(@as(usize, 0), hc.entries.items.len);
+    try testing.expectEqual(@as(u64, 0), hc.current_kv_bytes);
+    // Idempotent: a second release (or one for a slot that never checked out)
+    // is a no-op, never a second free.
+    hc.releaseCheckout(42, "cancelled");
+    hc.releaseCheckout(43, "cancelled");
+    slot.deinit();
+}
+
+test "restore by move: a commit RECLAIMS the checked-out entry with the grown buffers" {
+    // The happy path. The replace arm finds the same entry (its tokens are a
+    // prefix of the committed ones), installs the grown snapshot and clears the
+    // mark — so `releaseCheckout` afterwards finds nothing to drop.
+    const s = mlx.gpuStream();
+    restore_move_override = true;
+    defer restore_move_override = null;
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var prompt: [608]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc.ssd_first = true;
+    defer hc.deinit();
+    try testCheckoutCache(&hc, s, &tokens, 4096);
+
+    var slot = try KVCache.init(testing.allocator, 1);
+    defer slot.deinit();
+    var moe_off: usize = 0;
+    _ = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &prompt, false, 0, null, null, null, 42);
+    try testing.expect(hc.entries.items[0].checked_out_by != null);
+    try testWriteCacheLayer(&slot, s, 0, 600, 8);
+
+    try hc.commit(&slot, &prompt, false);
+    try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
+    const e = &hc.entries.items[0];
+    try testing.expectEqual(@as(?usize, null), e.checked_out_by);
+    try testing.expectEqual(@as(usize, 608), e.tokens.len);
+    try testing.expect(e.snapshot.entries[0].keys.ctx != null);
+    hc.releaseCheckout(42, "finished");
+    try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
+
+    // ...and the reclaimed entry restores like any other.
+    var slot2 = try KVCache.init(testing.allocator, 1);
+    defer slot2.deinit();
+    var moe_off2: usize = 0;
+    const res2 = try hc.lookupAndRestore(&slot2, &moe_off2, null, s, &prompt, false, 0, null, null);
+    try testing.expectEqual(@as(usize, 607), res2.matched);
+}
+
+test "restore by move: a checked-out entry is invisible to a second slot, to eviction and to the published residency" {
+    // Its snapshot is empty. A second slot restoring from it would get an
+    // uninitialized cache; an eviction pass would free nothing and discard the
+    // record the first slot is about to replace; and the connection thread
+    // would credit bytes that are already a live slot's.
+    const s = mlx.gpuStream();
+    restore_move_override = true;
+    defer restore_move_override = null;
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var prompt: [608]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc.ssd_first = true;
+    defer hc.deinit();
+    try testCheckoutCache(&hc, s, &tokens, 4096);
+
+    var slot = try KVCache.init(testing.allocator, 1);
+    defer slot.deinit();
+    var moe_off: usize = 0;
+    _ = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &prompt, false, 0, null, null, null, 42);
+    const billed = hc.entries.items[0].kv_bytes;
+    try testing.expect(billed > 0);
+
+    // (c) a second slot MISSES — it never touches the moved buffer.
+    var slot2 = try KVCache.init(testing.allocator, 1);
+    defer slot2.deinit();
+    var moe_off2: usize = 0;
+    const res2 = try hc.lookupAndRestoreForSlot(&slot2, &moe_off2, null, s, &prompt, false, 0, null, null, null, 43);
+    try testing.expectEqual(@as(usize, 0), res2.matched);
+    try testing.expect(!res2.full_match);
+    try testing.expectEqual(@as(usize, 0), slot2.step);
+    // ...and the first slot's checkout is untouched by that miss.
+    try testing.expectEqual(@as(?usize, 42), hc.entries.items[0].checked_out_by);
+
+    // (d) the reclaimable/digest helpers exclude it: nothing to reclaim, and
+    // no digest to publish.
+    const digests = try hc.digestsAlloc(testing.allocator);
+    defer testing.allocator.free(digests);
+    try testing.expectEqual(@as(usize, 0), digests.len);
+    try testing.expectEqual(@as(u64, 0), hc.reclaimableBytes());
+    try testing.expectEqual(@as(u64, 0), hc.reclaimableBytesFor(&prompt));
+    // The bill still counts it — the bytes really are resident, in the slot.
+    try testing.expectEqual(billed, hc.residentBytes());
+
+    // Eviction cannot take it, even when nothing else is left and the caller
+    // is not protecting the restored entry.
+    const Never = struct {
+        fn fits(_: ?*anyopaque) bool {
+            return false;
+        }
+    };
+    const report = hc.evictLruToAdmit(608, null, Never.fits, false);
+    try testing.expectEqual(@as(usize, 0), report.entries);
+    try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
+    try testing.expectEqual(@as(?usize, 42), hc.entries.items[0].checked_out_by);
+
+    hc.releaseCheckout(42, "test teardown");
+}
+
+test "restore by move: the policy is off outside the SSD-first arm and under the kill switch" {
+    // PURE. The gate is qwen4_exp's SSD-first arm (`ssd_first`) plus the env
+    // switch; no other architecture's restore changes, and `=0` is today's
+    // behaviour exactly.
+    // Eligible: SSD-first, enabled, no pending flush, whole entry matched,
+    // something left to append.
+    try testing.expect(HotPrefixCache.checkoutEligible(true, true, false, 600, 600, 608, true));
+    // Off outside the SSD-first arm.
+    try testing.expect(!HotPrefixCache.checkoutEligible(false, true, false, 600, 600, 608, true));
+    // Off under the kill switch.
+    try testing.expect(!HotPrefixCache.checkoutEligible(true, false, false, 600, 600, 608, true));
+    // Off when the caller names no slot (it cannot promise a release).
+    try testing.expect(!HotPrefixCache.checkoutEligible(true, true, false, 600, 600, 608, false));
+    // Off while a disk record shares the same buffers.
+    try testing.expect(!HotPrefixCache.checkoutEligible(true, true, true, 600, 600, 608, true));
+    // Partial hit: the entry is longer than the match.
+    try testing.expect(!HotPrefixCache.checkoutEligible(true, true, false, 600, 500, 608, true));
+    // Nothing to append: no donation to win, and the entry would be dropped
+    // for free.
+    try testing.expect(!HotPrefixCache.checkoutEligible(true, true, false, 600, 600, 600, true));
+    // An empty record is never checked out.
+    try testing.expect(!HotPrefixCache.checkoutEligible(true, true, false, 0, 0, 608, true));
 }
