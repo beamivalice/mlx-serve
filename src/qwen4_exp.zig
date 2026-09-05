@@ -314,7 +314,14 @@ pub const NgramTable = struct {
         // QWEN4_PLE_PREFETCH_PREFILL=0 restores the decode-only gate.
         const wide = row_ids.len > PrefetchPool.MAX_ROWS;
         const wide_ok = !wide or plePrefillPrefetchEnabled();
-        if (wide) notePrefillGatherArm(wide_ok, row_ids.len);
+        // Announce the arm that actually RUNS, not the lever that permits it.
+        // `wide_ok` alone reported POOLED for the two silent fallbacks this
+        // line exists to catch — no pool on this box, or a row wider than
+        // ROW_BUF — so a QWEN4_PLE_PREFETCH_PREFILL A/B on such a box read as
+        // "the lever does nothing" for precisely the reason it was added to
+        // rule out. Every condition the gather itself tests is tested here.
+        const pooled = wide_ok and self.pool != null and self.fd >= 0 and need <= PrefetchPool.ROW_BUF;
+        if (wide) notePrefillGatherArm(pooled, row_ids.len);
         if (self.pool) |p| if (self.fd >= 0 and need <= PrefetchPool.ROW_BUF and wide_ok) {
             const wl: usize = self.wcols * 4;
             const sl: usize = self.scols * 2;
