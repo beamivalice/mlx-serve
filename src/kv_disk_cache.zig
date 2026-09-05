@@ -385,6 +385,34 @@ pub const DiskTier = struct {
         if (self.writer) |w| w.drain();
     }
 
+    /// Host bytes staged for the writer and not yet written — a real claim on
+    /// unified memory that no bill currently sees. Zero when the writer is not
+    /// armed. Bounded by the permit (~1 GiB). (audit S11)
+    pub fn stagedHostBytes(self: *DiskTier) u64 {
+        const w = self.writer orelse return 0;
+        return w.pendingBytes();
+    }
+
+    /// Background write failures so far. A caller about to DISCARD the RAM copy
+    /// must consult this: the writer counts errors and drops the blob, so a
+    /// "complete" commit can still have left nothing on disk. (audit S3)
+    pub fn writeErrors(self: *DiskTier) u64 {
+        const w = self.writer orelse return 0;
+        return w.writeErrorCount();
+    }
+
+    /// Wait only for the files of entry `id` (audit S12): a restore needs ITS
+    /// chunks on disk, not the previous turn's tail.
+    fn drainEntry(self: *DiskTier, id: u64) void {
+        const w = self.writer orelse return;
+        const pre = std.fmt.allocPrint(self.allocator, "{s}/e{d}/", .{ self.root, id }) catch {
+            w.drain();
+            return;
+        };
+        defer self.allocator.free(pre);
+        w.drainPrefix(pre);
+    }
+
     pub fn deinit(self: *DiskTier) void {
         if (self.base_dir) |b| self.allocator.free(b);
         self.base_dir = null;
@@ -503,8 +531,9 @@ pub const DiskTier = struct {
     /// diverged-prefix "hit" that would otherwise read every stored chunk to
     /// serve a few hundred tokens — slower than a cold prefill).
     pub fn restorePrefixInto(self: *DiskTier, cache: *KVCache, idx: usize, limit: u32, s: mlx.mlx_stream) !void {
-        // Staged chunks must be on disk before we read them back.
-        self.drainWriter();
+        // Staged chunks must be on disk before we read them back — THIS entry's,
+        // not the whole queue's. (audit S12)
+        self.drainEntry(self.entries.items[idx].id);
         const e = &self.entries.items[idx];
         try self.restoreKvInto(cache, e, limit, s);
         e.last_used = self.bump();
@@ -527,7 +556,7 @@ pub const DiskTier = struct {
         cp_pos: u32,
         s: mlx.mlx_stream,
     ) !u32 {
-        self.drainWriter();
+        self.drainEntry(self.entries.items[idx].id);
         const e = &self.entries.items[idx];
         if (cp_pos == 0 or cp_pos > e.kv_len) return error.DiskCacheNoCheckpoint;
         if (std.mem.indexOfScalar(u32, e.ssm_positions, cp_pos) == null) return error.DiskCacheNoCheckpoint;
@@ -1516,6 +1545,9 @@ pub const DiskTier = struct {
         var data_len: u64 = 0;
         for (tensors) |*t| {
             var cont = mlx.mlx_array_new();
+            // Own it before anything can fail: a mid-loop error used to leak
+            // the fresh handle. (audit N8)
+            errdefer _ = mlx.mlx_array_free(cont);
             try mlx.check(mlx.mlx_contiguous(&cont, t.arr, false, s));
             _ = mlx.mlx_array_free(t.arr);
             t.arr = cont;
@@ -1839,6 +1871,9 @@ pub const DiskTier = struct {
         try self.renderMeta(&buf, e);
 
         const final_path = try std.fmt.allocPrint(self.allocator, "{s}/e{d}/meta.json", .{ self.root, e.id });
+        // Owned from here: the `dupe` below can OOM, and the submit takes the
+        // path only on the path where it succeeds. (audit N8)
+        errdefer self.allocator.free(final_path);
         if (self.writer) |w| {
             // Mechanism 2: the index rides the SAME FIFO queue as this entry's
             // chunks, so it is the LAST file to land. A kill -9 mid-flush
@@ -2245,12 +2280,26 @@ pub fn sweepBase(
             };
             defer allocator.free(meta);
             const st = std.Io.Dir.cwd().statFile(io, meta, .{}) catch {
-                // No index — a crash leftover. Nothing can restore from it.
+                // No index. That is a crash leftover — OR another live server's
+                // flush in progress: the FIFO writes meta LAST by design, so
+                // "chunks and no meta.json" is exactly what a concurrent
+                // mid-write entry looks like. Two mlx-serve instances share
+                // `~/.mlx-serve/kv-cache`, and our fence cannot reach into
+                // another process, so age is the only signal we have. Only
+                // sweep what is too old to be in flight. (audit S4)
+                if (dirYoungerThan(io, e_abs, STRAY_MIN_AGE_NS)) {
+                    allocator.free(e_abs);
+                    continue;
+                }
                 deleteTreeAbsolute(io, e_abs);
                 allocator.free(e_abs);
                 strays += 1;
                 continue;
             };
+            // A `.tmp` older than the same bar is a crash leftover of the
+            // writer's tmp+rename: the rename never happened, so nothing will
+            // ever claim it. Reclaim it without touching the entry. (audit S15)
+            reapStaleTmp(io, e_abs);
             const bytes = dirBytes(io, e_abs);
             total += bytes;
             victims.append(allocator, .{ .path = e_abs, .bytes = bytes, .mtime = st.mtime.nanoseconds }) catch {
@@ -2279,6 +2328,47 @@ pub fn sweepBase(
             total >> 20,
             sibling_budget >> 20,
         });
+    }
+}
+
+/// How old an index-less entry directory must be before a sweep may treat it
+/// as a crash leftover rather than another process's flush in progress. The
+/// FIFO writes `meta.json` last, so a live entry legitimately has chunks and no
+/// index for as long as its write takes; 10 minutes is far past any real flush
+/// and far short of a session. (audit S4)
+const STRAY_MIN_AGE_NS: i128 = 10 * 60 * @as(i128, std.time.ns_per_s);
+
+/// True when ANY regular file directly inside `dir_abs` was modified within
+/// `age_ns`. Conservative on failure: an unreadable directory reports YOUNG, so
+/// the sweep leaves it alone rather than deleting something it cannot inspect.
+fn dirYoungerThan(io: std.Io, dir_abs: []const u8, age_ns: i128) bool {
+    var d = std.Io.Dir.openDirAbsolute(io, dir_abs, .{ .iterate = true }) catch return true;
+    defer d.close(io);
+    const now = std.Io.Timestamp.now(io, .real).nanoseconds;
+    var it = d.iterate();
+    while (it.next(io) catch null) |dent| {
+        if (dent.kind != .file) continue;
+        const st = d.statFile(io, dent.name, .{}) catch return true;
+        if (now -| st.mtime.nanoseconds < age_ns) return true;
+    }
+    return false;
+}
+
+/// Delete `.tmp` files in `dir_abs` older than `STRAY_MIN_AGE_NS`. The writer
+/// renames on success, so a survivor is a crash leftover; without this they
+/// accumulate for the life of the cache directory. A YOUNG `.tmp` may be a live
+/// write and is left alone. (audit S15)
+fn reapStaleTmp(io: std.Io, dir_abs: []const u8) void {
+    var d = std.Io.Dir.openDirAbsolute(io, dir_abs, .{ .iterate = true }) catch return;
+    defer d.close(io);
+    const now = std.Io.Timestamp.now(io, .real).nanoseconds;
+    var it = d.iterate();
+    while (it.next(io) catch null) |dent| {
+        if (dent.kind != .file) continue;
+        if (!std.mem.endsWith(u8, dent.name, ".tmp")) continue;
+        const st = d.statFile(io, dent.name, .{}) catch continue;
+        if (now -| st.mtime.nanoseconds < STRAY_MIN_AGE_NS) continue;
+        d.deleteFile(io, dent.name) catch {};
     }
 }
 
@@ -3672,7 +3762,10 @@ test "DiskTier: SSD-first stages the flush off-thread and indexes LAST" {
     try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "fp-ssd-writer/e1/meta.json", .{}));
 
     var paths = std.ArrayList([]const u8).empty;
-    defer paths.deinit(testing.allocator);
+    defer {
+        for (paths.items) |p| testing.allocator.free(p);
+        paths.deinit(testing.allocator);
+    }
     try tier.writer.?.stagedPaths(&paths, testing.allocator);
     try testing.expectEqual(@as(usize, 6), paths.items.len); // 5 chunks + meta
     for (paths.items[0 .. paths.items.len - 1]) |p| {
@@ -3760,7 +3853,10 @@ test "DiskTier: SSD-first write-through extends without rewriting a persisted ch
     tier.writer.?.setPaused(true);
     _ = try tier.appendCommit(cache.entries, 768, cache.config, tokens[0..768], false, &cps640, s);
     var staged = std.ArrayList([]const u8).empty;
-    defer staged.deinit(testing.allocator);
+    defer {
+        for (staged.items) |p| testing.allocator.free(p);
+        staged.deinit(testing.allocator);
+    }
     try tier.writer.?.stagedPaths(&staged, testing.allocator);
     for (staged.items) |p| {
         // c000000..c000004 are already on disk and must NOT be restaged.
@@ -3869,10 +3965,17 @@ test "DiskTier: v5 entries cross the SSD-first boundary in BOTH directions (no m
 
 test "DiskTier: the root-wide sweep drops strays and never touches the live tier's own root" {
     // Mechanism 6, disk half. A sibling fingerprint's entry with no meta.json
-    // is a crash leftover — nothing can restore from it — and goes. The LIVE
-    // tier's own root is skipped entirely: during a write-through its newest
-    // entry legitimately holds chunks with no index yet, and sweeping on that
-    // signal would delete the prefill in flight.
+    // and no recent writes is a crash leftover — nothing can restore from it —
+    // and goes. The LIVE tier's own root is skipped entirely: during a
+    // write-through its newest entry legitimately holds chunks with no index
+    // yet, and sweeping on that signal would delete the prefill in flight.
+    //
+    // Index-less is NOT by itself the stray signal (audit S4): another
+    // mlx-serve sharing `~/.mlx-serve/kv-cache` writes meta.json LAST, so a
+    // fresh chunks-without-index directory is what its flush IN PROGRESS looks
+    // like, and our epoch fence cannot reach another process. AGE is the
+    // signal, so the stray fixture is BACKDATED past `STRAY_MIN_AGE_NS` and a
+    // young twin is staged beside it to pin that the sweep leaves it alone.
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -3893,6 +3996,15 @@ test "DiskTier: the root-wide sweep drops strays and never touches the live tier
     }
     try tmp.dir.createDirPath(io, "fp-stray/e9");
     try tmp.dir.writeFile(io, .{ .sub_path = "fp-stray/e9/c000000.safetensors", .data = "orphan" });
+    // Old enough that no live flush could still be holding it.
+    const aged: std.Io.Timestamp = .{
+        .nanoseconds = std.Io.Timestamp.now(io, .real).nanoseconds - 2 * @as(i96, @intCast(STRAY_MIN_AGE_NS)),
+    };
+    try tmp.dir.setTimestamps(io, "fp-stray/e9/c000000.safetensors", .{ .modify_timestamp = .{ .new = aged } });
+    // Its young twin: index-less, but written just now — indistinguishable from
+    // another process's flush in flight, so it must SURVIVE.
+    try tmp.dir.createDirPath(io, "fp-inflight/e3");
+    try tmp.dir.writeFile(io, .{ .sub_path = "fp-inflight/e3/c000000.safetensors", .data = "another server" });
     var live = try DiskTier.init(testing.allocator, io, base, "fp-live", 0, 128);
     defer live.deinit();
     live.ssd_first = true;
@@ -3907,8 +4019,10 @@ test "DiskTier: the root-wide sweep drops strays and never touches the live tier
     live.max_bytes = 1 << 40;
     sweepBase(testing.allocator, io, base, live.root, live.max_bytes);
 
-    // The stray sibling is gone; the real sibling and the live root survive.
+    // The aged stray is gone; the real sibling, the young index-less twin and
+    // the live root survive.
     try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "fp-stray/e9/c000000.safetensors", .{}));
+    try testing.expect(tmp.dir.statFile(io, "fp-inflight/e3/c000000.safetensors", .{}) catch null != null);
     try testing.expect(tmp.dir.statFile(io, "fp-sibling/e1/meta.json", .{}) catch null != null);
     try testing.expect(tmp.dir.statFile(io, "fp-live/e1/c000000.safetensors", .{}) catch null != null);
 
@@ -3917,4 +4031,7 @@ test "DiskTier: the root-wide sweep drops strays and never touches the live tier
     sweepBase(testing.allocator, io, base, live.root, 0);
     try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "fp-sibling/e1/meta.json", .{}));
     try testing.expect(tmp.dir.statFile(io, "fp-live/e1/c000000.safetensors", .{}) catch null != null);
+    // A zero budget is an LRU bar over INDEXED entries; it is not a licence to
+    // delete what might be another server's flush.
+    try testing.expect(tmp.dir.statFile(io, "fp-inflight/e3/c000000.safetensors", .{}) catch null != null);
 }

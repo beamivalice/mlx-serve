@@ -212,6 +212,16 @@ var ssd_first_env_cached: ?bool = null;
 /// Test/bench override for `ssdFirstEnabled()`. Null = read the environment.
 pub var ssd_first_override: ?bool = null;
 
+/// Resolve this module's lazily-cached env reads ONCE, from the main thread,
+/// before any other thread exists — the same discipline (and the same reason)
+/// as `transformer.warmQsaEnvCaches`: `ssd_first_env_cached` is a `?bool`
+/// filled on first touch, and a non-atomic optional written from two threads
+/// is UB. Only the inference thread touches it today; this is what keeps that
+/// true when a second caller appears. Called from `main()`. (audit N7)
+pub fn warmEnvCaches() void {
+    _ = ssdFirstEnabled();
+}
+
 /// SSD-first prefix cache mode. `MLX_SERVE_PREFIX_SSD_FIRST=0` restores the
 /// RAM-first behaviour every other arch already has; the mode is armed only
 /// where `ModelConfig.ssdFirstCapable()` is also true (qwen4_exp today), so
@@ -1216,6 +1226,18 @@ pub const HotPrefixCache = struct {
         if (self.ssd_first and self.disk != null and vision_key == 0) {
             self.capturePendingDisk(source_cache, tokens, has_tools, ssm_cps, dflash, mtp);
         }
+        // The record refcount-SHARES the live KV, so it keeps a whole session's
+        // buffers alive. On the success path `flushPendingDisk` consumes it; on
+        // an ERROR return there is no such consumer, and the slot's KVCache
+        // deinit then frees nothing — 24 GB at 1M ctx pinned until the next
+        // successful commit, precisely under the memory pressure that caused
+        // the error. At FUNCTION scope on purpose: an errdefer inside the block
+        // above is discarded when that block exits normally, which is every
+        // path that can still fail. (audit S2)
+        errdefer if (self.pending_disk) |*p| {
+            p.deinit(self.allocator);
+            self.pending_disk = null;
+        };
 
         var replace_idx: ?usize = null;
         for (self.entries.items, 0..) |*e, i| {
@@ -1700,6 +1722,12 @@ pub const HotPrefixCache = struct {
         if (self.entries.items.len <= 1) return;
         const d = if (self.disk) |*dd| dd else return;
 
+        // The active session is the single MOST-recently-used entry, and the
+        // `== newest_used` test below relies on `last_used` being a strictly
+        // increasing counter (`bumpCounter`), so exactly one entry can hold the
+        // maximum. If it ever becomes a timestamp, two entries can tie and BOTH
+        // would be kept resident — which is the one thing this must not do.
+        // (audit N12)
         var newest_used: u64 = 0;
         for (self.entries.items) |*e| newest_used = @max(newest_used, e.last_used);
 
@@ -1729,6 +1757,20 @@ pub const HotPrefixCache = struct {
             };
             // A partial copy is not a copy. Keep the entry until it is whole.
             if (!complete) continue;
+            // ...and a STAGED copy is not a durable one. `appendCommit` reports
+            // what it handed the writer, not what reached the disk: the writer
+            // logs a failed blob, counts it, and drops it. Discarding RAM on
+            // that promise loses the session outright. Wait for the queue, then
+            // check the counter — only a write that actually landed earns the
+            // eviction. Cost is bounded and paid at END of request, never on
+            // the next turn's TTFT path (which is why the RESTORE drain is
+            // entry-scoped instead — audit S12). (audit S3)
+            const errs_before = d.writeErrors();
+            d.drainWriter();
+            if (d.writeErrors() != errs_before) {
+                log.warn("  [hot-cache] idle spill: background write failed — entry stays resident\n", .{});
+                continue;
+            }
             self.evictAt(i, "SSD-first idle spill");
             spilled += 1;
         }
@@ -2070,6 +2112,19 @@ pub const HotPrefixCache = struct {
     /// thread's admission guard (it may race a commit by one entry); the
     /// decision that MATTERS is made on the inference thread by
     /// `evictLruToAdmit`, which re-reads live memory after every eviction.
+    /// Host bytes this cache's SSD writer is holding for files it has not
+    /// written yet. On unified memory those compete with the Metal working
+    /// set, so a headroom that reads only `mlx_get_active_memory` is optimistic
+    /// by up to the writer's permit (~1 GiB) — and the moment they peak is a
+    /// long prefill's chunk boundary, which is exactly when the adaptive width
+    /// probe runs. INFERENCE THREAD ONLY: reaches the disk tier directly.
+    /// (audit S11 — the subtraction in `prefillHeadroomNow` belongs to the
+    /// adaptive owner; this is the number to subtract.)
+    pub fn stagedHostBytes(self: *HotPrefixCache) u64 {
+        const d = if (self.disk) |*dd| dd else return 0;
+        return d.stagedHostBytes();
+    }
+
     pub fn residentBytes(self: *const HotPrefixCache) u64 {
         return self.current_kv_bytes;
     }
@@ -4641,15 +4696,22 @@ test "prefix cache: an oversized commit names WHICH outcome declined it" {
     try testing.expect(!std.mem.eql(u8, a, c));
     try testing.expect(!std.mem.eql(u8, b, c));
 
-    const source = @embedFile("prefix_cache.zig");
-    const at = std.mem.indexOf(u8, source, "skipped oversized entry ({d} tokens") orelse
-        return error.MissingSkipLine;
+    // Scan the CODE, not this test's own literals. Every needle below appears
+    // verbatim a few lines further down in this very file, so an unsplit
+    // `indexOf` over the whole embed finds ITSELF once the impl is deleted —
+    // the scan then passes on exactly the regression it exists for. Both
+    // mitigations the project already uses are applied: the source is trimmed
+    // at the first test, and the needles are split. (audit B0c)
+    const whole = @embedFile("prefix_cache.zig");
+    const source = whole[0 .. std.mem.indexOf(u8, whole, "\ntest \"") orelse whole.len];
+    const skip_needle = "skipped oversized" ++ " entry ({d} tokens";
+    const at = std.mem.indexOf(u8, source, skip_needle) orelse return error.MissingSkipLine;
     const line = source[at..@min(source.len, at + 400)];
-    try testing.expect(std.mem.indexOf(u8, line, "decline.reason()") != null);
-    try testing.expect(std.mem.indexOf(u8, line, "err_name") != null);
+    try testing.expect(std.mem.indexOf(u8, line, "decline." ++ "reason()") != null);
+    try testing.expect(std.mem.indexOf(u8, line, "err_" ++ "name") != null);
     // Both failure arms set a distinct decline AND keep the error.
-    try testing.expect(std.mem.indexOf(u8, source, "decline = .snapshot_copy_failed;") != null);
-    try testing.expect(std.mem.indexOf(u8, source, "decline = .checkpoint_list_copy_failed;") != null);
+    try testing.expect(std.mem.indexOf(u8, source, "decline = ." ++ "snapshot_copy_failed;") != null);
+    try testing.expect(std.mem.indexOf(u8, source, "decline = ." ++ "checkpoint_list_copy_failed;") != null);
 }
 
 test "prefix cache: every ssm checkpoint retention site thins span-preserving" {
