@@ -2241,8 +2241,19 @@ pub const Generator = struct {
             // us already clamped by the server, but a reservation is a number
             // two subsystems must agree on and neither may trust its caller
             // for it (the omitted-max_tokens sentinel, #353 follow-up).
+            // ABSOLUTE capacity, so it must be billed in ABSOLUTE positions.
+            // `prompt_ids` is the TAIL after a prefix-cache hit, and the cache
+            // already holds `ssm_checkpoint_pos_offset` rows — so on every warm
+            // path the reservation landed BELOW the capacity the cache already
+            // had, `nextCapacityReserved` fell through to the +25% ladder, and
+            // the tail prefill re-grew: exactly the old+new coexistence
+            // transient #353 measured at 7.75 GB @ 458k, silently absent on
+            // the warm long-context path this reservation exists for. The
+            // admission guard already bills the FULL prompt length
+            // (`server.reservedCacheTokens`), so this also stops the two
+            // drifting apart. `total_ctx_for_chunk` is that absolute length.
             const reserved_tokens = transformer_mod.KVCache.reservedTokens(
-                prompt_ids.len,
+                total_ctx_for_chunk,
                 max_tokens,
                 default_chunk,
                 xfm.config.max_position_embeddings,
