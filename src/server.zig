@@ -768,6 +768,22 @@ pub var prefix_cache_capacity: u32 = 32;
 /// from `--prefix-cache-entries` still applies).
 pub var prefix_cache_mem_bytes: u64 = 2 * 1024 * 1024 * 1024;
 
+/// What the hot cache was ACTUALLY given for the model that is loaded, after
+/// `clampedPrefixCacheMem`. Published by `prefixCacheMemForLoad`; every
+/// post-load reserve reads it through `resolvedPrefixCacheMem()` so the sizer,
+/// the ANE gate and the cache itself all reserve ONE number. Kept separate
+/// from the ask above rather than overwriting it: the ask is the launch flag,
+/// and re-clamping an already-clamped value on the next model load would
+/// ratchet the budget toward 1 byte across a model swap. 0 = no load has
+/// resolved it yet, in which case the ask is the honest (larger) reserve.
+var hot_cache_mem_resolved: u64 = 0;
+
+/// The hot-cache byte budget every post-load reserve must bill: the clamp's
+/// answer once a model is loaded, the raw ask before that.
+pub fn resolvedPrefixCacheMem() u64 {
+    return if (hot_cache_mem_resolved > 0) hot_cache_mem_resolved else prefix_cache_mem_bytes;
+}
+
 /// SSD tier for the hot prefix cache (`--prefix-cache-disk`). Committed KV
 /// prefixes persist as chunked safetensors under
 /// `~/.mlx-serve/kv-cache/<model-fingerprint>` and are restored across RAM
@@ -1279,8 +1295,8 @@ pub fn serve(
             " [hybrid: SSM checkpoints]"
         else
             "";
-        if (prefix_cache_mem_bytes > 0) {
-            const cap_mb = @as(f64, @floatFromInt(prefix_cache_mem_bytes)) / (1024.0 * 1024.0);
+        if (resolvedPrefixCacheMem() > 0) {
+            const cap_mb = @as(f64, @floatFromInt(resolvedPrefixCacheMem())) / (1024.0 * 1024.0);
             log.info("Hot prefix cache: ENABLED (capacity={d}, mem-cap={d:.1} MB){s}\n", .{ prefix_cache_capacity, cap_mb, ssm_note });
         } else {
             log.info("Hot prefix cache: ENABLED (capacity={d}, mem-cap=unlimited){s}\n", .{ prefix_cache_capacity, ssm_note });
@@ -2848,7 +2864,7 @@ pub fn aneGateHeadroom(config: *const model_mod.ModelConfig, chunk: u32) u64 {
         ane_mod.MIN_CONTEXT_TOKENS;
     return ane_mod.GATE_BASELINE_BYTES +|
         (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) *| ctx) +|
-        prefix_cache_mem_bytes +|
+        resolvedPrefixCacheMem() +|
         prefillTransientReserve(config, kv_bits, chunk);
 }
 
@@ -2862,6 +2878,17 @@ pub const PREFILL_CHUNK_LADDER = [_]u32{ 8192, 4096, 2048, 1024, 512 };
 /// trading the whole session's context for one forward's speed, which is the
 /// trade that reported a 1024-token context on a 16 GB Mac.
 const PREFILL_RESERVE_BUDGET_SHARE: u64 = 4;
+
+/// The hot prefix cache's smallest USEFUL budget. One agentic prefix on a
+/// large model is order-GB of KV, so below this the cache cannot retain a
+/// single turn and the feature is dead weight — a prefill chunk that would
+/// price the cache under this steps down instead of taking the bytes.
+///
+/// This is what stops `requested == 0` ("no byte cap") from resolving to the
+/// 1-byte floor `clampedPrefixCacheMem` returns when the headroom is gone: the
+/// clamp cannot defend a budget the chunk has already spent, so the defence
+/// belongs one step earlier, in the sizer.
+const HOT_CACHE_FLOOR_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// PURE: the widest prefill chunk THIS machine can afford for THIS model.
 ///
@@ -2877,16 +2904,44 @@ const PREFILL_RESERVE_BUDGET_SHARE: u64 = 4;
 ///
 /// Never raises anything: `effectivePrefillChunk` takes the MIN of this and the
 /// launch chunk, and an explicit `--prefill-chunk` outranks it entirely.
+///
+/// It does NOT read the hot-cache ASK, and must not. The clamp downstream
+/// (`clampedPrefixCacheMem`) subtracts THIS chunk's reserve from the cache's
+/// headroom, so feeding the ask back in here closed a loop that was
+/// non-monotone in the ask: a bigger `--prefix-cache-mem` stepped the chunk
+/// DOWN, which shrank the reserve, which handed the cache MORE bytes than a
+/// smaller ask got (live: 10 GB clamped to 3873 MB, 24 GB to 5703 MB, same
+/// box, same pack). The order is one-way now — the chunk is sized against the
+/// post-weights serving budget alone, and the cache is the RESIDUAL claimant
+/// that takes what the chunk leaves. So the quarter-share bar prices the whole
+/// serving budget rather than a post-cache remainder: pre-charging the cache
+/// here and charging the chunk to the cache there is the same bytes billed
+/// twice, in a circle.
+///
+/// `ctx_kv_bytes` is the KV a PINNED context has already spoken for (0 under
+/// auto-context, which is derived FROM this chunk and adapts to it — reading a
+/// context that does not exist yet would be circular). It is ask-independent,
+/// so it cannot reintroduce the loop above; what it buys is the second half of
+/// the same bug: at `--ctx-size 1048576` the context alone takes 20.2 GB of a
+/// 28.2 GB serving budget, and a rung sized against the quarter share of the
+/// WHOLE budget then spends the remaining 8 GB on one forward and leaves the
+/// cache at the clamp's 1-byte floor.
 pub fn resolvePrefillChunk(
     config: *const model_mod.ModelConfig,
     kv_bits: u64,
     ceiling: u64,
     active_mem: u64,
-    hot_cache_reserve: u64,
+    ctx_kv_bytes: u64,
 ) u32 {
-    const spoken_for: u64 = active_mem +| hot_cache_reserve;
-    const serving_budget: u64 = if (ceiling > spoken_for) ceiling - spoken_for else 0;
-    const cap: u64 = serving_budget / PREFILL_RESERVE_BUDGET_SHARE;
+    const serving_budget: u64 = ceiling -| active_mem;
+    // Two ask-independent bars, both of which the rung must clear: a share of
+    // the serving budget (one forward never trades the whole session for its
+    // own speed), and whatever the pinned context leaves, less a cache worth
+    // having.
+    const cap: u64 = @min(
+        serving_budget / PREFILL_RESERVE_BUDGET_SHARE,
+        (serving_budget -| ctx_kv_bytes) -| HOT_CACHE_FLOOR_BYTES,
+    );
     for (PREFILL_CHUNK_LADDER) |chunk| {
         if (prefillTransientReserve(config, kv_bits, chunk) <= cap) return chunk;
     }
@@ -2894,6 +2949,45 @@ pub fn resolvePrefillChunk(
     // rung: it is the smallest bill this box can be asked for, and returning 0
     // would read as "not pinned" and hand the forward the launch width.
     return PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1];
+}
+
+/// The width `--prefill-chunk` asked for, or 0 when the operator asked for
+/// nothing. `generate.effectivePrefillChunk` lets an explicit flag outrank the
+/// machine-sized pin, so the BILL has to let it outrank the pin too: without
+/// this, `--prefill-chunk 4096` ran a 4096-token forward while the hot-cache
+/// clamp had reserved a 512- or 1024-token transient — an under-reserve of
+/// several GB, and the memory the clamp is there to protect.
+pub fn explicitPrefillChunk() u32 {
+    if (!generate_mod.prefill_chunk_explicit) return 0;
+    const raw: usize = @min(generate_mod.prefill_chunk_override, @as(usize, std.math.maxInt(u32)));
+    return @intCast(raw);
+}
+
+/// PURE: the chunk this model is BILLED at — and therefore the chunk it runs
+/// at. `chunk_override` (0 = none) is the operator's explicit width, mirroring
+/// `generate.effectivePrefillChunk`'s precedence exactly; everything else is
+/// the machine-sized rung.
+pub fn billedPrefillChunk(
+    config: *const model_mod.ModelConfig,
+    kv_bits: u64,
+    ceiling: u64,
+    active_mem: u64,
+    ctx_kv_bytes: u64,
+    chunk_override: u32,
+) u32 {
+    if (chunk_override > 0) return chunk_override;
+    return resolvePrefillChunk(config, kv_bits, ceiling, active_mem, ctx_kv_bytes);
+}
+
+/// The context KV the chunk sizer must leave standing: the PINNED context's
+/// bill under an explicit `--ctx-size`, and 0 while the context is auto — the
+/// auto sizer subtracts the chunk's reserve itself, so it shrinks to fit
+/// whatever rung this picks, and feeding it back here would be circular
+/// (`pinAutoContext` pins the chunk BEFORE it computes any context).
+pub fn sizerCtxKvBytes(config: *const model_mod.ModelConfig, kv_bits: u64) u64 {
+    if (server_config.max_context_size == 0) return 0;
+    return (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +|
+        statePerTokenBilled(config)) *| server_config.max_context_size;
 }
 
 /// Freeze this model's prefill chunk at load, from live memory. Idempotent.
@@ -2905,12 +2999,14 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
     if (config.pinned_prefill_chunk == 0) {
         var active_mem: usize = 0;
         _ = mlx.mlx_get_active_memory(&active_mem);
-        config.pinned_prefill_chunk = resolvePrefillChunk(
+        const kv_bits: u64 = defaultKvBits();
+        config.pinned_prefill_chunk = billedPrefillChunk(
             config,
-            defaultKvBits(),
+            kv_bits,
             currentGpuMemoryCeiling(active_mem),
             active_mem,
-            prefix_cache_mem_bytes,
+            sizerCtxKvBytes(config, kv_bits),
+            explicitPrefillChunk(),
         );
         // Say it once per model, wherever the model was pinned from (startup
         // primary or on-demand load) — a narrowed prefill otherwise reads as an
@@ -2944,30 +3040,79 @@ pub fn clampedPrefixCacheMem(
     return @min(requested, headroom);
 }
 
+/// What the hot cache gets and what it was charged for getting it.
+pub const HotCachePlan = struct {
+    /// The chunk the forward will run AND the bill reserves for.
+    chunk: u32,
+    /// `prefillTransientReserve` at that chunk.
+    reserve: u64,
+    /// The serving context's KV + out-of-cache state.
+    ctx_kv: u64,
+    /// The clamped byte budget — what `initWithMem` is handed.
+    budget: u64,
+};
+
+/// PURE: the whole chain, in the one order that is monotone in the ask —
+/// chunk first (ask-independent), then the cache takes the residual. Every
+/// term the load site bills comes from here so the log line and the budget
+/// cannot describe different arithmetic.
+///
+/// MONOTONE NON-DECREASING in `requested`, by construction: nothing before
+/// `clampedPrefixCacheMem` reads it, and that function is `@min(requested,
+/// headroom)` over a headroom this function fixed already.
+pub fn planHotCache(
+    config: *const model_mod.ModelConfig,
+    kv_bits: u64,
+    ceiling: u64,
+    active_weights: u64,
+    ctx_tokens: u64,
+    sizer_ctx_kv: u64,
+    requested: u64,
+    chunk_override: u32,
+) HotCachePlan {
+    const chunk = billedPrefillChunk(config, kv_bits, ceiling, active_weights, sizer_ctx_kv, chunk_override);
+    const reserve = prefillTransientReserve(config, kv_bits, chunk);
+    const ctx_kv: u64 = (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +|
+        statePerTokenBilled(config)) *| ctx_tokens;
+    return .{
+        .chunk = chunk,
+        .reserve = reserve,
+        .ctx_kv = ctx_kv,
+        .budget = clampedPrefixCacheMem(requested, ceiling, active_weights, ctx_kv, reserve),
+    };
+}
+
 /// Impure wrapper for the model-load site (`Scheduler.doLoadOnInferenceThread`,
 /// reached through the LoadParams/LoadRequest resolver pointer — the scheduler
 /// deliberately has no server.zig import): the weights are resident there, so
-/// `mlx_get_active_memory` is honest. Logs one line when the clamp bites.
+/// `mlx_get_active_memory` is honest. Logs one line when the clamp bites, and
+/// PUBLISHES the answer (`hot_cache_mem_resolved`) so the auto-context sizer
+/// and the ANE gate stop reserving a budget the cache was never given.
 pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64) u64 {
     var active_mem: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_mem);
     const kv_bits: u64 = defaultKvBits();
-    const chunk: u64 = pinPrefillChunk(config);
-    const ctx_kv: u64 = (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config)) *|
-        getEffectiveContextLength(config);
-    const clamped = clampedPrefixCacheMem(
-        requested,
+    // Pin first, then hand the pinned width in as the override: the plan must
+    // bill the width `generate.effectivePrefillChunk` will resolve to, and the
+    // pin is that width (it already folded in an explicit `--prefill-chunk`).
+    const pinned: u32 = pinPrefillChunk(config);
+    const plan = planHotCache(
+        config,
+        kv_bits,
         currentGpuMemoryCeiling(active_mem),
         active_mem,
-        ctx_kv,
-        prefillTransientReserve(config, kv_bits, chunk),
+        getEffectiveContextLength(config),
+        sizerCtxKvBytes(config, kv_bits),
+        requested,
+        pinned,
     );
-    if (requested > 0 and clamped < requested) {
-        log.info("[hot-cache] budget clamped {d} -> {d} MB (weights + ctx KV + prefill reserve vs GPU ceiling)\n", .{ requested >> 20, clamped >> 20 });
+    hot_cache_mem_resolved = plan.budget;
+    if (requested > 0 and plan.budget < requested) {
+        log.info("[hot-cache] budget clamped {d} -> {d} MB (chunk {d} reserve {d} MB, ctx KV {d} MB)\n", .{ requested >> 20, plan.budget >> 20, plan.chunk, plan.reserve >> 20, plan.ctx_kv >> 20 });
     } else if (requested == 0) {
-        log.info("[hot-cache] budget capped at {d} MB (no --prefix-cache-mem; weights + ctx KV + prefill reserve vs GPU ceiling)\n", .{clamped >> 20});
+        log.info("[hot-cache] budget capped at {d} MB (no --prefix-cache-mem; chunk {d} reserve {d} MB, ctx KV {d} MB)\n", .{ plan.budget >> 20, plan.chunk, plan.reserve >> 20, plan.ctx_kv >> 20 });
     }
-    return clamped;
+    return plan.budget;
 }
 
 test "clampedPrefixCacheMem: the budget never exceeds what the weights leave under the ceiling" {
@@ -2983,6 +3128,218 @@ test "clampedPrefixCacheMem: the budget never exceeds what the weights leave und
     try t.expectEqual(96 * GB - 80 * GB, clampedPrefixCacheMem(0, 96 * GB, 70 * GB, 6 * GB, 4 * GB));
     // No headroom at all: never 0 — initWithMem reads 0 as "no byte cap".
     try t.expectEqual(@as(u64, 1), clampedPrefixCacheMem(40 * GB, 64 * GB, 70 * GB, 6 * GB, 4 * GB));
+}
+
+/// A stand-in for the deployed long-context pack: qwen3_5-shaped GDN+MoE trunk
+/// with a QSA indexer, so both out-of-KV terms the bill has (`statePerTokenBilled`
+/// and `qsaMaskBytes`) are non-zero. The absolute rung it lands on depends on
+/// the checkpoint's own reserve ladder; every assertion below is an INVARIANT
+/// over that ladder, never a hardcoded width.
+fn longCtxTestConfig() model_mod.ModelConfig {
+    var cfg = model_mod.ModelConfig{};
+    cfg.num_hidden_layers = 40;
+    cfg.num_attention_heads = 24;
+    cfg.num_key_value_heads = 2;
+    cfg.head_dim = 256;
+    cfg.hidden_size = 2560;
+    cfg.intermediate_size = 9216;
+    cfg.intermediate_size_declared = true;
+    cfg.quant_bits = 4;
+    cfg.max_position_embeddings = 1048576;
+    cfg.indexer_budget = 2048;
+    cfg.indexer_n_heads = 4;
+    cfg.indexer_head_dim = 128;
+    cfg.indexer_compress_ratio = 4;
+    return cfg;
+}
+
+test "planHotCache: the budget is MONOTONE in the ask" {
+    // The defect: `pinPrefillChunk` fed the RAW `--prefix-cache-mem` into
+    // `resolvePrefillChunk`, and `prefixCacheMemForLoad` then billed that
+    // chunk's transient back against the same request. Bigger ask -> narrower
+    // chunk -> smaller reserve -> BIGGER cache. Live on a 137 GB Mac with the
+    // 69 GB qwen4_exp pack at --ctx-size 1048576 --kv-quant 8:
+    //   --prefix-cache-mem 10GB -> rung 1024, reserve ~4300 MB -> 3873 MB
+    //   --prefix-cache-mem 24GB -> ladder floor 512, reserve ~2470 MB -> 5703 MB
+    // Asking for less bought MORE cache. The sweep below is the guard.
+    const t = std.testing;
+    const GiB: u64 = 1 << 30;
+    const cfg = longCtxTestConfig();
+    const kv_bits: u64 = 8;
+    const ctx_tokens: u64 = 262144;
+    const weights: u64 = 69 * GiB;
+    const ceiling: u64 = weights + 28_909 * (1 << 20);
+
+    var prev: u64 = 0;
+    var ask: u64 = GiB;
+    while (ask <= 64 * GiB) : (ask += GiB) {
+        const plan = planHotCache(&cfg, kv_bits, ceiling, weights, ctx_tokens, 0, ask, 0);
+        try t.expect(plan.budget >= prev);
+        // Nothing may exceed the headroom the clamp is defending.
+        try t.expect(plan.budget <= @max((ceiling -| weights) -| plan.ctx_kv -| plan.reserve, 1));
+        prev = plan.budget;
+    }
+
+    // The two live asks, which used to invert, now agree — the chunk is the
+    // same rung for both because the sizer no longer sees the ask at all.
+    const at10 = planHotCache(&cfg, kv_bits, ceiling, weights, ctx_tokens, 0, 10 * GiB, 0);
+    const at24 = planHotCache(&cfg, kv_bits, ceiling, weights, ctx_tokens, 0, 24 * GiB, 0);
+    try t.expect(at24.budget >= at10.budget);
+    try t.expectEqual(at10.chunk, at24.chunk);
+}
+
+test "planHotCache: an out-of-the-box boot gets the whole remaining headroom, never the 1-byte floor" {
+    // ONE boot with no flags is the bar: no `--prefix-cache-mem` (ask 0, "no
+    // byte cap") and no `--prefill-chunk`. `requested == 0` used to hand the
+    // sizer a ZERO hot-cache reserve, so it took a wide rung whose transient
+    // then ate the whole headroom and `clampedPrefixCacheMem` returned its
+    // 1-byte "never 0" floor — an enabled cache that can hold nothing.
+    // `HOT_CACHE_FLOOR_BYTES` moves that defence into the sizer, which is the
+    // only place that can still step down.
+    const t = std.testing;
+    const GiB: u64 = 1 << 30;
+    const cfg = longCtxTestConfig();
+    const kv_bits: u64 = 8;
+    const weights: u64 = 69 * GiB;
+    const ceiling: u64 = weights + 28_909 * (1 << 20);
+    // A PINNED context (`--ctx-size`) is what the sizer must leave standing.
+    const ctx_tokens: u64 = 262144;
+    const per_tok: u64 = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) + statePerTokenBilled(&cfg);
+    const sizer_ctx_kv: u64 = per_tok * ctx_tokens;
+
+    const boot = planHotCache(&cfg, kv_bits, ceiling, weights, ctx_tokens, sizer_ctx_kv, 0, 0);
+    // Everything left over, exactly — the cache is the residual claimant.
+    try t.expectEqual(@max((ceiling -| weights) -| boot.ctx_kv -| boot.reserve, 1), boot.budget);
+    // And a cache worth having, not the floor. The disjunction is the honest
+    // guarantee: if not even the narrowest rung clears the bar the ladder
+    // bottoms out and the box is simply too small.
+    try t.expect(boot.budget >= HOT_CACHE_FLOOR_BYTES or
+        boot.chunk == PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1]);
+
+    // The rung is the WIDEST that clears both ask-independent bars.
+    const serving: u64 = ceiling - weights;
+    const cap: u64 = @min(serving / PREFILL_RESERVE_BUDGET_SHARE, (serving -| sizer_ctx_kv) -| HOT_CACHE_FLOOR_BYTES);
+    for (PREFILL_CHUNK_LADDER) |c| {
+        if (c <= boot.chunk) break;
+        try t.expect(prefillTransientReserve(&cfg, kv_bits, c) > cap);
+    }
+
+    // An explicit ask can only ever take a SLICE of that same headroom, so a
+    // huge one lands exactly on the no-flag default and no ask beats it.
+    const huge = planHotCache(&cfg, kv_bits, ceiling, weights, ctx_tokens, sizer_ctx_kv, 1024 * GiB, 0);
+    try t.expectEqual(boot.budget, huge.budget);
+    try t.expect(planHotCache(&cfg, kv_bits, ceiling, weights, ctx_tokens, sizer_ctx_kv, 4 * GiB, 0).budget <= boot.budget);
+}
+
+test "the clamp's live inversion, as arithmetic" {
+    // The reported boot, reduced to `clampedPrefixCacheMem` with nothing else
+    // moving: ceiling - weights = 28,909 MiB, ctx KV = (13,056 + 7,680) B/tok
+    // x 1,048,576 = 20,736 MiB. The only difference between the two arms was
+    // the rung the sizer picked BECAUSE of the ask.
+    const t = std.testing;
+    const MiB: u64 = 1 << 20;
+    const GiB: u64 = 1 << 30;
+    const serving: u64 = 28_909 * MiB;
+    const ctx_kv: u64 = 20_736 * MiB;
+    const reserve_1024: u64 = 4_300 * MiB;
+    const reserve_512: u64 = 2_470 * MiB;
+
+    const ask10 = clampedPrefixCacheMem(10 * GiB, serving, 0, ctx_kv, reserve_1024);
+    const ask24 = clampedPrefixCacheMem(24 * GiB, serving, 0, ctx_kv, reserve_512);
+    try t.expectEqual(3_873 * MiB, ask10);
+    try t.expectEqual(5_703 * MiB, ask24);
+    try t.expect(ask10 < ask24); // the inversion, in the numbers that shipped
+
+    // ONE ask-independent reserve and the inversion cannot be expressed: the
+    // clamp is `@min(ask, headroom)` over a headroom no ask can move.
+    var prev: u64 = 0;
+    var ask: u64 = GiB;
+    while (ask <= 64 * GiB) : (ask += GiB) {
+        const got = clampedPrefixCacheMem(ask, serving, 0, ctx_kv, reserve_1024);
+        try t.expect(got >= prev);
+        try t.expect(got <= @max((serving -| ctx_kv) -| reserve_1024, 1));
+        prev = got;
+    }
+    try t.expectEqual(3_873 * MiB, clampedPrefixCacheMem(0, serving, 0, ctx_kv, reserve_1024));
+}
+
+test "an explicit --prefill-chunk is the chunk that gets BILLED" {
+    // `generate.effectivePrefillChunk` lets the flag outrank the machine pin,
+    // and `pinPrefillChunk` did not — so `--prefill-chunk 4096` ran a
+    // 4096-token forward against a bill that had reserved a 512- or
+    // 1024-token transient. Both readers must answer the same width.
+    const t = std.testing;
+    const GiB: u64 = 1 << 30;
+    var cfg = longCtxTestConfig();
+    cfg.head_dim = 128; // fused dim: boundedPrefillChunk returns its base untouched
+    const kv_bits: u64 = 8;
+    const weights: u64 = 69 * GiB;
+    // Deliberately squeezed, so the machine sizer would step BELOW the flag.
+    const ceiling: u64 = weights + 6 * GiB;
+
+    generate_mod.prefill_chunk_override = 4096;
+    generate_mod.prefill_chunk_explicit = true;
+    defer {
+        generate_mod.prefill_chunk_override = 8192;
+        generate_mod.prefill_chunk_explicit = false;
+    }
+    try t.expectEqual(@as(u32, 4096), explicitPrefillChunk());
+    const sized = resolvePrefillChunk(&cfg, kv_bits, ceiling, weights, 0);
+    try t.expect(sized < 4096); // the machine would have narrowed it
+
+    const billed = billedPrefillChunk(&cfg, kv_bits, ceiling, weights, 0, explicitPrefillChunk());
+    try t.expectEqual(@as(u32, 4096), billed);
+
+    // The other reader, called with that same pin, agrees — this is the pair
+    // that must never drift.
+    try t.expectEqual(@as(usize, 4096), generate_mod.effectivePrefillChunk(
+        cfg.prefillScoreHeadDim(),
+        cfg.num_attention_heads,
+        40_000,
+        cfg.has_sliding_window,
+        cfg.isMoe(),
+        billed,
+    ));
+
+    // And the plan reserves that width, not the sized-down one.
+    const plan = planHotCache(&cfg, kv_bits, ceiling, weights, 8192, 0, 2 * GiB, billed);
+    try t.expectEqual(@as(u32, 4096), plan.chunk);
+    try t.expectEqual(prefillTransientReserve(&cfg, kv_bits, 4096), plan.reserve);
+    try t.expect(plan.reserve > prefillTransientReserve(&cfg, kv_bits, sized));
+}
+
+test "every post-load hot-cache reserve reads the RESOLVED budget, not the ask" {
+    // `prefixCacheMemForLoad` clamps, but the clamped value used to reach only
+    // `initWithMem`: the auto-context sizer and the ANE gate kept reserving
+    // the raw `--prefix-cache-mem`, so three places disagreed about how many
+    // bytes the cache would ever hold. Needles split so this scan's own source
+    // cannot satisfy it.
+    const t = std.testing;
+    const src = @embedFile("server.zig");
+    const needle = "prefix_cache_mem" ++ "_bytes";
+    const accessor = "resolvedPrefix" ++ "CacheMem()";
+
+    var lines = std.mem.splitScalar(u8, src, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, needle) == null) continue;
+        const trimmed = std.mem.trim(u8, line, " \t");
+        // The declaration, the accessor's own fallback, and prose.
+        if (std.mem.startsWith(u8, trimmed, "///")) continue;
+        if (std.mem.startsWith(u8, trimmed, "//")) continue;
+        if (std.mem.startsWith(u8, trimmed, "pub var " ++ needle)) continue;
+        if (std.mem.indexOf(u8, trimmed, "hot_cache_mem_resolved") != null) continue;
+        std.debug.print("unmediated read of the hot-cache ASK: {s}\n", .{trimmed});
+        return error.UnmediatedAskRead;
+    }
+
+    // And the two reserves that used to read it now go through the accessor.
+    for ([_][]const u8{ "pub fn aneGateHeadroom(", "fn computeMemoryContext(" }) |decl| {
+        const at = std.mem.indexOf(u8, src, decl) orelse return error.CallSiteMoved;
+        const body = src[at..@min(src.len, at + 2400)];
+        try t.expect(std.mem.indexOf(u8, body, accessor) != null);
+    }
+    // The load site publishes it — otherwise the accessor is a synonym for the ask.
+    try t.expect(std.mem.indexOf(u8, src, "hot_cache_mem_resolved = plan.budget;") != null);
 }
 
 /// The largest context this model's per-token footprint fits into RAM right
@@ -3022,7 +3379,7 @@ fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
         active_mem,
         // The hot prefix cache fills to this cap over a session, and a prefill
         // has to land on top of whatever context we report — reserve both.
-        prefix_cache_mem_bytes +| prefillTransientReserve(config, kv_bits, chunk),
+        resolvedPrefixCacheMem() +| prefillTransientReserve(config, kv_bits, chunk),
         per_tok,
         // 0 = do NOT clamp to the checkpoint's max here. The caller applies that
         // cap AFTER the safety margin, so a model whose own max is the binding
@@ -16207,7 +16564,7 @@ test "aneGateHeadroom: reserves a usable context and scales with the chunk" {
     // an admitted offload leaves a usable context behind.
     try t.expect(narrow == ane_mod.GATE_BASELINE_BYTES +
         kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), defaultKvBits()) * ane_mod.MIN_CONTEXT_TOKENS +
-        prefix_cache_mem_bytes +
+        resolvedPrefixCacheMem() +
         prefillTransientReserve(&cfg, defaultKvBits(), 1024));
 
     // A model that cannot reach the reserve context only reserves its own max.
@@ -16985,7 +17342,7 @@ test "prefix cache default capacity covers interleaved agent flows" {
     // full re-prefill per turn. The byte budget (prefix_cache_mem_bytes)
     // still bounds memory.
     try testing.expect(prefix_cache_capacity >= 4);
-    try testing.expect(prefix_cache_mem_bytes > 0);
+    try testing.expect(resolvedPrefixCacheMem() > 0);
 }
 
 test "parseToolCallsForRequest coerces args to the schema (server-side chokepoint wiring)" {
@@ -17991,12 +18348,17 @@ test "prefillMemoryNeeded: fused hd-256 kernel drops the score bill, keeps KV + 
 
 test "resolvePrefillChunk: a squeezed box steps the chunk down; a roomy one keeps it" {
     // The reserve at the widest chunk must never claim more than a quarter of
-    // what is left after the weights and the hot-cache budget. Numbers are the
-    // measured 16 GB profile: Metal's recommended working set on a 16 GB Mac is
-    // ~11.9 GiB, Mistral-7B-4bit sits at 3.80 GiB resident, the hot prefix
-    // cache reserves its default 2 GB. At chunk 8192 the transient reserve is
-    // 7.2 GiB against 6.1 GiB of budget — the case that reported a 1024-token
-    // context and 400'd a 10k-token prompt whose real peak is 2.39 GiB.
+    // what is left after the weights. Numbers are the measured 16 GB profile:
+    // Metal's recommended working set on a 16 GB Mac is ~11.9 GiB and
+    // Mistral-7B-4bit sits at 3.80 GiB resident. At chunk 8192 the transient
+    // reserve is ~7.6 GiB against 1.83 GiB of share — the case that reported a
+    // 1024-token context and 400'd a 10k-token prompt whose real peak is
+    // 2.39 GiB.
+    //
+    // UPDATED with the ask-independence fix: the hot-cache budget is no longer
+    // an input to this function (it was the non-monotone loop), so the former
+    // `2 * GiB` argument is now the PINNED-context KV bar and is 0 here — this
+    // profile runs auto-context, which adapts to whatever rung comes out.
     const t = std.testing;
     const GiB: u64 = 1024 * 1024 * 1024;
     var mistral = model_mod.ModelConfig{};
@@ -18012,19 +18374,23 @@ test "resolvePrefillChunk: a squeezed box steps the chunk down; a roomy one keep
 
     const ceiling_16: u64 = 11_918_000_000;
     const weights: u64 = 4_080_000_000;
-    const narrowed = resolvePrefillChunk(&mistral, 16, ceiling_16, weights, 2 * GiB);
+    const narrowed = resolvePrefillChunk(&mistral, 16, ceiling_16, weights, 0);
     try t.expect(narrowed < 8192);
     try t.expect(narrowed >= 512);
     // It is the WIDEST rung that fits, not simply the floor.
     try t.expect(prefillTransientReserve(&mistral, 16, narrowed) <=
-        (ceiling_16 - weights - 2 * GiB) / 4);
+        (ceiling_16 - weights) / 4);
+    for (PREFILL_CHUNK_LADDER) |c| {
+        if (c <= narrowed) break;
+        try t.expect(prefillTransientReserve(&mistral, 16, c) > (ceiling_16 - weights) / 4);
+    }
 
     // Same model, a machine with room: nothing narrows.
-    try t.expectEqual(@as(u32, 8192), resolvePrefillChunk(&mistral, 16, 95 * GiB, weights, 2 * GiB));
+    try t.expectEqual(@as(u32, 8192), resolvePrefillChunk(&mistral, 16, 95 * GiB, weights, 0));
 
     // A model that barely fits gets the narrowest rung rather than a wide one
     // it cannot pay for — and never 0, which would read as "not pinned".
-    try t.expectEqual(@as(u32, 512), resolvePrefillChunk(&mistral, 16, weights + 64 * 1024 * 1024, weights, 2 * GiB));
+    try t.expectEqual(@as(u32, 512), resolvePrefillChunk(&mistral, 16, weights + 64 * 1024 * 1024, weights, 0));
 
     // Every rung is a real ladder entry, descending, floored at generate's own
     // minimum — a chunk generate would refuse is a chunk the bill cannot model.
@@ -18427,7 +18793,10 @@ test "checkAttentionMemory wires the CONFIG's key bound, not a dense seq" {
     // The prefill transient: the sizer RESERVES it once at the chunk width
     // (`prefillTransientReserve` is the same estimator with the KV term zeroed),
     // never as a per-token multiplier on the context it is solving for.
-    try t.expect(std.mem.indexOf(u8, src, "prefix_cache_mem_bytes +| prefillTransientReserve(config, kv_bits, chunk)") != null);
+    // Reads the RESOLVED budget, not the ask: the sizer must reserve what the
+    // cache was actually given (`prefixCacheMemForLoad` publishes it), or a
+    // clamped-down cache keeps a reserve nobody will ever use.
+    try t.expect(std.mem.indexOf(u8, src, "resolvedPrefixCacheMem() +| prefillTransientReserve(config, kv_bits, chunk)") != null);
 }
 
 test "the chunk the guard BILLS is the chunk the forward will RUN" {
@@ -18505,7 +18874,9 @@ test "resolvePrefillChunk: the 16 GB tier gets a working context instead of the 
     const launch = safeContextForBudget(ceiling, weights, 2 * GiB +| prefillTransientReserve(&cfg, 16, 8192), per_tok, 32768);
     try t.expectEqual(@as(u32, 1024), launch); // the floor: nothing fits
 
-    const chunk = resolvePrefillChunk(&cfg, 16, ceiling, weights, 2 * GiB);
+    // The hot-cache budget is no longer an input (see the ask-independence
+    // fix); auto-context here means the pinned-context bar is 0 too.
+    const chunk = resolvePrefillChunk(&cfg, 16, ceiling, weights, 0);
     const sized = safeContextForBudget(ceiling, weights, 2 * GiB +| prefillTransientReserve(&cfg, 16, chunk), per_tok, 32768);
     try t.expect(sized > 12_000);
 
