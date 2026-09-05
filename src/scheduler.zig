@@ -3873,6 +3873,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             };
             // Mirror the ONE arch predicate onto the disk tier (mechanism 4).
             entry.prefix_cache.?.disk.?.ssd_first = entry.prefix_cache.?.ssd_first;
+            // Mechanism 2: the background writer, SSD-first only.
+            if (entry.prefix_cache.?.ssd_first) entry.prefix_cache.?.disk.?.enableBackgroundWriter();
         }
         entry.ssm_checkpoint_stride = params.ssm_checkpoint_stride;
         entry.ssm_checkpoint_max = params.ssm_checkpoint_max;
