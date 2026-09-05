@@ -1822,8 +1822,18 @@ accumulated. Pricing a transient you can delete is the wrong trade.
   `RESERVE_MIN_TOKENS` = 32k) is reserved before the first chunk writes, so a
   long prefill grows its buffers exactly ONCE and nothing coexists. The guard
   bills that reservation's headroom — tens of megabytes — instead of a second
-  copy of the cache. Short prompts keep the proportional policy untouched;
-  `MLX_SERVE_KV_RESERVE=0` restores it everywhere.
+  copy of the cache. Short prompts keep the proportional policy untouched.
+
+  **`MLX_SERVE_KV_RESERVE=0` restores the ALLOCATION policy, not the bill**
+  (audit N3, correcting an earlier draft of this line that said it "restores it
+  everywhere"). The switch is read in `KVCache.nextCapacity`, so with it off the
+  cache returns to proportional growth; but `server.reservedCacheTokens`
+  delegates to `KVCache.reservedTokens`, which does NOT read it, so the
+  admission guard keeps billing the reservation either way. The direction is
+  conservative — the bill exceeds what the engine then allocates, so a request
+  is refused slightly early rather than admitted and OOMed — but it is not the
+  byte-for-byte return the line promised, and a wrong restore claim sends the
+  next person hunting the wrong file when the numbers do not match.
 * `retainedSsmCheckpointBytes` and `statePerTokenBilled` join the estimator,
   the latter read by the auto-context sizer AND the guard so advertised and
   admitted contexts cannot diverge. The QSA history was billed at TWO copies
@@ -2288,6 +2298,30 @@ never be able to shrink the context that is then used to bill that ask.
 The manual path is untouched by all of it: `--ctx-size` wins in the resolver's
 first branch, before any memory arithmetic runs, so a pinned boot bills exactly
 what it billed before.
+
+### Deliberately NOT fixed: crediting reclaimable cache to the width chooser
+
+The audit (N5) notes that `prefillAdmissionBill` computes `available` WITHOUT
+`reclaimable` and hands that to `chooseRequestPrefillChunk`, so a resident hot
+cache can narrow the prefill width — 512 instead of 4096 — rather than being
+evicted. That is arguably the inverse of the stated policy, "a cached prefix is
+an optimization, the request is the work".
+
+**Left as is, deliberately.** Adding `reclaimable` there would choose a width
+justified by memory that eviction has not actually returned yet — the same
+"credit what you cannot prove" shape as the `evictable` vs `reclaimable` split
+this work introduced, after a 383k prompt was admitted on 1,564 MB of cache
+that turned out to be the single entry the prompt itself had just restored.
+Narrowing first and widening later, once the eviction has really happened and
+`prefillFitsNow` is re-asked against live memory, is the safe order. Widening
+on a promise is the unsafe one, and the two failure costs are not symmetric: a
+narrow width costs prefill throughput, a width that was justified by absent
+memory costs an uncatchable Metal OOM.
+
+The genuine improvement is not a wider bill but a second look — re-ask the
+width after the eviction pass, which the scheduler already does for the
+admission decision itself. That is a follow-up, not a one-line argument
+change.
 
 ### Rules this produced
 
