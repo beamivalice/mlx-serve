@@ -3044,9 +3044,14 @@ pub fn clampedPrefixCacheMem(
 
 /// What the hot cache gets and what it was charged for getting it.
 pub const HotCachePlan = struct {
-    /// The chunk the forward will run AND the bill reserves for.
+    /// The width the sizer pinned: the boot log's number, and the default
+    /// `InitOptions.pinned_prefill_chunk` for a request that does not choose
+    /// its own.
     chunk: u32,
-    /// `prefillTransientReserve` at that chunk.
+    /// The width the CLAMP reserved for, which is NOT `chunk` on an arch that
+    /// re-bills per request — see `clampReserveWidth`.
+    reserve_chunk: u32,
+    /// `prefillTransientReserve` at `reserve_chunk`.
     reserve: u64,
     /// The serving context's KV + out-of-cache state.
     ctx_kv: u64,
@@ -3062,6 +3067,32 @@ pub const HotCachePlan = struct {
 /// MONOTONE NON-DECREASING in `requested`, by construction: nothing before
 /// `clampedPrefixCacheMem` reads it, and that function is `@min(requested,
 /// headroom)` over a headroom this function fixed already.
+/// PURE: the prefill width the LOAD-TIME clamp reserves for.
+///
+/// The load-time reserve is a promise to the FIRST request. On an arch that
+/// picks its width per request, every request re-bills its own REAL width at
+/// admission against live memory, and `fitsAfterEviction` can hand hot-cache
+/// bytes back to admit it — so the promise only has to cover the narrowest
+/// forward the box can ever be asked for, which is the ladder floor.
+///
+/// Billing the sizer's auto rung instead made the clamp non-monotone in the
+/// CEILING: a bigger ceiling affords a wider rung whose reserve grows faster
+/// than the headroom did, so a strictly better machine got a smaller cache.
+/// Live, same 10 GB ask and same pack: 3873 MB at the default ceiling, but
+/// 1076 MB at `iogpu.wired_limit_mb 120000`. With the floor the budget is
+/// `ceiling - weights - ctx_kv - reserve(floor)`, monotone in the ceiling AND
+/// in the ask.
+///
+/// An explicit `--prefill-chunk` is still billed as-is: the operator pinned a
+/// width, every request runs it, and nothing narrower is ever chosen. Archs
+/// without the gate keep the sizer's rung — they have no per-request re-bill
+/// to fall back on.
+pub fn clampReserveWidth(config: *const model_mod.ModelConfig, pinned_width: u32) u32 {
+    if (explicitPrefillChunk() > 0) return pinned_width;
+    if (!perRequestPrefillChunkEnabled(config)) return pinned_width;
+    return PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1];
+}
+
 pub fn planHotCache(
     config: *const model_mod.ModelConfig,
     kv_bits: u64,
@@ -3073,11 +3104,13 @@ pub fn planHotCache(
     chunk_override: u32,
 ) HotCachePlan {
     const chunk = billedPrefillChunk(config, kv_bits, ceiling, active_weights, sizer_ctx_kv, chunk_override);
-    const reserve = prefillTransientReserve(config, kv_bits, chunk);
+    const reserve_chunk = clampReserveWidth(config, chunk);
+    const reserve = prefillTransientReserve(config, kv_bits, reserve_chunk);
     const ctx_kv: u64 = (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +|
         statePerTokenBilled(config)) *| ctx_tokens;
     return .{
         .chunk = chunk,
+        .reserve_chunk = reserve_chunk,
         .reserve = reserve,
         .ctx_kv = ctx_kv,
         .budget = clampedPrefixCacheMem(requested, ceiling, active_weights, ctx_kv, reserve),
@@ -3110,9 +3143,9 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64) u64
     );
     hot_cache_mem_resolved = plan.budget;
     if (requested > 0 and plan.budget < requested) {
-        log.info("[hot-cache] budget clamped {d} -> {d} MB (chunk {d} reserve {d} MB, ctx KV {d} MB)\n", .{ requested >> 20, plan.budget >> 20, plan.chunk, plan.reserve >> 20, plan.ctx_kv >> 20 });
+        log.info("[hot-cache] budget clamped {d} -> {d} MB (chunk {d}, reserve at width {d} = {d} MB, ctx KV {d} MB)\n", .{ requested >> 20, plan.budget >> 20, plan.chunk, plan.reserve_chunk, plan.reserve >> 20, plan.ctx_kv >> 20 });
     } else if (requested == 0) {
-        log.info("[hot-cache] budget capped at {d} MB (no --prefix-cache-mem; chunk {d} reserve {d} MB, ctx KV {d} MB)\n", .{ plan.budget >> 20, plan.chunk, plan.reserve >> 20, plan.ctx_kv >> 20 });
+        log.info("[hot-cache] budget capped at {d} MB (no --prefix-cache-mem; chunk {d}, reserve at width {d} = {d} MB, ctx KV {d} MB)\n", .{ plan.budget >> 20, plan.chunk, plan.reserve_chunk, plan.reserve >> 20, plan.ctx_kv >> 20 });
     }
     return plan.budget;
 }
@@ -3387,6 +3420,77 @@ fn widthForRung(cfg: *const model_mod.ModelConfig, seq: u64, rung: u32) u32 {
         cfg.isMoe(),
         rung,
     ));
+}
+
+test "clampReserveWidth: the load-time reserve is a promise to the FIRST request" {
+    // The ceiling inversion. Same 10 GB ask, same pack, only the Metal ceiling
+    // differs, both PRE-fix and both live:
+    //   default ceiling            -> [hot-cache] budget clamped 10240 -> 3873 MB
+    //   iogpu.wired_limit_mb 120000 -> [hot-cache] budget clamped 10240 -> 1076 MB
+    // A strictly better machine got a 3.6x smaller cache, because the extra
+    // headroom bought the sizer a wider rung and the rung's reserve grew
+    // faster than the headroom did. The cache is the residual claimant, so it
+    // paid for the upgrade.
+    //
+    // On an arch that re-bills its width per request, the load-time reserve
+    // only has to cover the narrowest forward the box can be asked for — every
+    // request prices its own real width at admission against live memory, and
+    // `fitsAfterEviction` can reclaim cache to admit it. So the clamp bills the
+    // ladder floor and the budget becomes monotone in the CEILING too.
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const MiB: u64 = 1 << 20;
+    const GiB: u64 = 1 << 30;
+    const weights: u64 = 70 * GiB;
+    const ctx_tokens: u64 = 1_048_576;
+    const floor_rung = PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1];
+
+    // Gate ON: the clamp reserves at the floor whatever rung the sizer picked.
+    const low = planHotCache(&cfg, kv_bits, weights + 28_909 * MiB, weights, ctx_tokens, 0, 10 * GiB, 0);
+    const high = planHotCache(&cfg, kv_bits, weights + 43_000 * MiB, weights, ctx_tokens, 0, 10 * GiB, 0);
+    try t.expectEqual(floor_rung, low.reserve_chunk);
+    try t.expectEqual(floor_rung, high.reserve_chunk);
+    try t.expectEqual(prefillTransientReserve(&cfg, kv_bits, floor_rung), low.reserve);
+    // THE BAR: a bigger ceiling never buys a smaller cache.
+    try t.expect(high.budget >= low.budget);
+    // And the sizer's rung is still reported for the boot log — the two
+    // numbers are different questions and the log names both.
+    try t.expect(low.chunk >= low.reserve_chunk);
+
+    // Monotone across a ceiling sweep, not just at two points.
+    var prev: u64 = 0;
+    var mb: u64 = 24_000;
+    while (mb <= 60_000) : (mb += 1_000) {
+        const p = planHotCache(&cfg, kv_bits, weights + mb * MiB, weights, ctx_tokens, 0, 10 * GiB, 0);
+        try t.expect(p.budget >= prev);
+        prev = p.budget;
+    }
+
+    // An explicit --prefill-chunk is billed as-is: the operator pinned a width
+    // and every request runs it, so the promise is that width, not the floor.
+    generate_mod.prefill_chunk_override = 4096;
+    generate_mod.prefill_chunk_explicit = true;
+    const pinned = planHotCache(&cfg, kv_bits, weights + 43_000 * MiB, weights, ctx_tokens, 0, 10 * GiB, explicitPrefillChunk());
+    generate_mod.prefill_chunk_override = 8192;
+    generate_mod.prefill_chunk_explicit = false;
+    try t.expectEqual(@as(u32, 4096), pinned.reserve_chunk);
+    try t.expectEqual(prefillTransientReserve(&cfg, kv_bits, 4096), pinned.reserve);
+
+    // Gate OFF: today's behaviour — the clamp reserves at the sizer's rung,
+    // because there is no per-request re-bill to fall back on.
+    per_request_chunk_override = false;
+    defer per_request_chunk_override = null;
+    const off = planHotCache(&cfg, kv_bits, weights + 28_909 * MiB, weights, ctx_tokens, 0, 10 * GiB, 0);
+    try t.expectEqual(off.chunk, off.reserve_chunk);
+    try t.expectEqual(prefillTransientReserve(&cfg, kv_bits, off.chunk), off.reserve);
+    per_request_chunk_override = null;
+
+    // An arch without the gate is untouched by any of this.
+    var other = qwen4RequestTestConfig();
+    other.model_type = "qwen3_5";
+    const neutral = planHotCache(&other, kv_bits, weights + 28_909 * MiB, weights, ctx_tokens, 0, 10 * GiB, 0);
+    try t.expectEqual(neutral.chunk, neutral.reserve_chunk);
 }
 
 test "the per-token widths the request chooser is built on" {

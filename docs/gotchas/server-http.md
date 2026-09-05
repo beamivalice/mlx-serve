@@ -2017,6 +2017,56 @@ context 20.7 GB is subtracted from the cache's headroom for KV that only exists
 once a request is that long. That is being removed arch-gated on the SSD-first
 branch. This fix makes the default sane with that bill still in place.
 
+**And there was a second inversion, in the CEILING.** Same 10 GB ask, same
+pack, same session; only `iogpu.wired_limit_mb` differs — from
+`judge_mega3_fix.budget.txt`, boot 1 at 2026-09-05 13:42:36:
+
+```
+sysctl iogpu.wired_limit_mb = 120000
+[preflight] weights ~70.13 GB, available 108.72 GB
+[hot-cache] budget clamped 10240 -> 1076 MB
+```
+
+against the default ceiling's `10240 -> 3873 MB`. **Raising the ceiling ~10 GB
+shrank the cache 3.6x.** Mechanism: the extra headroom bought the sizer a wider
+rung, the rung's reserve grew faster than the headroom did, and the cache — the
+residual claimant — paid for the upgrade. Making the ask monotone did not touch
+this: the rung ladder is discrete, so any ceiling increase that crosses a rung
+boundary can cost more than it gains.
+
+The fix is to notice what the load-time reserve is FOR. **It is a promise to
+the FIRST request.** On an arch that picks its width per request (below), every
+request re-prices its own real width at admission against live memory, and
+`fitsAfterEviction` can hand hot-cache bytes back to admit it — so the promise
+only has to cover the narrowest forward the box can ever be asked for. That is
+the ladder floor, and it does not move with the ceiling:
+
+```
+budget = ceiling - weights - ctx_kv - reserve(floor)
+```
+
+monotone in the ceiling AND in the ask. `clampReserveWidth` is the one place
+that decides it; `HotCachePlan` carries both widths (`chunk` for the boot log
+and the default pin, `reserve_chunk` for what the clamp billed) and the log
+line names both, because they answer different questions:
+
+```
+[hot-cache] budget clamped 10240 -> 7000 MB (chunk 1024, reserve at width 512 = 2470 MB, ctx KV 20736 MB)
+```
+
+Two carve-outs. An explicit `--prefill-chunk` is billed as-is — the operator
+pinned a width, every request runs it, nothing narrower is ever chosen. And an
+arch without the per-request gate keeps the sizer's rung, because it has no
+per-request re-bill to fall back on; for those the load-time promise really is
+the promise.
+
+**The residual risk, stated:** the floor promise leans on evict-to-admit, and
+`reclaimableBytes` is residency minus the largest entry — so a cache holding
+one giant entry cannot give it back. That entry is the one a restore would
+share, which is why it is excluded; the exposure is a wide forward arriving
+against a cache that is one huge unreclaimable entry. The admission bill still
+refuses by name rather than OOMing in that case.
+
 **CORRECTED BY MEASUREMENT.** I first wrote here that the wide rung would
 arrive when the SSD-first branch removed this bill. It does not need to, and
 the arithmetic I used to say so was wrong in two ways: I was comparing a full
