@@ -1581,10 +1581,21 @@ pub const DiskTier = struct {
         defer _ = mlx.mlx_vector_array_free(vec);
         for (tensors) |*t| {
             var cont = mlx.mlx_array_new();
-            // Own it before anything can fail: a mid-loop error used to leak
-            // the fresh handle. (audit N8)
-            errdefer _ = mlx.mlx_array_free(cont);
-            try mlx.check(mlx.mlx_contiguous(&cont, t.arr, false, s));
+            {
+                // The window where `cont` is owned LOCALLY. Own it before
+                // anything can fail: a mid-loop error used to leak the fresh
+                // handle (audit N8). The scope CLOSES before the transfer —
+                // past `t.arr = cont` the caller's list owns the handle and
+                // its `defer freeNamed(&list)` frees it, so an errdefer still
+                // armed there is a DOUBLE free of the same mlx array on any
+                // later failure in this loop. At `e88cf07` the fallible
+                // per-tensor eval still sat inside that window: a double free
+                // on exactly the Metal working-set abort the errdefer was
+                // written for. Nothing fallible may sit between this `}` and
+                // the transfer. (audit NB-1)
+                errdefer _ = mlx.mlx_array_free(cont);
+                try mlx.check(mlx.mlx_contiguous(&cont, t.arr, false, s));
+            }
             _ = mlx.mlx_array_free(t.arr);
             t.arr = cont;
             try mlx.check(mlx.mlx_vector_array_append_value(vec, t.arr));
@@ -4339,4 +4350,86 @@ test "DiskTier: a failing synchronous writeMeta frees the final path exactly onc
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "errdefer self.allocator.free(final" ++ "_path);"));
     try testing.expect(fork < errd);
     try testing.expect(errd < defr);
+}
+
+test "materializeContiguous: the fresh-handle errdefer never outlives the transfer" {
+    // NB-1. `mlx_contiguous` can fail, so the fresh handle needs an errdefer
+    // (audit N8) — but the loop then does `t.arr = cont`, handing the handle to
+    // the caller's list, whose `defer self.freeNamed(&list)` frees every
+    // `t.arr`. A function-scope errdefer stays armed across that transfer, so a
+    // failure at any LATER step frees the same mlx array twice. History:
+    // `5c4b4bc` had no errdefer (the N8 leak, no double free); `e88cf07` added
+    // one with the fallible `mlx_array_eval(t.arr)` still inside its scope —
+    // a double free on exactly the Metal working-set abort it was written for;
+    // `ssd-persist` moved that eval out of the loop, narrowing it to a
+    // `std::bad_alloc` on the vector append. Narrow is not closed.
+    const t = testing;
+
+    // 1. The ownership rule, exercised for real under `std.testing.allocator`:
+    //    a heap allocation stands in for the mlx handle, so a double free is
+    //    the allocator's own abort and a leak is the suite's leak check. This
+    //    is the production loop transliterated step for step — fresh handle,
+    //    fallible make-contiguous, free the old, TRANSFER, fallible append —
+    //    with the append failing.
+    const Item = struct { arr: *u32 };
+    const S = struct {
+        fn run(a: std.mem.Allocator, items: []Item, fail_at: usize) !void {
+            for (items, 0..) |*it, i| {
+                const cont = try a.create(u32);
+                {
+                    // `cont` is owned LOCALLY only here.
+                    errdefer a.destroy(cont);
+                    cont.* = it.arr.* + 1;
+                }
+                a.destroy(it.arr);
+                it.arr = cont;
+                // The transfer is done: from here the list owns `cont`.
+                if (i == fail_at) return error.Injected;
+            }
+        }
+    };
+
+    var items: [4]Item = undefined;
+    for (&items, 0..) |*it, i| {
+        it.* = .{ .arr = try testing.allocator.create(u32) };
+        it.arr.* = @intCast(i);
+    }
+    // The caller's `defer freeNamed(&list)`: it owns every `arr`, on every
+    // outcome. With the errdefer scoped to the pre-transfer window this frees
+    // each handle exactly once. With it at loop-body scope — the pre-fix shape
+    // — `items[2].arr` is destroyed by the errdefer AND again here, which
+    // `std.testing.allocator` aborts on as a double free.
+    defer for (&items) |*it| testing.allocator.destroy(it.arr);
+    try t.expectError(error.Injected, S.run(testing.allocator, &items, 2));
+    // The transfers that completed before the failure stand.
+    try t.expectEqual(@as(u32, 1), items[0].arr.*);
+    try t.expectEqual(@as(u32, 3), items[2].arr.*);
+    try t.expectEqual(@as(u32, 3), items[3].arr.*);
+
+    // 2. ...and the production loop has that shape. Scan-pinned on
+    //    `materializeContiguous`'s own body, needles split so this test's bytes
+    //    can never satisfy them. RED on the pre-fix bytes: there the errdefer
+    //    sits at loop-body scope with no block to close, so `MissingScopeClose`
+    //    (and, were one added later, `close < transfer` is the real assertion).
+    const source = @embedFile("kv_disk_cache.zig");
+    const fs = std.mem.indexOf(u8, source, "fn materializeContiguous(") orelse
+        return error.MissingMaterializer;
+    const fe = std.mem.indexOfPos(u8, source, fs, "\n    }\n") orelse
+        return error.MissingMaterializerEnd;
+    const body = source[fs..fe];
+    const errd = std.mem.indexOf(u8, body, "errdefer _ = mlx.mlx_array" ++ "_free(cont);") orelse
+        return error.MissingErrdefer;
+    const transfer = std.mem.indexOf(u8, body, "t.arr = " ++ "cont;") orelse
+        return error.MissingTransfer;
+    // The errdefer's scope closes at loop-body indent (8 + 4 = 12) BEFORE the
+    // transfer: past `t.arr = cont` the list owns the handle.
+    const close = std.mem.indexOfPos(u8, body, errd, "\n            }\n") orelse
+        return error.MissingScopeClose;
+    try t.expect(errd < close);
+    try t.expect(close < transfer);
+    // Exactly one errdefer over the handle, and nothing fallible between the
+    // close and the transfer — a `try` there is armed over a handle the list
+    // already owns.
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, body, "errdefer _ = mlx.mlx_array" ++ "_free(cont);"));
+    try t.expect(std.mem.indexOf(u8, body[close..transfer], "try ") == null);
 }
