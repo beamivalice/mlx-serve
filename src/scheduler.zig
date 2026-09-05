@@ -3871,6 +3871,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 log.warn("[disk-cache] init failed: {s} — persistence off for this model\n", .{@errorName(err)});
                 break :attach;
             };
+            // Mirror the ONE arch predicate onto the disk tier (mechanism 4).
+            entry.prefix_cache.?.disk.?.ssd_first = entry.prefix_cache.?.ssd_first;
         }
         entry.ssm_checkpoint_stride = params.ssm_checkpoint_stride;
         entry.ssm_checkpoint_max = params.ssm_checkpoint_max;

@@ -178,6 +178,13 @@ pub const DiskTier = struct {
     /// entries persist incrementally across turns (appendCommit reports
     /// incomplete and the hot cache keeps its dirty flag set).
     max_flush_bytes: u64 = 512 * 1024 * 1024,
+    /// SSD-first mode (`ModelConfig.ssdFirstCapable()` + the env switch,
+    /// mirrored from `HotPrefixCache.ssd_first`). Mechanism 4: the SSM
+    /// checkpoints ride OUTSIDE the per-flush byte budget, beside the chunk
+    /// that closes their position — a hybrid entry with KV and no checkpoint
+    /// is unrestorable, so budgeting them behind the chunks made the first
+    /// flush of a long entry worthless. False = today's shared budget.
+    ssd_first: bool = false,
     entries: std.ArrayList(IndexEntry),
     next_id: u64,
     total_bytes: u64,
@@ -1359,7 +1366,9 @@ pub const DiskTier = struct {
             const p = target[ti - 1];
             if (std.mem.indexOfScalar(u32, old_positions, p) != null) continue; // already on disk
             const cp = findCp(cps, p) orelse continue;
-            if (written_bytes.* >= self.max_flush_bytes) {
+            // Mechanism 4: under SSD-first a checkpoint is written beside the
+            // chunk that closes its position, outside the byte budget.
+            if (!self.ssd_first and written_bytes.* >= self.max_flush_bytes) {
                 complete = false;
                 continue; // budget exhausted — persist on a later flush
             }
@@ -3110,4 +3119,68 @@ test "DiskTier: the qwen4 MTP head's QSA half round-trips exactly; a head-less s
     defer kv_only.snap.deinit();
     try testing.expectEqual(@as(usize, 600), kv_only.snap.step);
     try testing.expect(kv_only.head_aux == null);
+}
+
+test "DiskTier: SSD-first writes a checkpoint beside the chunk that closes it" {
+    // Mechanism 4: checkpoints ride OUTSIDE the per-flush byte budget, so the
+    // FIRST flush of a long hybrid entry already restores. Without it (arm B,
+    // every other arch) the chunk consumes the budget and the entry carries KV
+    // with no recurrent state — unrestorable until a later turn.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var src128 = buildHybridEntries(s, 100.0, 500.0);
+    defer freeHybridEntries(&src128);
+    var cps = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src128, 128, s),
+    };
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+
+    // Arm A: SSD-first. One flush, one chunk — and its checkpoint.
+    {
+        var tier = try DiskTier.init(testing.allocator, io, base, "fp-ssdfirst-cp", 0, 128);
+        defer tier.deinit();
+        tier.ssd_first = true;
+        tier.max_flush_bytes = 1; // bound the flush to one chunk
+
+        const complete = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
+        try testing.expect(!complete); // KV is still partial
+        const e = &tier.entries.items[0];
+        try testing.expectEqual(@as(u32, 128), e.kv_len);
+        try testing.expectEqual(@as(usize, 1), e.ssm_positions.len);
+        try testing.expectEqual(@as(u32, 128), e.ssm_positions[0]);
+
+        // Restorable from the FIRST flush.
+        var cache2 = try KVCache.init(testing.allocator, 3);
+        defer cache2.deinit();
+        var dst: [3]SSMCacheEntry = .{
+            .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+            .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+            .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        };
+        defer freeHybridEntries(&dst);
+        try testing.expectEqual(@as(u32, 128), try tier.restoreIntoHybrid(&cache2, &dst, 0, 128, s));
+        try testing.expectEqual(@as(f32, 100.0), ssmArrVal(dst[0].conv_state, 0, s));
+    }
+
+    // Arm B: unchanged elsewhere — the chunk eats the budget, no checkpoint.
+    {
+        var tier = try DiskTier.init(testing.allocator, io, base, "fp-legacy-cp", 0, 128);
+        defer tier.deinit();
+        tier.max_flush_bytes = 1;
+
+        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
+        const e = &tier.entries.items[0];
+        try testing.expectEqual(@as(u32, 128), e.kv_len);
+        try testing.expectEqual(@as(usize, 0), e.ssm_positions.len);
+    }
 }
