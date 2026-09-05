@@ -2140,6 +2140,13 @@ pub const Scheduler = struct {
         ) == .regular;
     }
 
+    /// S21. Does this slot owe a module-head release? See
+    /// `Generator.mtpReleasePending` — one single-slot tick lands it.
+    fn slotReleasePending(slot: *const Slot) bool {
+        const gen = if (slot.legacy_gen) |*g| g else return false;
+        return gen.mtpReleasePending();
+    }
+
     /// Active-tick gate. Decides whether a slot is eligible for the batched
     /// decode kernel. Hybrid SSM / MoE / encoder / DSV4 models can't ride
     /// the batched kernel (it doesn't model their state), so any slot
@@ -2149,6 +2156,11 @@ pub const Scheduler = struct {
     fn batchable(self: *const Scheduler, slot: *const Slot) bool {
         _ = self;
         if (!slotTicksRegular(slot)) return false;
+        // S21: a slot whose module-owned MTP head release is armed but not yet
+        // landed is still holding the head. It lands on the next single-slot
+        // tick (`nextMtp`'s serial branch); the batched tick would skip it and
+        // the head would stay reserved for the rest of the request.
+        if (slotReleasePending(slot)) return false;
         if (slot.sampling.constraint != null) return false;
         if (slot.logprobs_n > 0) return false;
         // Embedded-GGUF slots (ds4 / llama.cpp) have no `ForwardCtx` — they
@@ -2237,14 +2249,46 @@ fn modelExclusiveDecode(model: *const model_registry_mod.LoadedModel) bool {
     return t.ownsModuleDecodeState();
 }
 
+/// Pure core of `slotExclusiveDecode`, so the S21 release is testable without
+/// a Slot, a LoadedModel and a Transformer.
+///
+/// `model_owns_state` is the MODEL-level bit (`ownsModuleDecodeState`, dsv4):
+/// it wins outright and `head_released` never touches it — that state is the
+/// trunk's decode state, not an MTP head, and nothing in this request can hand
+/// it back. The head clause below is the qwen4_exp one: `Qwen4Mtp.cache` is one
+/// per model, so the slot driving it takes the model to itself.
+///
+/// S21: `head_released` is that slot saying it is DONE with the head — the
+/// adaptive switch moved it to serial and the arm is sticky, so no round, no
+/// probe and no re-entry can follow (`Generator.mtpModuleHeadReleased`). Until
+/// this existed a re-arm was always possible, so the claim could never be
+/// dropped mid-request and a second MTP request queued behind a slot that had
+/// stopped speculating.
+pub fn headExclusiveFor(
+    model_owns_state: bool,
+    head_module_owned: bool,
+    slot_enable_mtp: bool,
+    head_released: bool,
+) bool {
+    if (model_owns_state) return true;
+    if (!head_module_owned or !slot_enable_mtp) return false;
+    return !head_released;
+}
+
 /// Per-SLOT exclusivity: the model's own bit, OR a slot that will drive a
 /// module-owned MTP head (qwen4: `Qwen4Mtp.cache` is one per model). Plain
 /// slots on the same model keep interleaving/batching beside it; two MTP
-/// slots serialize.
+/// slots serialize — until one of them releases the head (S21).
 fn slotExclusiveDecode(slot: *const Slot) bool {
-    if (modelExclusiveDecode(slot.model)) return true;
-    const head = slot.model.mtp orelse return false;
-    return slot.enable_mtp and head == .qwen4;
+    const head = slot.model.mtp;
+    return headExclusiveFor(
+        modelExclusiveDecode(slot.model),
+        // ONE answer for "is this head module-owned", shared with the
+        // generator side — never a second hand-rolled per-arch conjunct.
+        if (head) |h| h.moduleOwned() else false,
+        slot.enable_mtp,
+        if (slot.legacy_gen) |*g| g.mtpModuleHeadReleased() else false,
+    );
 }
 
 /// One pending-drain candidate (or live decoding slot), reduced to what
@@ -4728,6 +4772,14 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     // draft tail first (offset-only, cheap).
     const mtp_commit: ?prefix_cache_mod.DflashCommit = blk: {
         const mc = if (gen_ptr.mtp_cache) |*m| m else break :blk null;
+        // S21. A released module head is no longer this request's to read,
+        // let alone to TRUNCATE: the release is exactly what let another slot
+        // claim it, and that slot may be mid-generation on it right now. The
+        // history this request would have committed stopped growing at the
+        // switch anyway (a serial block moves the trunk, not the head), so
+        // there is nothing here worth racing for. The sidecar arm is
+        // unaffected — its cache is per-request and never released.
+        if (gen_ptr.mtpModuleHeadReleased()) break :blk null;
         const committed = gen_ptr.mtpCommittedHistoryLen();
         if (committed == 0) break :blk null;
         mc.truncate(committed, slot.model.transformer.?.s) catch |err| {
@@ -7081,6 +7133,97 @@ test "inferenceLoop pending drain routes through admitPendingTick" {
     // would mean a path still admits without the gate.
     const old = "to_prefill[n_prefill] = sch.pending." ++ "orderedRemove(0)";
     try testing.expect(std.mem.indexOf(u8, src, old) == null);
+}
+
+test "S21: a released module head drops the slot's exclusivity, and the MODEL bit is untouched" {
+    // Holding: the slot drives the one per-model head, so it gets the model.
+    try testing.expect(headExclusiveFor(false, true, true, false));
+    // Released (the sticky serial arm): no round, probe or re-entry can
+    // follow, so a second MTP request may be admitted behind it.
+    try testing.expect(!headExclusiveFor(false, true, true, true));
+    // A request that never armed MTP never held the head either way.
+    try testing.expect(!headExclusiveFor(false, true, false, false));
+    try testing.expect(!headExclusiveFor(false, true, false, true));
+    // A KV-only sidecar head is per-REQUEST: it was never exclusive, and S21
+    // is not a way for it to become so.
+    try testing.expect(!headExclusiveFor(false, false, true, false));
+    try testing.expect(!headExclusiveFor(false, false, true, true));
+    // The MODEL-level bit (dsv4's `ownsModuleDecodeState`) is the trunk's own
+    // decode state, not an MTP head. Nothing in a request can hand it back, so
+    // `head_released` must never reach it.
+    try testing.expect(headExclusiveFor(true, false, false, true));
+    try testing.expect(headExclusiveFor(true, true, true, true));
+
+    // And the wiring: the head's module-ownership comes from the ONE shared
+    // predicate, and the release from the generator's own accessor — a second
+    // hand-rolled per-arch conjunct here is exactly the list-of-one this file
+    // already learned about with `modelExclusiveDecode`.
+    const src = @embedFile("scheduler.zig");
+    const fn_at = std.mem.indexOf(u8, src, "fn slotExclusive" ++ "Decode(slot: *const Slot)") orelse
+        return error.MissingSlotExclusive;
+    const body = src[fn_at .. fn_at + 700];
+    try testing.expect(std.mem.indexOf(u8, body, "h.module" ++ "Owned()") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "g.mtpModuleHead" ++ "Released()") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "head == ." ++ "qwen4") == null);
+}
+
+test "S21: the batched group builder never admits a slot still driving a module-owned head" {
+    const src = @embedFile("scheduler.zig");
+    // The group is built at exactly ONE admission point, and it asks
+    // `batchable`, whose FIRST question is whether the slot's next tick
+    // dispatches the regular path.
+    try testing.expect(std.mem.indexOf(u8, src, "if (sch.batch" ++ "able(s) and batchable_n < batchable_buf.len)") != null);
+    const b_at = std.mem.indexOf(u8, src, "fn batch" ++ "able(self: *const Scheduler") orelse
+        return error.MissingBatchable;
+    const reg_at = std.mem.indexOfPos(u8, src, b_at, "if (!slotTicks" ++ "Regular(slot)) return false;") orelse
+        return error.MissingRegularGate;
+    try testing.expect(reg_at - b_at < 400);
+
+    // A slot still DRIVING the head dispatches `.mtp`, not `.regular`, so it
+    // can never reach a group — this is the property S21 must not break, and
+    // it is why the release is safe: the slot that hands the head back is by
+    // then already ticking regular.
+    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, false, false, false, false, false, false));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, true, false, false, false, false, false, false));
+    // While it drives the head it also holds the model alone; once released it
+    // holds nothing, which is what lets its neighbours batch.
+    try testing.expect(headExclusiveFor(false, true, true, false));
+    try testing.expect(!headExclusiveFor(false, true, true, true));
+
+    // And the S21 case the gate above CANNOT see: a sticky slot sets
+    // `spec_disabled_runtime` the moment it switches, which makes it batchable
+    // immediately — one plain neighbour on the same model in the very next
+    // tick would carry it into a group, `nextMtp` would never run again, the
+    // release would never land and the head would stay reserved to the end of
+    // the request. So a slot that still OWES the release is held out of the
+    // group for the one tick that lands it.
+    const b_end = std.mem.indexOfPos(u8, src, b_at, "\n};\n") orelse return error.MissingBatchableEnd;
+    try testing.expect(b_end > reg_at); // the window really is the whole fn
+    const body = src[b_at..b_end];
+    const pend_at = std.mem.indexOf(u8, body, "if (slotRelease" ++ "Pending(slot)) return false;") orelse
+        return error.MissingReleasePendingGate;
+    try testing.expect(pend_at + b_at > reg_at); // after the dispatch gate, inside batchable
+    try testing.expect(std.mem.indexOf(u8, src, "return gen.mtpRelease" ++ "Pending();") != null);
+
+    // NOT widened to a blanket `slotExclusiveDecode` veto: a slot disabled for
+    // a NON-adaptive reason (`--max-mtp-ctx`, the acceptance floor) still holds
+    // the head and still batches today, and taking that away is an unmeasured
+    // throughput change. Pinned so the omission is a decision, not an oversight.
+    try testing.expect(std.mem.indexOf(u8, body, "slotExclusive" ++ "Decode(slot)") == null);
+}
+
+test "S21: a released module head is not committed to the prefix cache" {
+    // The commit TRUNCATES the head cache before snapshotting it. On the
+    // qwen4_exp arm that cache is the model's, so a released slot doing this
+    // at request end would trim a history another slot is mid-generation on.
+    const src = @embedFile("scheduler.zig");
+    const blk_at = std.mem.indexOf(u8, src, "const mtp_commit: ?prefix_cache_mod.DflashCommit = blk: {") orelse
+        return error.MissingMtpCommit;
+    const rel_at = std.mem.indexOfPos(u8, src, blk_at, "if (gen_ptr.mtpModuleHead" ++ "Released()) break :blk null;") orelse
+        return error.MissingReleaseGuard;
+    const trim_at = std.mem.indexOfPos(u8, src, blk_at, "mc.trun" ++ "cate(committed, slot.model.transformer.?.s)") orelse
+        return error.MissingTrim;
+    try testing.expect(rel_at < trim_at);
 }
 
 test "modelExclusiveDecode asks the transformer, never one hardcoded arch" {
