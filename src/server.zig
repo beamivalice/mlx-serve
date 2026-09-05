@@ -3167,53 +3167,63 @@ pub fn ssdFirstPrefixCacheMem(
     return @max(ctx_kv_bytes +| idle, 1);
 }
 
-/// PURE: the context the SSD-first session bill must use at LOAD time.
+/// PURE: the context a LOAD-TIME bill must use, before `pinAutoContext` has run.
 ///
 /// `getEffectiveContextLength` cannot answer this yet on an AUTO boot. The
 /// resolver runs during the model load; `pinAutoContext` runs after it, so
 /// `config.pinned_context` is still 0 and the accessor re-derives through
 /// `computeMemoryContext` — which reserves `resolvedPrefixCacheMem()`, i.e. the
 /// very ask being resolved. With a large ask that reserve swamps the budget and
-/// the answer comes back as a placeholder (1024 tokens ≈ 26 MB of "session" on
-/// the box that found this, clamp live check #6).
+/// the answer comes back as a placeholder: 1024 tokens ≈ 26 MB of "session" on
+/// the box that found this (clamp live check #6, the 870-token boot).
 ///
-/// Billing a 1024-token session is not a small error here, it inverts the mode:
-/// the RAM floor collapses to ~26 MB, `headroom` becomes almost the whole
-/// machine, so the IDLE allowance is granted the entire ask — the opposite of
-/// "RAM holds the model plus ONE session" — and `computeMemoryContext` then
-/// reserves that published figure and collapses the advertised context.
+/// `cache_reserve` is the ONE argument the two arms differ in, and it is the
+/// reason this is shared rather than duplicated:
 ///
-/// The circularity is only real for the RAM-first arm, where the cache is
-/// memory in ADDITION to the live KV. Under SSD-first the resident entry IS
-/// the live KV, so the cache's sizer reserve at this moment is genuinely ZERO
-/// and the context that falls out is the one this machine will actually serve.
-/// That is the number to bill one session at, and it is not a fixpoint.
+///   * SSD-first passes **0**. Its resident entry IS the live KV, so the cache
+///     genuinely reserves nothing beyond the session, the context that falls
+///     out is the one the machine will actually serve, and there is no
+///     fixpoint. Not a convenience — the honest number.
+///   * RAM-first has no such out (its cache is memory in ADDITION to the live
+///     KV) and passes a CONSTANT. It must never pass the ask, nor anything
+///     derived from it: context is the primary claimant and the cache is the
+///     residual, the same order rule the prefill chunk already follows. An ask
+///     that can shrink the context is an ask that shrinks the bill computed
+///     against it — #6 again, one level in.
 ///
-/// Mirrors `autoContextFor` (margin, then the checkpoint cap) with the cache
-/// reserve omitted — deliberately NOT by calling it, so this does not depend on
-/// the accessor it is working around.
-pub fn ssdFirstSessionTokens(
+/// Mirrors `autoContextFor` (margin, then the checkpoint cap) WITHOUT calling
+/// it, so it cannot depend on the accessor it works around.
+pub fn resolvedContextForLoad(
     explicit_ctx: u32,
     pinned_ctx: u32,
     ceiling: u64,
     active_mem: u64,
+    cache_reserve: u64,
     transient_reserve: u64,
     per_tok: u64,
     ctx_cap: u32,
 ) u32 {
     if (explicit_ctx > 0) return explicit_ctx;
     if (pinned_ctx > 0) return pinned_ctx;
-    const sized = safeAutoContext(safeContextForBudget(ceiling, active_mem, transient_reserve, per_tok, 0));
+    const sized = safeAutoContext(safeContextForBudget(
+        ceiling,
+        active_mem,
+        cache_reserve +| transient_reserve,
+        per_tok,
+        0,
+    ));
     return if (ctx_cap > 0) @min(sized, ctx_cap) else sized;
 }
 
-/// Impure wrapper: reads live memory, same as `autoContextFor` does.
+/// The SSD-first call site: reads live memory like `autoContextFor` does, and
+/// passes `cache_reserve = 0` for the reason given above.
 fn ssdFirstSessionTokensNow(config: *const model_mod.ModelConfig, kv_bits: u64, active_mem: u64, chunk: u32) u32 {
-    return ssdFirstSessionTokens(
+    return resolvedContextForLoad(
         server_config.max_context_size,
         config.pinned_context,
         currentGpuMemoryCeiling(active_mem),
         active_mem,
+        0,
         prefillTransientReserve(config, kv_bits, chunk),
         kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config),
         config.contextCap(),
@@ -3283,7 +3293,7 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64) u64
     // would double-count it. One call site, one early return.
     const ssd_chunk: u64 = pinPrefillChunk(config);
     // NOT `getEffectiveContextLength`: on an auto boot it is still unpinned here
-    // and re-derives through the cache ask (see `ssdFirstSessionTokens`).
+    // and re-derives through the cache ask (see `resolvedContextForLoad`).
     const ssd_ctx_kv: u64 = (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config)) *|
         ssdFirstSessionTokensNow(config, kv_bits, active_mem, @intCast(ssd_chunk));
     // SSD-first takes the whole decision or none of it — ONE line here, so a
@@ -21305,7 +21315,7 @@ test "the per-chunk width is ONE estimator away from the admission bill, and say
     try t.expect(std.mem.indexOf(u8, src, "scheduler_mod.prefill_chunk_adapt = &adaptivePrefillWidthNow;") != null);
 }
 
-test "ssdFirstSessionTokens: an auto boot bills the session it will serve, not the placeholder" {
+test "resolvedContextForLoad: an auto boot bills the session it will serve, not the placeholder" {
     // Clamp live check #6, SSD-first arm. The resolver runs during the load and
     // `pinAutoContext` runs after it, so on an auto boot the effective-context
     // accessor re-derives through `computeMemoryContext`, which reserves the
@@ -21323,7 +21333,7 @@ test "ssdFirstSessionTokens: an auto boot bills the session it will serve, not t
 
     // Auto boot, nothing pinned: the session is what the machine can serve —
     // NOT the 1024-token placeholder.
-    const auto = ssdFirstSessionTokens(0, 0, ceiling, active, transient, per_tok, cap);
+    const auto = resolvedContextForLoad(0, 0, ceiling, active, 0, transient, per_tok, cap);
     try t.expect(auto > 100_000);
     try t.expect(auto <= cap);
 
@@ -21344,8 +21354,8 @@ test "ssdFirstSessionTokens: an auto boot bills the session it will serve, not t
 
     // An explicit --ctx-size wins outright, and a pinned context is used as-is;
     // neither may consult the sizer.
-    try t.expectEqual(@as(u32, 262_144), ssdFirstSessionTokens(262_144, 0, ceiling, active, transient, per_tok, cap));
-    try t.expectEqual(@as(u32, 131_072), ssdFirstSessionTokens(0, 131_072, ceiling, active, transient, per_tok, cap));
+    try t.expectEqual(@as(u32, 262_144), resolvedContextForLoad(262_144, 0, ceiling, active, 0, transient, per_tok, cap));
+    try t.expectEqual(@as(u32, 131_072), resolvedContextForLoad(0, 131_072, ceiling, active, 0, transient, per_tok, cap));
     // The checkpoint's own cap still binds on a roomy box.
-    try t.expectEqual(cap, ssdFirstSessionTokens(0, 0, active + 900_000 * MiB, active, transient, per_tok, cap));
+    try t.expectEqual(cap, resolvedContextForLoad(0, 0, active + 900_000 * MiB, active, 0, transient, per_tok, cap));
 }
