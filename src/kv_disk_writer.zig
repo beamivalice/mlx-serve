@@ -241,6 +241,22 @@ pub const Writer = struct {
     }
 
     /// Test-only: hold / release the writer thread.
+    /// Is a write to `path` still queued or in flight? READ-ONLY on the
+    /// queue — the opposite of `fence`, which DISCARDS what it matches. A
+    /// reader that must not consume another entry's pending files (the
+    /// chunk-share link) asks this and links only what has LANDED.
+    pub fn isPending(self: *Writer, path: []const u8) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.inflight_path) |p| {
+            if (std.mem.eql(u8, p, path)) return true;
+        }
+        for (self.queue.items) |b| {
+            if (std.mem.eql(u8, b.path, path)) return true;
+        }
+        return false;
+    }
+
     pub fn setPaused(self: *Writer, v: bool) void {
         self.mutex.lockUncancelable(self.io);
         self.paused = v;

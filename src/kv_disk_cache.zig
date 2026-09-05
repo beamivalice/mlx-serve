@@ -1071,14 +1071,27 @@ pub const DiskTier = struct {
             const old_cb = self.entries.items[i].chunk_bytes;
             try chunk_sizes.appendSlice(self.allocator, old_cb[0..@min(keep, old_cb.len)]);
         } else if (donor) |d| {
-            self.linkInheritedChunks(d, id, &chunk_sizes) catch {
-                // Write everything instead: no inheritance, no links left behind.
-                chunk_sizes.clearRetainingCapacity();
-                inherited = 0;
-                keep = 0;
-            };
+            // Only the donor's chunks that have LANDED are linked (a
+            // contiguous prefix); the count comes back and may be less than
+            // the token overlap allowed — or zero.
+            const linked = self.linkInheritedChunks(d, id, &chunk_sizes) catch 0;
+            if (linked == 0) chunk_sizes.clearRetainingCapacity();
+            inherited = linked;
+            keep = linked;
         }
-        std.debug.assert(keep >= inherited);
+        // A REAL check, not a debug assert: a rewrite must never land on a
+        // link (the sync arm truncates in place — that would edit the donor).
+        // Links are whole chunks below `inherited` and the rewritten partial
+        // chunk sits at `keep`; if the two ever cross, cut the links from
+        // `keep` on and write those chunks ourselves.
+        if (keep < inherited) {
+            var root_dir = std.Io.Dir.openDirAbsolute(self.io, self.root, .{}) catch null;
+            defer if (root_dir) |*rd| rd.close(self.io);
+            if (root_dir) |rd| self.unlinkChunkRange(rd, id, keep, inherited);
+            log.warn("  [disk-cache] chunk share: e{d} would rewrite an inherited chunk (keep {d} < inherited {d}) — writing from {d} instead\n", .{ id, keep, inherited, keep });
+            inherited = keep;
+            if (chunk_sizes.items.len > keep) chunk_sizes.shrinkRetainingCapacity(keep);
+        }
 
         var written_bytes: u64 = 0;
         var chunk_i: u32 = keep;
@@ -2046,23 +2059,30 @@ pub const DiskTier = struct {
 
     const ChunkDonor = struct { idx: usize, id: u64, chunks: u32 };
 
-    /// Hard-link the donor's first `d.chunks` chunk files into `e<id>/` and
-    /// record their sizes. The donor's files may still sit in the background
-    /// writer's queue, so its directory is FENCED first — a link to a file
-    /// that is not there yet is a miss, not a share. Any failure unwinds the
-    /// links made so far and returns an error; the caller then writes every
-    /// chunk itself. Never a half-inherited entry.
-    fn linkInheritedChunks(self: *DiskTier, d: ChunkDonor, id: u64, chunk_sizes: *std.ArrayList(u64)) !void {
-        const donor_dir_abs = try std.fmt.allocPrint(self.allocator, "{s}/e{d}/", .{ self.root, d.id });
-        defer self.allocator.free(donor_dir_abs);
-        if (self.writer) |w| w.fence(donor_dir_abs);
+    /// Hard-link the donor's leading chunk files into `e<id>/` and record
+    /// their sizes; returns how many were linked — a CONTIGUOUS prefix of the
+    /// `d.chunks` the token overlap allows, stopping at the first chunk that
+    /// has not LANDED: the file must exist under its final name at the size
+    /// the donor's manifest records, and must not be queued or in flight in
+    /// the background writer (`Writer.isPending`). The donor's pending blobs
+    /// are never touched — `Writer.fence` DISCARDS what it matches (it exists
+    /// for a directory about to be deleted) and would have destroyed the
+    /// donor's unwritten chunks and meta while the donor still claimed them;
+    /// with a one-chunk write-through that is the common state of a donor.
+    /// A link failure unwinds the links made so far and returns an error;
+    /// the caller then writes every chunk itself. Never a half-inherited
+    /// entry: what is not linked is written.
+    fn linkInheritedChunks(self: *DiskTier, d: ChunkDonor, id: u64, chunk_sizes: *std.ArrayList(u64)) !u32 {
         var root_dir = try std.Io.Dir.openDirAbsolute(self.io, self.root, .{});
         defer root_dir.close(self.io);
         const donor_cb = self.entries.items[d.idx].chunk_bytes;
         var linked: u32 = 0;
-        errdefer self.unlinkChunks(root_dir, id, linked);
+        errdefer self.unlinkChunkRange(root_dir, id, 0, linked);
         var i: u32 = 0;
         while (i < d.chunks) : (i += 1) {
+            const old_abs = try std.fmt.allocPrint(self.allocator, "{s}/e{d}/c{d:0>6}.safetensors", .{ self.root, d.id, i });
+            defer self.allocator.free(old_abs);
+            if (!self.chunkLanded(old_abs, donor_cb[i])) break;
             const old_sub = try std.fmt.allocPrint(self.allocator, "e{d}/c{d:0>6}.safetensors", .{ d.id, i });
             defer self.allocator.free(old_sub);
             const new_sub = try std.fmt.allocPrint(self.allocator, "e{d}/c{d:0>6}.safetensors", .{ id, i });
@@ -2074,15 +2094,31 @@ pub const DiskTier = struct {
             linked += 1;
             try chunk_sizes.append(self.allocator, donor_cb[i]);
         }
+        if (linked == 0) return 0;
         var mb: f64 = 0;
-        for (donor_cb[0..d.chunks]) |b| mb += @as(f64, @floatFromInt(b));
+        for (donor_cb[0..linked]) |b| mb += @as(f64, @floatFromInt(b));
         mb /= 1024.0 * 1024.0;
-        log.info("  [disk-cache] chunk share: e{d} inherits {d} chunks ({d:.1} MB) from e{d} by hard link\n", .{ id, d.chunks, mb, d.id });
+        log.info("  [disk-cache] chunk share: e{d} inherits {d} chunks ({d:.1} MB) from e{d} by hard link\n", .{ id, linked, mb, d.id });
+        return linked;
     }
 
-    fn unlinkChunks(self: *DiskTier, root_dir: std.Io.Dir, id: u64, n: u32) void {
-        var i: u32 = 0;
-        while (i < n) : (i += 1) {
+    /// Has a chunk file LANDED — final name, recorded size, and no write to it
+    /// queued or in flight? The writer renames `.tmp` into the final name, so
+    /// a final-name file is never half-written; the size check catches an
+    /// older version of a chunk that is about to be replaced, and the pending
+    /// check catches the same-size case.
+    fn chunkLanded(self: *DiskTier, abs_path: []const u8, want_size: u64) bool {
+        const st = statFile(self.io, abs_path) orelse return false;
+        if (st.size != want_size) return false;
+        if (self.writer) |w| {
+            if (w.isPending(abs_path)) return false;
+        }
+        return true;
+    }
+
+    fn unlinkChunkRange(self: *DiskTier, root_dir: std.Io.Dir, id: u64, from: u32, to: u32) void {
+        var i: u32 = from;
+        while (i < to) : (i += 1) {
             const sub = std.fmt.allocPrint(self.allocator, "e{d}/c{d:0>6}.safetensors", .{ id, i }) catch continue;
             defer self.allocator.free(sub);
             root_dir.deleteFile(self.io, sub) catch {};
@@ -4956,4 +4992,86 @@ test "scan: the write-through hook bounds its flush to ONE chunk, and the bound 
     const fn_end = std.mem.indexOfPos(u8, src, fn_start, "\n    }\n").?;
     try testing.expect(std.mem.indexOf(u8, src[fn_start..fn_end], "written_bytes >= flush_bound and chunk_i > keep") != null);
     try testing.expect(std.mem.indexOf(u8, src[fn_start..fn_end], "written_bytes >= self.max_flush" ++ "_bytes") == null);
+}
+
+test "DiskTier chunk share: an heir links ONLY the donor's landed chunks; the donor's queued chunks and meta drain intact (B-A1)" {
+    // A donor mid-persist is the COMMON case now that the write-through lands
+    // one chunk per boundary. The heir must link what is on disk, write the
+    // rest itself, and never touch the donor's queue: `Writer.fence` DISCARDS
+    // matching blobs, so fencing the donor's dir destroyed its unwritten
+    // chunks and meta while the donor entry still claimed them.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    chunk_share_override = true;
+    defer chunk_share_override = null;
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-landed", 0, 128);
+    defer tier.deinit();
+    tier.ssd_first = true;
+    tier.enableBackgroundWriter();
+    try testing.expect(tier.writer != null);
+    tier.max_flush_bytes = 1; // one chunk per flush, like the hook
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    const toks = chunkShareTokens(520);
+
+    // Donor: chunks 0 and 1 LANDED (two flushes, drained), chunk 2 QUEUED
+    // (third flush with the writer paused).
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.a, false, null, s);
+    tier.drainWriter();
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.a, false, null, s);
+    tier.drainWriter();
+    try testing.expectEqual(@as(u32, 256), tier.entries.items[0].kv_len);
+    tier.writer.?.setPaused(true);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.a, false, null, s);
+    try testing.expectEqual(@as(u32, 384), tier.entries.items[0].kv_len);
+    const donor_id = tier.entries.items[0].id;
+    try testing.expect(chunkStat(io, base, "fp-landed", donor_id, 2) == null); // still queued
+    const dropped_before = tier.writer.?.files_dropped;
+
+    // Heir: the overlap allows 4 whole chunks; only 2 have landed.
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.b, false, null, s);
+    try testing.expectEqual(@as(usize, 2), tier.entryCount());
+    const heir = &tier.entries.items[1];
+    try testing.expectEqual(@as(u32, 2), heir.inherited_chunks);
+    try testing.expectEqual(@as(usize, 5), heir.chunk_bytes.len);
+    try testing.expectEqual(@as(u32, 600), heir.kv_len);
+
+    // The donor's queue was never touched: nothing dropped, and once the
+    // writer runs again its chunk 2 and its meta land as committed.
+    try testing.expectEqual(dropped_before, tier.writer.?.files_dropped);
+    tier.writer.?.setPaused(false);
+    tier.drainWriter();
+    try testing.expectEqual(@as(u64, 0), tier.writeErrors());
+    const d2 = chunkStat(io, base, "fp-landed", donor_id, 2).?;
+    try testing.expectEqual(tier.entries.items[0].chunk_bytes[2], d2.size);
+    try testing.expectEqual(@as(u64, 1), @as(u64, @intCast(d2.nlink))); // the heir wrote its own chunk 2
+    // Linked: 0 and 1 (two links); written: 2..4 (one link each).
+    inline for (.{ 0, 1 }) |i| try testing.expectEqual(@as(u64, 2), @as(u64, @intCast(chunkStat(io, base, "fp-landed", heir.id, i).?.nlink)));
+    inline for (.{ 2, 3, 4 }) |i| try testing.expectEqual(@as(u64, 1), @as(u64, @intCast(chunkStat(io, base, "fp-landed", heir.id, i).?.nlink)));
+
+    // A fresh scan sees the donor exactly as it committed (kv 384, meta v6)
+    // and the heir whole.
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-landed", 0, 128);
+    defer tier2.deinit();
+    try testing.expectEqual(@as(usize, 2), tier2.entryCount());
+    for (tier2.entries.items) |*e| {
+        if (e.id == donor_id) try testing.expectEqual(@as(u32, 384), e.kv_len);
+        if (e.id == heir.id) {
+            try testing.expectEqual(@as(u32, 600), e.kv_len);
+            try testing.expectEqual(@as(u32, 2), e.inherited_chunks);
+        }
+    }
+    // And the share never calls the discarding fence: scan-pinned.
+    const src = @embedFile("kv_disk_cache.zig");
+    const fn_start = std.mem.indexOf(u8, src, "fn linkInherited" ++ "Chunks(").?;
+    const fn_end = std.mem.indexOfPos(u8, src, fn_start, "\n    }\n").?;
+    try testing.expect(std.mem.indexOf(u8, src[fn_start..fn_end], ".fence(") == null);
+    try testing.expect(std.mem.indexOf(u8, src[fn_start..fn_end], "chunkLanded(") != null);
 }
