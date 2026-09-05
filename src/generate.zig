@@ -8216,14 +8216,32 @@ pub const Generator = struct {
     /// reads (`bucketToRead` may fall back to a neighbour); the sample lands
     /// in the bucket the request is actually IN, which is what the flag keys
     /// on and what the next decision will read once it is active.
+    /// A probe buys the LAST missing input, never the first. The vote needs
+    /// all three of `table_ms_tok`, `window_ms_tok` and `serial_ms_tok`;
+    /// the window alone takes `MTP_PRICE_WINDOW` non-trial rounds to fill,
+    /// so a request short enough to end before that can never decide no
+    /// matter what the probe teaches it — it just pays 8 serial tokens.
+    /// Measured cold on Flash-Next: the short cell ran 82.7 against 88.3 on
+    /// a warm boot with the probes as the difference.
+    ///
+    /// The table cell is NOT part of this: it is cross-request, so a probe
+    /// that teaches the serial row leaves something behind for the next
+    /// request even when this one never votes. The window does not — it dies
+    /// with the request — so it is the honest "can this request ever use
+    /// what the probe buys" test.
+    pub fn mtpSerialProbeUseful(window_ms_tok: ?f32) bool {
+        return window_ms_tok != null;
+    }
+
     pub fn mtpSerialProbeArm(
         t: *round_cost.Table,
         bucket: usize,
         solo: bool,
         idle: bool,
         may_resume: bool,
+        useful: bool,
     ) ?usize {
-        if (!solo or !idle or !may_resume) return null;
+        if (!solo or !idle or !may_resume or !useful) return null;
         if (bucket >= round_cost.N_BUCKETS) return null;
         // Already taught: nothing to probe for.
         if (t.serialMsPerTok(bucket) != null) return null;
@@ -8648,7 +8666,7 @@ pub const Generator = struct {
             }
             // Nothing to decide with: teach the bucket a serial token, once.
             const idle = self.mtp_serial_left == 0 and self.mtp_serial_exit == .none;
-            if (mtpSerialProbeArm(t, b, self.spec_cost_solo, idle, self.mtpAdaptiveHeadMayResume())) |own| {
+            if (mtpSerialProbeArm(t, b, self.spec_cost_solo, idle, self.mtpAdaptiveHeadMayResume(), mtpSerialProbeUseful(window_ms_tok))) |own| {
                 self.mtp_serial_left = MTP_ADAPTIVE_PROBE_TOKENS;
                 log.info(
                     "  [mtp] adaptive: bucket {s} has no serial cell -> probing {d} serial tokens\n",
@@ -15138,7 +15156,7 @@ test "mtpSerialProbeArm: bounded RETRIES per bucket, and none once the cell is t
     var fired: u32 = 0;
     var i: u32 = 0;
     while (i < 50) : (i += 1) {
-        if (G.mtpSerialProbeArm(&t, b, true, true, true) != null) fired += 1;
+        if (G.mtpSerialProbeArm(&t, b, true, true, true, true) != null) fired += 1;
     }
     try testing.expectEqual(@as(u32, round_cost.MAX_SERIAL_PROBES), fired);
     try testing.expect(round_cost.MAX_SERIAL_PROBES > 1); // else it is the old flag
@@ -15146,24 +15164,24 @@ test "mtpSerialProbeArm: bounded RETRIES per bucket, and none once the cell is t
     // What ENDS the retries is the cell becoming trusted, not the attempts.
     var u = round_cost.Table{};
     const kv: u32 = 20_000;
-    try testing.expect(G.mtpSerialProbeArm(&u, b, true, true, true) != null);
+    try testing.expect(G.mtpSerialProbeArm(&u, b, true, true, true, true) != null);
     var k: u32 = 0;
     while (k < round_cost.MIN_SAMPLES) : (k += 1) _ = u.observeSerial(kv, 16.0, true, false);
     try testing.expect(u.serialMsPerTok(b) != null);
-    try testing.expect(G.mtpSerialProbeArm(&u, b, true, true, true) == null);
+    try testing.expect(G.mtpSerialProbeArm(&u, b, true, true, true, true) == null);
 
     // Another bucket is its own decision.
     var v = round_cost.Table{};
-    try testing.expect(G.mtpSerialProbeArm(&v, round_cost.bucketFor(1000), true, true, true) != null);
-    try testing.expect(G.mtpSerialProbeArm(&v, b, true, true, true) != null);
+    try testing.expect(G.mtpSerialProbeArm(&v, round_cost.bucketFor(1000), true, true, true, true) != null);
+    try testing.expect(G.mtpSerialProbeArm(&v, b, true, true, true, true) != null);
 
     // Refusals: contended, mid-block, an M-RoPE turn, and a bucket that is
     // not a bucket.
     var w = round_cost.Table{};
-    try testing.expect(G.mtpSerialProbeArm(&w, b, false, true, true) == null);
-    try testing.expect(G.mtpSerialProbeArm(&w, b, true, false, true) == null);
-    try testing.expect(G.mtpSerialProbeArm(&w, b, true, true, false) == null);
-    try testing.expect(G.mtpSerialProbeArm(&w, round_cost.N_BUCKETS, true, true, true) == null);
+    try testing.expect(G.mtpSerialProbeArm(&w, b, false, true, true, true) == null);
+    try testing.expect(G.mtpSerialProbeArm(&w, b, true, false, true, true) == null);
+    try testing.expect(G.mtpSerialProbeArm(&w, b, true, true, false, true) == null);
+    try testing.expect(G.mtpSerialProbeArm(&w, round_cost.N_BUCKETS, true, true, true, true) == null);
     // None of those consumed an attempt.
     try testing.expectEqual(@as(u8, 0), w.serial_probes[b]);
 }
@@ -15250,7 +15268,7 @@ test "S21: every site that can start an MTP round refuses a sticky-serial reques
     try testing.expect(std.mem.indexOf(u8, src[fn_at..reentry_at], "self.mtpAdaptiveHeadMay" ++ "Resume()") != null);
 
     // (iii) the probe arm takes the same predicate as its `may_resume`.
-    try testing.expect(std.mem.indexOf(u8, src, "mtpSerialProbe" ++ "Arm(t, b, self.spec_cost_solo, idle, self.mtpAdaptiveHeadMayResume())") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "mtpSerialProbe" ++ "Arm(t, b, self.spec_cost_solo, idle, self.mtpAdaptiveHeadMayResume(), ") != null);
 
     // (iv) the deferred stash: a sticky request drops it instead of paying a
     // head forward to keep a head it is handing back.
@@ -15635,6 +15653,42 @@ test "L27 characterization: a sidecar (legacy-layout) boot plans EXACTLY as a93e
         prev = p.m_lo;
     }
 
+    // ── the WIDTH is a table-state property too, not only the extension.
+    // Same acceptance stream, a warm table whose cells make a wider base
+    // look good: a93e2c0 holds the base at 2 (the standing-base hysteresis
+    // measured cells earn and the prior does not have), while the SAME
+    // request on a cold table climbs to 3. Recorded from a93e2c0.
+    var wide = round_cost.Table{ .layout = .legacy };
+    for (0..round_cost.MIN_SAMPLES) |_| {
+        _ = wide.observe(2, kv, 44.0, 2.70, true, false);
+        _ = wide.observe(3, kv, 51.0, 3.20, true, false);
+        _ = wide.observe(4, kv, 55.0, 4.00, true, false);
+        _ = wide.observe(5, kv, 75.0, 4.20, true, false);
+    }
+    const wide_src = G.MtpCostSource.init(costs, kv, &wide);
+    prev = 1;
+    for (0..8) |_| {
+        const p = G.mtpEvPlanSrc(&a, cap, wide_src, prev + 1);
+        try testing.expectEqual(@as(u32, 2), p.m_lo);
+        try testing.expectEqual(@as(u32, 4), p.m_hi);
+        try testing.expectApproxEqAbs(@as(f32, -0.506371), p.tau_ln, 1e-5);
+        prev = p.m_lo;
+    }
+    // The cold arm over the SAME acceptance stream settles one width wider —
+    // a cheaper round that earns less, which is the shape the field saw
+    // (tok/step 3.31 -> 2.67 with the round 53.9 -> 44.6 ms). The width the
+    // plan picks is a property of the TABLE, so the table's identity, grid
+    // and store version have to be the arch's, not the build's.
+    prev = 1;
+    var cold_final: u32 = 0;
+    for (0..8) |_| {
+        const p = G.mtpEvPlanSrc(&a, cap, cold_src, prev + 1);
+        cold_final = p.m_lo;
+        prev = p.m_lo;
+    }
+    try testing.expectEqual(@as(u32, 3), cold_final);
+    try testing.expect(cold_final != G.mtpEvPlanSrc(&a, cap, wide_src, 8).m_lo);
+
     // The width trial reads the SAME bucket through the table's own grid,
     // and owes the same width a93e2c0 owed (recorded: 3).
     try testing.expectEqual(
@@ -15655,4 +15709,25 @@ test "mtpAdaptiveModelEligible: the serial row and its price window are the modu
     // head's weights load with the trunk, so presence alone is not consent.
     try testing.expect(!G.mtpAdaptiveModelEligible(false, true));
     try testing.expect(!G.mtpAdaptiveModelEligible(false, false));
+}
+
+test "mtpSerialProbeUseful: a probe buys the LAST missing input, never the first (L27)" {
+    const G = Generator;
+    // The vote needs table, window and serial. The window takes
+    // MTP_PRICE_WINDOW non-trial rounds to fill and dies with the request,
+    // so a request that cannot fill it can never use what a probe buys — it
+    // just pays 8 serial tokens. Measured cold on Flash-Next: the short cell
+    // ran 82.7 against 88.3 warm, the probes being the difference.
+    try testing.expect(!G.mtpSerialProbeUseful(null));
+    try testing.expect(G.mtpSerialProbeUseful(12.5));
+
+    var t = round_cost.Table{ .layout = .long };
+    const b = round_cost.bucketFor(20_000);
+    // Every other precondition satisfied, window empty: no probe, no cost,
+    // and — the point of a COUNT rather than a flag — no budget spent either.
+    try testing.expect(G.mtpSerialProbeArm(&t, b, true, true, true, G.mtpSerialProbeUseful(null)) == null);
+    try testing.expectEqual(@as(u8, 0), t.serial_probes[b]);
+    // Once the window is full the probe arms exactly as before.
+    try testing.expectEqual(@as(?usize, b), G.mtpSerialProbeArm(&t, b, true, true, true, G.mtpSerialProbeUseful(12.5)));
+    try testing.expectEqual(@as(u8, 1), t.serial_probes[b]);
 }

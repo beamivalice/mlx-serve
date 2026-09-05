@@ -804,8 +804,10 @@ fn cachePath(buf: []u8, key: []const u8) ?[]const u8 {
     return std.fmt.bufPrint(buf, "{s}/.mlx-serve/round-cost/{s}.txt", .{ homeDir(), key }) catch null;
 }
 
-pub fn loadCached(allocator: std.mem.Allocator, io: std.Io, key: []const u8, layout: Layout) ?Table {
-    if (!persistEnabled() or key.len == 0) return null;
+/// Read one table file at `key`, parsed under `layout`. Null on anything at
+/// all — missing, unreadable, wrong version.
+fn readCached(allocator: std.mem.Allocator, io: std.Io, key: []const u8, layout: Layout) ?Table {
+    if (key.len == 0) return null;
     var path_buf: [512]u8 = undefined;
     const path = cachePath(&path_buf, key) orelse return null;
     const f = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return null;
@@ -815,6 +817,51 @@ pub fn loadCached(allocator: std.mem.Allocator, io: std.Io, key: []const u8, lay
     const text = rs.interface.allocRemaining(allocator, .limited(16384)) catch return null;
     defer allocator.free(text);
     return parse(text, layout);
+}
+
+/// Lift a legacy (six-bucket) table onto the long grid. The two grids share
+/// the edges 2048/4096/8192/16384/32768, so buckets 0..4 mean EXACTLY the
+/// same context in both and carry over cell for cell.
+///
+/// Bucket 5 does not: on the legacy grid it is `32k+`, an EMA of everything
+/// from 32k to 1M, and the long grid has three cells in that span. Handing
+/// it to any one of them would serve numbers measured at another context —
+/// the reason the version was bumped in the first place — so it is DROPPED.
+/// The long grid re-measures its own long-context cells, and the short ones,
+/// which is where a boot's first requests live, are warm from token one.
+pub fn migrateLegacy(src: Table) Table {
+    var t = Table{ .layout = .long };
+    const shared = nBuckets(.legacy) - 1; // 0..4: identical edges
+    for (src.cells, 0..) |row, wi| {
+        for (row[0..shared], 0..) |c, b| t.cells[wi][b] = c;
+    }
+    t.seq = RESEED_GAP + 1;
+    t.serial_seq = RESEED_GAP + 1;
+    t.restored = t.foldedCells();
+    t.restored_serial = 0;
+    return t;
+}
+
+/// The table for `layout`, warm-started from the previous format when its
+/// own file is absent.
+///
+/// A store-version bump is not "one re-explore": `MtpCostSource.fromTable()`
+/// is the single term deciding whether the EV plan prices widths and
+/// extension from MEASUREMENTS or from the fitted prior, and the prior plans
+/// a different width and an always-open extension valve. A cold boot is
+/// therefore a measurable regression on the first requests of every process,
+/// not a one-off. Reading the old file is what makes the bump free.
+pub fn loadCached(allocator: std.mem.Allocator, io: std.Io, key: []const u8, layout: Layout) ?Table {
+    if (!persistEnabled()) return null;
+    if (readCached(allocator, io, key, layout)) |t| return t;
+    if (layout != .long) return null;
+    // Fall back to the legacy file for the SAME (chip, model, quant, OS
+    // build): only the version prefix differs, so it is one bufPrint away.
+    if (key.len < 4) return null;
+    var legacy_key_buf: [64]u8 = undefined;
+    const legacy_key = std.fmt.bufPrint(&legacy_key_buf, "rc{d}-{s}", .{ storeVersion(.legacy), key[4..] }) catch return null;
+    const old = readCached(allocator, io, legacy_key, .legacy) orelse return null;
+    return migrateLegacy(old);
 }
 
 /// Best-effort: a machine that cannot write re-explores next boot.
@@ -1241,4 +1288,47 @@ test "round_cost: the legacy layout is a93e2c0's grid, writes rc1 and reads the 
     // file, and neither is one carrying a serial row.
     try testing.expect(parse("rc1\n2 6 44.0 2.7 3\n", .legacy) == null);
     try testing.expect(parse("rc1\ns 3 16.0 1.0 3\n", .legacy) == null);
+}
+
+test "round_cost: the long layout warm-starts from a legacy file — no user boots cold (L27)" {
+    // A store-version bump is not "one re-explore". `fromTable()` is the one
+    // term deciding whether the EV plan prices WIDTHS and extension from
+    // measurements or from the fitted prior, and the prior plans a different
+    // width and an always-open extension valve. So the long grid reads the
+    // legacy file it can honestly reuse.
+    var legacy = Table{ .layout = .legacy };
+    for (0..MIN_SAMPLES) |_| {
+        _ = legacy.observe(2, 1000, 20.0, 2.0, true, false); // bucket 0
+        _ = legacy.observe(3, 8192, 51.0, 3.2, true, false); // bucket 3
+        _ = legacy.observe(4, 20000, 70.0, 4.0, true, false); // bucket 4
+        _ = legacy.observe(3, 400_000, 900.0, 3.0, true, false); // bucket 5: `32k+`
+    }
+    try testing.expectEqual(@as(usize, 5), legacy.bucketOf(400_000));
+
+    const lifted = migrateLegacy(legacy);
+    try testing.expectEqual(Layout.long, lifted.layout);
+    // Buckets 0..4 share their edges with the long grid, cell for cell.
+    try testing.expectApproxEqAbs(20.0, lifted.measuredMs(2, 0).?, 1e-3);
+    try testing.expectApproxEqAbs(2.0, lifted.measuredTok(2, 0).?, 1e-3);
+    try testing.expectApproxEqAbs(51.0, lifted.measuredMs(3, 3).?, 1e-3);
+    try testing.expectApproxEqAbs(70.0, lifted.measuredMs(4, 4).?, 1e-3);
+    try testing.expectEqual(@as(u32, 3), lifted.restored);
+    // The legacy `32k+` cell is an EMA of everything from 32k to 1M and the
+    // long grid has three cells in that span, so it is DROPPED rather than
+    // served to one of them — that mis-assignment is what the bump was for.
+    for (5..N_BUCKETS) |b| {
+        try testing.expect(lifted.measuredMs(3, b) == null);
+        try testing.expect(!lifted.active(b));
+    }
+    // Restored cells are stale, never fresh: another boot is another thermal
+    // and OS state, so the first live sample blends at RESEED_WEIGHT.
+    try testing.expect(lifted.seq > RESEED_GAP);
+    // A legacy file carries no serial row, so the long grid has none to lift.
+    try testing.expectEqual(@as(u32, 0), lifted.restored_serial);
+    try testing.expectEqual(@as(u32, 0), lifted.foldedSerialCells());
+
+    // The short buckets — where a boot's first requests live — are warm, and
+    // that is what `fromTable()` reads.
+    try testing.expect(lifted.active(3));
+    try testing.expectEqual(@as(?usize, 3), lifted.bucketToRead(8192));
 }
