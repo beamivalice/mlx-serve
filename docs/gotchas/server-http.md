@@ -2477,6 +2477,13 @@ forward is a real conflict and the session wins it; the reverse is what must
 never happen, so when nothing fits the narrowest rung is taken rather than the
 resident session given up. `--prefill-chunk` still outranks everything.
 
+That explicit-1M rung is pessimistic for a reason this arm cannot fix: at LOAD
+it must bill a session at the CONFIGURED context, and almost no request is that
+long. The chunk becomes a per-REQUEST admission decision separately — the widest
+rung whose transient fits beside THIS prompt's reserved KV, carried on
+`InitOptions.pinned_prefill_chunk` — so what is chosen here only has to be a
+sane default, not the last word.
+
 The slack is deliberately NOT a second session. The resident entry and the live
 KV are the same buffers, so subtracting one session already reserves the cache's
 floor — subtracting it twice is the very double count this mechanism removes,
