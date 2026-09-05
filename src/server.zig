@@ -3187,10 +3187,15 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64) u64
             prefillTransientReserve(config, kv_bits, ssd_chunk),
         );
         hot_cache_mem_resolved = budget;
-        log.info("[hot-cache] SSD-first budget {d} MB = one session at the working context ({d} MB) + {d} MB for idle entries\n", .{
+        // D1: on this arch `--prefix-cache-mem` means the IDLE allowance, not
+        // the whole cache — 0 is "no idle entries", not "use all headroom".
+        // Say so once, naming the flag, so the resolved budget is never a
+        // mystery in a log.
+        log.info("[hot-cache] SSD-first budget {d} MB = one session at the working context ({d} MB) + {d} MB idle (--prefix-cache-mem {d} MB = the IDLE allowance on this arch; 0 = no idle entries)\n", .{
             budget >> 20,
             ssd_ctx_kv >> 20,
             (budget -| ssd_ctx_kv) >> 20,
+            requested >> 20,
         });
         return budget;
     }

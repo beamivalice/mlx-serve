@@ -307,6 +307,9 @@ pub const DiskTier = struct {
     /// what is already there stays restorable. Latched so the warning is
     /// logged once per transition.
     store_declined: bool = false,
+    /// `<base>` (the parent of `root`), kept for the root-wide sweep. Owned,
+    /// null when the dupe failed — the sweep is then skipped, never guessed.
+    base_dir: ?[]u8 = null,
     entries: std.ArrayList(IndexEntry),
     next_id: u64,
     total_bytes: u64,
@@ -346,6 +349,7 @@ pub const DiskTier = struct {
             log.warn("[disk-cache] scan failed: {s} — starting empty\n", .{@errorName(err)});
         };
         self.gcToBudget();
+        self.base_dir = allocator.dupe(u8, base_dir) catch null;
         return self;
     }
 
@@ -381,6 +385,8 @@ pub const DiskTier = struct {
     }
 
     pub fn deinit(self: *DiskTier) void {
+        if (self.base_dir) |b| self.allocator.free(b);
+        self.base_dir = null;
         if (self.writer) |w| {
             w.drain();
             w.deinit();
@@ -422,8 +428,28 @@ pub const DiskTier = struct {
             }
         } else if (!self.store_declined) {
             self.store_declined = true;
-            log.warn("[disk-cache] volume below the store floor ({d} MB free) — no new entries persist\n", .{vs.free >> 20});
+            // D4: the refusal is silent to the REQUEST, never to the log —
+            // name the volume, what it has, and the floor it missed.
+            log.warn("[disk-cache] {s}: {d} MB free is below the {d} MB store floor — no NEW entries persist (already-persisted entries stay restorable)\n", .{
+                self.root,
+                vs.free >> 20,
+                DISK_STORE_FLOOR >> 20,
+            });
         }
+    }
+
+    /// Mechanism 6, disk half: sweep OTHER models' fingerprints under the same
+    /// base — strays always, and LRU eviction once they collectively exceed
+    /// one budget's worth. The rule is deliberately simple: this model may
+    /// hold `max_bytes`, and every other model TOGETHER may hold `max_bytes`,
+    /// so a machine that has served five models cannot quietly sit on five
+    /// budgets while the free-space calculation for today's model is done
+    /// against what they left. SSD-first only.
+    pub fn sweepSiblings(self: *DiskTier) void {
+        if (!self.ssd_first) return;
+        const base = self.base_dir orelse return;
+        self.refreshDiskBudget();
+        sweepBase(self.allocator, self.io, base, self.root, self.max_bytes);
     }
 
     pub fn entryCount(self: *const DiskTier) usize {
@@ -2166,6 +2192,120 @@ pub const DiskTier = struct {
 /// checkpoint rewrites config.json, which rolls the fingerprint and orphans
 /// the stale KV (GC'd by the disk budget eventually; different fingerprint
 /// dirs never mix). 16 hex chars of XxHash64.
+/// SSD-first mechanism 6: a root-wide LRU sweep across model fingerprints,
+/// plus the startup sweep of strays.
+///
+/// The per-tier LRU only sees its OWN `<base>/<fingerprint>/` directory, so a
+/// machine that has served three models keeps three full budgets on disk and
+/// the free-space-derived budget of the model loaded today is computed against
+/// space two other models are silently holding. This walks every SIBLING
+/// fingerprint (never `keep_root`, which the tier's own `scan` owns and which
+/// may legitimately hold chunks with no index while a write-through is in
+/// flight) and, oldest first, deletes whole entry directories until the
+/// siblings fit in `sibling_budget` — plus any sibling directory that has no
+/// `meta.json` at all, which is a crash leftover by construction.
+///
+/// Best effort throughout: this is housekeeping, and a failure costs disk
+/// space, never a request.
+pub fn sweepBase(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    base_dir: []const u8,
+    keep_root: []const u8,
+    sibling_budget: u64,
+) void {
+    var base = std.Io.Dir.openDirAbsolute(io, base_dir, .{ .iterate = true }) catch return;
+    defer base.close(io);
+
+    const Victim = struct { path: []u8, bytes: u64, mtime: i128 };
+    var victims = std.ArrayList(Victim).empty;
+    defer {
+        for (victims.items) |v| allocator.free(v.path);
+        victims.deinit(allocator);
+    }
+    var total: u64 = 0;
+    var strays: usize = 0;
+
+    var fps = base.iterate();
+    while (fps.next(io) catch null) |fp| {
+        if (fp.kind != .directory) continue;
+        const fp_abs = std.fmt.allocPrint(allocator, "{s}/{s}", .{ base_dir, fp.name }) catch continue;
+        defer allocator.free(fp_abs);
+        if (std.mem.eql(u8, fp_abs, keep_root)) continue; // the live tier owns its own
+
+        var fpd = std.Io.Dir.openDirAbsolute(io, fp_abs, .{ .iterate = true }) catch continue;
+        defer fpd.close(io);
+        var es = fpd.iterate();
+        while (es.next(io) catch null) |dent| {
+            if (dent.kind != .directory) continue;
+            if (dent.name.len < 2 or dent.name[0] != 'e') continue;
+            const e_abs = std.fmt.allocPrint(allocator, "{s}/{s}", .{ fp_abs, dent.name }) catch continue;
+            const meta = std.fmt.allocPrint(allocator, "{s}/meta.json", .{e_abs}) catch {
+                allocator.free(e_abs);
+                continue;
+            };
+            defer allocator.free(meta);
+            const st = std.Io.Dir.cwd().statFile(io, meta, .{}) catch {
+                // No index — a crash leftover. Nothing can restore from it.
+                deleteTreeAbsolute(io, e_abs);
+                allocator.free(e_abs);
+                strays += 1;
+                continue;
+            };
+            const bytes = dirBytes(io, e_abs);
+            total += bytes;
+            victims.append(allocator, .{ .path = e_abs, .bytes = bytes, .mtime = st.mtime }) catch {
+                allocator.free(e_abs);
+            };
+        }
+    }
+
+    if (strays > 0) log.info("  [disk-cache] swept {d} stray entry directories under {s}\n", .{ strays, base_dir });
+    if (total <= sibling_budget) return;
+
+    std.mem.sort(Victim, victims.items, {}, struct {
+        fn lt(_: void, a: Victim, b: Victim) bool {
+            return a.mtime < b.mtime;
+        }
+    }.lt);
+    var freed: u64 = 0;
+    for (victims.items) |v| {
+        if (total -| freed <= sibling_budget) break;
+        deleteTreeAbsolute(io, v.path);
+        freed += v.bytes;
+    }
+    if (freed > 0) {
+        log.info("  [disk-cache] root-wide LRU freed {d} MB across other models ({d} MB held, {d} MB budget)\n", .{
+            freed >> 20,
+            total >> 20,
+            sibling_budget >> 20,
+        });
+    }
+}
+
+/// Total bytes of the regular files directly inside `dir_abs`. Entry
+/// directories are flat, so one level is the whole entry.
+fn dirBytes(io: std.Io, dir_abs: []const u8) u64 {
+    var d = std.Io.Dir.openDirAbsolute(io, dir_abs, .{ .iterate = true }) catch return 0;
+    defer d.close(io);
+    var total: u64 = 0;
+    var it = d.iterate();
+    while (it.next(io) catch null) |dent| {
+        if (dent.kind != .file) continue;
+        const st = d.statFile(io, dent.name, .{}) catch continue;
+        total += st.size;
+    }
+    return total;
+}
+
+fn deleteTreeAbsolute(io: std.Io, dir_abs: []const u8) void {
+    const parent = std.fs.path.dirname(dir_abs) orelse return;
+    const name = std.fs.path.basename(dir_abs);
+    var pd = std.Io.Dir.openDirAbsolute(io, parent, .{ .iterate = true }) catch return;
+    defer pd.close(io);
+    pd.deleteTree(io, name) catch {};
+}
+
 pub fn modelFingerprint(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8) ![]u8 {
     if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return error.BadModelDir;
     var h = std.hash.XxHash64.init(0x6b76_6361_6368_6531);
@@ -3655,4 +3795,120 @@ test "volumeSpace: the live probe is plausible or null (statfs ABI guard)" {
     try testing.expect(vs.total > 0);
     try testing.expect(vs.free <= vs.total);
     try testing.expect(vs.total > 1024 * 1024 * 1024); // a macOS root volume
+}
+
+test "DiskTier: v5 entries cross the SSD-first boundary in BOTH directions (no manifest bump)" {
+    // D6. SSD-first changes WHEN chunks are written (write-through) and WHICH
+    // checkpoints are present (outside the byte budget) — never the on-disk
+    // FORMAT. So the manifest stays at v5, and this is the test that buys that
+    // decision: an entry written by the legacy path must restore under
+    // SSD-first, and an entry written by the SSD-first path (hand-serialized
+    // safetensors from the background writer, not `mlx_save_safetensors`) must
+    // restore under the legacy path.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    // Written by the LEGACY path → read by SSD-first.
+    {
+        var legacy = try DiskTier.init(testing.allocator, io, base, "fp-x-legacy", 0, 128);
+        _ = try legacy.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
+        legacy.deinit();
+
+        var ssd = try DiskTier.init(testing.allocator, io, base, "fp-x-legacy", 0, 128);
+        defer ssd.deinit();
+        ssd.ssd_first = true;
+        ssd.enableBackgroundWriter();
+        try testing.expectEqual(@as(usize, 1), ssd.entryCount());
+        var out = try KVCache.init(testing.allocator, 3);
+        defer out.deinit();
+        try testing.expectEqual(@as(u32, 600), try ssd.restoreInto(&out, 0, s));
+        for ([_]u32{ 0, 1, 2 }) |li| for ([_]u32{ 0, 127, 128, 599 }) |pos| {
+            try testing.expectEqual(try cacheValueAt(&cache, li, pos, 3, s), try cacheValueAt(&out, li, pos, 3, s));
+        };
+    }
+
+    // Written by SSD-FIRST (background writer, hand-serialized) → read by the
+    // legacy path.
+    {
+        var ssd = try DiskTier.init(testing.allocator, io, base, "fp-x-ssd", 0, 128);
+        ssd.ssd_first = true;
+        ssd.enableBackgroundWriter();
+        _ = try ssd.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
+        ssd.drainWriter();
+        ssd.deinit();
+
+        var legacy = try DiskTier.init(testing.allocator, io, base, "fp-x-ssd", 0, 128);
+        defer legacy.deinit();
+        try testing.expect(legacy.writer == null);
+        try testing.expectEqual(@as(usize, 1), legacy.entryCount());
+        var out = try KVCache.init(testing.allocator, 3);
+        defer out.deinit();
+        try testing.expectEqual(@as(u32, 600), try legacy.restoreInto(&out, 0, s));
+        for ([_]u32{ 0, 1, 2 }) |li| for ([_]u32{ 0, 127, 128, 599 }) |pos| {
+            try testing.expectEqual(try cacheValueAt(&cache, li, pos, 3, s), try cacheValueAt(&out, li, pos, 3, s));
+        };
+        // The manifest is still v5 — no bump rode in with SSD-first.
+        const meta = try tmp.dir.readFileAlloc(io, "fp-x-ssd/e1/meta.json", testing.allocator, .limited(1 << 20));
+        defer testing.allocator.free(meta);
+        try testing.expect(std.mem.indexOf(u8, meta, "\"v\":5") != null);
+    }
+}
+
+test "DiskTier: the root-wide sweep drops strays and never touches the live tier's own root" {
+    // Mechanism 6, disk half. A sibling fingerprint's entry with no meta.json
+    // is a crash leftover — nothing can restore from it — and goes. The LIVE
+    // tier's own root is skipped entirely: during a write-through its newest
+    // entry legitimately holds chunks with no index yet, and sweeping on that
+    // signal would delete the prefill in flight.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    // A sibling with a REAL entry, and a sibling that is a crash leftover.
+    {
+        var sib = try DiskTier.init(testing.allocator, io, base, "fp-sibling", 0, 128);
+        defer sib.deinit();
+        var cache = try KVCache.init(testing.allocator, 1);
+        defer cache.deinit();
+        try fillCache(&cache, s, 1, 600, 8, 0.0, .float32);
+        var tokens: [600]u32 = undefined;
+        for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+        _ = try sib.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
+    }
+    try tmp.dir.createDirPath(io, "fp-stray/e9");
+    try tmp.dir.writeFile(io, .{ .sub_path = "fp-stray/e9/c000000.safetensors", .data = "orphan" });
+    // The live tier's own root, mid-write-through: chunks, no index.
+    try tmp.dir.createDirPath(io, "fp-live/e1");
+    try tmp.dir.writeFile(io, .{ .sub_path = "fp-live/e1/c000000.safetensors", .data = "inflight" });
+
+    var live = try DiskTier.init(testing.allocator, io, base, "fp-live", 0, 128);
+    defer live.deinit();
+    live.ssd_first = true;
+    // A budget large enough that no LRU eviction fires — strays only.
+    live.max_bytes = 1 << 40;
+    sweepBase(testing.allocator, io, base, live.root, live.max_bytes);
+
+    // The stray sibling is gone; the real sibling and the live root survive.
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "fp-stray/e9/c000000.safetensors", .{}));
+    try testing.expect(tmp.dir.statFile(io, "fp-sibling/e1/meta.json", .{}) catch null != null);
+    try testing.expect(tmp.dir.statFile(io, "fp-live/e1/c000000.safetensors", .{}) catch null != null);
+
+    // With a budget of zero the siblings' real entries go too, oldest first —
+    // and the live root is STILL untouched.
+    sweepBase(testing.allocator, io, base, live.root, 0);
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "fp-sibling/e1/meta.json", .{}));
+    try testing.expect(tmp.dir.statFile(io, "fp-live/e1/c000000.safetensors", .{}) catch null != null);
 }

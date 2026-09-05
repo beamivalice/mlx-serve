@@ -6047,6 +6047,15 @@ pub const KVCache = struct {
     /// the length where the coexistence became gigabytes.
     pub const RESERVE_MIN_TOKENS: u64 = 32768;
 
+    /// How many times a KV capacity buffer actually grew — the twin of
+    /// `qsa_cap_buf_allocs`. A grow is not in place (`growQuantBuf` allocates
+    /// the new capacity and slice_updates the old buffer into it, both live
+    /// until the eval), so this counts the moments a SECOND copy of the whole
+    /// cache exists. The SSD-first companion bar reads it: a restore into a
+    /// reserved cache must ADOPT the entry's buffer when its capacity
+    /// suffices, never grow into a fresh one at the tightest moment.
+    pub var kv_cap_buf_grows: usize = 0;
+
     /// Ask this cache to hold `tokens` up front. Idempotent and monotone: a
     /// reservation never shrinks a buffer that is already larger.
     /// `MLX_SERVE_KV_RESERVE=0` restores pure proportional growth.
@@ -6198,6 +6207,7 @@ pub const KVCache = struct {
             const needed = entry.offset + new_len;
             const cur_cap = if (entry.initialized) bufferCapacity(entry.keys) else 0;
             const new_cap: c_int = @intCast(self.nextCapacityReserved(cur_cap, needed));
+            kv_cap_buf_grows += 1;
 
             try growQuantBuf(s, &entry.keys, entry.initialized, entry.offset, new_cap, B, heads, q_last, .uint32);
             try growQuantBuf(s, &entry.values, entry.initialized, entry.offset, new_cap, B, heads, vq_last, .uint32);
@@ -6291,6 +6301,7 @@ pub const KVCache = struct {
             const needed = entry.offset + new_len;
             const cur_cap = if (entry.initialized) bufferCapacity(entry.keys) else 0;
             const new_cap: c_int = @intCast(self.nextCapacityReserved(cur_cap, needed));
+            kv_cap_buf_grows += 1;
             const initialized = entry.initialized;
             try growQuantBuf(s, &entry.keys, initialized, entry.offset, new_cap, B, heads, head_dim, dtype);
             try growQuantBuf(s, &entry.values, initialized, entry.offset, new_cap, B, heads, v_head_dim, dtype);

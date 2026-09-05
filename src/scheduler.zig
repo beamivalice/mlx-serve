@@ -3874,7 +3874,12 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             // Mirror the ONE arch predicate onto the disk tier (mechanism 4).
             entry.prefix_cache.?.disk.?.ssd_first = entry.prefix_cache.?.ssd_first;
             // Mechanism 2: the background writer, SSD-first only.
-            if (entry.prefix_cache.?.ssd_first) entry.prefix_cache.?.disk.?.enableBackgroundWriter();
+            if (entry.prefix_cache.?.ssd_first) {
+                entry.prefix_cache.?.disk.?.enableBackgroundWriter();
+                // Mechanism 6: startup sweep of strays + root-wide LRU across
+                // the other models' fingerprints under the same base.
+                entry.prefix_cache.?.disk.?.sweepSiblings();
+            }
         }
         entry.ssm_checkpoint_stride = params.ssm_checkpoint_stride;
         entry.ssm_checkpoint_max = params.ssm_checkpoint_max;
@@ -4833,7 +4838,14 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     }
     slot.markFinished(reason);
     if (hc_opt) |hc| {
-        if (stream_opt) |s| hc.flushPendingDisk(s);
+        if (stream_opt) |s| {
+            hc.flushPendingDisk(s);
+            // Mechanism 6: RAM keeps the active session, everything else goes
+            // to the SSD. Runs AFTER the flush so this turn's entry is the
+            // most recently used one (= the active session) and so any entry
+            // spilled here already has a complete copy to spill INTO.
+            hc.spillIdleEntries(s);
+        }
     }
     // Return this turn's transients to the OS. The per-`CACHE_CLEAR_INTERVAL`
     // clear inside `Generator.advanceStep` can't cover the tail of a turn, and

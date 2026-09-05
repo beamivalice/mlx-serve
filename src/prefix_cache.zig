@@ -1446,6 +1446,89 @@ pub const HotPrefixCache = struct {
         self.pending_disk = rec;
     }
 
+    const EntrySpecs = struct {
+        dflash: ?kv_disk_cache.SpecCommit = null,
+        mtp: ?kv_disk_cache.SpecCommit = null,
+    };
+
+    /// The disk-tier spec payloads for one RAM entry. Both the flush and the
+    /// idle spill build them, and they must not drift: passing null where the
+    /// entry HAS a payload deletes the sidecar on disk (the supersede rule).
+    fn entrySpecCommits(e: *Entry) EntrySpecs {
+        return .{
+            .dflash = if (e.dflash) |*df| .{
+                .entries = df.snapshot.entries,
+                .step = df.snapshot.step,
+                .config = df.snapshot.config,
+                .base_pos = df.base_pos,
+            } else null,
+            .mtp = if (e.mtp) |*mm| .{
+                .entries = mm.snapshot.entries,
+                .step = mm.snapshot.step,
+                .config = mm.snapshot.config,
+                .base_pos = mm.base_pos,
+                // qwen4_exp: the head's QSA half rides the SAME sidecar (v5).
+                .head_aux = if (mm.head_aux) |*a| a else null,
+                .head_pos_base = mm.head_pos_base,
+            } else null,
+        };
+    }
+
+    /// SSD-first mechanism 6: at the end of a request RAM keeps exactly the
+    /// ACTIVE session's entry and every other entry spills to the SSD tier and
+    /// leaves RAM.
+    ///
+    /// This is what makes the budget's promise real. `ssdFirstPrefixCacheMem`
+    /// floors RAM at one entry precisely because the resident entry for the
+    /// session being served is the SAME buffers as the live KV; a second
+    /// resident session is a second real 24 GB. Spilling is safe only because
+    /// mechanisms 1–4 make the disk copy COMPLETE — an entry whose copy is
+    /// still partial stays in RAM rather than being thrown away.
+    ///
+    /// The active entry is the most recently used one: the commit that just
+    /// ran bumped it, and a restore bumps the entry it restored from.
+    pub fn spillIdleEntries(self: *HotPrefixCache, s: mlx.mlx_stream) void {
+        if (!self.ssd_first) return;
+        if (self.entries.items.len <= 1) return;
+        const d = if (self.disk) |*dd| dd else return;
+
+        var newest_used: u64 = 0;
+        for (self.entries.items) |*e| newest_used = @max(newest_used, e.last_used);
+
+        var spilled: usize = 0;
+        var i: usize = self.entries.items.len;
+        while (i > 0) {
+            i -= 1;
+            const e = &self.entries.items[i];
+            if (e.last_used == newest_used) continue; // the active session
+            // Vision entries never spill: an image placeholder token is
+            // identical across images, so a token-only disk key is ambiguous.
+            if (e.vision_key != 0) continue;
+            const specs = entrySpecCommits(e);
+            const complete = d.appendCommitWithSpec(
+                e.snapshot.entries,
+                e.snapshot.step,
+                e.snapshot.config,
+                e.tokens,
+                e.has_tools,
+                e.ssm_checkpoints,
+                specs.dflash,
+                specs.mtp,
+                s,
+            ) catch |err| {
+                log.warn("  [hot-cache] idle spill failed: {s} — entry stays resident\n", .{@errorName(err)});
+                continue;
+            };
+            // A partial copy is not a copy. Keep the entry until it is whole.
+            if (!complete) continue;
+            self.evictAt(i, "SSD-first idle spill");
+            spilled += 1;
+        }
+        if (spilled > 0) {
+            log.info("  [hot-cache] SSD-first: spilled {d} idle entries to disk; RAM holds the active session\n", .{spilled});
+        }
+    }
+
     /// Flush the most recent commit to the SSD tier. Called by the scheduler
     /// AFTER `markFinished` (the client already has its response) — the
     /// chunk-append is bounded (partial tail + new chunks) but synchronous on
@@ -1508,21 +1591,9 @@ pub const HotPrefixCache = struct {
         // v4: the spec snapshots (dflash context / MTP history) ride along —
         // eligibility was enforced at commitWithState, so the disk tier
         // persists exactly what the RAM entry holds.
-        const dflash_spec: ?kv_disk_cache.SpecCommit = if (newest.dflash) |*df| .{
-            .entries = df.snapshot.entries,
-            .step = df.snapshot.step,
-            .config = df.snapshot.config,
-            .base_pos = df.base_pos,
-        } else null;
-        const mtp_spec: ?kv_disk_cache.SpecCommit = if (newest.mtp) |*mm| .{
-            .entries = mm.snapshot.entries,
-            .step = mm.snapshot.step,
-            .config = mm.snapshot.config,
-            .base_pos = mm.base_pos,
-            // qwen4_exp: the head's QSA half rides the SAME sidecar (v5).
-            .head_aux = if (mm.head_aux) |*a| a else null,
-            .head_pos_base = mm.head_pos_base,
-        } else null;
+        const specs = entrySpecCommits(newest);
+        const dflash_spec = specs.dflash;
+        const mtp_spec = specs.mtp;
         const complete = d.appendCommitWithSpec(
             newest.snapshot.entries,
             newest.snapshot.step,
@@ -3837,5 +3908,127 @@ test "SSD-first: the disk flush carries the full prefix while RAM keeps a trim" 
         try testing.expect(hc.pending_disk == null);
         try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
         try testing.expect(hc.disk.?.entries.items[0].kv_len < tokens.len);
+    }
+}
+
+test "SSD-first companion: a restore adopts the entry's buffer when its capacity suffices" {
+    // Mechanism 7. The #353 reservation sizes the KV to prompt + max_tokens
+    // up front, and a grow is NOT in place — `growQuantBuf` allocates the new
+    // capacity and slice_updates the old buffer into it, so both are live at
+    // once. A restore must therefore land in the DONOR's buffer, which already
+    // carries the previous turn's reservation, rather than provoking a fresh
+    // allocation of the entry's whole size at the moment memory is tightest.
+    //
+    // `KVCache.kv_cap_buf_grows` counts exactly those moments.
+    const s = mlx.gpuStream();
+    const Grows = &transformer_mod.KVCache.kv_cap_buf_grows;
+
+    // Turn 1: a reserved cache grows ONCE, to the reservation.
+    var donor = try KVCache.init(testing.allocator, 1);
+    defer donor.deinit();
+    donor.reserve(4096);
+    const g0 = Grows.*;
+    try testFillCache(&donor, s, 1, 600);
+    try testing.expectEqual(@as(usize, 1), Grows.* - g0);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc.ssd_first = true;
+    defer hc.deinit();
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    try hc.commit(&donor, &tokens, false);
+
+    // Turn 2: restore into a fresh slot cache that reserves the SAME length.
+    // The entry's buffer already holds it, so nothing allocates: the restore
+    // adopted, it did not copy.
+    var slot = try KVCache.init(testing.allocator, 1);
+    defer slot.deinit();
+    var moe_off: usize = 0;
+    const res = try hc.lookupAndRestore(&slot, &moe_off, null, s, &tokens, false, 0, null, null);
+    try testing.expect(res.full_match);
+    slot.reserve(4096);
+    const g1 = Grows.*;
+    try testFillCache(&slot, s, 1, 8); // the diverged tail
+    try testing.expectEqual(@as(usize, 0), Grows.* - g1);
+
+    // Negative arm — the bar can SEE a copy: a reservation past the donor's
+    // capacity does grow, so the assertion above is not vacuous.
+    var slot2 = try KVCache.init(testing.allocator, 1);
+    defer slot2.deinit();
+    var moe_off2: usize = 0;
+    _ = try hc.lookupAndRestore(&slot2, &moe_off2, null, s, &tokens, false, 0, null, null);
+    slot2.reserve(65536);
+    const g2 = Grows.*;
+    try testFillCache(&slot2, s, 1, 8);
+    try testing.expectEqual(@as(usize, 1), Grows.* - g2);
+}
+
+test "SSD-first: an idle entry spills to disk and leaves RAM; the active session stays" {
+    // Mechanism 6, RAM half. `ssdFirstPrefixCacheMem` floors RAM at ONE entry
+    // because the resident entry for the session being served shares its
+    // buffers with the live KV — a second resident session is a second real
+    // copy. So at the end of a request everything but the active session goes
+    // to the SSD tier, and only once its copy is COMPLETE.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+
+    var tokens_a: [600]u32 = undefined;
+    for (&tokens_a, 0..) |*t, i| t.* = @intCast(i + 7);
+    var tokens_b: [600]u32 = undefined;
+    for (&tokens_b, 0..) |*t, i| t.* = @intCast(i + 90_000);
+
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 1, 600);
+
+    // Arm A: SSD-first spills the idle session.
+    {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var buf: [512]u8 = undefined;
+        const root_len = try tmp.dir.realPath(io, &buf);
+
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc.ssd_first = true;
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, buf[0..root_len], "fp-spill", 0, 128);
+        defer hc.deinit();
+
+        // Session A finishes, then session B finishes: B is now active.
+        try hc.commit(&cache, &tokens_a, false);
+        hc.flushPendingDisk(s);
+        try hc.commit(&cache, &tokens_b, false);
+        hc.flushPendingDisk(s);
+        try testing.expectEqual(@as(usize, 2), hc.entryCount());
+
+        hc.spillIdleEntries(s);
+        // RAM holds the active session only...
+        try testing.expectEqual(@as(usize, 1), hc.entryCount());
+        try testing.expectEqualSlices(u32, &tokens_b, hc.entries.items[0].tokens);
+        // ...and A is still served, from disk.
+        try testing.expectEqual(@as(usize, 2), hc.disk.?.entryCount());
+        hc.disk.?.drainWriter();
+        var back = try KVCache.init(testing.allocator, 1);
+        defer back.deinit();
+        var moe_off: usize = 0;
+        const res = try hc.lookupAndRestore(&back, &moe_off, null, s, &tokens_a, false, 0, null, null);
+        try testing.expectEqual(@as(usize, 600), res.matched);
+    }
+
+    // Arm B: every other arch keeps both entries resident.
+    {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var buf: [512]u8 = undefined;
+        const root_len = try tmp.dir.realPath(io, &buf);
+
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, buf[0..root_len], "fp-nospill", 0, 128);
+        defer hc.deinit();
+        try hc.commit(&cache, &tokens_a, false);
+        hc.flushPendingDisk(s);
+        try hc.commit(&cache, &tokens_b, false);
+        hc.flushPendingDisk(s);
+        hc.spillIdleEntries(s);
+        try testing.expectEqual(@as(usize, 2), hc.entryCount());
     }
 }

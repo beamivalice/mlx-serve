@@ -386,6 +386,38 @@ Assistant shape (no embed table, no lm_head — borrows the trunk's): `encoder.f
 
 **Sampled requests** draft greedily and accept through the one-hot rule, and that is the MEASURED choice, not a v1 shortcut: on Muse 4-bit there is no temperature penalty (temp 0 → 1.98x / 55.1% per-draft; temp 0.7 → 1.98x / 57.7%, 3 reps x 4 prompts, same-boot serial reference). `MLX_SERVE_DFLASH_SAMPLED_DRAFTS=1` draws each draft from the request's own filtered distribution (`filteredProbsBlock`, one filter pass + one categorical over all m rows) and accepts through the full Leviathan ratio with the residual taken against the true q — exact, and a LOSS (1.87x / 54.5%): expected acceptance is `p(argmax q)` greedy vs `1 − TV(p,q)` sampled, and this assistant's argmax tracks the trunk while its distribution shape does not. Per-request spec cells swing ~10% run to run at temperature; 3+ reps before believing a temperature claim.
 
+### SSD-first prefix cache (qwen4_exp)
+
+At 1M context on a 128 GB M5 Max the budget is weights ~70 GB + one session's
+entry ~24 GB (~24 KB/token: 12.3 KB of 8-bit KV, 3.8 KB of QSA indexer history,
+SSM checkpoints, pooled banks) + transients 3–7 GB against a ~107.5 GB ceiling.
+RAM therefore holds the model and ONE session; the SSD is the capacity tier, and
+`--prefix-cache-disk` becomes the real limit (~100 GB ≈ four 1M sessions). A
+disk hit streams the entry back in seconds against ~25 minutes of re-prefill.
+
+ONE arch predicate — `ModelConfig.ssdFirstCapable()` (`model_type ==
+"qwen4_exp"`) AND `prefix_cache.ssdFirstEnabled()`
+(`MLX_SERVE_PREFIX_SSD_FIRST`, default on) — is read at a single place, the
+scheduler's disk-tier attach, into `HotPrefixCache.ssd_first`, and mirrored onto
+`DiskTier.ssd_first` and the writer arm. Every mechanism reads that field, never
+a model_type; a source scan pins the single arming site and each mechanism's
+test carries an arm B for the legacy path.
+
+| mechanism | what it does |
+|---|---|
+| 1 — flush the LIVE cache | `capturePendingDisk` records the live snapshot, FULL token record, checkpoints and spec snaps at commit, BEFORE the RAM byte-budget trim; the flush prefers that record. All handles refcount-shared, consumed once, dropped on invalidation. |
+| 2 — background writer | `src/kv_disk_writer.zig`: one thread, FIFO, ~1 GiB host-byte permit, prefix-scoped epoch fence at the tier's one directory-removal site. The inference thread keeps the device→host readback; `serializeSafetensors` writes mlx's own image so `mlx_load_safetensors` reads it back. `meta.json` is submitted after its chunks ⇒ FIFO lands the index LAST; every file is tmp+rename. `max_flush_bytes` becomes `SSD_FIRST_READBACK_BYTES` (2 GiB/flush readback bound), not a truncation cliff. |
+| 3 — per-chunk write-through | `Generator.WriteThroughHook` at each completed prefill chunk; the scheduler passes `full_prompt[0..abs_pos]`, which `appendCommit` reads as an EXTEND, so chunks `[0, kv_len/chunk)` are never rewritten. A killed prefill leaves a restorable chunk-aligned prefix. Gate: `writeThroughArmed`. |
+| 4 — checkpoint-bearing chunks | SSM checkpoints ride OUTSIDE the per-flush byte budget, beside the chunk that closes their position ⇒ a hybrid entry restores from its FIRST flush. |
+| 5 — budget semantics | `server.ssdFirstPrefixCacheMem` floors RAM at one entry at the working context (the entry IS the live KV) and `--prefix-cache-mem` becomes the IDLE allowance (0 = none idle) — a deliberate, qwen4_exp-only change, logged once at load naming the flag. Disk budget = `min(operator cap, free − min(64 GiB, 10% of volume))`, 1 GiB store floor, re-read via `volumeSpace` before every store; below the floor no NEW entry persists and existing ones stay restorable. `MIN_DISK_ADVANTAGE_TOKENS` unchanged. |
+| 6 — evict-on-idle + root-wide LRU | `HotPrefixCache.spillIdleEntries` at end of request: RAM keeps the most-recently-used entry (the active session), every other entry spills and leaves — only when its copy comes back COMPLETE. `DiskTier.sweepSiblings` → `sweepBase` walks the OTHER fingerprints under `<base>`: strays (an entry dir with no `meta.json`) always go, and LRU eviction fires once the siblings together exceed one budget. The live tier's own root is skipped — during a write-through its newest entry legitimately has chunks and no index yet. |
+| 7 — reservation adoption | `snapshot`/`restore` refcount-SHARE the capacity buffer, so a restored entry carries the previous turn's `#353` reservation and the grow guard does not fire. `KVCache.kv_cap_buf_grows` counts the moments a second whole-cache copy exists; the guard asserts zero across a sufficient-capacity restore, with a negative arm proving it can see one. |
+
+No manifest bump: the on-disk format is unchanged (v5), pinned by a
+both-directions legacy↔SSD-first restore test instead of a version number.
+`volumeSpace` hand-declares darwin's `struct statfs` (std has no binding in this
+Zig) with a plausibility guard so a wrong layout fails SAFE to the operator cap.
+
 **Assistant context survives the prefix cache** (`prefix_cache.DflashSnap` / `DflashCommit` / `DflashTarget`). A restore forwards no trunk layers, so it produces no captures and the context would start EMPTY on every reused prefix — measured 92.6% → 66.5% per-draft acceptance and 80.2 → 60.9 tok/s on a full-prefix hit, i.e. the multi-turn case paid for the cache twice. The context snapshot rides `Entry` beside the KV, its bytes folded into `kv_bytes` so `--prefix-cache-mem` and eviction cover it (~20.5 KB/token here vs the trunk's ~53.2). Every failure path degrades rather than errors — no payload, SSD tier, snapshot failure, or a base past the trunk cursor all return `LookupResult.dflash_base = null` and leave the caller's cache untouched (start blind) — which is safe precisely because the state is DRAFT-side. The scheduler adopts only when `base + step == matched` EXACTLY, since `nextDflash` asserts `dctx.absLen() == anchor_pos`.
 
 Protocol per round (`generate.nextDflash`):

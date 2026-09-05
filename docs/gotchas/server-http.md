@@ -2429,6 +2429,19 @@ generous tail and a plausibility check — `f_bsize` a power of two in
 [512 B, 1 MiB], available never past total — so a wrong layout fails SAFE back
 to the operator cap instead of inventing a budget.
 
+**A deliberate semantics change, qwen4_exp only.** `--prefix-cache-mem` means
+something different on this arch: it is the allowance for IDLE entries on top
+of the one-session floor, and `0` means "no idle entries" rather than today's
+"no explicit cap, use all the headroom". At long context that is strictly
+better — the headroom at 1M is less than one entry, so the old reading cached
+nothing usable — but at SHORT context it is a real reduction: a 32k-context
+qwen4_exp server that passes no flag now keeps one session resident where it
+used to keep several. That is the design ("model + transients + one current KV
+copy in RAM, the rest on SSD"), and evict-on-idle makes the two readings
+converge at rest anyway, since RAM holds one session between requests either
+way. The resolved budget is logged once at load, naming the flag, so nobody
+has to infer which reading applied.
+
 **Blast radius.** Every one of these is gated on `ModelConfig.ssdFirstCapable()`
 (`model_type == "qwen4_exp"`) AND `MLX_SERVE_PREFIX_SSD_FIRST`, read at exactly
 one place — the scheduler's disk-tier attach — into `HotPrefixCache.ssd_first`
@@ -2436,3 +2449,22 @@ and mirrored onto `DiskTier.ssd_first` and the writer arm. Every mechanism reads
 that field; none reads a model_type. A source scan pins the single arming site,
 and each mechanism's test carries an arm B asserting the legacy path is what
 runs when the predicate is false.
+
+**No manifest bump.** SSD-first changes WHEN chunks are written and WHICH
+checkpoints are present — never the on-disk format — so the manifest stays at
+v5 and no existing entry becomes a miss. What buys that decision is a test
+rather than a version number: an entry written by the legacy path must restore
+under SSD-first, and an entry written by SSD-first (hand-serialized safetensors
+out of the background writer, never `mlx_save_safetensors`) must restore under
+the legacy path. Both directions, same values, in one test.
+
+**Two companions.** The `#353` reservation sizes the KV to prompt + max_tokens
+up front, and a grow is not in place, so a restore that provokes one holds two
+copies of the whole cache at the tightest possible moment. It does not, because
+`snapshot`/`restore` refcount-SHARE the capacity buffer: the entry carries the
+PREVIOUS turn's reservation with it, and the grow guard (`offset + new_len >
+bufferCapacity`) then simply does not fire. That was true by construction and
+untested, which is the same as untrue — `KVCache.kv_cap_buf_grows` now counts
+the moments a second copy exists, and the guard asserts zero across a restore
+whose donor capacity suffices, with a negative arm (a reservation past the
+donor's capacity) proving the counter can see a copy at all.
