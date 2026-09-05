@@ -6487,6 +6487,30 @@ pub const KVCache = struct {
         }
     }
 
+    /// The sequence length of the ATTENTION state this cache holds — the one
+    /// number anything sizing an attention-shaped tensor from a slot may read.
+    ///
+    /// `step` is maintained by `update` on LAYER 0 ONLY. That makes it the
+    /// absolute sequence position on a trunk whose layer 0 is an attention
+    /// layer, and a permanent ZERO on every trunk whose layer 0 is LINEAR — a
+    /// GatedDeltaNet / Mamba2 / gated-conv block never reaches this cache at
+    /// all (qwen3_5, qwen3_5_moe, qwen4_exp, qwen3_next, nemotron_h, lfm2,
+    /// bailing_hybrid). Only attention layers are ever `initialized`, so on
+    /// those trunks the first initialized entry's `offset` IS the KV length.
+    ///
+    /// Attention-first trunks keep reading `step` — the field the batched cap
+    /// read before this accessor existed, so those archs are provably
+    /// unchanged. `entries[0].offset` agrees with it: `offset` is the LOGICAL
+    /// token count and is monotonic, since a sliding window trims only the
+    /// VIEW, never the count.
+    pub fn kvLenForBatching(self: *const KVCache) usize {
+        if (self.entries.len > 0 and self.entries[0].initialized) return self.step;
+        for (self.entries) |*e| {
+            if (e.initialized) return e.offset;
+        }
+        return self.step;
+    }
+
     /// Truncate the KV cache to keep only the first `len` tokens on the sequence axis.
     pub fn truncate(self: *KVCache, len: usize, s: mlx.mlx_stream) !void {
         self.step = len;
@@ -30558,6 +30582,53 @@ test "KVCache step without trimming matches offset" {
     // Without trimming, step and offset should be equal
     try testing.expectEqual(@as(usize, 10), cache.entries[0].offset);
     try testing.expectEqual(@as(usize, 10), cache.step);
+}
+
+test "kvLenForBatching: the batched cap reads the ATTENTION layers, never layer 0's step" {
+    // `KVCache.step` advances inside `update` on GLOBAL layer 0 only. The slot
+    // cache is allocated with the full layer count and the forward passes the
+    // GLOBAL index, so on every trunk whose layer 0 is a LINEAR block that
+    // layer never calls `update` and `step` reads 0 forever. Four families
+    // land there — GDN (qwen3_5 / qwen4_exp), gated-conv (lfm2), Mamba2
+    // (nemotron_h), KDA (bailing_hybrid) — and they differ only in WHICH
+    // index the first attention layer sits at, which is why the probe is
+    // "is entry 0 initialized?" and not an arch list.
+    const families = [_]struct { layers: u32, first_attn: u32, len: usize }{
+        .{ .layers = 48, .first_attn = 3, .len = 60_000 }, // qwen3_5 / qwen4_exp GDN
+        .{ .layers = 16, .first_attn = 2, .len = 4_096 }, // lfm2 gated-conv
+        .{ .layers = 52, .first_attn = 4, .len = 1_000 }, // nemotron_h mamba2
+        .{ .layers = 32, .first_attn = 7, .len = 131_072 }, // bailing_hybrid KDA
+    };
+    for (families) |f| {
+        var cache = try KVCache.init(testing.allocator, f.layers);
+        defer cache.deinit();
+        // Only attention layers are ever `initialized` — a linear block never
+        // reaches this cache at all.
+        var li = f.first_attn;
+        while (li < f.layers) : (li += 4) {
+            cache.entries[li].initialized = true;
+            cache.entries[li].offset = f.len;
+        }
+        try testing.expectEqual(@as(usize, 0), cache.step); // the trap
+        try testing.expectEqual(f.len, cache.kvLenForBatching());
+    }
+
+    // Attention-first trunk: `step` stays the answer — the exact field the cap
+    // read before this accessor existed, so dense archs are unchanged. The two
+    // agree in practice (`offset` is the logical count and a sliding window
+    // trims only the VIEW), and `step` is what the arm is pinned to.
+    var attn = try KVCache.init(testing.allocator, 4);
+    defer attn.deinit();
+    attn.step = 4096;
+    attn.entries[0].initialized = true;
+    attn.entries[0].offset = 4096;
+    try testing.expectEqual(@as(usize, 4096), attn.kvLenForBatching());
+
+    // Nothing prefilled anywhere: 0. The readiness gate, not this, is what
+    // keeps an unprefilled slot out of a batch.
+    var cold = try KVCache.init(testing.allocator, 4);
+    defer cold.deinit();
+    try testing.expectEqual(@as(usize, 0), cold.kvLenForBatching());
 }
 
 test "KVCache step with multi-layer only increments once per update" {

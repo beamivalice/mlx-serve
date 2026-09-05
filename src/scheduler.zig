@@ -687,6 +687,13 @@ pub const Slot = struct {
         return slot;
     }
 
+    /// This slot's attention KV length, for the batched group's sort key and
+    /// its pad-waste cap. Delegates to `batchKvLenOf` — the ONE source, and
+    /// never `cache.step` (0 forever on a linear-layer-0 trunk).
+    pub fn batchKvLen(self: *const Slot) u32 {
+        return batchKvLenOf(&self.cache);
+    }
+
     /// Free everything the slot owns. Only safe to call when no thread can
     /// observe the slot anymore (i.e. after the inference thread has
     /// finished/errored it AND the connection thread has consumed the final
@@ -2180,12 +2187,14 @@ pub const Scheduler = struct {
 /// decode serially this tick, so every slot still advances.
 ///
 /// Returns how many of `kv_lens_asc` may batch together (0 or 1 = nobody batches).
-/// The lengths handed in are the caller's `cache.step` — the PRE-tick counts,
-/// while the forward pads to the post-update view, and a sliding layer's view
-/// is trimmed shorter still. So this is deliberately an approximation of the
-/// padding the forward will actually build (one token low, and an upper bound
-/// on sliding layers); it is a heuristic bar, not an accounting identity, and
-/// re-deriving it from the exact per-layer view widths buys nothing.
+/// The lengths handed in come from `batchKvLenOf` — the arch's TRUE attention KV
+/// length, which is NOT `cache.step` on a linear-layer-0 trunk (it is 0 forever
+/// there, which made this cap dead on every GDN / conv / mamba / KDA arch). They
+/// are still PRE-tick counts, while the forward pads to the post-update view, and
+/// a sliding layer's view is trimmed shorter still. So this is deliberately an
+/// approximation of the padding the forward will actually build (one token low,
+/// and an upper bound on sliding layers); it is a heuristic bar, not an accounting
+/// identity, and re-deriving it from the exact per-layer view widths buys nothing.
 /// The padded tensor may be at most this multiple of the bytes the group
 /// actually needs. It must stay BELOW 2.0 or a two-slot group can never be
 /// vetoed: one 1-token slot beside one 200k slot pads to exactly 2x, which is
@@ -2205,6 +2214,34 @@ pub fn batchedKvKeepCount(kv_lens_asc: []const u32) usize {
         if (padded <= MAX_PAD_WASTE * @as(f64, @floatFromInt(sum))) return k;
     }
     return 0;
+}
+
+/// The padding waste the WHOLE group would pay: the padded `N x kv_max` tensor
+/// over the `sum(kv_len)` bytes the slots actually need. Reported by the cap's
+/// log so the decision names the number it compared, never just its outcome.
+pub fn batchedPadWaste(kv_lens_asc: []const u32) f64 {
+    var sum: u64 = 0;
+    for (kv_lens_asc) |l| sum += l;
+    if (sum == 0 or kv_lens_asc.len == 0) return 1.0;
+    const padded: f64 = @floatFromInt(@as(u64, kv_lens_asc.len) * kv_lens_asc[kv_lens_asc.len - 1]);
+    return padded / @as(f64, @floatFromInt(sum));
+}
+
+/// ONE source for the length the batched group is sorted by AND capped by.
+///
+/// It must be the arch's TRUE attention KV length. `cache.step` is not: it
+/// advances only inside `update` on GLOBAL layer 0, so on every trunk whose
+/// layer 0 is a LINEAR block — GDN (qwen3_5, qwen3_5_moe, qwen4_exp,
+/// qwen3_next), gated-conv (lfm2, lfm2_moe, lfm2_vl), Mamba2 (nemotron_h),
+/// KDA (bailing_hybrid) — layer 0 never calls `update` and `step` reads 0
+/// forever. Fed from `step`, every slot reported 0, the waste ratio was 1.0
+/// for ANY group and `MAX_PAD_WASTE` never capped anything: a 1k-token slot
+/// batched beside a 60k one padded 59k rows per tick, the unbilled transient
+/// this cap exists to bound. `KVCache.kvLenForBatching` reads the first
+/// ATTENTION layer's own offset on those trunks and `step` where layer 0 is
+/// attention, so it is right on every arch and needs no arch list here.
+pub fn batchKvLenOf(cache: *const KVCache) u32 {
+    return @intCast(cache.kvLenForBatching());
 }
 
 /// Pure-config predicate: is this model's architecture compatible with the
@@ -5925,19 +5962,37 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         // they need. Sort ascending by kv_len and let `batchedKvKeepCount` say
         // how many still fit; the tail decodes serially this tick.
         if (group.len >= 2) {
-            std.sort.pdq(*Slot, group, {}, struct {
-                fn lt(_: void, a: *Slot, b: *Slot) bool {
-                    return a.cache.step < b.cache.step;
-                }
-            }.lt);
+            // ONE read of each slot's true attention KV length. NOT layer 0's
+            // step bookkeeping — that is 0 forever on a linear-layer-0 trunk,
+            // which made this cap dead there; see `batchKvLenOf`. Carried
+            // alongside the slots so the sort key and the waste ratio are
+            // literally the same numbers.
             var kv_lens: [32]u32 = undefined;
-            for (group, 0..) |g, i| kv_lens[i] = @intCast(g.cache.step);
+            for (group, 0..) |g, i| kv_lens[i] = g.batchKvLen();
+            // Ascending by length, slots and lengths moving together. Insertion
+            // sort: `group.len <= 32`, and this runs once per decode tick.
+            var i: usize = 1;
+            while (i < group.len) : (i += 1) {
+                const slot_i = group[i];
+                const len_i = kv_lens[i];
+                var j = i;
+                while (j > 0 and kv_lens[j - 1] > len_i) : (j -= 1) {
+                    group[j] = group[j - 1];
+                    kv_lens[j] = kv_lens[j - 1];
+                }
+                group[j] = slot_i;
+                kv_lens[j] = len_i;
+            }
             const keep = batchedKvKeepCount(kv_lens[0..group.len]);
             if (keep < group.len) {
                 if (!kv_skew_split_logged) {
                     kv_skew_split_logged = true;
-                    log.info("[batched] kv-length skew: batching {d} of {d} slots (kv_len {d}..{d}), rest serial\n", .{
-                        keep, group.len, kv_lens[0], kv_lens[group.len - 1],
+                    log.info("[batched] pad-waste cap: kept {d} of {d} slots (waste {d:.2}x, kv_len {d}..{d}), rest serial\n", .{
+                        keep,
+                        group.len,
+                        batchedPadWaste(kv_lens[0..group.len]),
+                        kv_lens[0],
+                        kv_lens[group.len - 1],
                     });
                 }
                 for (group[keep..]) |s| try runSingleDecodeTick(sch, s);
@@ -6827,6 +6882,93 @@ test "the batched group is capped by padding waste before it is dispatched" {
     try testing.expect(std.mem.indexOf(u8, body, "batchedKvKeepCount(") != null);
     // ...and the dropped slots must still be ticked, or they never advance.
     try testing.expect(std.mem.indexOf(u8, body, "for (group[keep..]) |s| try runSingleDecodeTick") != null);
+}
+
+test "the pad-waste cap reads the arch's TRUE attention KV length, not cache.step" {
+    // The defect: `cache.step` advances only inside `update` on GLOBAL layer 0,
+    // so on a linear-layer-0 trunk it reads 0 forever. Fed from `step`, a 1k
+    // slot and a 60k one both reported 0, the waste ratio came out 1.0 for ANY
+    // group and `MAX_PAD_WASTE` never capped: the short slots padded 59k rows
+    // per tick, the unbilled transient this cap exists to bound.
+    //
+    // Four families have a linear global layer 0 — GDN (qwen3_5, qwen3_5_moe,
+    // qwen4_exp, qwen3_next), gated-conv (lfm2*), Mamba2 (nemotron_h), KDA
+    // (bailing_hybrid). The first attention layer sits at a different index in
+    // each, so the length source probes the cache, never an arch list.
+    const lens = [_]usize{ 1_000, 1_000, 60_000 };
+    const first_attn = [_]u32{ 3, 2, 7 }; // GDN / gated-conv / KDA spacings
+    var caches: [3]KVCache = undefined;
+    var built: usize = 0;
+    defer for (caches[0..built]) |*c| c.deinit();
+    for (lens, first_attn, 0..) |len, fa, i| {
+        caches[i] = try KVCache.init(testing.allocator, 32);
+        built += 1;
+        caches[i].entries[fa].initialized = true;
+        caches[i].entries[fa].offset = len;
+        try testing.expectEqual(@as(usize, 0), caches[i].step); // the trap
+    }
+
+    var kv_lens: [3]u32 = undefined;
+    for (caches[0..], 0..) |*c, i| kv_lens[i] = batchKvLenOf(c);
+    // RED before the fix: every entry here was `cache.step` == 0.
+    try testing.expectEqualSlices(u32, &[_]u32{ 1_000, 1_000, 60_000 }, &kv_lens);
+
+    // With the real lengths the cap fires. All three pads to 3 x 60000 = 180k
+    // against 62k useful (2.9x); the 60k slot falls out and decodes serially,
+    // and the two 1k slots batch at 1.0x waste.
+    try testing.expectEqual(@as(usize, 2), batchedKvKeepCount(&kv_lens));
+    try testing.expect(batchedPadWaste(&kv_lens) > MAX_PAD_WASTE);
+
+    // What the defect handed it instead — a group nothing could ever cap,
+    // because a waste ratio over all-zero lengths is 1.0 by construction.
+    try testing.expectEqual(@as(usize, 3), batchedKvKeepCount(&[_]u32{ 0, 0, 0 }));
+    try testing.expectEqual(@as(f64, 1.0), batchedPadWaste(&[_]u32{ 0, 0, 0 }));
+}
+
+test "an attention-first trunk's batching lengths are unchanged by the fix" {
+    // Dense / attention-first archs must be byte-identical across this change:
+    // entry 0 is initialized, so the length source is still `step` and the cap
+    // sees exactly the numbers it saw before.
+    const lens = [_]usize{ 1_000, 1_000, 1_000, 100_000 };
+    var caches: [4]KVCache = undefined;
+    var built: usize = 0;
+    defer for (caches[0..built]) |*c| c.deinit();
+    var kv_lens: [4]u32 = undefined;
+    for (lens, 0..) |len, i| {
+        caches[i] = try KVCache.init(testing.allocator, 8);
+        built += 1;
+        caches[i].step = len;
+        caches[i].entries[0].initialized = true;
+        caches[i].entries[0].offset = len;
+        kv_lens[i] = batchKvLenOf(&caches[i]);
+    }
+    try testing.expectEqualSlices(u32, &[_]u32{ 1_000, 1_000, 1_000, 100_000 }, &kv_lens);
+    // Same keep count as reading `cache.step` directly — the pre-fix answer.
+    try testing.expectEqual(@as(usize, 3), batchedKvKeepCount(&kv_lens));
+    try testing.expectEqual(
+        batchedKvKeepCount(&[_]u32{ 1_000, 1_000, 1_000, 100_000 }),
+        batchedKvKeepCount(&kv_lens),
+    );
+}
+
+test "the batched group takes its kv length from the ONE accessor, never cache.step" {
+    // Class guard. `cache.step` is 0 forever on every linear-layer-0 trunk, so
+    // a length read from it makes the pad-waste cap dead on exactly the archs
+    // that batch a GDN/conv/mamba/KDA kernel — silently, since the group still
+    // forms and every byte still matches.
+    const src = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, src, "// Group batchable slots by model pointer") orelse return error.MissingGrouping;
+    const end = std.mem.indexOfPos(u8, src, start, "\n}\n") orelse return error.MissingGroupingEnd;
+    const body = src[start..end];
+    try testing.expect(std.mem.indexOf(u8, body, "batchKvLen()") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "cache.step") == null);
+    // The cap's log names the number it compared, not just its outcome.
+    try testing.expect(std.mem.indexOf(u8, body, "pad-waste cap: kept") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "batchedPadWaste(") != null);
+    // ...and the one accessor is the KVCache's, not a re-derivation.
+    const src_of = std.mem.indexOf(u8, src, "pub fn batchKvLenOf(") orelse return error.MissingAccessor;
+    const of_end = std.mem.indexOfPos(u8, src, src_of, "\n}\n") orelse return error.MissingAccessorEnd;
+    try testing.expect(std.mem.indexOf(u8, src[src_of..of_end], "kvLenForBatching()") != null);
 }
 
 test "modelBatchable permits pure-attention" {
