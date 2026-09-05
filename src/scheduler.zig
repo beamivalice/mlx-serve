@@ -4656,6 +4656,14 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     // Phase D: per-model prefix cache — read off the slot's LoadedModel.
     const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return;
     if (slot.error_code != null) return;
+    // S20. `runSingleDecodeTickInner` can reach `finishSlot` — and so this
+    // commit — on an EOS the failing forward itself produced, BEFORE the
+    // wrapper's `checkErrorDecode` reads the latch and stamps `error_code`.
+    // Metal returns ZEROS before it aborts, so that EOS can be plausible and
+    // the KV under it is garbage. `error_code` is therefore not the whole
+    // guard: a latch that is still unread means this slot's last forward may
+    // have failed, and a committed prefix outlives the request that made it.
+    if (mlx.errorPending()) return;
     const gen_ptr = if (slot.legacy_gen) |*g| g else {
         // A Generator-less slot whose cache is non-empty is a prefill the
         // client disconnected from mid-chunk-loop: initWithOptions threw
