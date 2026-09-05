@@ -1822,8 +1822,18 @@ accumulated. Pricing a transient you can delete is the wrong trade.
   `RESERVE_MIN_TOKENS` = 32k) is reserved before the first chunk writes, so a
   long prefill grows its buffers exactly ONCE and nothing coexists. The guard
   bills that reservation's headroom — tens of megabytes — instead of a second
-  copy of the cache. Short prompts keep the proportional policy untouched;
-  `MLX_SERVE_KV_RESERVE=0` restores it everywhere.
+  copy of the cache. Short prompts keep the proportional policy untouched.
+
+  **`MLX_SERVE_KV_RESERVE=0` restores the ALLOCATION policy, not the bill**
+  (audit N3, correcting an earlier draft of this line that said it "restores it
+  everywhere"). The switch is read in `KVCache.nextCapacity`, so with it off the
+  cache returns to proportional growth; but `server.reservedCacheTokens`
+  delegates to `KVCache.reservedTokens`, which does NOT read it, so the
+  admission guard keeps billing the reservation either way. The direction is
+  conservative — the bill exceeds what the engine then allocates, so a request
+  is refused slightly early rather than admitted and OOMed — but it is not the
+  byte-for-byte return the line promised, and a wrong restore claim sends the
+  next person hunting the wrong file when the numbers do not match.
 * `retainedSsmCheckpointBytes` and `statePerTokenBilled` join the estimator,
   the latter read by the auto-context sizer AND the guard so advertised and
   admitted contexts cannot diverge. The QSA history was billed at TWO copies
@@ -2245,17 +2255,203 @@ the judge at chunk 4096 peaked 90.3 GB of a ~93 GiB ceiling at 384k, so the
 estimator is not loose, and the share is what stops one forward from trading
 the whole session for its own speed at LOAD time.
 
-**One ordering wrinkle, deliberately left standing.**
-`prefixCacheMemForLoad` calls `getEffectiveContextLength`, which on an
-un-pinned auto-context computes through `resolvedPrefixCacheMem()` — i.e. the
-PREVIOUS model's resolved value, or the raw ask on a first load. So on an
-auto-context boot the clamp's ctx term and the context that eventually gets
-pinned can differ by one iteration. It predates this fix, the direction is
-bounded, and it is moot once the SSD-first branch removes the full-context bill
-from the clamp entirely — at which point there is no ctx term to be stale.
+**The ordering wrinkle was NOT moot — it was the whole of live check #6.**
+An earlier draft of this section said the clamp reading a stale context was
+"bounded, and moot once the SSD-first branch removes the full-context bill."
+Both halves were wrong, and the live check found it:
+
+    # auto-context boot (no --ctx-size), --prefix-cache-mem 60GB
+    [hot-cache] budget clamped 61440 -> 48673 MB (chunk 4096, reserve at width 512 = 1474 MB, ctx KV 26 MB)
+    Context size: 870 tokens (auto: 85% of the 1024-token memory ceiling)
+    # the same boot at the default ask
+    Context size: 1048576 tokens (auto: the model's maximum; memory would allow 1113088)
+
+`ctx KV 26 MB` is the tell. The clamp runs during the load and `pinAutoContext`
+runs after it, so `getEffectiveContextLength` answers with the 1024-token floor;
+the clamp subtracts ~26 MB of "context" instead of ~20.7 GB, grants almost the
+whole ask, and the sizer that runs afterwards has nothing left. An
+over-generous `--prefix-cache-mem` therefore pinned an **870-token advertised
+context** for the life of the process — and agent CLIs read that number once
+per session. Publishing the RESOLVED budget rather than the raw ask made it
+48,673 instead of 61,440, which is smaller and still fatal: **an ORDER bug is
+not fixed by better arithmetic on the wrong input.**
+
+It is also not SSD-first's to fix. Both arms of the load-time bill had it, and
+both now read ONE pure resolver, `resolvedContextForLoad` — explicit
+`--ctx-size` wins, else a pinned context, else a sized one that mirrors
+`autoContextFor`'s margin-then-cap WITHOUT calling the accessor it works
+around. The arms differ in exactly one argument, the cache reserve:
+
+- **SSD-first passes 0.** Its resident entry IS the live KV, so the honest
+  load-time reserve genuinely is zero and no fixpoint exists.
+- **RAM-first passes `CTX_SIZING_CACHE_RESERVE`**, a fixed 2 GiB. It holds cache
+  in ADDITION to the live KV, so it has no such out — which is why the
+  parameter exists at all.
+
+That constant must never be derived from the ask, and passing the ask itself is
+the same bug one level in: `ceiling - active` is 39,568 MiB against a 61,440 MiB
+ask, so sizing the context against it saturates to zero usable and returns the
+1024-token floor — the 870 boot again. **Context is the primary claimant and the
+cache is the residual**, the same order the prefill chunk follows. An ask must
+never be able to shrink the context that is then used to bill that ask.
+
+The manual path is untouched by all of it: `--ctx-size` wins in the resolver's
+first branch, before any memory arithmetic runs, so a pinned boot bills exactly
+what it billed before.
+
+### The width is re-asked after the eviction pass (N5)
+
+`prefillAdmissionBill` computes `available` WITHOUT `reclaimable` and hands
+that to `chooseRequestPrefillChunk`, so a resident hot cache narrows the
+prefill width — the ladder floor instead of 4096 — rather than being evicted.
+That is the right call at that moment: crediting `reclaimable` there would
+choose a width justified by memory eviction has not actually returned yet, the
+same "credit what you cannot prove" shape as the `evictable` vs `reclaimable`
+split this work introduced after a 383k prompt was admitted on 1,564 MB of
+cache that turned out to be the single entry the prompt itself had just
+restored. The two failure costs are not symmetric: a narrow width costs prefill
+throughput, a width justified by absent memory costs an uncatchable Metal OOM.
+
+The fix is therefore not a wider bill but **a second look**. The scheduler's
+prefill path now asks the width TWICE around the eviction pass:
+
+1. `admitted_prefill_chunk` — the pre-eviction reading, taken through the same
+   `prefill_request_chunk` hook, with the same inputs and the same live memory
+   as the probe that just failed. It is captured ONLY on the path that actually
+   evicts: when the probe already fits, no memory moves and there is nothing to
+   compare a second reading against.
+2. `evictLruToAdmit` runs and returns an `EvictionReport`.
+3. `evicted_live_bytes = report.bytes` — the ALLOCATOR's delta, never
+   `accounted_bytes` (a shared snapshot bills megabytes and returns none of
+   them) and never `reclaimable` (a projection).
+4. The re-ask, then `scheduler.postEvictionPrefillChunk(admitted, reasked)`.
+
+**The clamp is an assertion, not a policy.** An eviction only ever RETURNS
+memory, so post-eviction availability is `>=` pre-eviction and `reasked >=
+admitted` by construction — the chooser's ladder is monotone and its fallback
+is the floor. Taking the MAX therefore changes nothing on the expected path and
+catches the one case that would be a real bug: a narrower re-ask, which can only
+mean memory moved between the two reads (a co-tenant slot's decode
+allocations). There the admitted width is the one a bill was actually taken at,
+and the per-chunk adapter — the mechanism that IS allowed to narrow — re-prices
+from it at the first chunk boundary. Both directions log under `[prefill] re-ask:` (a distinct
+prefix from the per-chunk `[prefill] width N -> M at pos P` contract line), the
+widening at info naming the bytes the pass returned.
+
+The re-asked width has to reach two consumers with different rules, and a
+change that wires one and not the other ships a width nobody runs:
+
+* The request's own chunk: `req_prefill_chunk` →
+  `InitOptions.pinned_prefill_chunk` → `effectivePrefillChunk` →
+  `PREFILL_CHUNK` → `default_chunk` → `cur_chunk`.
+* The per-chunk adapter's ceiling, `cap_adapt`. It is built from the arch
+  resolver with the pin left OUT (a literal `0` rung), so it is `>=` any ladder
+  width the chooser can return and cannot clip a re-ask. If it ever starts
+  reading the pin, the widened width becomes its own ceiling and the adapter
+  can only narrow.
+
+Both are scan-pinned (`the re-asked width reaches the request's chunk AND is
+never capped by the adapter`), as is the ORDER of the four steps above.
+
+### The admission bill is logged on ADMITTED requests too
+
+The tight-admission path used to log nothing when it went through: the numbers
+only ever appeared once a request had already been refused, so there was no way
+to watch the machine walk up to the edge. `checkAttentionMemory` now emits ONE
+line per REQUEST — never per chunk — at the admission decision:
+
+```
+[admission] needed=N MB available=A MB reclaimable=R MB width=W verdict=admit|evict|refuse
+```
+
+Every field comes off the SAME `AdmissionBill` the three arms act on and the
+refusal message quotes, so the two cannot name different numbers for the same
+request; a second estimator call here would be #126 ("a gate that runs BEFORE
+the estimator that knows better IS the estimator") in log form, quoting a bill
+nobody acted on. `admissionVerdict` derives the verdict from that bill with the
+same two predicates the arms branch on (`fits`, `fitsAfterEviction`).
+
+The level is chosen by `admissionLogLevel`: info on the first request after a
+model becomes resident (`model_registry.load_generation`, consumed by one
+compare-and-swap so N racing connection threads produce ONE line), info
+whenever `needed > 0.9 * available` — the band where the next request is the
+one that evicts or refuses — and debug otherwise, because a roomy machine
+would otherwise write one info line per request for the life of the process.
+The level check runs FIRST and the byte divisions and verdict string happen
+only after it; under `--log-level warn` the call returns before it can even
+consume the post-load token, which must not be spent on a line that was never
+going to be written.
+
+### The billed session and the advertised session were two numbers (2026-09-05)
+
+Found by the SSD-first owner while folding these branches together, and it is
+the same family as audit S6 one level out.
+
+On an SSD-first boot the load-time bill and the pinned context are supposed to
+be one session:
+
+- `ssdFirstSessionTokensNow` bills the session the budget FLOOR is built for
+  (`ssdFirstPrefixCacheMem` floors the budget at one entry at the working
+  context), and it passed `cache_reserve = 0` — the reasoning being that the
+  resident entry IS the live KV, so the cache reserves nothing beyond the
+  session.
+- `pinAutoContext` -> `computeMemoryContext` then sized the ADVERTISED context
+  against `CTX_SIZING_CACHE_RESERVE`.
+
+Same box, same instant, two reserves, two sessions. An agent CLI reads the
+smaller number out of `/v1/models` ONCE and budgets against it for the whole
+session, while the cache floor holds RAM for the larger one. It survived review
+because neither number looks wrong on its own: both are real contexts, a few
+percent apart, and the wrongness is only visible when you ask which one "one
+session" means.
+
+The `= 0` argument is true of the RESIDENT entry and false of the mode's IDLE
+allowance, which is RAM in addition to it. But the honest idle allowance is
+`--prefix-cache-mem`, i.e. the ASK — and reading the ask is live check #6 (a
+60GB ask collapsed the advertised context to 870 tokens), while reading the
+budget resolved from it is audit S6, the same bug as a one-step loop. Context is
+the primary claimant and the cache is the residual. So the reserve is the
+CONSTANT on both arms and on both sides, and the constant is the server's own
+`--prefix-cache-mem` default, so a default boot is unchanged.
+
+The relation, stated exactly, is now one expression in one helper
+(`autoContextFrom`) that both sides run:
+
+```
+advertised = autoContextFrom(
+    safeContextForBudget(ceiling, active,
+                         CTX_SIZING_CACHE_RESERVE + transient,
+                         per_tok, 0),
+    ctx_cap)
+```
+
+The 85% memory margin lives INSIDE it and the checkpoint cap is applied AFTER
+the margin, un-margined — get that order wrong and the two sides differ by
+exactly the margin, which is how the S6 test read at the fold (it compared the
+raw memory context against the clamp's margined answer).
+
+Explicit `--ctx-size` boots are untouched: the operator's number is the
+resolver's FIRST early return and `pinAutoContext` returns it before any sizing
+runs. Pinned as INVARIANCE in the reserve rather than against a recorded
+constant, because that is the property the change has to preserve.
 
 ### Rules this produced
 
+- The load-time session bill and the advertised context are ONE number. They are
+  computed in different functions at different times, so they must read one
+  reserve and one margin helper, or they are two answers to "how big is one
+  session" and the cache floor is sized for a session nobody can request.
+- A per-arm reserve is a per-arm SESSION. If an arm has a reason to reserve
+  differently, the sizer needs the same reason — otherwise the arm is billing a
+  machine the server does not advertise.
+- A margin and a cap that are applied in a fixed ORDER belong in one helper. Two
+  sites spelling "85% then cap" agree until one of them is edited.
+- A width chosen from free memory is asked TWICE around an eviction pass, and the
+  second reading is credited only the bytes the ALLOCATOR returned — never
+  `reclaimable`, never `accounted_bytes`. The clamp to the max is the assertion
+  that an eviction cannot take memory away.
+- An admission path logs its bill on the requests it ADMITS, not only on the
+  ones it refuses; both arms format the same fields from the same bill.
 - A resolver whose output is billed back against its own input is a loop; check
   monotonicity in the input before believing the output.
 - A knob that is read on both sides of a bill with opposite signs is not a

@@ -312,6 +312,36 @@ pub var prefill_admission_fits: ?*const fn (*const model_mod.ModelConfig, usize,
 /// exactly the behaviour every arch but qwen4_exp gets anyway.
 pub var prefill_request_chunk: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool) u32 = null;
 
+/// PURE: the prefill width to RUN, given the width the admission bill was
+/// taken at BEFORE the eviction pass (`admitted`) and the width re-asked
+/// against live memory AFTER it (`reasked`).
+///
+/// Audit N5. The width is a function of what is free, and until this the free
+/// memory it was a function of was the memory BEFORE the hot cache gave
+/// anything back: a request whose bill only fit at the ladder floor was
+/// admitted, the eviction pass then returned gigabytes, and the prefill ran at
+/// the floor anyway. Re-asking after the pass is the whole fix — and it is a
+/// re-ask against memory that was ACTUALLY RETURNED (`EvictionReport.bytes`,
+/// the live allocator delta), never against `reclaimable`, which is a
+/// projection. The unsafe order is widening on a promise; this is the safe
+/// one.
+///
+/// `admitted == 0` means no eviction pass ran — nothing was returned, so there
+/// is no second reading and the re-ask IS the only ask. The request keeps the
+/// width it was admitted at.
+///
+/// INVARIANT: an eviction only ever RETURNS memory, so post-eviction
+/// availability is >= pre-eviction and `reasked >= admitted`. The clamp is the
+/// assertion: take the MAX, never narrow. A narrower re-ask means memory moved
+/// under us between the two reads (a co-tenant slot's decode allocations), and
+/// the admitted width is the one a bill was actually taken at — the per-chunk
+/// adapter re-prices from there at the first boundary, which is the mechanism
+/// that is allowed to narrow.
+pub fn postEvictionPrefillChunk(admitted: u32, reasked: u32) u32 {
+    if (admitted == 0) return reasked;
+    return @max(admitted, reasked);
+}
+
 /// Fourth of the family, and the only one the PREFILL LOOP asks rather than
 /// the scheduler: the width of the NEXT chunk, re-priced at every chunk
 /// boundary against live memory (`server.adaptivePrefillWidthNow`). Null keeps
@@ -329,6 +359,13 @@ pub var prefill_chunk_adapt: ?*const fn (
 /// compared, from the module that owns them. A refusal quotes the number it
 /// compared, and the scheduler cannot format a bill it has no estimator for.
 pub var prefill_admission_refused_log: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool) void = null;
+
+/// Invalidate the published hot-cache budget (`server.clearResolvedPrefixCacheMem`).
+/// The budget is PER MODEL but the global holding it is process-wide, so an
+/// unload or a switch must retire it — otherwise the next model's ANE gate
+/// reserves the previous model's cache (audit S5/S7). Same fn-pointer shape as
+/// the neighbours: the scheduler deliberately has no server.zig import.
+pub var hot_cache_budget_invalidate: ?*const fn () void = null;
 
 pub const SlotState = enum { pending_prefill, decoding, finished, errored };
 
@@ -1614,6 +1651,7 @@ pub const Scheduler = struct {
         self.dflash = null;
         self.hot_prefix_cache = null;
         self.resident_hot_cache_bytes.store(0, .monotonic);
+        if (hot_cache_budget_invalidate) |f| f();
         self.reclaimable_hot_cache_bytes.store(0, .monotonic);
         if (self.load_error_name) |n| self.allocator.free(n);
 
@@ -2628,6 +2666,7 @@ fn doLoadDs4OnInferenceThread(sch: *Scheduler, params: anytype) !void {
     sch.dflash = null;
     sch.hot_prefix_cache = null;
     publishHotCacheResidency(sch);
+    if (hot_cache_budget_invalidate) |f| f();
 }
 
 /// llama.cpp load on the inference thread. Mirrors `doLoadDs4OnInferenceThread`:
@@ -2705,6 +2744,7 @@ fn doLoadLlamaOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     sch.dflash = null;
     sch.hot_prefix_cache = null;
     publishHotCacheResidency(sch);
+    if (hot_cache_budget_invalidate) |f| f();
 }
 
 /// The post-load residency bill the eviction gate reserves, in bytes.
@@ -2843,6 +2883,7 @@ fn doLoadGenOnInferenceThread(sch: *Scheduler, params: anytype, modality: gen_mo
     sch.dflash = null;
     sch.hot_prefix_cache = null;
     publishHotCacheResidency(sch);
+    if (hot_cache_budget_invalidate) |f| f();
 }
 
 /// Sum of `*.safetensors` bytes in `model_dir` — the MLX weight footprint used
@@ -4645,6 +4686,7 @@ fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
         sch.dflash = null;
         sch.hot_prefix_cache = null;
         publishHotCacheResidency(sch);
+        if (hot_cache_budget_invalidate) |f| f();
     }
     sch.registry.mutex.lockUncancelable(sch.io);
     sch.registry.accountEvictedLocked(bytes);
@@ -5656,6 +5698,15 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // against a precomputed shortfall: freeing an entry moves live MLX
     // memory, and the gate that runs before the estimator that knows better
     // IS the estimator (#126).
+    //
+    // Audit N5: the width chosen below is a function of what is free, so the
+    // two readings on either side of this pass are two different answers.
+    // `admitted_prefill_chunk` is the pre-eviction one (0 = no pass ran, so
+    // nothing was returned and there is no second reading), and
+    // `evicted_live_bytes` is what the allocator ACTUALLY got back — the live
+    // delta, never `reclaimable`.
+    var admitted_prefill_chunk: u32 = 0;
+    var evicted_live_bytes: u64 = 0;
     if (prefill_admission_fits) |fits_fn| {
         if (slot.model.config) |cfg| {
             // The probe bills what the connection thread's guard admitted
@@ -5686,6 +5737,15 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 .fits = fits_fn,
             };
             if (!Probe.call(&probe)) {
+                // The width admission was billed at, read BEFORE anything is
+                // evicted and only on the path that actually evicts: when the
+                // probe already fits, no memory moves and the single ask below
+                // is the whole story. Same hook, same inputs, same live
+                // memory as the probe that just ran, so this IS the admitted
+                // width and not a second opinion (#126).
+                if (prefill_request_chunk) |pick_pre| {
+                    admitted_prefill_chunk = pick_pre(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, probe.unchunked);
+                }
                 // Per-MODEL, off the slot — same rule as `commitSlotIfApplicable`
                 // ("Phase D: per-model prefix cache"). `sch.hot_prefix_cache`
                 // is whichever model the inference thread loaded last; in a
@@ -5708,6 +5768,11 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 else
                     prefix_cache_mod.EvictionReport{ .admitted = false };
                 publishHotCacheResidency(sch);
+                // `bytes`, not `accounted_bytes`: what the allocator returned,
+                // not what the cache was billed for. A shared snapshot bills
+                // megabytes and returns none, and a width justified by memory
+                // that never came back is an uncatchable Metal OOM.
+                evicted_live_bytes = report.bytes;
                 if (!report.admitted) {
                     // Nothing left to give back. Refuse by NAME — the memory
                     // class, so the client gets a 503 that says so rather
@@ -5740,13 +5805,26 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     const req_prefill_chunk: u32 = if (slot.model.config) |cfg| blk: {
         const pin = cfg.pinned_prefill_chunk;
         const pick = prefill_request_chunk orelse break :blk pin;
-        break :blk pick(
+        const reasked = pick(
             cfg,
             slot.full_prompt.len,
             slot.max_tokens,
             slot.cache.config,
             generate_mod.visionPrefillUnchunked(slot.vision_embeddings != null),
         );
+        // Audit N5. Without an eviction pass this is the only ask and the
+        // request keeps its width; with one it is the SECOND ask, taken
+        // against the memory the pass really returned, and the clamp asserts
+        // the direction (an eviction cannot take memory away).
+        const width = postEvictionPrefillChunk(admitted_prefill_chunk, reasked);
+        if (admitted_prefill_chunk != 0) {
+            if (reasked > admitted_prefill_chunk) {
+                log.info("[prefill] re-ask: width {d} -> {d} after the eviction pass returned {d} MB\n", .{ admitted_prefill_chunk, reasked, evicted_live_bytes >> 20 });
+            } else if (reasked < admitted_prefill_chunk) {
+                log.warn("[prefill] re-ask: width {d} is NARROWER than the admitted {d} after the eviction pass returned {d} MB — memory moved between the two reads; keeping the admitted width (the per-chunk adapter narrows from there)\n", .{ reasked, admitted_prefill_chunk, evicted_live_bytes >> 20 });
+            }
+        }
+        break :blk width;
     } else 0;
 
     // Chunk-boundary decode yields: the hook advances already-decoding
@@ -7575,4 +7653,120 @@ test "the digest snapshot is freed AFTER the inference thread is joined" {
     // join would satisfy nothing above but reintroduce the race.
     const rest = body[free_at + 1 ..];
     try testing.expect(std.mem.indexOf(u8, rest, "self.allocator.free(self.hot_cache" ++ "_digests);") == null);
+}
+
+test "postEvictionPrefillChunk: the width is re-asked after the eviction pass, never narrowed by it" {
+    // Audit N5. `chooseRequestPrefillChunk` prices the ladder against what is
+    // FREE, and until this the free memory it saw was the memory before the
+    // hot cache gave anything back: a 383k prompt was admitted at the ladder
+    // floor, the eviction pass then returned gigabytes, and the prefill ran at
+    // the floor for its whole length.
+
+    // 1. Admitted at 1024, affords 4096 once the pass has returned memory —
+    //    the request runs at 4096. This is the whole point of the fix.
+    try testing.expectEqual(@as(u32, 4096), postEvictionPrefillChunk(1024, 4096));
+    try testing.expectEqual(@as(u32, 8192), postEvictionPrefillChunk(512, 8192));
+
+    // 2. No eviction pass ran (`admitted == 0`): nothing was returned, so
+    //    there is no second reading and the request keeps the width its one
+    //    and only ask produced. A resident cache still narrows the width here
+    //    — deliberately. Widening on memory that was never freed is the
+    //    unsafe order, and the failure costs are not symmetric: a narrow
+    //    width costs throughput, a width justified by absent memory costs an
+    //    uncatchable Metal OOM.
+    try testing.expectEqual(@as(u32, 1024), postEvictionPrefillChunk(0, 1024));
+    try testing.expectEqual(@as(u32, 512), postEvictionPrefillChunk(0, 512));
+
+    // 3. THE INVARIANT, asserted rather than assumed: an eviction only ever
+    //    RETURNS memory, so post-eviction availability is >= pre-eviction and
+    //    the re-ask cannot legitimately come back narrower. If it does,
+    //    memory moved between the two reads (a co-tenant slot's decode) — keep
+    //    the width a bill was actually taken at and let the per-chunk adapter,
+    //    the mechanism that is allowed to narrow, re-price at the first
+    //    boundary.
+    try testing.expectEqual(@as(u32, 4096), postEvictionPrefillChunk(4096, 1024));
+    try testing.expectEqual(@as(u32, 2048), postEvictionPrefillChunk(2048, 512));
+
+    // 4. Unchanged memory is a no-op in both directions — the gate-off arm
+    //    (`requestPrefillChunkNow` hands back the load-time pin for every
+    //    non-per-request arch and under an explicit `--prefill-chunk`) reaches
+    //    this with the SAME number twice and must be byte-identical.
+    inline for (.{ 512, 1024, 2048, 4096, 8192 }) |w| {
+        try testing.expectEqual(@as(u32, w), postEvictionPrefillChunk(w, w));
+    }
+}
+
+test "the per-request width is asked TWICE around the eviction pass, and the pass's live delta is what pays for it" {
+    // The order is the fix: capture the admitted width BEFORE `evictLruToAdmit`,
+    // re-ask AFTER it, clamp to the max. A re-ask that runs before the pass —
+    // or a clamp fed a projection instead of the live delta — is the bug back.
+    // Needles ++-split so this test's own source cannot satisfy the scan.
+    const src = @embedFile("scheduler.zig");
+
+    const capture = "admitted_prefill_chunk = pick_pre(cfg, slot.full_" ++ "prompt.len";
+    const evict = "hc.evictLruToAdmit(slot.full_" ++ "prompt.len, &probe, Probe.call, true)";
+    const returned = "evicted_live_bytes = report" ++ ".bytes;";
+    const clamp = "postEvictionPrefillChunk(admitted_prefill_chunk, " ++ "reasked)";
+
+    const i_capture = std.mem.indexOf(u8, src, capture) orelse return error.CallSiteMoved;
+    const i_evict = std.mem.indexOf(u8, src, evict) orelse return error.CallSiteMoved;
+    const i_returned = std.mem.indexOf(u8, src, returned) orelse return error.CallSiteMoved;
+    const i_clamp = std.mem.indexOf(u8, src, clamp) orelse return error.CallSiteMoved;
+
+    // capture -> evict -> record what came back -> re-ask and clamp.
+    try testing.expect(i_capture < i_evict);
+    try testing.expect(i_evict < i_returned);
+    try testing.expect(i_returned < i_clamp);
+
+    // The credit is the ALLOCATOR's delta. `accounted_bytes` is what the cache
+    // was billed for and a shared snapshot returns none of it; `reclaimable`
+    // is a projection. Neither may reach the width.
+    try testing.expect(std.mem.indexOf(u8, src, "evicted_live_bytes = report" ++ ".accounted_bytes") == null);
+    try testing.expect(std.mem.indexOf(u8, src, "evicted_live_bytes = report" ++ ".reclaimable") == null);
+
+    // ONE definition of the clamp — a second one is a second rule.
+    var defs: usize = 0;
+    var lines = std.mem.splitScalar(u8, src, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "pub fn postEviction" ++ "PrefillChunk(")) defs += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), defs);
+}
+
+test "the re-asked width reaches the request's chunk AND is never capped by the adapter" {
+    // The fix is only worth what it REACHES. Two consumers, two different
+    // rules, and a fold that wires one and not the other ships a width nobody
+    // runs:
+    //
+    //   1. The request's own chunk: `req_prefill_chunk` ->
+    //      `InitOptions.pinned_prefill_chunk` -> `effectivePrefillChunk` ->
+    //      `PREFILL_CHUNK` -> `default_chunk` -> `cur_chunk`, the width the
+    //      FIRST chunk forwards at.
+    //   2. The per-CHUNK adapter's ceiling, `cap_adapt`. It is built from the
+    //      arch resolver with the pin left OUT (a literal `0` rung) precisely
+    //      so widening past the request's width is possible — which also means
+    //      it is >= any ladder width the chooser can return, so a re-ask can
+    //      never be clipped by it. If a fold ever makes `cap_adapt` read the
+    //      pin, the widened width becomes its own ceiling and the adapter can
+    //      only narrow. Needles ++-split so this scan cannot satisfy itself.
+    const sched = @embedFile("scheduler.zig");
+    const gen = @embedFile("generate.zig");
+
+    // 1. The scheduler's width is what init is given.
+    try testing.expect(std.mem.indexOf(u8, sched, ".pinned_prefill_chunk = req_prefill" ++ "_chunk,") != null);
+    // ...and it is the CLAMPED width, not the raw re-ask.
+    try testing.expect(std.mem.indexOf(u8, sched, "break :blk " ++ "width;") != null);
+    // ...which the prefill loop resolves into the width it forwards.
+    try testing.expect(std.mem.indexOf(u8, gen, "options.pinned_prefill" ++ "_chunk,") != null);
+    try testing.expect(std.mem.indexOf(u8, gen, "const default_chunk = if (has_vision and !vision_chunked) loop_end else PREFILL" ++ "_CHUNK;") != null);
+
+    // 2. The adapter's cap excludes the pin. Assert the shape of the call, not
+    //    just the name: the rung argument is the literal 0 on the line before
+    //    the closing paren.
+    const cap = std.mem.indexOf(u8, gen, "const cap" ++ "_adapt: u32 =") orelse return error.CallSiteMoved;
+    const cap_call = gen[cap..@min(cap + 400, gen.len)];
+    try testing.expect(std.mem.indexOf(u8, cap_call, "effectivePrefill" ++ "Chunk(") != null);
+    try testing.expect(std.mem.indexOf(u8, cap_call, "\n                0,\n            ));") != null);
+    try testing.expect(std.mem.indexOf(u8, cap_call, "pinned_prefill" ++ "_chunk") == null);
+    try testing.expect(std.mem.indexOf(u8, cap_call, "PREFILL" ++ "_CHUNK") == null);
 }
