@@ -4506,11 +4506,11 @@ test "the session bill and the advertised context read ONE reserve and ONE margi
     }
 
     // The resolver holds both arms, and the constant is defined once.
-    const res_body = declBody(src, "fn ctxSizingCacheReserve(") orelse return error.CallSiteMoved;
+    const res_body = declBody(src, "fn ctxSizingCache" ++ "Reserve(") orelse return error.CallSiteMoved;
     try t.expect(std.mem.indexOf(u8, res_body, "CTX_SIZING_CACHE_" ++ "RESERVE") != null);
     try t.expect(std.mem.indexOf(u8, res_body, "legacyCtxSizingCache" ++ "Reserve()") != null);
     // The ask is read in ONE place, and it is not the resolved budget.
-    const legacy_body = declBody(src, "fn legacyCtxSizingCacheReserve(") orelse return error.CallSiteMoved;
+    const legacy_body = declBody(src, "fn legacyCtxSizingCache" ++ "Reserve(") orelse return error.CallSiteMoved;
     try t.expect(std.mem.indexOf(u8, legacy_body, "resolvedPrefixCache" ++ "Mem()") == null);
 
     // ONE margin: both consumers apply it through the shared helper rather than
@@ -24004,8 +24004,11 @@ test "ctxSizingCacheReserve: the advertised context is a93e2c0's on every other 
     // sizer does — otherwise the hot-cache floor is built for a session the
     // box never advertises.
     const src = @embedFile("server.zig");
-    const at = std.mem.indexOf(u8, src, "fn ctxSizingCache" ++ "Reserve(") orelse return error.HelperMoved;
-    try t.expect(std.mem.indexOf(u8, src[at..@min(src.len, at + 400)], "config.longCtx" ++ "Gated()") != null);
+    // `declBody`, not a raw `indexOf`: it requires the match to START a line,
+    // so it finds the DECLARATION and never a needle inside another test's
+    // source. (A raw scan found this file's own scan-test needle first.)
+    const res = declBody(src, "fn ctxSizingCache" ++ "Reserve(") orelse return error.HelperMoved;
+    try t.expect(std.mem.indexOf(u8, res, "config.longCtx" ++ "Gated()") != null);
     for ([_][]const u8{ "fn ramFirstContextForLoad(", "fn ssdFirstSessionTokensNow(" }) |decl| {
         const body = declBody(src, decl) orelse return error.CallSiteMoved;
         try t.expect(std.mem.indexOf(u8, body, "ctxSizingCache" ++ "Reserve(config)") != null);
