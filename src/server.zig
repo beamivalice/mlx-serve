@@ -22025,6 +22025,48 @@ test "adaptivePrefillWidth: a widen costs 1.25x AND two consecutive supporting p
     try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, kv, cost_up * 4, 2048, cap, &st3));
 }
 
+test "the tail-merge bound scales ONLY where the per-chunk adaptive width is live" {
+    // BL-5, the arch half. `generate.nextChunkEnd` takes the gate as a
+    // parameter; this is the predicate that fills it. Every arch but an
+    // adaptive-width qwen4_exp keeps the flat `TAIL_MERGE_MAX`, byte for byte,
+    // at every chunk width — including the sub-4096 widths the machine ladder
+    // and the score budget hand out on gemma4, qwen3_5/3_6, muse_glimmer and
+    // deepseek_v4, where the scaled bound was never measured.
+    const t = std.testing;
+
+    // Another arch: the gate fails at its FIRST conjunct (`perRequestPrefillChunk`),
+    // so no env, flag or override can turn it on. Nothing to restore.
+    var other = qwen4RequestTestConfig();
+    other.model_type = "qwen3_5";
+    try t.expect(!other.perRequestPrefillChunk());
+    try t.expect(!adaptivePrefillChunkEnabled(&other));
+    const off = adaptivePrefillChunkEnabled(&other);
+    try t.expectEqual(generate_mod.TAIL_MERGE_MAX, generate_mod.tailMergeMaxFor(512, off));
+    try t.expectEqual(generate_mod.TAIL_MERGE_MAX, generate_mod.tailMergeMaxFor(2048, off));
+    // A 300-token tail at the ladder's 512 rung still merges: ONE chunk.
+    try t.expectEqual(@as(usize, 812), generate_mod.nextChunkEnd(0, 812, 512, false, 0, 0, off));
+
+    // qwen4_exp with the per-chunk width live: the bound scales and the tail
+    // becomes its own chunk.
+    const cfg = qwen4RequestTestConfig();
+    try t.expect(cfg.perRequestPrefillChunk());
+    per_request_chunk_override = true;
+    defer per_request_chunk_override = null;
+    adaptive_chunk_override = true;
+    defer adaptive_chunk_override = null;
+    // The remaining conjuncts are "no operator pinned a width" — env/flag
+    // state, so the gate is asserted against them rather than assumed.
+    const unpinned = explicitPrefillChunk() == 0 and generate_mod.envPrefillChunk() == 0;
+    try t.expectEqual(unpinned, adaptivePrefillChunkEnabled(&cfg));
+    try t.expectEqual(@as(usize, 64), generate_mod.tailMergeMaxFor(512, true));
+    try t.expectEqual(@as(usize, 512), generate_mod.nextChunkEnd(0, 812, 512, false, 0, 0, true));
+    // ...and an operator pin turns the scaling back off with everything else:
+    // that width is what every forward runs, narrowed or not.
+    adaptive_chunk_override = false;
+    try t.expect(!adaptivePrefillChunkEnabled(&cfg));
+    try t.expectEqual(generate_mod.TAIL_MERGE_MAX, generate_mod.tailMergeMaxFor(512, adaptivePrefillChunkEnabled(&cfg)));
+}
+
 test "adaptivePrefillWidth: the ratchet is one-way, and the cap is a ceiling" {
     const t = std.testing;
     const cfg = qwen4RequestTestConfig();
