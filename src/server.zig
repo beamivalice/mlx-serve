@@ -5146,11 +5146,26 @@ pub const WarmPrefix = struct {
     /// slot's cache and passes 0, which credits nothing — its guard defers the
     /// warm decision to the inference thread instead (`checkAttentionMemory`).
     capacity_tokens: u64 = 0,
+    /// Did the restore CHECK OUT its entry (`prefix_cache.checkoutEligible`)?
+    /// Only then are the restored rows the slot's own: everywhere else
+    /// `KVCache.restore` is a refcount SHARE, the entry keeps its second
+    /// reference, `array::is_donatable()` fails and the turn's very first
+    /// `writeAtOffset` privatises the ENTIRE prefix through
+    /// `SliceUpdate::eval_gpu` -> `copy_gpu` (the restore-by-move story). A
+    /// shared restore therefore allocates exactly what the cold bill charges,
+    /// and crediting it is an under-bill on a path whose failure mode is an
+    /// uncatchable Metal abort (audit B-A3). Assigned from restore-move's OWN
+    /// predicate — never re-derived from its conjuncts — so the two decisions
+    /// cannot drift apart.
+    will_donate: bool = false,
 
     /// PURE: rows of KV this request will NOT allocate, because the restore
     /// already handed it the buffer holding them. All-or-nothing on the
     /// capacity gate, and never more than the reservation itself.
     pub fn creditedRows(self: WarmPrefix, reserved: u64) u64 {
+        // A restore that did not check out SHARES; a shared prefix is copied
+        // on the first append, so its rows really are allocated again.
+        if (!self.will_donate) return 0;
         if (self.matched_tokens == 0) return 0;
         if (reserved > self.capacity_tokens) return 0;
         return @min(self.matched_tokens, reserved);
@@ -5632,6 +5647,7 @@ pub fn requestPrefillChunkNow(
     unchunked_prefill: bool,
     warm_matched: u64,
     warm_capacity: u64,
+    warm_will_donate: bool,
 ) u32 {
     const pin: u32 = config.pinned_prefill_chunk;
     const explicit: u32 = explicitPrefillChunk();
@@ -5646,7 +5662,7 @@ pub fn requestPrefillChunkNow(
     var active_mem: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_mem);
     const available: u64 = currentGpuMemoryCeiling(active_mem) -| active_mem;
-    const warm = WarmPrefix{ .matched_tokens = warm_matched, .capacity_tokens = warm_capacity };
+    const warm = WarmPrefix{ .matched_tokens = warm_matched, .capacity_tokens = warm_capacity, .will_donate = warm_will_donate };
     const chosen = chooseRequestPrefillChunk(config, seq, max_tokens, kv_bits, available, pin, 0, warm);
     if (chosen != pin) {
         // `chosen` IS the width (see `chooseRequestPrefillChunk`).
@@ -6078,10 +6094,11 @@ fn logAdmissionDecision(bill: AdmissionBill) void {
 /// fp16 on the inference thread — over-billing by ~2.4x, evicting a hot cache
 /// that did not need to go and refusing by name a request the connection
 /// thread had already admitted. One estimator means one set of INPUTS too.
-pub fn prefillFitsNow(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, unchunked_prefill: bool, warm_matched: u64, warm_capacity: u64) bool {
+pub fn prefillFitsNow(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, unchunked_prefill: bool, warm_matched: u64, warm_capacity: u64, warm_will_donate: bool) bool {
     return prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null, .{
         .matched_tokens = warm_matched,
         .capacity_tokens = warm_capacity,
+        .will_donate = warm_will_donate,
     }).fits();
 }
 
@@ -6089,12 +6106,14 @@ pub fn prefillFitsNow(config: *const model_mod.ModelConfig, prompt_len: usize, m
 /// estimator, re-read after the eviction pass gave back everything it could.
 /// The scheduler calls this through `prefill_admission_refused_log`; it cannot
 /// format a bill it has no estimator for.
-pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, unchunked_prefill: bool, warm_matched: u64, warm_capacity: u64) void {
-    // The SAME warm inputs the probe was refused on, so the refusal quotes the
-    // number it COMPARED and not a cold sibling of it.
+pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, unchunked_prefill: bool, warm_matched: u64, warm_capacity: u64, warm_will_donate: bool) void {
+    // The SAME warm inputs the probe was refused on — the checkout decision
+    // included — so the refusal quotes the number it COMPARED and not a cold
+    // (or, worse, an over-credited) sibling of it.
     const bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null, .{
         .matched_tokens = warm_matched,
         .capacity_tokens = warm_capacity,
+        .will_donate = warm_will_donate,
     });
     const mb = 1024 * 1024;
     // "narrowest width TRIED" is only true where the ladder was walked; on a
@@ -22135,7 +22154,7 @@ test "the admission probe bills the request's OWN kv-quant and chunking, not the
 
     // The probe is a pure forward of its inputs into that one estimator.
     const src = @embedFile("server.zig");
-    const fwd = "return prefillAdmission" ++ "Bill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null, .{\n        .matched_tokens = warm_matched,\n        .capacity_tokens = warm_capacity,\n    }).fits();";
+    const fwd = "return prefillAdmission" ++ "Bill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null, .{\n        .matched_tokens = warm_matched,\n        .capacity_tokens = warm_capacity,\n        .will_donate = warm_will_donate,\n    }).fits();";
     // The needle is assembled with `++`, so this test's own source does NOT
     // contain it: the call site is the only occurrence.
     try t.expectEqual(@as(usize, 1), std.mem.count(u8, src, fwd));
@@ -23042,7 +23061,11 @@ test "a WARM turn is not billed for the prefix it is about to SHARE (786,707 @ 1
     try t.expectEqual(@as(u64, 787_419), reserved);
     try t.expect(reserved <= capacity);
 
-    const warm_prefix = WarmPrefix{ .matched_tokens = matched, .capacity_tokens = capacity };
+    // `will_donate`: this restore CHECKED OUT its entry (SSD-first, full-prefix
+    // hit, switch on), so the buffers are the slot's own and the append donates
+    // in place. Without the checkout the first write copies the whole prefix and
+    // there is nothing to credit — pinned next door (audit B-A3).
+    const warm_prefix = WarmPrefix{ .matched_tokens = matched, .capacity_tokens = capacity, .will_donate = true };
     try t.expectEqual(matched, warm_prefix.creditedRows(reserved));
 
     // The CONTRACT, stated as arithmetic: the credit is the handed-over rows
@@ -23072,7 +23095,7 @@ test "a WARM turn is not billed for the prefix it is about to SHARE (786,707 @ 1
     // credit is a property of what is resident, never of the prompt length.
     try t.expect(prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, .{}) > available);
     // As does a warm prompt whose match is below the restore floor.
-    try t.expect(prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, .{ .matched_tokens = 0, .capacity_tokens = capacity }) > available);
+    try t.expect(prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, .{ .matched_tokens = 0, .capacity_tokens = capacity, .will_donate = true }) > available);
 }
 
 test "a chain extension that OUTGROWS the resident entry is credited nothing" {
@@ -23101,7 +23124,7 @@ test "a chain extension that OUTGROWS the resident entry is credited nothing" {
 
     const reserved = reservedCacheTokens(seq, max_tokens, chunk, getEffectiveContextLength(&cfg));
     try t.expectEqual(@as(u64, 1_048_268), reserved);
-    const extend = WarmPrefix{ .matched_tokens = 786_707, .capacity_tokens = capacity };
+    const extend = WarmPrefix{ .matched_tokens = 786_707, .capacity_tokens = capacity, .will_donate = true };
     try t.expect(reserved > capacity);
     try t.expectEqual(@as(u64, 0), extend.creditedRows(reserved));
     try t.expectEqual(
@@ -23113,13 +23136,151 @@ test "a chain extension that OUTGROWS the resident entry is credited nothing" {
     // the state a `--ctx-size`-wide reservation leaves after one long turn —
     // and the credit is the full shared prefix again. The gate is CAPACITY,
     // not prompt length.
-    const roomy = WarmPrefix{ .matched_tokens = 786_707, .capacity_tokens = 1_048_576 };
+    const roomy = WarmPrefix{ .matched_tokens = 786_707, .capacity_tokens = 1_048_576, .will_donate = true };
     try t.expectEqual(@as(u64, 786_707), roomy.creditedRows(reserved));
     const credit = 786_707 * kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits);
     try t.expectEqual(
         prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, .{}) - credit * 5 / 4,
         prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, roomy),
     );
+}
+
+/// The live 768k scenario's checkout inputs, as `prefix_cache.checkoutEligible`
+/// takes them: a full-prefix hit on a 786,695-token entry by a 786,707-token
+/// prompt, on the SSD-first arm with a slot to hand the buffers to.
+const CheckoutCase = struct {
+    ssd_first: bool = true,
+    move_enabled: bool = true,
+    pending_disk: bool = false,
+    entry_tokens: usize = 786_695,
+    shared: usize = 786_695,
+    prompt_len: usize = 786_707,
+    has_slot: bool = true,
+
+    /// Build the WarmPrefix the scheduler builds, with `will_donate` coming
+    /// from restore-move's OWN predicate — the point of the fix.
+    fn warm(self: CheckoutCase, matched: u64, capacity: u64) WarmPrefix {
+        return .{
+            .matched_tokens = matched,
+            .capacity_tokens = capacity,
+            .will_donate = prefix_cache_mod.HotPrefixCache.checkoutEligible(
+                self.ssd_first,
+                self.move_enabled,
+                self.pending_disk,
+                self.entry_tokens,
+                self.shared,
+                self.prompt_len,
+                self.has_slot,
+            ),
+        };
+    }
+};
+
+test "the warm KV credit fires ONLY where the restore checked its entry out" {
+    const t = std.testing;
+    // AUDIT B-A3. `KVCache.restore` binds the entry's buffers by REFCOUNT, and
+    // mlx donates a `slice_update`'s input only when `is_donatable()` holds —
+    // `use_count() == 1`. The entry's second reference fails it, so on a
+    // SHARED restore the turn's first `writeAtOffset` falls through
+    // `SliceUpdate::eval_gpu` -> `copy_gpu` and privatises the whole prefix:
+    // the credited bytes ARE allocated. Only the CHECKOUT (restore by move)
+    // drops the entry's handles and makes the credit true.
+    //
+    // The credit was gated on `matched > 0` alone, so it fired on every arch
+    // and every partial hit — 12,244 MB removed at the pinned scenario from a
+    // bill whose failure mode is an uncatchable Metal abort, not a 400.
+    const cfg = qwen4ExpOomConfig();
+    const seq: u64 = 786_707;
+    const chunk: u64 = 512;
+    const kv_bits: u64 = 8;
+    const max_tokens: u32 = 200;
+    const mb: u64 = 1024 * 1024;
+    const matched: u64 = 786_676;
+    const capacity: u64 = 787_456;
+    const reserved = reservedCacheTokens(seq, max_tokens, chunk, getEffectiveContextLength(&cfg));
+    const cold = prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, .{});
+
+    // (1) qwen4_exp, SSD-first, full-prefix hit, switch ON: the entry is
+    // checked out, the append donates in place, and the credit is real.
+    const donating = (CheckoutCase{}).warm(matched, capacity);
+    try t.expect(donating.will_donate);
+    try t.expectEqual(matched, donating.creditedRows(reserved));
+    const warm = prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, donating);
+    try t.expectEqual(cold - matched * kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) * 5 / 4, warm);
+    try t.expect(warm / mb > 11_500 and warm / mb < 13_000);
+
+    // Every arm below is the SAME restore minus one conjunct of the checkout,
+    // and every one of them SHARES — so every one of them is billed cold.
+    const shared_arms = [_]WarmPrefix{
+        // (2) a PARTIAL hit: the ordinary chain-divergence case. The entry
+        // describes a prefix this prompt left, the commit lands beside it,
+        // and the checkout is declined so the next request can still use it.
+        (CheckoutCase{ .shared = 700_000 }).warm(matched, capacity),
+        // (3) a non-qwen4 arch: `ssd_first` is `ModelConfig.ssdFirstCapable`
+        // AND a disk tier, so a checkout can never be taken there — yet the
+        // credit used to fire on every warm restore on every arch.
+        (CheckoutCase{ .ssd_first = false }).warm(matched, capacity),
+        // (4) `MLX_SERVE_RESTORE_MOVE=0`, a documented arm: the refcount-share
+        // byte for byte, which is exactly the copy this credit denies.
+        (CheckoutCase{ .move_enabled = false }).warm(matched, capacity),
+        // (5) a pending disk record shares the same buffers, so mlx's own
+        // use_count test would decline the donation anyway.
+        (CheckoutCase{ .pending_disk = true }).warm(matched, capacity),
+        // (6) no slot to hand the buffers to (the connection thread's shape).
+        (CheckoutCase{ .has_slot = false }).warm(matched, capacity),
+    };
+    for (shared_arms, 0..) |arm, i| {
+        errdefer std.debug.print("shared arm {d} credited\n", .{i});
+        try t.expect(!arm.will_donate);
+        try t.expectEqual(@as(u64, 0), arm.creditedRows(reserved));
+        try t.expectEqual(cold, prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, arm));
+    }
+
+    // The capacity gate still binds ON TOP of the checkout: a checked-out
+    // entry whose buffer cannot cover the reservation grows, and a grow
+    // allocates the whole new capacity beside the old one.
+    const outgrown = (CheckoutCase{}).warm(matched, 700_000);
+    try t.expect(outgrown.will_donate);
+    try t.expectEqual(@as(u64, 0), outgrown.creditedRows(reserved));
+}
+
+test "the checkout decision reaches the bill from restore-move's OWN predicate" {
+    const t = std.testing;
+    const src = @embedFile("server.zig");
+    const pc = @embedFile("prefix_cache.zig");
+    const sched = @embedFile("scheduler.zig");
+
+    // ONE predicate. `WarmPrefix.will_donate` is never re-derived from
+    // `ssd_first`/`restoreMoveEnabled`/`pending_disk`/`shared` — the credit
+    // and the checkout drifting apart is the whole defect (audit B-A3).
+    const credited = declBody(src, "    pub fn creditedRows(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, credited, "if (!self.will_" ++ "donate) return 0;") != null);
+    // The estimator never re-derives the checkout: it neither calls the
+    // conjuncts nor spells them. `ssdFirstActive` is the CACHE's arming
+    // predicate and is a different question from "did this restore donate".
+    try t.expectEqual(@as(usize, 0), std.mem.count(u8, src, "prefix_cache_mod.ssdFirst" ++ "Enabled("));
+    try t.expectEqual(@as(usize, 0), std.mem.count(u8, src, "prefix_cache_mod.restoreMove" ++ "Enabled("));
+    const warm_decl = declBody(src, "pub const WarmPrefix = struct {") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, warm_decl, "pending_disk") == null);
+    try t.expect(std.mem.indexOf(u8, warm_decl, "ssd_first") == null);
+
+    // The lookup REPORTS the checkout it took, and it takes it through the
+    // predicate — not a second copy of the conjuncts.
+    const cie = declBody(pc, "    fn checkoutIfEligible(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, cie, "if (!checkout" ++ "Eligible(") != null);
+    try t.expect(std.mem.indexOf(u8, cie, "return false;") != null);
+    try t.expect(std.mem.indexOf(u8, cie, "return true;") != null);
+    try t.expect(std.mem.indexOf(u8, pc, "res.checked_out = self.checkoutIf" ++ "Eligible(") != null);
+
+    // ...and the inference thread's probe carries it into BOTH guards: the
+    // fits probe and the refusal that must quote the number it compared.
+    try t.expect(std.mem.indexOf(u8, sched, "hot_checked_out = lookup.checked_out;") != null);
+    try t.expect(std.mem.indexOf(u8, sched, ".warm_will_" ++ "donate = hot_checked_out,") != null);
+    try t.expectEqual(@as(usize, 2), std.mem.count(u8, sched, "probe.warm_matched, probe.warm_capacity, probe.warm_will_" ++ "donate"));
+
+    // The CONNECTION thread still defers rather than pricing any of this.
+    const guard = declBody(src, "fn checkAttentionMemory(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, guard, "will_" ++ "donate") == null);
 }
 
 test "the shared prefix is subtracted EXACTLY once, and never by the thread that cannot see it" {
@@ -23180,8 +23341,8 @@ test "the shared prefix is subtracted EXACTLY once, and never by the thread that
     try t.expect(std.mem.indexOf(u8, sched, ".warm_matched = hot_matched,\n                .warm_capacity = slot.cache.residentCapacity" ++ "Tokens(),") != null);
     // The refusal is re-billed with the SAME warm inputs, so it quotes the
     // number it compared and not a cold sibling of it.
-    try t.expect(std.mem.indexOf(u8, sched, "probe.unchunked, probe.warm_matched, probe.warm_capacity);") != null);
-    try t.expectEqual(@as(usize, 2), std.mem.count(u8, sched, "probe.warm_matched, probe.warm_capacity"));
+    try t.expect(std.mem.indexOf(u8, sched, "probe.unchunked, probe.warm_matched, probe.warm_capacity, probe.warm_will_" ++ "donate);") != null);
+    try t.expectEqual(@as(usize, 2), std.mem.count(u8, sched, "probe.warm_matched, probe.warm_capacity, probe.warm_will_" ++ "donate"));
 }
 
 test "pinnedResidentBytes names the entry a restore would share, and only that" {

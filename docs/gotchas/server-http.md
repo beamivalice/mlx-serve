@@ -3652,3 +3652,39 @@ value that is zero forever on a linear-layer trunk. The fold now SKIPS an
 uninitialized entry and takes the minimum over those that hold a buffer, 0 when
 none does — which is also the safe direction, since a caching layer with no rows
 yet can only happen while the whole cache is cold.
+
+### ...and "hands over without allocating" means the CHECKOUT, not the restore (audit B-A3)
+
+The third bite of the same rule, and the one that shows how narrow it really is.
+The credit fired on `matched > 0`: any restore, any arch. But `KVCache.restore`
+is `mlx_array_set` — a refcount bump — and the story two sections up
+("Restore by MOVE") is the proof that a refcount-shared prefix is COPIED by the
+turn's first `writeAtOffset`: `is_donatable()` is
+`array_desc_.use_count() == 1 && data.use_count() == 1`, the entry's second
+reference fails it, and `SliceUpdate::eval_gpu` falls through to `copy_gpu` on
+the whole prefix. A shared restore therefore allocates exactly what the COLD
+bill charges. Only the CHECKOUT — `HotPrefixCache.checkoutEligible`, which drops
+the entry's own handles so the slot is the sole owner — makes the credited rows
+rows nobody allocates.
+
+The checkout is narrow: SSD-first (qwen4_exp AND a disk tier) ∧ full-prefix hit
+∧ no pending disk record ∧ `MLX_SERVE_RESTORE_MOVE`. So the credit was an
+under-bill on every non-qwen4 arch, on every PARTIAL hit (the ordinary
+chain-divergence case), while a flush is pending, and on both documented
+kill-switch arms — 12,244 MB removed at the pinned 786,707-token scenario, on a
+path whose failure mode is an uncatchable Metal abort rather than a 400.
+
+The fix carries the decision rather than re-deriving it: `checkoutIfEligible`
+RETURNS whether it took the checkout, `LookupResult.checked_out` carries it out
+of the cache, the scheduler's `hot_checked_out` rides beside `hot_matched` into
+both inference-thread guards (the fits probe and the refusal that must quote the
+number it compared), and `WarmPrefix.will_donate` gates `creditedRows` ahead of
+the capacity gate. ONE predicate: a scan pins that the estimator never calls or
+spells `ssdFirstEnabled`/`restoreMoveEnabled`/`pending_disk`, because the credit
+and the checkout drifting apart IS the defect. The connection thread is
+unchanged — it still has no slot, no cache and no capacity reading, so it defers
+(`pinnedResidentBytes`) instead of pricing any of this.
+
+Numbers at the pinned scenario are unchanged where the checkout is taken: cold
+24,475 MB, credit 786,676 × 13,056 × 5/4 = 12,244 MB, warm 12,231 MB against
+19,032 MB free. Everywhere else the bill is the cold one again.
