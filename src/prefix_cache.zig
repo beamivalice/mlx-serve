@@ -1902,6 +1902,42 @@ pub const HotPrefixCache = struct {
         return self.current_kv_bytes -| largest;
     }
 
+    /// The same question asked with the PROMPT in hand: bytes an eviction pass
+    /// can prove it will get back, given that only an entry this prompt could
+    /// actually restore from is unevictable.
+    ///
+    /// `reclaimableBytes` above subtracts the largest entry unconditionally
+    /// because its caller has no prompt and a restore pins at most one entry.
+    /// That rule is maximally pessimistic exactly where SSD-first puts the
+    /// steady state: ONE resident entry, so it always subtracts the whole
+    /// cache — and a request for a DIFFERENT session is then judged as if a
+    /// fully-flushed entry were immovable, though nothing would have shared it.
+    ///
+    /// Here an entry is excluded only when it shares a restorable prefix with
+    /// `prompt_tokens`. Two deliberate conservatisms:
+    ///   * the key filters (`has_tools`, quant, vision) are NOT applied — the
+    ///     caller may not know them, and skipping them can only ADD candidates,
+    ///     never remove one the real lookup would pick;
+    ///   * among qualifying entries the LARGEST is subtracted, not the
+    ///     longest-matching one. The real lookup ranks by restorable position
+    ///     and may pick a different entry than a raw token peek would; taking
+    ///     the largest covers whichever it picks.
+    /// So this is never larger than the truth, and never smaller than
+    /// `reclaimableBytes()` — it degenerates to it when every entry matches.
+    pub fn reclaimableBytesFor(self: *const HotPrefixCache, prompt_tokens: []const u32) u64 {
+        var pinned: u64 = 0;
+        for (self.entries.items) |*e| {
+            const max_shared = @min(e.tokens.len, prompt_tokens.len);
+            var shared: usize = 0;
+            while (shared < max_shared and e.tokens[shared] == prompt_tokens[shared]) shared += 1;
+            // Below the floor the lookup reports a cold miss and restores
+            // nothing, so the entry is not pinned by this prompt.
+            if (shared < MIN_CANCELLED_COMMIT_TOKENS) continue;
+            pinned = @max(pinned, e.kv_bytes);
+        }
+        return self.current_kv_bytes -| pinned;
+    }
+
     /// LIMIT THE CACHE WHILE MEMORY IS LEFT. Evict least-recently-used
     /// entries until `fits()` says the request fits, and report what it cost.
     ///
@@ -4096,4 +4132,54 @@ test "SSD-first: one resident session makes reclaimableBytes truthfully ZERO" {
     hc.spillIdleEntries(s);
     try testing.expectEqual(@as(usize, 1), hc.entryCount());
     try testing.expectEqual(@as(u64, 0), hc.reclaimableBytes());
+}
+
+test "reclaimableBytesFor: only an entry the PROMPT could restore from is unevictable" {
+    // The conn-thread guard's credit, asked with the prompt in hand. Under
+    // SSD-first the steady state is ONE resident entry, where the
+    // prompt-blind rule always subtracts the whole cache — so a different
+    // session's request is judged as if a fully-flushed entry were immovable.
+    const s = mlx.gpuStream();
+
+    var tokens_a: [600]u32 = undefined;
+    for (&tokens_a, 0..) |*t, i| t.* = @intCast(i + 7);
+    var tokens_b: [600]u32 = undefined;
+    for (&tokens_b, 0..) |*t, i| t.* = @intCast(i + 90_000);
+
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 1, 600);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc.ssd_first = true;
+    defer hc.deinit();
+    try hc.commit(&cache, &tokens_a, false);
+    try testing.expectEqual(@as(usize, 1), hc.entryCount());
+    const resident = hc.residentBytes();
+    try testing.expect(resident > 0);
+
+    // (1) The prompt EXTENDS the resident session: the entry is the request's
+    // own KV once restored — shared buffers, nothing to reclaim. D2 stands.
+    try testing.expectEqual(@as(u64, 0), hc.reclaimableBytesFor(&tokens_a));
+    try testing.expectEqual(@as(u64, 0), hc.reclaimableBytes());
+
+    // (2) A DIFFERENT session's prompt: nothing would share this entry, so its
+    // bytes ARE reclaimable — where the prompt-blind rule says 0.
+    try testing.expectEqual(resident, hc.reclaimableBytesFor(&tokens_b));
+    try testing.expect(hc.reclaimableBytesFor(&tokens_b) > hc.reclaimableBytes());
+
+    // A prefix too short to restore from does not pin the entry either.
+    var barely: [600]u32 = undefined;
+    for (&barely, 0..) |*t, i| t.* = @intCast(i + 7);
+    for (barely[MIN_CANCELLED_COMMIT_TOKENS - 8 ..]) |*t| t.* = 424_242;
+    try testing.expectEqual(resident, hc.reclaimableBytesFor(&barely));
+
+    // (3) Two entries, prompt matches one: only THAT one is withheld.
+    try hc.commit(&cache, &tokens_b, false);
+    try testing.expectEqual(@as(usize, 2), hc.entryCount());
+    const both = hc.residentBytes();
+    const credit_a = hc.reclaimableBytesFor(&tokens_a);
+    try testing.expect(credit_a > 0 and credit_a < both);
+    // Never larger than the truth, never smaller than the prompt-blind rule.
+    try testing.expect(credit_a >= hc.reclaimableBytes());
 }
