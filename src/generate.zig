@@ -5616,27 +5616,6 @@ pub const Generator = struct {
         return null;
     }
 
-    /// Fold ONE plain serial decode token into the model's serial cell. Every
-    /// serial decode tick the server runs passes through here: a request that
-    /// never armed MTP (`enable_mtp:false`, `--no-mtp`), one whose
-    /// speculation turned itself off, and the bounded probe. The first
-    /// `MTP_ADAPTIVE_PROBE_WARM` ticks of a block are offered as transitions
-    /// — the GPU still holds the previous round's tail — and contention only
-    /// ever ADDS time, so a busy server restarts the clock rather than
-    /// teaching the table a lie.
-    /// Will ANYONE read a serial cell for this model? The cell exists for
-    /// exactly one consumer, the adaptive switch, so folding one anywhere
-    /// else is pure cost: `observeSerialTick` sits on the scheduler's regular
-    /// decode path, which every model takes, so gemma3, llama, a GGUF and any
-    /// `--no-mtp` boot were all folding a serial cell on every token and
-    /// rewriting `~/.mlx-serve/round-cost/<key>.txt` at the end of every
-    /// request for a table nothing would ever read.
-    ///
-    /// The gate is on the MODEL, not the request: `enable_mtp:false` against a
-    /// checkpoint that HAS a head is the cleanest source of serial data there
-    /// is, and it must keep feeding the cell. Known gap: a request that opted
-    /// out of a SIDECAR head has neither `self.mtp` nor `xfm.qwen4_mtp`, so it
-    /// does not fold — conservative, and never wrong.
     /// S22 / L27. Model-level twin of `mtpAdaptiveArchEligible`: is the
     /// adaptive switch's whole calibration valid for THIS checkpoint?
     ///
@@ -5655,6 +5634,20 @@ pub const Generator = struct {
         return mtpAdaptiveModelEligible(self.model_has_mtp, self.xfm.qwen4_mtp != null);
     }
 
+    /// Will ANYONE read a serial cell for this model? The cell exists for
+    /// exactly one consumer, the adaptive switch, so folding one anywhere
+    /// else is pure cost: `observeSerialTick` sits on the scheduler's regular
+    /// decode path, which every model takes, so gemma3, llama, a GGUF and any
+    /// `--no-mtp` boot were all folding a serial cell on every token and
+    /// rewriting `~/.mlx-serve/round-cost/<key>.txt` at the end of every
+    /// request for a table nothing would ever read.
+    ///
+    /// The gate is on the MODEL, not the request: `enable_mtp:false` against a
+    /// checkpoint whose serial row IS read is the cleanest source of serial
+    /// data there is, and it must keep feeding the cell. Scope (L27): a
+    /// SIDECAR pack never folds a serial cell AT ALL — `mtpAdaptiveModelOk`
+    /// declines the whole ARCH, not merely the request that opted out —
+    /// because nothing on that arch will ever read the row.
     pub fn serialCellWanted(self: *const Generator) bool {
         if (!mtpAdaptiveSerialEnabled() or !mtpCostTableEnabled()) return false;
         // The ARCH gate first: on a sidecar pack nothing reads the serial
@@ -5687,6 +5680,14 @@ pub const Generator = struct {
         self.mtp_serial_warm = 0;
     }
 
+    /// Fold ONE plain serial decode token into the model's serial cell. Every
+    /// serial decode tick the server runs passes through here: a request that
+    /// never armed MTP (`enable_mtp:false`, `--no-mtp`), one whose
+    /// speculation turned itself off, and the bounded probe. The first
+    /// `MTP_ADAPTIVE_PROBE_WARM` ticks of a block are offered as transitions
+    /// — the GPU still holds the previous round's tail — and contention only
+    /// ever ADDS time, so a busy server restarts the clock rather than
+    /// teaching the table a lie.
     pub fn observeSerialTick(self: *Generator) void {
         if (!self.serialCellWanted()) {
             self.mtp_serial_clock = null;
