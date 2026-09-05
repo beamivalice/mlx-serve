@@ -3177,12 +3177,18 @@ pub const Generator = struct {
 
         const step_logits = self.pending_logits;
         self.has_pending_logits = false;
-        const lazy = self.sampleLazy(step_logits);
-        _ = mlx.mlx_array_free(step_logits);
-        try mlx.check(mlx.mlx_array_eval(lazy));
-        var val: i32 = 0;
-        try mlx.check(mlx.mlx_array_item_int32(&val, lazy));
-        _ = mlx.mlx_array_free(lazy);
+        // Same hole as `mtpSerialCaptureTick` (N17) and the site that one was
+        // copied from: with the latch these checks RETURN instead of ending
+        // the process, so the handle needs an owner on the error path.
+        const val: i32 = blk: {
+            const lazy = self.sampleLazy(step_logits);
+            _ = mlx.mlx_array_free(step_logits);
+            defer _ = mlx.mlx_array_free(lazy);
+            try mlx.check(mlx.mlx_array_eval(lazy));
+            var v: i32 = 0;
+            try mlx.check(mlx.mlx_array_item_int32(&v, lazy));
+            break :blk v;
+        };
         self.next_token_id = @intCast(val);
         return .{ .drained = token };
     }
@@ -5573,11 +5579,22 @@ pub const Generator = struct {
         self.advanceStep(1);
         try self.generated_ids.append(allocator, token);
 
-        const lazy = self.sampleLazy(logits);
-        try mlx.check(mlx.mlx_array_eval(lazy));
-        var val: i32 = 0;
-        try mlx.check(mlx.mlx_array_item_int32(&val, lazy));
-        _ = mlx.mlx_array_free(lazy);
+        // N17. Both checks below now RETURN on a Metal working-set abort
+        // instead of ending the process — that is what the error latch is for,
+        // and it is exactly the failure this code path exists to survive — so
+        // the handle needs an owner on the error path. A scoped `defer` rather
+        // than an `errdefer` plus a manual free: this function ends in
+        // `return try mtpSerialOneToken(...)`, and an errdefer paired with an
+        // explicit free would double-free the moment anything after the free
+        // fails.
+        const val: i32 = blk: {
+            const lazy = self.sampleLazy(logits);
+            defer _ = mlx.mlx_array_free(lazy);
+            try mlx.check(mlx.mlx_array_eval(lazy));
+            var v: i32 = 0;
+            try mlx.check(mlx.mlx_array_item_int32(&v, lazy));
+            break :blk v;
+        };
         self.next_token_id = @intCast(val);
 
         // Block over. The next MTP round must not bill the serial block it
