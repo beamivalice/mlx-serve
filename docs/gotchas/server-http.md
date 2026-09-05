@@ -2133,6 +2133,25 @@ re-clamping an already-clamped value on the next model load would ratchet the
 budget toward 1 byte across a model swap. A line scan over `server.zig` pins
 that no code path reads the ask directly except the accessor's own fallback.
 
+**Known limit — the ANE gate reads the budget before the load publishes it.**
+`aneGateHeadroom` is the one remaining consumer (after the sizer fix above,
+`computeMemoryContext` no longer reads the published budget at all), and it is
+NOT ordered behind the resolver: `doLoadOnInferenceThread` calls
+`buildAnePrefill(..., params.ane_headroom_resolver)` at `scheduler.zig` ~3929,
+while `prefixCacheMemForLoad` publishes ~74 lines later at ~4004. So on a first
+boot the gate reads the pre-load fallback — the raw ask, which is the LARGER
+reserve, so the direction is conservative — and after a model switch that leaves
+the previous entry resident, or a load of a model whose prefix cache is off
+(`scheduler.zig` ~4110 is `if (entry.prefix_cache) |*hc|` with no else, so
+neither the resolver nor the retire hook runs), model B's gate can reserve model
+A's budget. What DID land is the staleness half: `hot_cache_mem_resolved` is
+atomic, and `scheduler.hot_cache_budget_invalidate` retires the published number
+at every site that drops the resident cache (five sites; the test scans for the
+PAIRING, so a sixth drop site fails the scan). The ordering half is open. It is
+reachable only through `--ane-prefill`, which is opt-in and M4-and-below, and
+this box cannot exercise that path — so the reorder is recorded as a follow-up
+rather than done blind. Do not read this section as "S7 fixed".
+
 **The damage was worse than a mis-sized reserve: it floored the ADVERTISED
 context.** Right-hand column of the probe table above — `max_safe_context` goes
 1.03M -> 565k -> 34k -> **1,024** as the ask grows 10 -> 24 -> 40 -> 60 GB.
@@ -3175,3 +3194,57 @@ load-generation and 0.9x-threshold branches, `admissionVerdict` against the
 arms' own predicates, a same-bill scan proving the admit and refuse arms format
 from one shared value, the post-load single-CAS arming scan, and
 `log.enabled`/`log.atLevel` gating.
+
+## The SSD-first write-through was 100% of a warm turn's TTFT regression (2026-09-05)
+
+On the warm control ladder (a restored prefix plus a 31-token instruction tail)
+the SSD-first bundle prefilled new tokens at 60-98 tok/s where the branch
+without the write-through ran 196-235. Decode was equal, the adaptive width
+probe never fired (a warm turn is one chunk, so `pos == loop_end` and the hook
+is not called), and every other candidate was bounded by a 2-3 ms residual. The
+whole gap is the prefill write-through, which runs inside the chunk loop on the
+inference thread and therefore lands inside `prompt_ms` and inside TTFT:
+
+| rung | `prompt_ms` with | without | Δ | write-through persist | unexplained |
+|---|---|---|---|---|---|
+| 16k (16,357 tok) | 316.1 | 133.3 | **182.8** | 181 ms / 203.7 MB / +16 chunks | 1.8 ms |
+| 32k (32,427 tok) | 506.3 | 144.9 | **361.4** | 358 ms / 403.9 MB / +32 chunks | 3.4 ms |
+| 64k (65,665 tok) | 899.3 | 156.5 | **742.8** | 741 ms / 818.0 MB / +65 chunks | 1.8 ms |
+
+Matched 1:1 by the persist at every rung, reproduced on a second boot
+(186/369/753 ms of persist against Δ 204/371/755 ms), four warm arms per rung
+all within 6 ms. Not variance. Source: `~/claude-tmp/bench-qwen4-ladder/WARM_TURN_TRACE.md`.
+
+**Half of it was a per-TENSOR GPU sync wearing bandwidth's clothes.**
+`DiskTier.serializeSafetensors` called `mlx_array_eval` on one array at a time.
+12 KV layers x 6 affine buffers x 32 chunks is ~2,300 full syncs on a 32k warm
+turn — a fixed per-tensor cost that reads as a flat ~1.13 GB/s, against the
+7-8 GB/s the same data reaches through `mlx_save_safetensors` on the same box.
+The tell was in the same log: the end-of-request disk commit goes through mlx's
+own saver (which evals ONCE) and ran 7x faster per byte than the write-through.
+
+The split is `materializeContiguous` (the contiguous pass, then ONE batched
+`mlx_eval` over a vector — exactly what `mlx::core::save_safetensors` does) plus
+`encodeSafetensors` (pure header + payload; no stream, no eval). The output is
+byte-identical, and that is the point: **the eval strategy is a latency
+decision, never a format one.** A regression here is byte-invisible, so it is
+pinned three ways — a timing-free `serialize_eval_count` demanding exactly one
+eval per chunk file, the pre-fix per-tensor materializer kept as a test-only
+golden with the two images compared byte-for-byte, and a scan fixing the SHAPE
+(one eval, batched form, at function-body indent after the loop closes).
+
+**The other half was persisting a prefix that had nothing new in it.**
+`writeThroughArmed` now also takes this turn's un-cached span
+(`prefill_tokens.len`) and declines below one `chunk_tokens`
+(`writeThroughSpanReached`, a pure helper with its own unit test; a scan pins
+that the arming site passes the un-cached tail and that the gate compares
+against the tier's OWN `chunk_tokens`). A restored 32k prefix plus a 31-token
+tail has no chunk-aligned progress a cancel could lose, so the turn was paying
+in-request for a prefix the end-of-request commit persists anyway — and that
+commit runs after the response text, where it costs the user nothing. Declining
+is announced once, not per request.
+
+The rule underneath both halves: **the write-through's job is to make a KILLED
+prefill restartable, not to be the persistence mechanism.** It buys nothing on a
+turn that cannot lose a chunk, and anything it does buy is charged to TTFT — so
+its cost per chunk is a first-class number, not an implementation detail.
