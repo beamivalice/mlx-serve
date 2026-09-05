@@ -3652,3 +3652,73 @@ value that is zero forever on a linear-layer trunk. The fold now SKIPS an
 uninitialized entry and takes the minimum over those that hold a buffer, 0 when
 none does — which is also the safe direction, since a caching layer with no rows
 yet can only happen while the whole cache is cold.
+
+## PR #363 blast-radius ledger — what runs on archs the PR never measured
+
+PR #363 is described as a qwen4_exp (Qwen3.8-Flash-Next) long-context
+optimization. It is not one: a systematic sweep of
+`git diff a93e2c0..aad0315 -- src/` found behaviour changes reaching llama,
+mistral, gemma3/4, muse_glimmer, qwen3_5 (the 27B sidecar-MTP pack),
+qwen3_5_moe, qwen3_next, lfm2, nemotron_h, bailing_hybrid and deepseek_v4 —
+none of which was benchmarked, and several of which can only lose.
+
+The policy this ledger encodes: **every long-context behaviour change is
+qwen4_exp-gated by ONE predicate (`ModelConfig.longCtxGated()`); other archs
+are byte-identical to a93e2c0, characterization-pinned. Genuine bug fixes are
+NOT gated — they ship for everyone.**
+
+Classes: **A** = bug fix, keep for all archs. **B** = output-preserving, proof
+cited. **C** = behaviour change on a non-qwen4 arch, must be gated. **D** =
+already unreachable off qwen4 by a verified guard (a comment claiming a guard
+is not a guard — every D below was checked by reading the predicate body).
+
+### Class C — gated by this round
+
+| # | site | what changed for other archs | gate | pin |
+|---|---|---|---|---|
+| 1 | `KVCache.reserve` from `generate.runPrefill` | every arch past a 32k prompt allocated prompt + 8192 + chunk of KV up front instead of the +25% ladder | `generate.reservedPrefillTokens` returns 0 ungated ⇒ `reserve_tokens` stays 0 ⇒ `nextCapacityReserved` IS `nextCapacity` | `reservedPrefillTokens:` tests + the one-call-site scan |
+| 2 | `scheduler.batchKvLenOf` / `Slot.batchKvLen` | a93e2c0 fed the pad-waste cap `cache.step`, which is 0 forever on a linear-layer-0 trunk, so the cap was DEAD there; the PR wakes it and skewed groups now split on qwen3_5 dense and qwen3_next | `batchKvLenOf(cache, cfg)` — `cfg.longCtxGated()` picks the kv-length rule, else `cache.step` | `batchKvLen:` characterization over the four hybrid families |
+| 3 | `transformer.spanPreservingDropIndex` at five retention sites | a93e2c0 had TWO baselines: drop-oldest at the two prefill-capture sites and at the disk tier, min-span-with-NO-recency-quarter at `mergeCheckpointLists`/`shedCheckpointsToFit`. The PR replaced both with min-span + a dense newest quarter, so which checkpoint a warm turn restores from moved on every hybrid | a per-site `ThinPolicy` chosen by the ONE predicate; the ungated arm names which a93e2c0 policy it reproduces | retention characterization per site |
+| 4 | `server.prefillRequestTerms` (all four terms) | reserved KV headroom billed on every arch while its allocator twin was gated; retained SSM checkpoints (~1.9 GB) billed on qwen3_5/qwen3_5_moe/qwen3_next/bailing_hybrid but NOT lfm2/nemotron_h; the warm credit under-bills on every arch | `if (!config.longCtxGated()) return .{};` — `.{}` is the identity for `prefillMemoryNeeded`, so the bill is a93e2c0's 13-argument expression | bill characterization + the sizer/bill consistency test on qwen4 |
+| 5 | `server.prefillChunkCap` (ex-`resolvePrefillChunk`) | TWO changes at once: the hot-cache ask was dropped from the serving budget (widens the rung) and the ctx bar was added (can pin chunk 512 for a process) | one gated helper; the ungated arm is a93e2c0's `(ceiling − (active + ask)) / SHARE` | `prefillChunkCap:` characterization over seven archs |
+
+### Class C — found by the sweep, still open
+
+| site | reach | note |
+|---|---|---|
+| `prefix_cache.evictLruToAdmit` + `reclaimableBytes`/`digestsAlloc`/`reclaimableFromDigests` + `scheduler`'s `prefill_admission_fits` pass + `error.PrefillDoesNotFit` | every arch, every request | wholly new (a93e2c0 has none of it). A long prefill now EVICTS hot-cache entries and can be refused by a name that did not exist. The `publishHotCacheResidency` half is class A (it fixes a real connection-thread use-after-free on `hot_prefix_cache`); the CREDIT and the EVICTION are the policy change |
+| `prefix_cache.trimLenForBudget` shed simulation | every hybrid, no flag needed | a93e2c0 billed EVERY lower checkpoint; the PR bills only shed survivors, so it systematically retains a LONGER prefix at the same budget |
+| `server.prefixCacheMemForLoad` | every arch | three simultaneous input changes to the resolved hot-cache budget: static instead of live ceiling, `ramFirstContextForLoad` instead of `getEffectiveContextLength`, `planHotCache` instead of the direct clamp |
+| `server.computeMemoryContext` → `CTX_SIZING_CACHE_RESERVE` | every arch | changes the ADVERTISED `context_length` whenever `--prefix-cache-mem` differs from the 2 GiB default; agent CLIs read that number once per session |
+| `server.checkAttentionMemory` new evict / warm-deferral admit arms | every arch, four surfaces | a93e2c0 refused pre-flight with a clean 400; the PR admits and can die later after evicting the whole hot cache |
+| `kv_disk_cache.SSM_DISK_MAX_PER_ENTRY` 8 → 16 | every hybrid with `--prefix-cache-disk` | doubles the persisted checkpoint footprint per entry and changes `gcToBudget` pressure |
+| `kv_disk_cache` meta.json `"v":4` → `"v":6`, written unconditionally | every arch with disk on | forward-compatible, NOT backward: an a93e2c0 binary rejects v6 and discards the whole persisted tier on downgrade |
+| `prefix_cache` trim retry loop | every arch, error path | a failed `trimmedCopy` retries at the next-lower checkpoint instead of declining |
+| `ModelConfig.perRequestPrefillChunk` | — | hand-rolls `model_type == "qwen4_exp"` instead of delegating; `model.zig`'s own doc forbids exactly that (a second predicate drifts) |
+
+### Class A — kept for every arch, deliberately ungated
+
+The MLX error latch (`mlx.installErrorHandler`, `checkError` in the prefill
+chunk loop and both decode ticks, `commitSlotIfApplicable`'s `errorPending`
+guard — a Metal working-set abort used to `exit(-1)`, and a poisoned prefix
+used to be committed from an EOS the failing forward produced); the
+`Transformer` teardown double free of `aux_state`/`qsa_pooled`; the
+`publishHotCacheResidency` scalar (the guard used to dereference
+inference-thread state); `hot_cache_digests` freed below the thread join;
+`warmQsaEnvCaches`/`warmEnvCaches` on the main thread (first touch of a lazy
+`?bool` cache from two threads is a race); `snapshotRowBytes`' ndim guard (an
+out-of-bounds shape read on a dense snapshot); the slot error-NAME mapping
+(`slotFailure`, `errorIsMemory`) that turns a memory failure into a 503 and a
+pre-prefill refusal into a 400 instead of a generic 500; and
+`kv_disk_cache.appendSsmOnly`'s byte accounting, which drops the spec
+sidecar's size delta and drifts `total_bytes` on every sidecar-only commit
+(reachable on any arch with a dflash/MTP snap plus `--prefix-cache-disk`).
+
+### The rule this leaves
+
+A "qwen4_exp long-context" change that touches a shared function is a
+cross-arch change until a predicate says otherwise. The predicate is
+`ModelConfig.longCtxGated()`, it has ONE body, and a site that cannot see a
+ModelConfig mirrors it ONCE into a field at wiring time
+(`HotPrefixCache.span_preserving_cps`, the `qsa_history_required` pattern) and
+is scan-pinned to it.
