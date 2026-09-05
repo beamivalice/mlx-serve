@@ -3323,6 +3323,15 @@ fn qwen4RequestTestConfig() model_mod.ModelConfig {
     cfg.num_attention_heads = 24;
     cfg.num_key_value_heads = 2;
     cfg.head_dim = 256;
+    // No sliding-band layers: the trunk is GDN + full attention with QSA, and
+    // `ModelConfig`'s field DEFAULTS to true, which is a different arch and a
+    // different prefill-chunk policy family (it routes `boundedPrefillChunk`
+    // down the composed-causal score-budget path, where every rung collapses
+    // to the floor past ~300k and the whole per-request mechanism reads as a
+    // no-op). A test config is a checkpoint claim: leave a field at a default
+    // the real pack does not have and the test measures a machine that does
+    // not exist.
+    cfg.has_sliding_window = false;
     cfg.hidden_size = 2560;
     cfg.moe_intermediate_size = 1024;
     cfg.num_experts_per_tok = 8;
@@ -3335,6 +3344,49 @@ fn qwen4RequestTestConfig() model_mod.ModelConfig {
     cfg.indexer_compress_ratio = 4;
     cfg.pinned_prefill_chunk = 1024; // what load-time sizing gives at 1M ctx
     return cfg;
+}
+
+/// The source of one top-level declaration: from its header to the closing
+/// brace in column 0.
+///
+/// Two traps, both hit live while writing these scans. A fixed-size window is
+/// a landmine — a comment grows and the scan silently stops covering the line
+/// it was written for. And a bare `indexOf` finds the SCAN'S OWN string
+/// literal when the test sits above the declaration it names, so it happily
+/// verifies a claim about itself; the header must start a LINE.
+fn countDecls(src: []const u8, header: []const u8) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, src, i, header)) |at| {
+        i = at + 1;
+        if (at > 0 and src[at - 1] == '\n') n += 1; // a declaration, not a scan's own literal
+    }
+    return n;
+}
+
+fn declBody(src: []const u8, decl: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, src, i, decl)) |at| {
+        i = at + 1;
+        if (at == 0 or src[at - 1] != '\n') continue; // a mention, not a declaration
+        const rest = src[at..];
+        const end = std.mem.indexOf(u8, rest, "\n}\n") orelse return rest;
+        return rest[0 .. end + 3];
+    }
+    return null;
+}
+
+/// The width a ladder rung actually forwards at for this prompt — the resolver
+/// the chooser prices against, spelled once so the tests cannot drift from it.
+fn widthForRung(cfg: *const model_mod.ModelConfig, seq: u64, rung: u32) u32 {
+    return @intCast(generate_mod.effectivePrefillChunk(
+        cfg.prefillScoreHeadDim(),
+        cfg.num_attention_heads,
+        @intCast(seq),
+        cfg.has_sliding_window,
+        cfg.isMoe(),
+        rung,
+    ));
 }
 
 test "the per-token widths the request chooser is built on" {
@@ -3355,70 +3407,93 @@ test "chooseRequestPrefillChunk: an ordinary prompt buys the wide chunk a 1M ses
     // The user's bar: `--ctx-size 1048576` with no chunk or cache flags must
     // still prefill ordinary prompts at the wide chunk. Load-time sizing
     // cannot do it — it has to reserve for the whole configured session, which
-    // at 1M is 20,736 MiB of a 28,909 MiB serving budget, leaving one rung.
-    // But the request in front of the server is not a 1M session, and the
-    // admission bill is the one estimator that knows the difference.
+    // at 1M is 20,736 MiB of a 28,909 MiB serving budget, leaving rung 1024
+    // for every prompt of the boot. The request in front of the server is not
+    // a 1M session, and the admission bill is the estimator that knows it.
+    //
+    // MEASURED bills for this shape at `available` = 28,909 MiB (ceiling minus
+    // the 69 GB pack), in MB, from the estimator itself:
+    //   seq      w4096   w2048   w1024   w512
+    //   4,096     3981    2441    1521    1136
+    //   300,000  12743   11249   10351    9978
+    //   384,000  15024   13529   12632   12258
+    //   1,048,576 33027  31532   30635   30261
     const t = std.testing;
     const cfg = qwen4RequestTestConfig();
     const kv_bits: u64 = 8;
-    const available: u64 = 28_909 * (1 << 20); // ceiling - weights, live
-    const no_override: u32 = 0;
+    const MiB: u64 = 1 << 20;
+    const available: u64 = 28_909 * MiB;
+    const pin = cfg.pinned_prefill_chunk;
 
-    const short = chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, available, cfg.pinned_prefill_chunk, no_override);
-    const full = chooseRequestPrefillChunk(&cfg, 1_048_576, 2048, kv_bits, available, cfg.pinned_prefill_chunk, no_override);
+    // An ordinary agent prompt, and the 384k the judge actually ran: both get
+    // 4096 — the width the load-time pin could never hand out.
+    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, 4096, 2048, kv_bits, available, pin, 0));
+    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, available, pin, 0));
+    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, 384_000, 2048, kv_bits, available, pin, 0));
+    // 4x the pinned width, and the whole point of the change.
+    try t.expect(4096 > pin);
 
-    // The invariant, true of any checkpoint's ladder: a shorter prompt holds
-    // less KV, so it can afford at least as wide a forward. This is the whole
-    // mechanism — a monotone-in-the-prompt width, where load-time sizing has
-    // one width for every prompt.
-    try t.expect(short >= full);
-    // Whatever it picks, it picked something the guard will admit.
-    try t.expect(prefillNeededAtChunk(&cfg, 300_000, 2048, kv_bits, short) <= available or
-        short == PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1]);
-    try t.expect(prefillNeededAtChunk(&cfg, 1_048_576, 2048, kv_bits, full) <= available or
-        full == PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1]);
-    // Never wider than the arch forwards: a hd-256 MoE caps at 4096, and the
-    // chooser returns the WIDTH, so the pin can never describe a phantom rung.
-    try t.expect(short <= 4096 and full <= 4096);
-    try t.expect(full >= PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1]);
+    // The full 1M context does not fit on this box at ANY width — 30,261 MiB
+    // at the ladder floor against 28,909 available — so the chooser bottoms
+    // out and admission refuses. That is honest: the advertised context is
+    // larger than this machine can prefill, which is what the ctx-KV bill on
+    // the SSD-first branch is about, not something a width can fix.
+    const full = chooseRequestPrefillChunk(&cfg, 1_048_576, 2048, kv_bits, available, pin, 0);
+    try t.expectEqual(@as(u32, 512), full);
+    try t.expect(prefillNeededAtChunk(&cfg, 1_048_576, 2048, kv_bits, 512) > available);
+
+    // The invariant behind all of it, true of any checkpoint's ladder: a
+    // shorter prompt holds less KV, so it can afford at least as wide a
+    // forward. Load-time sizing has ONE width for every prompt.
+    var prev: u32 = 0;
+    var i: usize = 0;
+    const seqs = [_]u64{ 1_048_576, 384_000, 300_000, 60_000, 4096 };
+    while (i < seqs.len) : (i += 1) {
+        const w = chooseRequestPrefillChunk(&cfg, seqs[i], 2048, kv_bits, available, pin, 0);
+        try t.expect(w >= prev);
+        prev = w;
+    }
 }
 
 test "chooseRequestPrefillChunk: WIDEST that fits, at the boundary" {
     // The rule is "widest that fits", not "wide when there is lots of room".
-    // Priced at the exact bill of a rung, that rung must come out; one byte
-    // under it, the next one down must. Uses the config's OWN ladder, so it
-    // pins the RULE rather than a checkpoint constant nobody can execute here.
+    // Priced at the exact bill of a width, that width must come out; one byte
+    // under it, a strictly narrower one must — except at the bottom of the
+    // ladder, where there is nothing narrower and the floor is the answer.
+    // Walks the config's OWN ladder, so it pins the RULE rather than a
+    // constant.
     const t = std.testing;
     const cfg = qwen4RequestTestConfig();
     const kv_bits: u64 = 8;
     const seq: u64 = 300_000;
     const pin = cfg.pinned_prefill_chunk;
+    const floor_width: u32 = widthForRung(&cfg, seq, PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1]);
 
-    // Walk the ladder in width order and check each step of the staircase.
-    var prev_width: u64 = 0;
+    var prev_width: u32 = 0;
+    var distinct: usize = 0;
     for (PREFILL_CHUNK_LADDER) |rung| {
-        const width: u64 = @intCast(generate_mod.effectivePrefillChunk(
-            cfg.prefillScoreHeadDim(),
-            cfg.num_attention_heads,
-            @intCast(seq),
-            cfg.has_sliding_window,
-            cfg.isMoe(),
-            rung,
-        ));
-        if (width == prev_width) continue; // 8192 and 4096 both forward at 4096
+        const width = widthForRung(&cfg, seq, rung);
+        if (width == prev_width) continue; // rungs 8192 and 4096 both forward at 4096
         prev_width = width;
+        distinct += 1;
         const bill = prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, width);
         // Exactly affordable: this width comes out.
-        try t.expectEqual(@as(u32, @intCast(width)), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, bill, pin, 0));
-        // One byte short: something strictly narrower does.
-        try t.expect(chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, bill - 1, pin, 0) < width);
+        try t.expectEqual(width, chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, bill, pin, 0));
+        // One byte short: strictly narrower, unless this IS the narrowest.
+        const under = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, bill - 1, pin, 0);
+        if (width == floor_width) {
+            try t.expectEqual(floor_width, under);
+        } else {
+            try t.expect(under < width);
+        }
     }
+    // The ladder has to offer real choices or none of the above means anything.
+    try t.expect(distinct >= 4);
 
     // Nothing fits at all: the ladder floor, never 0 and never the load-time
     // pin — admission decides whether it runs, the width just has to be the
     // smallest bill this request can be asked for.
-    try t.expect(chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, 0, pin, 0) ==
-        PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1]);
+    try t.expectEqual(floor_width, chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, 0, pin, 0));
 }
 
 test "chooseRequestPrefillChunk: the explicit flag and the gate both outrank it" {
@@ -3451,37 +3526,25 @@ test "chooseRequestPrefillChunk: the explicit flag and the gate both outrank it"
 
 test "admission tries the ladder DOWN before refusing: a prompt that fits only at 512" {
     // Gap closed in the same pass: the scheduler chose a per-request width but
-    // the PROBE still priced the load-time pin, so a prompt that fits at 512
-    // and nothing wider was refused by name at a width it never had to use.
-    // At `--ctx-size 1048576` that is not a corner case — it is the 1M prompt
-    // the context was configured for.
+    // the PROBE still priced the load-time pin, so a prompt that fits at the
+    // ladder floor and nothing wider was refused by name — a 400 — for a
+    // forward that would never have run.
     //
     // `prefillAdmissionBill` reads live MLX memory, so the bar here is the
     // pure pair it composes: the chooser picks the width, `prefillNeededAtChunk`
-    // prices it, and `fits` is `needed <= available`.
+    // prices it, and `fits` is `needed <= available`. 384k is the judge's own
+    // prompt length; its measured bills are 12,632 MB at w1024 and 12,258 at
+    // w512, so a budget of exactly the floor's bill is the case.
     const t = std.testing;
     const cfg = qwen4RequestTestConfig();
     const kv_bits: u64 = 8;
-    const seq: u64 = 1_048_576;
+    const seq: u64 = 384_000;
     const pin = cfg.pinned_prefill_chunk;
-    const floor_width: u64 = @intCast(generate_mod.effectivePrefillChunk(
-        cfg.prefillScoreHeadDim(),
-        cfg.num_attention_heads,
-        @intCast(seq),
-        cfg.has_sliding_window,
-        cfg.isMoe(),
-        PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1],
-    ));
-    const pin_width: u64 = @intCast(generate_mod.effectivePrefillChunk(
-        cfg.prefillScoreHeadDim(),
-        cfg.num_attention_heads,
-        @intCast(seq),
-        cfg.has_sliding_window,
-        cfg.isMoe(),
-        pin,
-    ));
-    // The premise: the load-time pin is a strictly wider — and dearer — forward
-    // than the ladder floor. Without that there is no gap to close.
+    const floor_width = widthForRung(&cfg, seq, PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1]);
+    const pin_width = widthForRung(&cfg, seq, pin);
+
+    // The premise: the load-time pin is a strictly wider — and dearer —
+    // forward than the ladder floor. Without it there is no gap to close.
     try t.expect(pin_width > floor_width);
     const at_floor = prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, floor_width);
     const at_pin = prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, pin_width);
@@ -3493,25 +3556,15 @@ test "admission tries the ladder DOWN before refusing: a prompt that fits only a
 
     // Gate ON: the chooser walks down, lands on the floor, and the request is
     // admitted at a width the machine can actually run.
-    const on = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, available, pin, 0);
-    try t.expectEqual(@as(u32, @intCast(floor_width)), on);
-    try t.expect(prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, on) <= available);
+    try t.expectEqual(floor_width, chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, available, pin, 0));
+    try t.expect(prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, floor_width) <= available);
 
     // Gate OFF: the load-time pin, priced as-is, does not fit — the named 400
-    // this used to fire on every time.
+    // this used to fire every time.
     per_request_chunk_override = false;
     defer per_request_chunk_override = null;
-    const off = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, available, pin, 0);
-    try t.expectEqual(pin, off);
-    const off_width: u64 = @intCast(generate_mod.effectivePrefillChunk(
-        cfg.prefillScoreHeadDim(),
-        cfg.num_attention_heads,
-        @intCast(seq),
-        cfg.has_sliding_window,
-        cfg.isMoe(),
-        off,
-    ));
-    try t.expect(prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, off_width) > available);
+    try t.expectEqual(pin, chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, available, pin, 0));
+    try t.expect(prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, pin_width) > available);
     per_request_chunk_override = null;
 
     // An explicit `--prefill-chunk` keeps today's behaviour on purpose: the
@@ -3548,23 +3601,17 @@ test "the refusal names the width it tried, and one rule picks it everywhere" {
     // same chooser — a probe that refuses at a width the forward would never
     // run is the bug this closes, in the other direction.
     for ([_][]const u8{ "pub fn prefillAdmissionBill(", "pub fn requestPrefillChunkNow(" }) |decl| {
-        const at = std.mem.indexOf(u8, src, decl) orelse return error.CallSiteMoved;
-        const body = src[at..@min(src.len, at + 3500)];
+        const body = declBody(src, decl) orelse return error.CallSiteMoved;
         try t.expect(std.mem.indexOf(u8, body, chooser) != null);
     }
     // And `prefillFitsNow` is that bill, not a second opinion.
-    const probe_at = std.mem.indexOf(u8, src, "pub fn prefillFitsNow(") orelse return error.CallSiteMoved;
-    const probe = src[probe_at..@min(src.len, probe_at + 400)];
+    const probe = declBody(src, "pub fn prefillFitsNow(") orelse return error.CallSiteMoved;
     try t.expect(std.mem.indexOf(u8, probe, "prefillAdmission" ++ "Bill(") != null);
 
-    var defs: usize = 0;
-    var i: usize = 0;
-    const decl_needle = "pub fn " ++ chooser;
-    while (std.mem.indexOfPos(u8, src, i, decl_needle)) |at| {
-        defs += 1;
-        i = at + 1;
-    }
-    try t.expectEqual(@as(usize, 1), defs);
+    // ONE definition — a second one is a second rule. Counted at line starts:
+    // the sibling scan below names this same header in a string literal, and a
+    // counter that cannot tell a declaration from a mention of one reports 2.
+    try t.expectEqual(@as(usize, 1), countDecls(src, "pub fn " ++ chooser));
 }
 
 test "the per-request rung is priced by the SAME estimator that admits it" {
@@ -3578,19 +3625,11 @@ test "the per-request rung is priced by the SAME estimator that admits it" {
     const est = "prefillNeeded" ++ "AtChunk(";
 
     for ([_][]const u8{ "pub fn chooseRequestPrefillChunk(", "pub fn prefillAdmissionBill(" }) |decl| {
-        const at = std.mem.indexOf(u8, src, decl) orelse return error.CallSiteMoved;
-        const body = src[at..@min(src.len, at + 3000)];
+        const body = declBody(src, decl) orelse return error.CallSiteMoved;
         try t.expect(std.mem.indexOf(u8, body, est) != null);
     }
     // Exactly one definition — a second one is a second bill.
-    var defs: usize = 0;
-    var i: usize = 0;
-    const decl_needle = "pub fn " ++ est;
-    while (std.mem.indexOfPos(u8, src, i, decl_needle)) |at| {
-        defs += 1;
-        i = at + 1;
-    }
-    try t.expectEqual(@as(usize, 1), defs);
+    try t.expectEqual(@as(usize, 1), countDecls(src, "pub fn " ++ est));
 
     // And the width the scheduler pins is the one this chooser returned.
     const sched = @embedFile("scheduler.zig");
@@ -3627,8 +3666,7 @@ test "every post-load hot-cache reserve reads the RESOLVED budget, not the ask" 
 
     // And the two reserves that used to read it now go through the accessor.
     for ([_][]const u8{ "pub fn aneGateHeadroom(", "fn computeMemoryContext(" }) |decl| {
-        const at = std.mem.indexOf(u8, src, decl) orelse return error.CallSiteMoved;
-        const body = src[at..@min(src.len, at + 2400)];
+        const body = declBody(src, decl) orelse return error.CallSiteMoved;
         try t.expect(std.mem.indexOf(u8, body, accessor) != null);
     }
     // The load site publishes it — otherwise the accessor is a synonym for the ask.
@@ -4099,18 +4137,20 @@ pub fn prefillNeededAtChunk(
     // on the gather). Detection mirrors prefillAttnKeys: declared ratios or
     // stay generic.
     const is_dsv4: bool = std.mem.eql(u8, config.model_type, "deepseek_v4") and config.dsv4_n_compress_ratios > 0;
-    if (is_dsv4) {
-        return dsv4PrefillMemoryNeeded(
-            seq,
-            config.num_hidden_layers,
-            @as(u64, config.num_key_value_heads) * config.head_dim,
-            config.hidden_size,
-            prefillFfnWidth(config),
-            dsv4_mod.prefillSub(),
-            config.prefillAttnKeys(seq),
-        );
-    }
-    return prefillMemoryNeeded(seq, config.num_attention_heads, config.num_key_value_heads, config.kvBytesPerToken(), config.head_dim, config.prefillScoreHeadDim(), config.hidden_size, prefillFfnWidth(config), kv_bits, chunk, config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config), prefillRequestTerms(config, seq, max_tokens, kv_bits, chunk)) +
+    // These aliases are load-bearing, not style: two scan tests pin the exact
+    // argument SPELLING at this site (`checkAttentionMemory routes deepseek_v4
+    // ...` and `... wires the CONFIG's key bound, not a dense seq`), because
+    // the bug class they guard is a caller passing a dense `seq` or a
+    // recomputed KV product instead of what the config says. Moving the site
+    // here from `prefillAdmissionBill` must not cost that.
+    const heads: u64 = config.num_attention_heads;
+    const layers: u64 = config.num_hidden_layers;
+    const kv_heads: u64 = config.num_key_value_heads;
+    const hdim: u64 = config.head_dim;
+    const hidden: u64 = config.hidden_size;
+    const ffn: u64 = prefillFfnWidth(config);
+    if (is_dsv4) return dsv4PrefillMemoryNeeded(seq, layers, kv_heads * hdim, hidden, ffn, dsv4_mod.prefillSub(), config.prefillAttnKeys(seq));
+    return prefillMemoryNeeded(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, chunk, config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config), prefillRequestTerms(config, seq, max_tokens, kv_bits, chunk)) +
         qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq);
 }
 
