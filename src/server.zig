@@ -3449,6 +3449,124 @@ test "chooseRequestPrefillChunk: the explicit flag and the gate both outrank it"
     try t.expect(cfg.perRequestPrefillChunk());
 }
 
+test "admission tries the ladder DOWN before refusing: a prompt that fits only at 512" {
+    // Gap closed in the same pass: the scheduler chose a per-request width but
+    // the PROBE still priced the load-time pin, so a prompt that fits at 512
+    // and nothing wider was refused by name at a width it never had to use.
+    // At `--ctx-size 1048576` that is not a corner case — it is the 1M prompt
+    // the context was configured for.
+    //
+    // `prefillAdmissionBill` reads live MLX memory, so the bar here is the
+    // pure pair it composes: the chooser picks the width, `prefillNeededAtChunk`
+    // prices it, and `fits` is `needed <= available`.
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const seq: u64 = 1_048_576;
+    const pin = cfg.pinned_prefill_chunk;
+    const floor_width: u64 = @intCast(generate_mod.effectivePrefillChunk(
+        cfg.prefillScoreHeadDim(),
+        cfg.num_attention_heads,
+        @intCast(seq),
+        cfg.has_sliding_window,
+        cfg.isMoe(),
+        PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1],
+    ));
+    const pin_width: u64 = @intCast(generate_mod.effectivePrefillChunk(
+        cfg.prefillScoreHeadDim(),
+        cfg.num_attention_heads,
+        @intCast(seq),
+        cfg.has_sliding_window,
+        cfg.isMoe(),
+        pin,
+    ));
+    // The premise: the load-time pin is a strictly wider — and dearer — forward
+    // than the ladder floor. Without that there is no gap to close.
+    try t.expect(pin_width > floor_width);
+    const at_floor = prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, floor_width);
+    const at_pin = prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, pin_width);
+    try t.expect(at_floor < at_pin);
+
+    // Exactly enough for the floor width and not a byte more: it fits ONLY
+    // there, at the very bottom of the ladder.
+    const available = at_floor;
+
+    // Gate ON: the chooser walks down, lands on the floor, and the request is
+    // admitted at a width the machine can actually run.
+    const on = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, available, pin, 0);
+    try t.expectEqual(@as(u32, @intCast(floor_width)), on);
+    try t.expect(prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, on) <= available);
+
+    // Gate OFF: the load-time pin, priced as-is, does not fit — the named 400
+    // this used to fire on every time.
+    per_request_chunk_override = false;
+    defer per_request_chunk_override = null;
+    const off = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, available, pin, 0);
+    try t.expectEqual(pin, off);
+    const off_width: u64 = @intCast(generate_mod.effectivePrefillChunk(
+        cfg.prefillScoreHeadDim(),
+        cfg.num_attention_heads,
+        @intCast(seq),
+        cfg.has_sliding_window,
+        cfg.isMoe(),
+        off,
+    ));
+    try t.expect(prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, off_width) > available);
+    per_request_chunk_override = null;
+
+    // An explicit `--prefill-chunk` keeps today's behaviour on purpose: the
+    // operator chose the width, so a refusal at that width is the honest
+    // answer rather than a silent downgrade.
+    generate_mod.prefill_chunk_override = 4096;
+    generate_mod.prefill_chunk_explicit = true;
+    defer {
+        generate_mod.prefill_chunk_override = 8192;
+        generate_mod.prefill_chunk_explicit = false;
+    }
+    const forced = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, available, pin, explicitPrefillChunk());
+    try t.expectEqual(@as(u32, 4096), forced);
+    try t.expect(prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, forced) > available);
+}
+
+test "the refusal names the width it tried, and one rule picks it everywhere" {
+    // A refusal quotes the number it COMPARED — and that number is meaningless
+    // without the width it describes, now that the width is per request. Both
+    // refusal surfaces carry `bill.chunk`, which is the width the bill was
+    // actually taken at.
+    const t = std.testing;
+    const src = @embedFile("server.zig");
+    const chooser = "chooseRequest" ++ "PrefillChunk(";
+
+    try t.expect(std.mem.indexOf(u8, src, "at prefill chunk {d} (the narrowest width tried)") != null);
+    try t.expect(std.mem.indexOf(u8, src, "prompt_len, bill.needed / mb, bill.chunk, bill.available / mb") != null);
+    try t.expect(std.mem.indexOf(u8, src, "(KV+working+margin) at prefill chunk {d}") != null);
+    try t.expect(std.mem.indexOf(u8, src, "prompt_len, needed_mb, bill.chunk, avail_mb") != null);
+
+    // ONE rule, both sides. `prefillFitsNow` (the inference-thread probe, and
+    // the connection thread's guard through the same bill) and
+    // `requestPrefillChunkNow` (what the scheduler pins with) must reach the
+    // same chooser — a probe that refuses at a width the forward would never
+    // run is the bug this closes, in the other direction.
+    for ([_][]const u8{ "pub fn prefillAdmissionBill(", "pub fn requestPrefillChunkNow(" }) |decl| {
+        const at = std.mem.indexOf(u8, src, decl) orelse return error.CallSiteMoved;
+        const body = src[at..@min(src.len, at + 3500)];
+        try t.expect(std.mem.indexOf(u8, body, chooser) != null);
+    }
+    // And `prefillFitsNow` is that bill, not a second opinion.
+    const probe_at = std.mem.indexOf(u8, src, "pub fn prefillFitsNow(") orelse return error.CallSiteMoved;
+    const probe = src[probe_at..@min(src.len, probe_at + 400)];
+    try t.expect(std.mem.indexOf(u8, probe, "prefillAdmission" ++ "Bill(") != null);
+
+    var defs: usize = 0;
+    var i: usize = 0;
+    const decl_needle = "pub fn " ++ chooser;
+    while (std.mem.indexOfPos(u8, src, i, decl_needle)) |at| {
+        defs += 1;
+        i = at + 1;
+    }
+    try t.expectEqual(@as(usize, 1), defs);
+}
+
 test "the per-request rung is priced by the SAME estimator that admits it" {
     // A chooser with its own arithmetic is #126 waiting to happen: it would
     // run BEFORE the estimator that knows better and therefore BE the
@@ -3934,6 +4052,11 @@ pub const AdmissionBill = struct {
     /// entry returns nothing and `evictLruToAdmit` will not even try. A
     /// restore pins at most one entry, so this is the provable credit.
     reclaimable: u64 = 0,
+    /// The prefill WIDTH this bill was taken at — on a per-request arch, the
+    /// widest ladder rung that fit `available` (`chooseRequestPrefillChunk`),
+    /// so a refusal can name the narrowest width it tried instead of leaving
+    /// the operator to guess which forward the number describes.
+    chunk: u64 = 0,
 
     pub fn fits(self: AdmissionBill) bool {
         return self.needed <= self.available;
@@ -4100,34 +4223,56 @@ pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: us
     const kv_cfg: transformer_mod.KVQuantConfig = kv_override orelse
         (if (global_scheduler) |sch| sch.kv_quant_config else transformer_mod.KVQuantConfig.dense);
     const kv_bits: u64 = if (kv_cfg.scheme == .off) 16 else kv_cfg.bits;
-    // A vision prefill chunks like text since issue #197 (the splice resumes
-    // its row index across chunks), so it bills the chunk-bounded envelope —
-    // UNLESS the MLX_SERVE_VISION_CHUNKED=0 kill switch restored the
-    // whole-prompt forward, in which case `unchunked_prefill` bills the real
-    // width. Call sites pass generate_mod.visionPrefillUnchunked(has_vision)
-    // so the guard and the prefill loop cannot disagree.
-    const chunk: u64 = if (unchunked_prefill)
-        @max(seq, 1)
-    else
-        @intCast(generate_mod.effectivePrefillChunk(config.prefillScoreHeadDim(), config.num_attention_heads, prompt_len, config.has_sliding_window, config.isMoe(), config.pinned_prefill_chunk));
-    // RAM hot-cache restores rebind MLX array handles by refcount; they do not
-    // allocate another copy of the cached buffers. `active_mem` below already
-    // includes the resident entry, while `prefillMemoryNeeded` bills the full
-    // destination KV capacity that may be allocated when the restored cache
-    // grows. Adding the resident entry here again would invent a third copy
-    // and reject long warm prompts (and even cache misses) spuriously.
-    const needed: u64 = prefillNeededAtChunk(config, seq, max_tokens, kv_bits, chunk);
-
     // Available = GPU allocation ceiling minus current usage (model weights,
     // resident hot-cache KV, etc.). The ceiling is the LESSER of Metal's static
     // working-set max and what's physically reachable now (currentGpuMemoryCeiling)
     // so the two prefill guards agree AND both see external memory pressure — a
     // docker stack holding tens of GB otherwise leaves this guard admitting a
     // prefill that OOMs the command buffer (#64).
+    //
+    // Read BEFORE the width is chosen: on a per-request arch the width is a
+    // function of what is free, so the order is load-bearing.
     var active_mem: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_mem);
     const total_limit: u64 = currentGpuMemoryCeiling(active_mem);
     const available = if (total_limit > active_mem) total_limit - active_mem else 0;
+
+    // A vision prefill chunks like text since issue #197 (the splice resumes
+    // its row index across chunks), so it bills the chunk-bounded envelope —
+    // UNLESS the MLX_SERVE_VISION_CHUNKED=0 kill switch restored the
+    // whole-prompt forward, in which case `unchunked_prefill` bills the real
+    // width. Call sites pass generate_mod.visionPrefillUnchunked(has_vision)
+    // so the guard and the prefill loop cannot disagree.
+    //
+    // Otherwise the width comes from `chooseRequestPrefillChunk` — the SAME
+    // rule the scheduler pins with, so the guard cannot refuse a width the
+    // forward would never have run. On an arch that has not opted in (and
+    // under an explicit `--prefill-chunk`) the chooser hands back the
+    // load-time pin and this is byte-for-byte the old expression; on a
+    // per-request arch it is the widest rung that fits, which is what stops a
+    // 1M-token prompt at `--ctx-size 1048576` from being refused at a width it
+    // never had to use. `effectivePrefillChunk` is applied either way: the
+    // chooser returns a width and this resolver is idempotent on one.
+    const chosen: u32 = if (unchunked_prefill) 0 else chooseRequestPrefillChunk(
+        config,
+        seq,
+        max_tokens,
+        kv_bits,
+        available,
+        config.pinned_prefill_chunk,
+        explicitPrefillChunk(),
+    );
+    const chunk: u64 = if (unchunked_prefill)
+        @max(seq, 1)
+    else
+        @intCast(generate_mod.effectivePrefillChunk(config.prefillScoreHeadDim(), config.num_attention_heads, prompt_len, config.has_sliding_window, config.isMoe(), chosen));
+    // RAM hot-cache restores rebind MLX array handles by refcount; they do not
+    // allocate another copy of the cached buffers. `active_mem` above already
+    // includes the resident entry, while `prefillMemoryNeeded` bills the full
+    // destination KV capacity that may be allocated when the restored cache
+    // grows. Adding the resident entry here again would invent a third copy
+    // and reject long warm prompts (and even cache misses) spuriously.
+    const needed: u64 = prefillNeededAtChunk(config, seq, max_tokens, kv_bits, chunk);
     // PUBLISHED number, never the pointer: `hot_prefix_cache` is
     // inference-thread state — nulled and freed on every model switch — so
     // dereferencing it from a connection thread to ask `residentBytes()` was a
@@ -4143,7 +4288,7 @@ pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: us
         sch.reclaimable_hot_cache_bytes.load(.monotonic)
     else
         0;
-    return .{ .needed = needed, .available = available, .evictable = evictable, .reclaimable = reclaimable };
+    return .{ .needed = needed, .available = available, .evictable = evictable, .reclaimable = reclaimable, .chunk = chunk };
 }
 
 /// Inference-thread predicate behind `Scheduler`'s admission hook: does this
@@ -4168,8 +4313,8 @@ pub fn prefillFitsNow(config: *const model_mod.ModelConfig, prompt_len: usize, m
 pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, unchunked_prefill: bool) void {
     const bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill);
     const mb = 1024 * 1024;
-    log.warn("  prompt {d} tokens needs ~{d}MB, ~{d}MB available after evicting ~{d}MB of hot cache — refused before prefill\n", .{
-        prompt_len, bill.needed / mb, bill.available / mb, bill.evictable / mb,
+    log.warn("  prompt {d} tokens needs ~{d}MB at prefill chunk {d} (the narrowest width tried), ~{d}MB available after evicting ~{d}MB of hot cache — refused before prefill\n", .{
+        prompt_len, bill.needed / mb, bill.chunk, bill.available / mb, bill.evictable / mb,
     });
 }
 
@@ -4195,7 +4340,7 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_len:
     if (needed > available) {
         const needed_mb = needed / (1024 * 1024);
         const avail_mb = available / (1024 * 1024);
-        log.warn("  prompt {d} tokens needs ~{d}MB (KV+working+margin), ~{d}MB available + ~{d}MB reclaimable of ~{d}MB resident hot cache — rejecting\n", .{ prompt_len, needed_mb, avail_mb, bill.reclaimable / (1024 * 1024), bill.evictable / (1024 * 1024) });
+        log.warn("  prompt {d} tokens needs ~{d}MB (KV+working+margin) at prefill chunk {d}, ~{d}MB available + ~{d}MB reclaimable of ~{d}MB resident hot cache — rejecting\n", .{ prompt_len, needed_mb, bill.chunk, avail_mb, bill.reclaimable / (1024 * 1024), bill.evictable / (1024 * 1024) });
         // A refusal quotes the numbers it COMPARED — including the hot cache,
         // because the operator's first question is "why didn't it just drop a
         // cache entry?" and the honest answer here is that there was nothing
@@ -19115,6 +19260,19 @@ test "the chunk the guard BILLS is the chunk the forward will RUN" {
             i = at + 1;
             // Skip the declaration itself.
             if (at >= 3 and std.mem.eql(u8, src[at - 3 .. at], "fn ")) continue;
+            // Skip TEST call sites. The drift this scan exists to catch is a
+            // PRODUCTION path resolving a width nobody billed; a test may hand
+            // the resolver any width it likes, and since the width became a
+            // per-request value the tests hand it plenty. A hit belongs to a
+            // test when the nearest `test "` above it is nearer than the
+            // nearest function header.
+            const before = src[0..at];
+            const last_test = std.mem.lastIndexOf(u8, before, "\ntest \"");
+            const last_fn = std.mem.lastIndexOf(u8, before, "\nfn ") orelse 0;
+            const last_pub_fn = std.mem.lastIndexOf(u8, before, "\npub fn ") orelse 0;
+            if (last_test) |lt| {
+                if (lt > @max(last_fn, last_pub_fn)) continue;
+            }
             const tail = src[at..@min(src.len, at + 512)];
             const end = std.mem.indexOf(u8, tail, "));") orelse
                 std.mem.indexOf(u8, tail, ");") orelse return error.CallSiteMoved;
@@ -19124,10 +19282,10 @@ test "the chunk the guard BILLS is the chunk the forward will RUN" {
             // longer the only such value. `rung` is a candidate being PRICED
             // (its bill decides whether it is chosen) and `chosen`/the ladder
             // floor is the value that becomes `InitOptions.pinned_prefill_chunk`
-            // — both are billed by `prefillNeededAtChunk` in the same breath,
-            // pinned by "the per-request rung is priced by the SAME estimator".
-            // A bare launch-width argument still fails, which is the drift the
-            // scan exists to catch.
+            // — all three are billed by `prefillNeededAtChunk` in the same
+            // breath, pinned by "the per-request rung is priced by the SAME
+            // estimator". A bare launch-width argument still fails, which is
+            // the drift the scan exists to catch.
             const args = tail[0..end];
             try t.expect(std.mem.indexOf(u8, args, "pinned_prefill_chunk") != null or
                 std.mem.indexOf(u8, args, "rung") != null or

@@ -2111,6 +2111,36 @@ fit — but the scheduler's choice is bounded by live memory, so a request that
 only fits at 512 gets 512. The dangerous direction (admit narrow, run wide) is
 closed by the chooser never returning a width whose bill exceeds `available`.
 
+### The other direction: the guard refused at a width nobody was going to run
+
+Choosing the width at the scheduler left the ADMISSION probe still pricing the
+load-time pin, and that is a refusal, not a slowdown. A prompt that fits at 512
+and nothing wider was refused by name — `error.PrefillDoesNotFit`, a 400 — for
+a width the forward would never have used. **At `--ctx-size 1048576` the case
+this serves is the 1M-token prompt itself**: the context the operator
+configured, refused on the server configured to hold it.
+
+So `prefillAdmissionBill` picks its width the same way, through the same
+`chooseRequestPrefillChunk`, which walks the ladder from the widest affordable
+rung DOWN. Since `prefillFitsNow` (the inference-thread probe, re-asked after
+every eviction) and `checkAttentionMemory` (the connection thread) are both
+that bill, all three now ask one question. The named 400 fires only when
+NOTHING on the ladder fits, and the message says which width it gave up at:
+
+```
+prompt 1048576 tokens needs ~31402MB at prefill chunk 512 (the narrowest width
+tried), ~28909MB available after evicting ~0MB of hot cache — refused before
+prefill
+```
+
+`AdmissionBill.chunk` carries that width so the message and the number it
+quotes cannot describe different forwards.
+
+An explicit `--prefill-chunk` keeps TODAY's behaviour on purpose: the chooser
+returns it unchanged and the refusal fires at that width. The operator picked
+it; silently downgrading the width they asked for would be a worse answer than
+saying no.
+
 ### Scope
 
 Gated to `qwen4_exp` (`ModelConfig.perRequestPrefillChunk`) and killable with
