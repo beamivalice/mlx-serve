@@ -3175,3 +3175,72 @@ load-generation and 0.9x-threshold branches, `admissionVerdict` against the
 arms' own predicates, a same-bill scan proving the admit and refuse arms format
 from one shared value, the post-load single-CAS arming scan, and
 `log.enabled`/`log.atLevel` gating.
+
+## Restore by MOVE: a shared restore cannot donate, and the first append pays for it
+
+**Symptom.** Warm TTFT on qwen4_exp scaled linearly with context even though the turn
+forwarded 31 tokens: 198 ms at 128k, 277 ms at 256k, 360 ms at 384k — `prompt_ms ≈ 117 ms +
+0.617 µs × prompt_tokens`, i.e. two thirds of the wait was proportional to a prefix that was
+already in the cache. At 1M that projects to ~0.6 s of pure bookkeeping per warm turn.
+
+**Cause.** `KVCache.restore` binds the entry's buffers into the slot with `mlx_array_set`,
+which is a C++ `array` copy-assign in mlx-c — a refcount bump, deliberately, because the hot
+cache must keep the entry restorable for the next request. But mlx donates a `slice_update`'s
+input only when `array::is_donatable()` holds, and that is
+`array_desc_.use_count() == 1 && data.use_count() == 1` (`mlx/array.h`). The entry's second
+reference fails it, so the very first `writeAtOffset` of the turn fell through
+`SliceUpdate::eval_gpu` → `copy_gpu` and privatised the ENTIRE prefix: 13,056 B/tok × 392,966
+tokens = 5.13 GB, ~110 ms, 45% of the warm TTFT. Every subsequent append donated (its input
+was the uniquely-owned output of the first), and a cold prefill was never affected — which is
+why nothing in the KV growth counters could see it: **a copy-on-write is not a grow.**
+
+The same root cause fired a second time on the QSA side for a different reason. A restore
+republishes `aux_state` (the authority) but leaves the append ACCELERATOR empty, so
+`qsaAppendKeys` re-seeded with `materializedOwnedCopy` — producing a TIGHT `held`-row buffer
+that `capBufAppend` then grew one line later, `mlx_zeros` of the whole reservation plus a
+`slice_update` of the entire history. Two full passes over the prefix where one does, on the
+raw-key bank (3,072 B/tok) and again on the pooled bank (768 B/tok): ~81 ms at 384k.
+
+**Fix, and the ownership it costs.** On an SSD-first FULL-prefix hit — the entry's whole token
+record is a prefix of this prompt, which is what makes the commit's replace path land on this
+same entry — the restore is followed by a CHECKOUT: `KVCacheSnapshot.releaseHandles()` drops
+the entry's own handles, the slot becomes the sole owner, and the append donates in place. The
+copy disappears rather than moving.
+
+The price is that the record now outlives its bytes, so the entry is marked
+`checked_out_by = <slot>` and:
+
+* it is **invisible** to every other reader — `findBestRestorableMatch` (a second slot gets a
+  MISS, never an empty snapshot), `lruIndexExcluding` (eviction would free nothing and discard
+  the record the owner is about to replace), `spillIdleEntries`, `digestsAlloc`,
+  `reclaimableBytes`/`reclaimableBytesFor` (its bytes come OFF the base — crediting them is the
+  unsafe direction), and the commit path's "kept resident prefix" one-shot;
+* it is **reclaimed** by the commit that replaces it, which installs the grown buffers and
+  clears the mark;
+* it is **dropped** at slot end otherwise, with `[hot-cache] checked-out entry dropped: <reason>`.
+
+That last rule is where the class bug lives. There are TWO slot-end paths and they do not
+chain: `finishSlot`, and the inference loop's cleanup drain — which is where a decode-phase
+cancel lands, having been pulled straight out by `complete()` without ever reaching
+`finishSlot` (the same seam the commit-in-the-drain guard exists for). Both releases are
+unconditional (a pad-only, errored, oversized-and-declined or refused slot ends without a
+commit, and "the commit ran" is exactly the fact this cannot depend on) and the drain's sits
+BEFORE `s.deinit()`, which frees the very buffers the entry would otherwise still claim. Scan-pinned.
+
+**Rules.**
+
+* Restore by move is gated to the SSD-first arm (`ssd_first`, qwen4_exp today) and killed by
+  `MLX_SERVE_RESTORE_MOVE=0`, which is the refcount-share byte-for-byte. Partial-prefix hits
+  keep the share: they make no promise about the commit, and the entry is still worth keeping.
+* A checkout is declined while a `pending_disk` record shares the same buffers. mlx's own
+  use_count test would decline the donation anyway; the guard is there so nobody has to reason
+  about a flush reading buffers a slot is appending into.
+* `seedCapBuf` seeds a history accelerator AT its reservation. Byte-identical to the pair it
+  replaces — `capBufAppend`'s grow builds exactly that array — and the bar is that the grow it
+  would have done becomes a no-op: **1 seed, 0 `qsa_cap_buf_allocs`.**
+
+**The observable.** Buffer IDENTITY is the only in-process evidence of donation:
+`testKeyDataPtr` reads the layer's data pointer after an eval, and "the appended buffer sits at
+the address the prefix already occupied" IS "no copy happened". The copy arm cannot fake it —
+its donor is still alive in the entry, so the allocator cannot hand the copy that same address.
+Both arms then assert the SAME BYTES: the arms differ in ownership, never in output.
