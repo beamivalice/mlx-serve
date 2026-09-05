@@ -1435,6 +1435,13 @@ pub const DiskTier = struct {
         var ssm_res = try self.persistSsmCheckpoints(e.id, dir_rel, e.kv_len, e.ssm_positions, e.ssm_bytes, ssm_checkpoints, &written_bytes);
         errdefer ssm_res.deinit(self.allocator);
 
+        // Captured BEFORE the sidecar write overwrites it: this path bills a
+        // DELTA, and the old size is one of its two operands. Assigning
+        // `e.spec_bytes` first destroys it, which is how the sidecar came to
+        // be written and never billed (the entry's bytes and `total_bytes`
+        // stayed short by the whole file, so `gcToBudget` priced the tier low
+        // and the on-disk footprint drifted past `--prefix-cache-disk`).
+        const old_spec_bytes: u64 = e.spec_bytes;
         if (specWorkPending(e, dflash_snap, mtp_snap)) {
             const spec_res: SpecSidecarResult = self.writeSpecSidecar(dir_rel, dflash_snap, mtp_snap, s) catch |err| blk: {
                 log.warn("  [disk-cache] spec persist failed: {s} — entry keeps its old spec\n", .{@errorName(err)});
@@ -1447,10 +1454,12 @@ pub const DiskTier = struct {
 
         // Recompute total bytes: chunks + token record are unchanged; only the
         // ssm/spec contributions changed.
-        // Delta-based like the extend path: only the checkpoint files moved,
-        // so inherited (linked) chunks stay unbilled and a post-scan bill
-        // stays what the scan made it.
-        var delta: i64 = 0;
+        // Delta-based like the extend path: only the checkpoint and sidecar
+        // files moved, so inherited (linked) chunks stay unbilled and a
+        // post-scan bill stays what the scan made it. BOTH non-chunk terms are
+        // in the delta — the extend path gets this for free by differencing
+        // `nonChunkBytes(e)`, which is the identity this must reproduce.
+        var delta: i64 = @as(i64, @intCast(e.spec_bytes)) - @as(i64, @intCast(old_spec_bytes));
         for (ssm_res.bytes) |b| delta += @as(i64, @intCast(b));
         for (e.ssm_bytes) |b| delta -= @as(i64, @intCast(b));
 
@@ -5491,4 +5500,79 @@ test "every test that PAUSES the background writer owes a deferred unpause" {
         }
     }
     try testing.expect(checked >= 4);
+}
+
+test "DiskTier: an ssm/spec-only append bills the SPEC sidecar's byte delta" {
+    // CLASS A (ungated — a defect on every arch with a dflash/MTP snap and
+    // `--prefix-cache-disk`, not a qwen4_exp trade).
+    //
+    // `appendSsmOnly` computes its `total_bytes` delta from the checkpoint
+    // files alone, but it ALSO writes `spec.safetensors` and overwrites
+    // `e.spec_bytes` — before the delta is taken, so even the old value is
+    // gone. Every commit that lands a spec sidecar onto an already-complete
+    // entry therefore leaves `e.bytes` and `tier.total_bytes` short by the
+    // sidecar's size, and `gcToBudget` then prices the whole tier low: it
+    // evicts too little and the on-disk footprint drifts past
+    // `--prefix-cache-disk` with no symptom until the volume fills.
+    //
+    // The bar is the identity the CREATE path establishes and the extend path
+    // maintains through `nonChunkBytes(e)`: an entry's bytes are its non-chunk
+    // files plus the chunks it wrote itself.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-specbill", 0, 128);
+    defer tier.deinit();
+
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    // Turn 1: the entry lands complete, with NO spec sidecar.
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
+    try testing.expectEqual(@as(usize, 1), tier.entries.items.len);
+    try testing.expectEqual(@as(u64, 0), tier.entries.items[0].spec_bytes);
+    const bytes_before = tier.entries.items[0].bytes;
+    const total_before = tier.total_bytes;
+
+    // Turn 2: same tokens, same KV — but now carrying an MTP history snap.
+    // `specWorkPending` routes this to `appendSsmOnly`.
+    var mtp = try KVCache.init(testing.allocator, 1);
+    defer mtp.deinit();
+    try fillCache(&mtp, s, 1, 590, 8, 9.5, .float32);
+    _ = try tier.appendCommitWithSpec(
+        cache.entries,
+        cache.step,
+        cache.config,
+        &tokens,
+        false,
+        null,
+        null,
+        .{ .entries = mtp.entries, .step = mtp.step, .config = mtp.config, .base_pos = 0 },
+        s,
+    );
+
+    const e = &tier.entries.items[0];
+    try testing.expect(e.spec_bytes > 0); // the sidecar really was written
+    // RED before the fix: `bytes` never moved, so it was short by exactly the
+    // sidecar.
+    try testing.expectEqual(bytes_before + e.spec_bytes, e.bytes);
+    try testing.expectEqual(total_before + e.spec_bytes, tier.total_bytes);
+    // ...and the create-path identity holds again.
+    var own_chunks: u64 = 0;
+    for (e.chunk_bytes[@min(e.inherited_chunks, e.chunk_bytes.len)..]) |b| own_chunks += b;
+    try testing.expectEqual(nonChunkBytes(e) + own_chunks, e.bytes);
+
+    // A rescan of the same root reaches the same total: the delta arithmetic
+    // and the file system now agree, which is the property `gcToBudget` needs.
+    var rescanned = try DiskTier.init(testing.allocator, io, base, "fp-specbill", 0, 128);
+    defer rescanned.deinit();
+    try testing.expectEqual(@as(usize, 1), rescanned.entryCount());
+    try testing.expectEqual(tier.total_bytes, rescanned.total_bytes);
 }
