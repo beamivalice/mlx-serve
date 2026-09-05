@@ -4121,7 +4121,10 @@ pub fn qsaSparseAttn(
         const dense = (try gatherQsa256(s, q_rope, kv_view.k, kv_view.v, attn_scale, blocks, ratio)) orelse return null;
         // Bit +8: the two arms must not share a one-shot slot, or whichever
         // ran first would silence the other's engagement line for the process.
-        if (qsa_attn_engaged_bits.take(@as(u5, qsaWidthBucket(seq_len)) + 8)) {
+        // +8 keeps the dense arm's bits disjoint from the quantized arm's.
+        // The widen is explicit rather than resting on `qsaWidthBucket`
+        // returning `u2` two hundred lines away: at `u3` the sum wraps a `u5`.
+        if (qsa_attn_engaged_bits.take(@as(u5, @intCast(@as(u8, qsaWidthBucket(seq_len)) + 8)))) {
             log.info(
                 "[qsa-attn] engaged (S={d} kv={d} quant=off) — MLX_SERVE_QSA_ATTN_KERNEL=0 restores the union gather\n",
                 .{ seq_len, mlx.getShape(kv_view.k)[2] },
@@ -4155,6 +4158,27 @@ pub fn qsaSparseAttn(
     const vsc_sh = mlx.getShape(kv_view.v_triple_scales);
     if (ksc_sh.len != 4 or vsc_sh.len != 4 or ksc_sh[3] != groups or vsc_sh[3] != groups) return null;
     if (ksc_sh[2] != kv or vsc_sh[2] != kv) return null;
+
+    // N21. `ensure_row_contiguous = false` is deliberate (the packed triples
+    // are cache VIEWS and a contiguous copy erases the win), so the kernel is
+    // handed raw strides — and it indexes every innermost axis with `+ 1`
+    // arithmetic (`kq[wrow + ...]`, `blk[vi]`, a `vec<T,2>` load off `Qrow`).
+    // That holds for a kv-axis slice of a contiguous cache, which is all that
+    // reaches here today, but it is a precondition rather than a coincidence:
+    // a future layout with a strided last axis would read scrambled keys and
+    // report a plausible answer. Decline instead.
+    const innermost_unit = blk: {
+        if (mlx.mlx_array_strides(q_rope)[3] != 1) break :blk false;
+        if (mlx.mlx_array_strides(blocks)[2] != 1) break :blk false;
+        for ([_]mlx.mlx_array{
+            kv_view.k_triple_q,     kv_view.k_triple_scales, kv_view.k_triple_biases,
+            kv_view.v_triple_q,     kv_view.v_triple_scales, kv_view.v_triple_biases,
+        }) |a| {
+            if (mlx.mlx_array_strides(a)[3] != 1) break :blk false;
+        }
+        break :blk true;
+    };
+    if (!innermost_unit) return null;
 
     const kernel = getQsaAttnQKernel() catch return null;
     const merge_kernel = getQsaAttnMergeKernel() catch return null;
