@@ -2432,6 +2432,28 @@ pub const Generator = struct {
                 _ = mlx.mlx_clear_cache();
                 if (trace_enabled) eval_ns += prefill_sw.read() - eval_start_ns;
 
+                // THIS chunk's latch, read HERE — before anything persists it,
+                // snapshots it, or yields the thread (B0b). It used to be read
+                // at the top of the NEXT iteration, and three things ran in the
+                // gap, all on KV that Metal had already abandoned (the rule:
+                // Metal at the working-set edge returns ZEROS before it aborts):
+                //
+                //   * `captureSsmCheckpoint` below snapshots the garbage state;
+                //   * `write_through_hook` commits it to the SSD tier as a
+                //     durable, indexed restorable prefix that nothing removes,
+                //     so later requests restore FROM the failure;
+                //   * `interleave_hook` -> `checkErrorDecode` is the same
+                //     `consumeLatch`, so a co-tenant decode ate the latch and
+                //     was blamed for it — after which this prefill saw a clean
+                //     latch at the top of the next iteration and answered 200
+                //     with zeros.
+                //
+                // One failure, two wrong answers: a poisoned disk cache and an
+                // error charged to an innocent request. The checks at the top of
+                // the loop and after it are now redundant for the chunk's own
+                // forward and kept only for what the hooks themselves latch.
+                try mlx.checkError();
+
                 // Phase 1: snapshot SSM state at stride-aligned boundaries.
                 // We snapshot AFTER the eval above so the underlying buffers
                 // are realized; the snapshot is just a refcount-share of the
@@ -14959,4 +14981,57 @@ test "MTP head persistence kill switch: only a literal 0 turns it off" {
     try testing.expect(mtpHeadPersistFromEnv(""));
     try testing.expect(mtpHeadPersistFromEnv("1"));
     try testing.expect(!mtpHeadPersistFromEnv("0"));
+}
+
+test "scan: the prefill chunk loop's post-eval order is a contract (B0b + S17)" {
+    // SHARED CONTRACT with the adaptive-width owner (a8bb30c23939f18f4). The
+    // order after a chunk's forward is, and must stay:
+    //
+    //   eval -> mlx_clear_cache -> checkError -> write_through_hook
+    //        -> chunk_width_hook -> interleaveDecodeTick
+    //
+    // Each edge is load-bearing and they were established for different
+    // reasons, so a change that looks local to one owner can silently undo
+    // the other's:
+    //
+    //   clear   -> check : the chunk's own latch, read before ANYTHING acts
+    //                      on the KV it produced (B0b).
+    //   check   -> wt    : the write-through indexes a DURABLE restorable
+    //                      prefix on the SSD tier. Metal returns ZEROS before
+    //                      it aborts, so persisting first publishes garbage
+    //                      that later requests restore FROM, permanently.
+    //   check   -> tick  : `interleaveDecodeTick` -> `checkErrorDecode` is the
+    //                      same `consumeLatch`. Running it first let a
+    //                      co-tenant decode EAT this prefill's latch and be
+    //                      blamed, after which the failing prefill saw a clean
+    //                      latch and answered 200 with zeros.
+    //   wt      -> width : the width probe sizes the NEXT chunk; the hook
+    //                      above it persists the one just completed.
+    //   width   -> tick  : the probe reads steady-state headroom, so a
+    //                      co-tenant's decode allocations are not charged to
+    //                      this prefill (the adaptive owner's attribution
+    //                      argument, S17).
+    //
+    // Every needle is SPLIT: this scan sits BELOW the impl in this file, and
+    // an unsplit needle matches the test's own literal first and can never go
+    // red — the failure mode the audit found in two other guards.
+    const src = @embedFile("generate.zig");
+    const wt = std.mem.indexOf(u8, src, "write_through" ++ "_hook) |wt|").?;
+    const before = src[0..wt];
+    // `lastIndexOf` anchors on THIS chunk's eval/clear pair, so the check at
+    // the TOP of the loop — which precedes the clear — cannot satisfy it.
+    const clear = std.mem.lastIndexOf(u8, before, "mlx_clear" ++ "_cache();").?;
+    const check = std.mem.lastIndexOf(u8, before, "try mlx.check" ++ "Error();").?;
+    const width = std.mem.indexOfPos(u8, src, wt, "chunk_width" ++ "_hook) |hk|").?;
+    const tick = std.mem.indexOfPos(u8, src, wt, "interleave" ++ "_hook) |hk|").?;
+
+    try std.testing.expect(clear < check);
+    try std.testing.expect(check < wt);
+    try std.testing.expect(wt < width);
+    try std.testing.expect(width < tick);
+
+    // The SSM checkpoint capture is on the same poisoned path — the snapshot
+    // is what the write-through then persists — so the check precedes it too.
+    const cp = std.mem.indexOfPos(u8, src, clear, "captureSsm" ++ "Checkpoint(").?;
+    try std.testing.expect(check < cp);
 }
