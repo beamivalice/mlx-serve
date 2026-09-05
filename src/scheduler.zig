@@ -5526,7 +5526,11 @@ fn prefillWriteThroughCb(opaque_ctx: *anyopaque, abs_kv_pos: usize, cps: []const
     if (abs_kv_pos == 0 or abs_kv_pos > slot.full_prompt.len) return;
     const s = if (slot.model.transformer) |x| x.s else return;
     wc.chunks += 1;
-    _ = d.appendCommit(
+    // Bounded to ONE chunk per boundary: this runs INSIDE the prefill, so
+    // every byte it serializes lands before the first token. A restored
+    // prefix that is not on disk yet (32 chunks, 464 MB, 375 ms at 64k) is
+    // left to the end-of-request flush, which runs after the response.
+    _ = d.appendCommitBounded(
         slot.cache.entries,
         abs_kv_pos,
         slot.cache.config,
@@ -5534,10 +5538,18 @@ fn prefillWriteThroughCb(opaque_ctx: *anyopaque, abs_kv_pos: usize, cps: []const
         slot.has_tools,
         if (cps.len > 0) cps else null,
         s,
+        WRITE_THROUGH_FLUSH_BOUND_BYTES,
     ) catch |err| {
         log.warn("  [disk-cache] prefill write-through failed: {s}\n", .{@errorName(err)});
     };
 }
+
+/// The write-through hook's per-call flush bound: ONE byte, so the chunk
+/// loop in `DiskTier.appendCommitWithSpecBounded` stops after the first
+/// chunk it writes — one chunk per prefill boundary, never a backlog on the
+/// TTFT path. An explicit call-site parameter, not tier state, so a scan can
+/// pin it (`kv_disk_cache.zig`: "the write-through hook bounds its flush").
+pub const WRITE_THROUGH_FLUSH_BOUND_BYTES: u64 = 1;
 
 const WriteThroughCtx = struct {
     slot: *Slot,
