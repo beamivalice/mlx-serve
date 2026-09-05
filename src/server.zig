@@ -1298,6 +1298,11 @@ pub fn serve(
     defer scheduler_mod.prefill_chunk_adapt = null;
     scheduler_mod.prefill_chunk_widen_ok = &adaptivePrefillWidenStillFits;
     defer scheduler_mod.prefill_chunk_widen_ok = null;
+    // Fifth: whether the fourth can move anything for a given model. The four
+    // installs above are process-wide and unconditional, so NONE of their
+    // presences is an arch gate — this is (audit B-A2).
+    scheduler_mod.prefill_chunk_adaptive_enabled = &adaptivePrefillChunkEnabled;
+    defer scheduler_mod.prefill_chunk_adaptive_enabled = null;
 
     // Gauge sampler: samples instantaneous system + queue state every 2 s and
     // writes the metrics gauges. Only runs when --metrics is on. Trivial cost
@@ -22166,6 +22171,85 @@ test "adaptivePrefillWidth: a widen costs 1.25x AND two consecutive supporting p
     try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, kv, between, 2048, cap, &st3));
     try t.expectEqual(@as(u8, 0), st3.supporting);
     try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, kv, cost_up * 4, 2048, cap, &st3));
+}
+
+test "the tail-merge gate reads the ARCH, not the installed hook (serve installs it for everyone)" {
+    // B-A2. The first cut of the S18 gate spelled the loop's flag
+    // `adapt_chunked and options.chunk_width_hook != null`, on the belief that
+    // the hook exists only where the adaptive width does. It does not: `serve`
+    // installs `prefill_chunk_adapt` UNCONDITIONALLY and process-wide, and
+    // `scheduler`'s one InitOptions site installs the hook whenever that
+    // global is non-null. So under a real server the hook is non-null on every
+    // arch and the scaled tail-merge bound was live everywhere again — the
+    // defect the gate exists to prevent, with two green tests over it, because
+    // both exercised the FLAG and neither exercised the WIRING.
+    //
+    // This one builds the slot state the way `serve` does: every hook of the
+    // family installed, then a non-qwen4 config, and it asserts the two
+    // answers DIFFER.
+    const t = std.testing;
+    scheduler_mod.prefill_chunk_adapt = &adaptivePrefillWidthNow;
+    defer scheduler_mod.prefill_chunk_adapt = null;
+    scheduler_mod.prefill_chunk_widen_ok = &adaptivePrefillWidenStillFits;
+    defer scheduler_mod.prefill_chunk_widen_ok = null;
+    scheduler_mod.prefill_chunk_adaptive_enabled = &adaptivePrefillChunkEnabled;
+    defer scheduler_mod.prefill_chunk_adaptive_enabled = null;
+
+    // What the scheduler's `.chunk_width_hook = if (prefill_chunk_adapt != null)`
+    // evaluates to for ANY slot, on ANY arch, under `serve`.
+    const hook_installed = scheduler_mod.prefill_chunk_adapt != null;
+    try t.expect(hook_installed);
+
+    var other = qwen4RequestTestConfig();
+    other.model_type = "qwen3_5";
+    // ...and what the arch actually says for this slot.
+    const adaptive = scheduler_mod.adaptiveChunkWidthFor(&other);
+    try t.expect(!adaptive);
+    // The whole finding in one line: the hook's presence is not the answer.
+    try t.expect(hook_installed != adaptive);
+
+    // So a qwen3_5 slot keeps the FLAT bound, hook and all — a 300-token tail
+    // at the machine ladder's 512 rung merges, one chunk, as before S18.
+    try t.expectEqual(generate_mod.TAIL_MERGE_MAX, generate_mod.tailMergeMaxFor(512, adaptive));
+    try t.expectEqual(@as(usize, 812), generate_mod.nextChunkEnd(0, 812, 512, false, 0, 0, adaptive));
+    try t.expectEqual(@as(usize, 1), generate_mod.prefillChunkCount(812, 512, false, 0, 0, adaptive));
+
+    // qwen4_exp on the same installed hooks: live, and the bound scales.
+    const cfg = qwen4RequestTestConfig();
+    per_request_chunk_override = true;
+    defer per_request_chunk_override = null;
+    adaptive_chunk_override = true;
+    defer adaptive_chunk_override = null;
+    const unpinned = explicitPrefillChunk() == 0 and generate_mod.envPrefillChunk() == 0;
+    try t.expectEqual(unpinned, scheduler_mod.adaptiveChunkWidthFor(&cfg));
+    if (unpinned) {
+        try t.expectEqual(@as(usize, 64), generate_mod.tailMergeMaxFor(512, scheduler_mod.adaptiveChunkWidthFor(&cfg)));
+        try t.expectEqual(@as(usize, 512), generate_mod.nextChunkEnd(0, 812, 512, false, 0, 0, scheduler_mod.adaptiveChunkWidthFor(&cfg)));
+    }
+    // A slot with no config (the embedded engines) and a host with no
+    // predicate installed both answer NOT LIVE, never "the hook is there".
+    try t.expect(!scheduler_mod.adaptiveChunkWidthFor(null));
+    scheduler_mod.prefill_chunk_adaptive_enabled = null;
+    try t.expect(!scheduler_mod.adaptiveChunkWidthFor(&cfg));
+    try t.expect(scheduler_mod.prefill_chunk_adapt != null); // ...with the hook still installed
+
+    // And the loop takes the flag, not the hook. Inside `initWithOptions`'
+    // own body, so neither needle can fall through to a test's bytes.
+    const gen = @embedFile("generate.zig");
+    const impl = generate_mod.productionDeclSource(gen, "    pub fn initWithOptions(") orelse return error.CallSiteMoved;
+    try t.expect(generate_mod.windowHasNoTestBlock(impl));
+    try t.expect(std.mem.indexOf(u8, impl, "const width_is_adaptive = " ++ "adapt_chunked and options.adaptive_chunk_width;") != null);
+    // The reverted spelling must not come back anywhere in that body.
+    try t.expect(std.mem.indexOf(u8, impl, "adapt_chunked and options.chunk_width" ++ "_hook != null") == null);
+    // ...and the scheduler fills it from the arch predicate, at the ONE
+    // InitOptions site.
+    const sched = @embedFile("scheduler.zig");
+    const sched_fn = generate_mod.productionDeclSource(sched, "pub fn adaptiveChunkWidthFor(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, sched_fn, "prefill_chunk_adaptive" ++ "_enabled orelse return false;") != null);
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, sched, ".adaptive_chunk_width = " ++ "adaptiveChunkWidthFor(width_ctx.cfg),"));
+    const serve_body = declBody(@embedFile("server.zig"), "pub fn serve(") orelse return error.CallSiteMoved;
+    try t.expect(generate_mod.windowHasNoTestBlock(serve_body));
+    try t.expect(std.mem.indexOf(u8, serve_body, "scheduler_mod.prefill_chunk_adaptive_enabled = &adaptivePrefillChunk" ++ "Enabled;") != null);
 }
 
 test "the tail-merge bound scales ONLY where the per-chunk adaptive width is live" {

@@ -3104,13 +3104,30 @@ deepseek_v4; any `--prefill-chunk` or `MLX_SERVE_PREFILL_CHUNK` under 4096
 hits everything. Chunk boundaries are not byte-stable, so that was a
 behaviour change on archs where the bound was never measured — and the
 sentence claiming otherwise is exactly what a future reader would use to skip
-the A/B. The bound now goes through `tailMergeMaxFor(width, adaptive_width)`,
-the loop passes `adapt_chunked and options.chunk_width_hook != null` (the hook
-exists only under `adaptivePrefillChunkEnabled`), and every other arch keeps
-the flat constant byte for byte. Guards: `generate.zig` "the scaled
-tail-merge bound is gated on the per-chunk adaptive width" (both arms plus the
-wiring scan) and `server.zig` "the tail-merge bound scales ONLY where the
-per-chunk adaptive width is live" (the arch predicate).
+the A/B. The bound now goes through `tailMergeMaxFor(width, adaptive_width)`
+and every other arch keeps the flat constant byte for byte.
+
+**And the first gate was wrong in the same shape, one level down.** It read
+`adapt_chunked and options.chunk_width_hook != null`, on the belief that the
+hook exists only where the adaptive width does. `serve` installs
+`prefill_chunk_adapt` **unconditionally and process-wide**, and the
+scheduler's one `InitOptions` site installs the hook whenever that global is
+non-null — so under a real server the hook is non-null on *every* arch and the
+scaled bound was live everywhere again. The width still held elsewhere, but
+for a different reason than the gate assumed: the POLICY behind the hook
+declines (`adaptivePrefillChunkEnabled`), the hook is not absent. Two tests
+sat green over the defect because both exercised the flag and neither
+exercised the wiring. The flag now comes from the arch predicate itself,
+per model: `scheduler.prefill_chunk_adaptive_enabled` (fifth of the admission
+hook family, `= &adaptivePrefillChunkEnabled`) →
+`scheduler.adaptiveChunkWidthFor(cfg)` → `InitOptions.adaptive_chunk_width`.
+Guards: `server.zig` "the tail-merge gate reads the ARCH, not the installed
+hook" (installs the whole family, then asserts the hook's presence and the
+arch's answer DIFFER for qwen3_5), `server.zig` "the tail-merge bound scales
+ONLY where the per-chunk adaptive width is live" (the predicate), and
+`generate.zig` "the scaled tail-merge bound is gated on the per-chunk adaptive
+width" (both arms, plus a scan that the loop reads the flag and that the
+hook-presence spelling is absent from the loop body).
 
 ### Rules this produced
 
@@ -3121,6 +3138,12 @@ per-chunk adaptive width is live" (the arch predicate).
   feature can *reach*. Before changing one in a shared helper, enumerate every
   route into it; if any predates the feature, gate the change on the feature
   rather than on the value that made you look.
+- **A hook's PRESENCE is not a capability gate.** A hook installed once at
+  startup is a property of the HOST, not of the model, the arch or the
+  request; if the policy behind it answers "no" per model, ask the policy.
+  Reading `!= null` as "this arch opted in" is how a correctly-gated feature
+  becomes ungated again — and a test that exercises the resulting FLAG cannot
+  see it, only one that builds the wiring the way the server does.
 - When attribution and safety want opposite orderings, do not pick one. Split
   the decision by direction: the safe direction commits early, the risky one
   is confirmed late.

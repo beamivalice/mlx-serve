@@ -362,6 +362,28 @@ pub var prefill_chunk_adapt: ?*const fn (
     u64,
 ) u32 = null;
 
+/// Fifth of the family, and the one that says whether the fourth can move
+/// anything at all: is the per-chunk adaptive width ENABLED for this model
+/// (`server.adaptivePrefillChunkEnabled` — qwen4_exp, its two kill switches,
+/// and no operator pin)?
+///
+/// It exists because the fourth hook's PRESENCE cannot answer that question.
+/// `serve` installs `prefill_chunk_adapt` unconditionally and process-wide, so
+/// it is non-null on every arch; the width holds elsewhere because the policy
+/// behind it declines, not because the hook is missing. Reading presence as
+/// the arch gate put the scaled tail-merge bound back on every arch (audit
+/// B-A2). Null here = not live, which is the right answer for a host with no
+/// estimator installed.
+pub var prefill_chunk_adaptive_enabled: ?*const fn (*const model_mod.ModelConfig) bool = null;
+
+/// PURE-ish: what `Generator.InitOptions.adaptive_chunk_width` gets for a slot.
+/// No config (the embedded engines) or no installed predicate = not live.
+pub fn adaptiveChunkWidthFor(cfg: ?*const model_mod.ModelConfig) bool {
+    const c = cfg orelse return false;
+    const enabled = prefill_chunk_adaptive_enabled orelse return false;
+    return enabled(c);
+}
+
 /// S17's twin: re-price a WIDEN after the interleave tick
 /// (`server.adaptivePrefillWidenStillFits`). Null declines every widen, which
 /// is the safe default for a host with no estimator installed.
@@ -6166,6 +6188,10 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 .{ .ctx = &width_ctx, .call = chunkWidthCb, .confirm = chunkWidenConfirmCb }
             else
                 null,
+            // ...and separately, whether that hook can move anything for THIS
+            // model. The install above is process-wide, so it is not the arch
+            // gate and nothing downstream may read it as one (audit B-A2).
+            .adaptive_chunk_width = adaptiveChunkWidthFor(width_ctx.cfg),
             // Init's argmax-only gate must see logprobs BEFORE the split-
             // prefill final-token forward runs — a post-init field write is
             // too late for the certified lm_head prune.
