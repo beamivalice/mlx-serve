@@ -20768,3 +20768,26 @@ test "ssdFirstPrefixCacheMem: the active session's KV is billed ONCE and is the 
     try t.expect(ssdFirstPrefixCacheMem(0, 0, 0, 0, 0) >= 1);
 }
 
+
+test "both hot-cache budget arms publish hot_cache_mem_resolved" {
+    // `hot_cache_mem_resolved` is what the auto-context sizer and the ANE gate
+    // read instead of re-deriving the budget. The RAM-first plan arm always
+    // published it; the SSD-first arm returned its budget without doing so, so
+    // an SSD-first boot sized against a budget the cache never got. The two
+    // arms are in different functions, which is exactly how one of them gets
+    // added later without the assignment — so scan both.
+    //
+    // The needle is split so this test's own source cannot satisfy the scan.
+    const src = @embedFile("server.zig");
+    const needle = "hot_cache_mem_" ++ "resolved = ";
+    const arms = [_][]const u8{ "fn ssdFirstBudgetForLoad(", "pub fn prefixCacheMemForLoad(" };
+    for (arms) |decl| {
+        const start = std.mem.indexOf(u8, src, decl) orelse return error.ArmNotFound;
+        const body = src[start..];
+        const end = std.mem.indexOf(u8, body, "\n}\n") orelse body.len;
+        std.testing.expect(std.mem.indexOf(u8, body[0..end], needle) != null) catch |err| {
+            std.debug.print("arm does not publish the resolved budget: {s}\n", .{decl});
+            return err;
+        };
+    }
+}
