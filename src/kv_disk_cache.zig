@@ -70,12 +70,37 @@ pub const MIN_PERSIST_TOKENS: u32 = 512;
 pub const DEFAULT_CHUNK_TOKENS: u32 = 1024;
 
 /// Max persisted SSM checkpoint positions per entry. Every turn adds an
-/// end-of-prompt checkpoint (~400 MB each on Qwen3.6-27B); unbounded, one
-/// long session would accumulate GBs in a single entry. Thinning is
-/// span-preserving (`transformer.positionDropIndex`, the RAM tier's policy):
-/// the lowest AND the newest position always survive, so a restore that
-/// diverges early still finds a checkpoint below its match.
-pub const SSM_DISK_MAX_PER_ENTRY: usize = 8;
+/// end-of-prompt checkpoint; unbounded, one long session would accumulate GBs
+/// in a single entry. Thinning is span-preserving
+/// (`transformer.positionDropIndex`, the RAM tier's policy): the lowest AND
+/// the newest position always survive, so a restore that diverges early still
+/// finds a checkpoint below its match.
+///
+/// The count is a SPACING decision priced against the tier. Span-preserving
+/// survivors sit ~`L/K` apart, and a warm turn that diverges between two of
+/// them re-prefills that gap — so a small K is cheap on disk and slow on a
+/// near-end divergence. A checkpoint is NOT a constant: on qwen4_exp it
+/// measures 83 MB + ~3 KB per token of its own position (191.3 MB at position
+/// 36,864), so the bill grows with K AND with where the survivors sit. At a
+/// 383k entry, with 4 entries in the tier:
+///
+///     K=8    5.6 GB cps/entry   41 GB at 4 entries   spacing ~54,700 tok (~61 s)
+///     K=16  10.6 GB cps/entry   61 GB at 4 entries   spacing ~25,500 tok (~28 s)
+///     K=24  15.6 GB cps/entry   81 GB at 4 entries   spacing ~16,700 tok (~19 s)
+///     K=32  20.7 GB cps/entry  101 GB at 4 entries   spacing ~12,400 tok (~14 s)
+///
+/// 16, not 32: K=32 does not fit a 100 GB tier at all (101 GB before a single
+/// KV chunk is counted), and K=24 — the smallest that holds a ~16k spacing —
+/// leaves 19 GB of headroom for a tier that must also hold every other entry
+/// and not thrash. 16 halves the worst-case near-end re-prefill (61 s -> 28 s)
+/// at 61% of the tier. Raise it only alongside the tier's byte budget.
+///
+/// The spacings above are the EVEN-spread ideal; the thin reserves a dense
+/// newest quarter (`transformer.spanPreservingDropIndex`), so the real shape
+/// at K=16 is a stride-spaced tail plus a ~37k widest gap below it. The
+/// near-end case the spacing column prices is served by the dense tail, not
+/// by the average.
+pub const SSM_DISK_MAX_PER_ENTRY: usize = 16;
 
 /// SSD-first per-flush READBACK bound (mechanism 2). Bounds only the
 /// device→host copy the inference thread performs; the file write is off
@@ -4034,4 +4059,66 @@ test "DiskTier: the root-wide sweep drops strays and never touches the live tier
     // A zero budget is an LRU bar over INDEXED entries; it is not a licence to
     // delete what might be another server's flush.
     try testing.expect(tmp.dir.statFile(io, "fp-inflight/e3/c000000.safetensors", .{}) catch null != null);
+}
+
+test "DiskTier: SSM retention spacing is priced against the tier, not just capped" {
+    // The audit's weakest cell. Span-preserving survivors sit ~L/K apart, and
+    // a warm turn diverging between two of them re-prefills that gap — so the
+    // COUNT is a spacing decision, not just a memory cap. At the live 383k
+    // shape (stride 4096, 93 stride captures plus the end snap) the old K=8
+    // left ~54,700-token gaps (~61 s of re-prefill at 900 tok/s). K=16 halves
+    // it to ~25,500 (~28 s) at 61% of a 100 GB tier.
+    //
+    // The review asked for <= ~16k, which needs K >= 24: that is 15.6 GB of
+    // checkpoints per entry and 81 GB at 4 entries, leaving 19 GB of headroom
+    // for a tier that must also hold every other entry's chunks. K=32 does not
+    // fit at all (101 GB before one KV chunk). The bar below is therefore the
+    // one K=16 actually holds, derived from the constant so it tracks a future
+    // change rather than going stale.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-spacing", 0, 128);
+    defer tier.deinit();
+
+    const L: u32 = 383_069;
+    var positions: [94]u32 = undefined;
+    for (positions[0..93], 0..) |*p, i| p.* = @intCast((i + 1) * 4096);
+    positions[93] = 383_039;
+
+    const kept = try tier.ssmTargetPositions(&positions, &[_]transformer_mod.SSMCheckpoint{}, L);
+    defer testing.allocator.free(kept);
+
+    try testing.expectEqual(SSM_DISK_MAX_PER_ENTRY, kept.len);
+    // Both ends survive: the lowest is what an early-diverging restore needs,
+    // the newest is where an append-growth turn matches.
+    try testing.expectEqual(@as(u32, 4096), kept[0]);
+    try testing.expectEqual(@as(u32, 383_039), kept[kept.len - 1]);
+
+    var max_gap: u32 = 0;
+    var i: usize = 1;
+    while (i < kept.len) : (i += 1) {
+        const gap = kept[i] - kept[i - 1];
+        if (gap > max_gap) max_gap = gap;
+    }
+    // Two properties, not one. The list is NOT evenly spaced: the newest
+    // quarter stays at capture density (a warm turn that edits near the end
+    // restores from there) and the rest is spread (a turn that diverges early
+    // restores at all). An even spread would satisfy a single max-gap bar and
+    // still re-prefill a whole spacing on the near-end edit, which is the
+    // regression the audit named.
+    try testing.expectEqual(@as(u32, 383_039 - 380_928), kept[kept.len - 1] - kept[kept.len - 2]);
+    try testing.expectEqual(@as(u32, 4096), kept[kept.len - 2] - kept[kept.len - 3]);
+    try testing.expectEqual(@as(u32, 4096), kept[kept.len - 3] - kept[kept.len - 4]);
+    // Spread below that: the widest gap is bounded, and far under the old
+    // K=8 spacing (~54,700 tokens, ~61 s of re-prefill at 900 tok/s). The
+    // recency bias buys the dense tail by widening this, so the bar is the
+    // measured shape, not an even-spacing ideal.
+    try testing.expect(max_gap <= 40_000);
+    try testing.expect(max_gap < 54_000);
+    // The front is un-anchored — the whole point of the policy: the lowest
+    // capture survives and the gap above it is many strides wide.
+    try testing.expect(kept[1] - kept[0] > 4 * 4096);
 }

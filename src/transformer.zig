@@ -7427,11 +7427,29 @@ pub fn spanPreservingDropIndex(
     items: []const T,
     comptime posOf: fn (*const T) usize,
 ) usize {
+    // Callers all guard this; the assert pins it rather than silently
+    // returning an index into an empty list.
+    std.debug.assert(items.len > 0);
     if (items.len < 3) return 0;
+    // RECENCY BIAS. An even spread is the wrong shape at the END of a long
+    // prompt: a warm turn that edits near the end restores from the highest
+    // checkpoint at or below the edit, so an evenly-thinned list makes it
+    // re-prefill up to one whole spacing (~L/K) where drop-oldest re-prefilled
+    // one stride. The newest quarter is therefore never a drop candidate — it
+    // stays at capture density — while everything below it is thinned
+    // span-preservingly, which is what un-anchors the front. Measured on the
+    // live 383k shape at K=32: the last gap goes 10,303 -> 2,111 tokens while
+    // the widest gap grows 16,384 -> 20,480, i.e. ~9 s bought at the end for
+    // ~4.5 s given up in the middle (900 tok/s). Below `RECENCY_DENSE_MIN`
+    // there is no room to reserve a quarter, so the whole interior is scanned.
+    const scan_end = if (items.len >= RECENCY_DENSE_MIN)
+        items.len - items.len / 4
+    else
+        items.len;
     var best_at: usize = 1;
     var best_span: usize = std.math.maxInt(usize);
     var k: usize = 1;
-    while (k + 1 < items.len) : (k += 1) {
+    while (k + 1 < items.len and k < scan_end) : (k += 1) {
         const span = posOf(&items[k + 1]) -| posOf(&items[k - 1]);
         if (span < best_span) {
             best_span = span;
@@ -7440,6 +7458,10 @@ pub fn spanPreservingDropIndex(
     }
     return best_at;
 }
+
+/// Shortest list that reserves a dense newest quarter. Below this the quarter
+/// would be 0 or 1 entries and the reservation only removes candidates.
+const RECENCY_DENSE_MIN: usize = 8;
 
 fn checkpointPosOf(cp: *const SSMCheckpoint) usize {
     return cp.pos;
@@ -46592,10 +46614,18 @@ test "ssm retention: the span-preserving thin keeps both ends and spreads the su
     try t.expectEqual(@as(usize, 16), n);
     try t.expectEqual(@as(usize, 4096), positions[0]);
     try t.expectEqual(@as(usize, 94 * 4096), positions[n - 1]);
-    // Roughly even: no surviving gap wider than twice the ideal spacing.
+    // Spread, but not EVENLY spread: no surviving gap wider than twice the
+    // ideal spacing, and the newest quarter stays at capture density because a
+    // warm turn that edits near the end restores from there (the recency bias
+    // — an even spread made that turn re-prefill a whole spacing).
     const ideal = (positions[n - 1] - positions[0]) / (n - 1);
     var i: usize = 1;
     while (i < n) : (i += 1) try t.expect(positions[i] - positions[i - 1] <= 2 * ideal);
+    try t.expectEqual(@as(usize, 4096), positions[n - 1] - positions[n - 2]);
+    try t.expectEqual(@as(usize, 4096), positions[n - 2] - positions[n - 3]);
+    // ... while the FRONT is still un-anchored: the lowest survivor is the
+    // lowest capture, and the gap above it is many strides wide.
+    try t.expect(positions[1] - positions[0] > 4 * 4096);
     // Under three there is no interior — the oldest goes.
     try t.expectEqual(@as(usize, 0), positionDropIndexUsize(positions[0..2]));
     try t.expectEqual(@as(usize, 0), positionDropIndexUsize(positions[0..1]));

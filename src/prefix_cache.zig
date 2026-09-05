@@ -631,7 +631,13 @@ pub const HotPrefixCache = struct {
         for (snap.entries) |e| {
             if (!e.initialized) continue;
             inline for (.{ e.keys, e.values, e.keys_scales, e.keys_biases, e.values_scales, e.values_biases }) |arr| {
-                if (arr.ctx != null) {
+                // A dense snapshot leaves the four quant handles as EMPTY
+                // 0-dim arrays: `ctx != null` is true for those, so reading
+                // `shape[2]` walks off the end of the shape. Harmless in
+                // effect (size 0 makes the numerator 0) but it is an
+                // out-of-bounds read in the price the trim multiplies by a
+                // prompt length — the ndim check makes axis 2 a fact.
+                if (arr.ctx != null and mlx.mlx_array_ndim(arr) > 2) {
                     const rows: u64 = @intCast(mlx.mlx_array_shape(arr)[2]);
                     if (rows > 0) {
                         total += (@as(u64, mlx.mlx_array_size(arr)) * @as(u64, mlx.mlx_array_itemsize(arr))) / rows;
@@ -664,21 +670,24 @@ pub const HotPrefixCache = struct {
         budget: u64,
         positions: []const usize,
         cp_bytes: []const u64,
+        total: usize,
         chosen: ?usize,
     ) []const u8 {
         var n: usize = 0;
-        appendTrimFmt(buf, &n, "  [hot-cache] trim inputs: tokens={d} row_bytes={d} budget={d:.2} MB survivors=[", .{
+        appendTrimFmt(buf, &n, "  [hot-cache] trim inputs: tokens={d} row_bytes={d} budget={d:.2} MB list_len={d} arm={s} survivors=[", .{
             tokens_len,
             row_bytes,
             @as(f64, @floatFromInt(budget)) / (1024.0 * 1024.0),
+            total,
+            trimBillArm(total),
         });
         const shown = @min(positions.len, TRIM_LOG_MAX_POS);
         for (positions[0..shown], 0..) |p, i| {
             if (i > 0) appendTrimFmt(buf, &n, ",", .{});
             appendTrimFmt(buf, &n, "{d}", .{p});
         }
-        if (shown < positions.len) appendTrimFmt(buf, &n, ",...", .{});
-        appendTrimFmt(buf, &n, "] ({d} of {d})", .{ shown, positions.len });
+        if (shown < total) appendTrimFmt(buf, &n, ",...", .{});
+        appendTrimFmt(buf, &n, "] ({d} of {d})", .{ shown, total });
         if (chosen) |tl| {
             appendTrimFmt(buf, &n, " chosen={d}", .{tl});
             var chosen_cp: u64 = 0;
@@ -715,8 +724,9 @@ pub const HotPrefixCache = struct {
                 byte_buf[k] = ssmCheckpointBytes(&list[k]);
             }
         }
+        const total = if (cps) |list| list.len else 0;
         var line: [768]u8 = undefined;
-        log.info("{s}", .{formatTrimInputs(&line, tokens_len, row_bytes, budget, pos_buf[0..k], byte_buf[0..k], chosen)});
+        log.info("{s}", .{formatTrimInputs(&line, tokens_len, row_bytes, budget, pos_buf[0..k], byte_buf[0..k], total, chosen)});
     }
 
     /// Stack bound for the shed simulation. A committed checkpoint list is
@@ -777,6 +787,14 @@ pub const HotPrefixCache = struct {
             if (shedSurvivorBytes(positions[0 .. k + 1], cp_bytes[0 .. k + 1], budget - rows) != null) return p;
         }
         return null;
+    }
+
+    /// Which arm `trimLenForBudget` bills a list of this length with. Audit
+    /// S15b: the `all_lower` arm never simulates the shed, so it is strictly
+    /// more pessimistic — a trim that lands far below its budget looks the
+    /// same from outside whichever arm ran, and the log has to say which.
+    fn trimBillArm(list_len: usize) []const u8 {
+        return if (list_len > SHED_SIM_MAX) "all_lower" else "shed";
     }
 
     /// Defensive arm for a checkpoint list past `SHED_SIM_MAX`: the pre-shed
@@ -4761,8 +4779,8 @@ test "prefix cache: the trim-inputs line carries the price, the positions and th
     var buf: [768]u8 = undefined;
     // Long list: elided at TRIM_LOG_MAX_POS, but the COUNT stays exact.
     {
-        const line = HotPrefixCache.formatTrimInputs(&buf, 383_069, row_bytes, budget, &all_pos, &bytes, 126_976);
-        try testing.expect(std.mem.startsWith(u8, line, "  [hot-cache] trim inputs: tokens=383069 row_bytes=13056 budget=3873.00 MB survivors=["));
+        const line = HotPrefixCache.formatTrimInputs(&buf, 383_069, row_bytes, budget, &all_pos, &bytes, all_pos.len, 126_976);
+        try testing.expect(std.mem.startsWith(u8, line, "  [hot-cache] trim inputs: tokens=383069 row_bytes=13056 budget=3873.00 MB list_len=94 arm=shed survivors=["));
         try testing.expect(std.mem.endsWith(u8, line, "\n"));
         try testing.expect(std.mem.indexOf(u8, line, "[4096,8192,12288,") != null);
         try testing.expect(std.mem.indexOf(u8, line, ",...] (32 of 94)") != null);
@@ -4775,21 +4793,34 @@ test "prefix cache: the trim-inputs line carries the price, the positions and th
     }
     // A short list prints whole, with no elision marker.
     {
-        const line = HotPrefixCache.formatTrimInputs(&buf, 900, row_bytes, budget, all_pos[0..3], bytes[0..3], 8192);
+        const line = HotPrefixCache.formatTrimInputs(&buf, 900, row_bytes, budget, all_pos[0..3], bytes[0..3], 3, 8192);
         try testing.expect(std.mem.indexOf(u8, line, "survivors=[4096,8192,12288] (3 of 3)") != null);
         try testing.expect(std.mem.indexOf(u8, line, "...") == null);
     }
     // A decline says so, and a plain-attention entry has no positions at all.
     {
-        const line = HotPrefixCache.formatTrimInputs(&buf, 900, row_bytes, budget, all_pos[0..2], bytes[0..2], null);
+        const line = HotPrefixCache.formatTrimInputs(&buf, 900, row_bytes, budget, all_pos[0..2], bytes[0..2], 2, null);
         try testing.expect(std.mem.indexOf(u8, line, " chosen=none") != null);
         try testing.expect(std.mem.indexOf(u8, line, "chosen_cp_bytes") == null);
     }
     {
-        const line = HotPrefixCache.formatTrimInputs(&buf, 900, row_bytes, budget, all_pos[0..0], bytes[0..0], 512);
+        const line = HotPrefixCache.formatTrimInputs(&buf, 900, row_bytes, budget, all_pos[0..0], bytes[0..0], 0, 512);
         try testing.expect(std.mem.indexOf(u8, line, "survivors=[] (0 of 0)") != null);
         try testing.expect(std.mem.indexOf(u8, line, " chosen=512 chosen_cp_bytes=0") != null);
     }
+    // Audit S15b: the line names WHICH bill ran. A list past SHED_SIM_MAX
+    // takes the pre-shed `all_lower` arm, which is strictly more pessimistic —
+    // the whole point of printing it is that the two are indistinguishable
+    // from the outcome alone.
+    try testing.expectEqualStrings("shed", HotPrefixCache.trimBillArm(32));
+    try testing.expectEqualStrings("shed", HotPrefixCache.trimBillArm(HotPrefixCache.SHED_SIM_MAX));
+    try testing.expectEqualStrings("all_lower", HotPrefixCache.trimBillArm(HotPrefixCache.SHED_SIM_MAX + 1));
+    {
+        const line = HotPrefixCache.formatTrimInputs(&buf, 383_069, row_bytes, budget, &all_pos, &bytes, 200, 126_976);
+        try testing.expect(std.mem.indexOf(u8, line, "list_len=200 arm=all_lower") != null);
+        try testing.expect(std.mem.indexOf(u8, line, ",...] (32 of 200)") != null);
+    }
+
     // The site emits it ONCE per oversized commit, before any decision.
     const source = @embedFile("prefix_cache.zig");
     const at = std.mem.indexOf(u8, source, "var inputs_logged = false;") orelse return error.MissingLatch;
@@ -4800,4 +4831,75 @@ test "prefix cache: the trim-inputs line carries the price, the positions and th
     const log_at = std.mem.indexOf(u8, site, "logTrimInputs(").?;
     const decide_at = std.mem.indexOf(u8, site, "orelse break :trim_blk").?;
     try testing.expect(log_at < decide_at);
+}
+
+test "prefix cache: the trim's row price is the entry's own bytes divided by its rows" {
+    // The trim walk multiplies `snapshotRowBytes` by a candidate length and
+    // compares against the budget, so the price has to be exactly the
+    // snapshot's bytes per row. It divides each of the SIX quantized arrays by
+    // its own `shape[2]`; that is only a row count if every array carries rows
+    // on axis 2, which is a layout assumption, not an identity. The live 383k
+    // trim behaved as though the price were ~8x the arch's per-token KV, so
+    // pin the invariant rather than the constant: it holds for any layout, and
+    // catches a miscount on any one of the six.
+    const s = mlx.gpuStream();
+
+    for ([_]kv_quant.KVQuantConfig{
+        kv_quant.KVQuantConfig.dense,
+        kv_quant.KVQuantConfig.affine(8),
+        kv_quant.KVQuantConfig.affine(4),
+    }) |cfg| {
+        var cache = try KVCache.initWithConfig(testing.allocator, 2, cfg);
+        defer cache.deinit();
+
+        // qwen4_exp's own attention shape: 2 kv heads, head_dim 256.
+        const mk = struct {
+            fn f(str: mlx.mlx_stream, len: c_int) !mlx.mlx_array {
+                const shape = [_]c_int{ 1, 2, len, 256 };
+                var a = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_ones(&a, &shape, 4, .bfloat16, str));
+                return a;
+            }
+        }.f;
+        // Two writes so the second crosses a growth event and the buffer
+        // capacity is genuinely larger than the logical length — the case
+        // where "bytes / rows" and "bytes / length" diverge.
+        for ([_]c_int{ 64, 40 }) |n| {
+            const k = try mk(s, n);
+            defer _ = mlx.mlx_array_free(k);
+            var dv = try cache.update(0, k, k, s, 0);
+            dv.deinit();
+            const k2 = try mk(s, n);
+            defer _ = mlx.mlx_array_free(k2);
+            var dv2 = try cache.update(1, k2, k2, s, 0);
+            dv2.deinit();
+        }
+
+        var snap = try cache.snapshot();
+        defer snap.deinit();
+
+        const row_bytes = HotPrefixCache.snapshotRowBytes(&snap);
+        const total = HotPrefixCache.snapshotBytes(&snap);
+        try testing.expect(row_bytes > 0);
+
+        // Every entry's arrays are sized from the same capacity, so the price
+        // times that capacity IS the snapshot's bytes. A miscounted axis on
+        // any array breaks this by exactly that array's ratio.
+        const cap: u64 = @intCast(mlx.getShape(snap.entries[0].keys)[2]);
+        try testing.expect(cap >= 104);
+        try testing.expectEqual(total, row_bytes * cap);
+
+        // And the price is per TOKEN, not per anything else: 2 layers of
+        // (K+V) at 2 heads x 256 dims. Dense is bf16; affine packs to `bits`
+        // plus one bf16 scale and bias per group of 64.
+        const per_layer: u64 = switch (cfg.scheme) {
+            .off => 2 * (2 * 256 * 2),
+            else => blk: {
+                const packed_b: u64 = 2 * 256 * @as(u64, cfg.bits) / 8;
+                const groups: u64 = 2 * 256 / cfg.group_size;
+                break :blk 2 * (packed_b + groups * 2 * 2);
+            },
+        };
+        try testing.expectEqual(2 * per_layer, row_bytes);
+    }
 }
