@@ -5203,18 +5203,24 @@ test "HotPrefixCache: a bounded disk flush leaves disk_dirty set and later flush
 
 // ── RESTORE BY MOVE (checkout) ───────────────────────────────────────────────
 
-/// Data pointer of a KV layer's key buffer, after an eval. Buffer IDENTITY is
-/// the only in-process observable of mlx's donation: `mlx_slice_update` donates
-/// its input when `is_donatable()` holds (`use_count() == 1` on both the
-/// descriptor and the data) and otherwise falls through to `copy_gpu`, which
-/// allocates. So "the appended buffer sits at the address the prefix already
-/// occupied" IS "no copy happened", and the copy arm cannot fake it: its donor
-/// is still alive in the entry, so the allocator cannot hand the copy that same
-/// address.
-fn testKeyDataPtr(cache: *KVCache, layer: usize) usize {
-    cache.evalState();
-    const p = mlx.mlx_array_data_float32(cache.entries[layer].keys);
-    return @intFromPtr(p);
+/// Live Metal bytes, with the allocator pool PINNED first. `mlx_clear_cache()`
+/// returns pooled-but-free buffers so the reading reflects what is actually
+/// held, and the synchronize makes sure every lazy node this test built has
+/// really allocated before we look.
+fn testLiveBytes(s: mlx.mlx_stream) u64 {
+    _ = mlx.mlx_synchronize(s);
+    _ = mlx.mlx_clear_cache();
+    var live: usize = 0;
+    _ = mlx.mlx_get_active_memory(&live);
+    return @intCast(live);
+}
+
+/// Bytes of one layer's key BUFFER (capacity, not logical rows) — the size of
+/// the second allocation a copy-on-write would have to make.
+fn testKeyBufferBytes(cache: *KVCache, layer: usize) u64 {
+    const sh = mlx.getShape(cache.entries[layer].keys);
+    return @as(u64, @intCast(sh[0])) * @as(u64, @intCast(sh[1])) *
+        @as(u64, @intCast(sh[2])) * @as(u64, @intCast(sh[3])) * 4; // f32
 }
 
 fn testCheckoutCache(hc: *HotPrefixCache, s: mlx.mlx_stream, tokens: []const u32, reserve: usize) !void {
@@ -5234,6 +5240,17 @@ test "restore by move: a full-prefix hit checks the entry out and the append don
     // tokens on qwen4_exp, 45% of the warm TTFT. Releasing the entry's handles
     // at restore (the checkout) makes the slot the sole owner and the copy
     // disappears rather than moving.
+    //
+    // THE OBSERVABLE IS ALLOCATION, NOT ADDRESS. The first shape of this test
+    // compared the appended buffer's data POINTER against the prefix's and
+    // called equality "donated". That passed in isolation and failed inside the
+    // full suite with different addresses every run: under suite-wide memory
+    // pressure MLX's buffer pool recycles, so an address is a statement about
+    // the allocator's mood, not about donation. What a copy cannot hide is the
+    // BYTES: `slice_update`'s output is capacity-shaped, so a copy must
+    // allocate a whole second buffer, and a donation allocates nothing beyond
+    // the appended tail. Measure that, with the pool pinned on both readings.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     var tokens: [600]u32 = undefined;
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
@@ -5241,9 +5258,15 @@ test "restore by move: a full-prefix hit checks the entry out and the append don
     // whose commit will replace this same entry.
     var prompt: [608]u32 = undefined;
     for (&prompt, 0..) |*t, i| t.* = @intCast(i + 7);
+    // A reservation big enough that ONE buffer dwarfs any pool noise the
+    // reading could carry: 1 Mi rows x 8 dims x 4 B = 32 MiB of K, same of V.
+    const reserve: usize = 1 << 20;
 
     var moved_bytes: [64]f32 = undefined;
     var copied_bytes: [64]f32 = undefined;
+    var moved_delta: u64 = 0;
+    var copied_delta: u64 = 0;
+    var buf_bytes: u64 = 0;
 
     // ── Arm A: the move.
     {
@@ -5252,7 +5275,7 @@ test "restore by move: a full-prefix hit checks the entry out and the append don
         var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
         hc.ssd_first = true;
         defer hc.deinit();
-        try testCheckoutCache(&hc, s, &tokens, 4096);
+        try testCheckoutCache(&hc, s, &tokens, reserve);
 
         var slot = try KVCache.init(testing.allocator, 1);
         defer slot.deinit();
@@ -5261,17 +5284,21 @@ test "restore by move: a full-prefix hit checks the entry out and the append don
         try testing.expectEqual(@as(usize, 600), res.matched);
 
         // The entry gave the buffers up: its handles are EMPTY and it names
-        // the slot that holds them.
+        // the slot that holds them. This is the OWNERSHIP half of the bar, and
+        // it is what makes the slot the only reference left — no snapshot, no
+        // pending disk record (`checkoutEligible` declines on one), no spec
+        // payload, and the donor cache died inside `testCheckoutCache`.
         const e = &hc.entries.items[0];
         try testing.expectEqual(@as(?usize, 0xA11CE), e.checked_out_by);
         try testing.expect(e.snapshot.entries[0].keys.ctx == null);
         try testing.expect(e.snapshot.entries[0].values.ctx == null);
 
-        // ...and the append lands in that same buffer.
-        const before = testKeyDataPtr(&slot, 0);
+        slot.evalState();
+        buf_bytes = testKeyBufferBytes(&slot, 0);
+        const before = testLiveBytes(s);
         try testWriteCacheLayer(&slot, s, 0, 600, 8);
-        const after = testKeyDataPtr(&slot, 0);
-        try testing.expectEqual(before, after);
+        slot.evalState();
+        moved_delta = testLiveBytes(s) -| before;
         try testReadKeyRows(&slot, 0, 596, &moved_bytes);
     }
 
@@ -5284,7 +5311,7 @@ test "restore by move: a full-prefix hit checks the entry out and the append don
         var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
         hc.ssd_first = true;
         defer hc.deinit();
-        try testCheckoutCache(&hc, s, &tokens, 4096);
+        try testCheckoutCache(&hc, s, &tokens, reserve);
 
         var slot = try KVCache.init(testing.allocator, 1);
         defer slot.deinit();
@@ -5295,15 +5322,24 @@ test "restore by move: a full-prefix hit checks the entry out and the append don
         try testing.expectEqual(@as(?usize, null), e.checked_out_by);
         try testing.expect(e.snapshot.entries[0].keys.ctx != null);
 
-        const before = testKeyDataPtr(&slot, 0);
+        slot.evalState();
+        try testing.expectEqual(buf_bytes, testKeyBufferBytes(&slot, 0));
+        const before = testLiveBytes(s);
         try testWriteCacheLayer(&slot, s, 0, 600, 8);
-        const after = testKeyDataPtr(&slot, 0);
-        // The entry still holds the donor, so the append HAD to copy.
-        try testing.expect(before != after);
+        slot.evalState();
+        copied_delta = testLiveBytes(s) -| before;
         try testReadKeyRows(&slot, 0, 596, &copied_bytes);
     }
 
-    // Byte-for-byte: the arms differ in ownership, never in output.
+    // The share arm HAD to copy: the entry still holds the donor, so the
+    // append allocated a second capacity-shaped buffer (K and V both).
+    try testing.expect(copied_delta > buf_bytes);
+    // The move arm allocated nothing beyond the 8-row tail. A quarter of ONE
+    // buffer is a deliberately loose ceiling — the real figure is ~0, and the
+    // gap between the arms is two whole buffers.
+    try testing.expect(moved_delta * 4 < buf_bytes);
+    // Byte-for-byte: the arms differ in ownership and in allocation, never in
+    // output.
     try testing.expectEqualSlices(f32, &copied_bytes, &moved_bytes);
 }
 
@@ -5314,6 +5350,7 @@ fn testReadKeyRows(cache: *KVCache, layer: usize, row: usize, out: []f32) !void 
     // The fixture writes [1, 1, T, 8].
     for (out, 0..) |*v, i| v.* = p[row * 8 + i];
 }
+
 
 test "restore by move: a partial-prefix hit keeps the refcount-share" {
     // The checkout is the promise "the commit replaces this entry". A prompt
