@@ -5524,14 +5524,39 @@ const WriteThroughCtx = struct {
     chunks: u32 = 0,
 };
 
+/// Mechanism 3's SPAN condition, pure so it is unit-testable without a Slot.
+///
+/// The write-through only earns its cost when this turn's prefill produces at
+/// least one whole disk chunk: a shorter span has no chunk-aligned progress a
+/// cancel could lose (everything below it is already in RAM and, modulo the
+/// sub-chunk tail, already on disk), while the persist runs INSIDE the prefill
+/// chunk loop on the inference thread and therefore lands in this request's
+/// TTFT. A warm turn — a restored 32k prefix plus a 31-token instruction tail
+/// — is exactly that case, and paid +183/+369/+737 ms at 16k/32k/64k for a
+/// prefix the end-of-request commit persists anyway.
+fn writeThroughSpanReached(new_span: usize, chunk_tokens: u32) bool {
+    return new_span >= chunk_tokens;
+}
+
+var write_through_span_declined_logged = std.atomic.Value(bool).init(false);
+
 /// The ONE gate for mechanism 3: SSD-first arch predicate + a live background
 /// writer (so the chunk write never runs on the inference thread) + a disk
-/// tier to write into. Pure over the slot so it can be unit-tested.
-fn writeThroughArmed(slot: *Slot) bool {
+/// tier to write into + a NEW span worth at least one chunk. Pure over the
+/// slot (plus this turn's un-cached span) so it can be unit-tested.
+fn writeThroughArmed(slot: *Slot, new_span: usize) bool {
     const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return false;
     if (!hc.ssd_first) return false;
     const d = if (hc.disk) |*dd| dd else return false;
-    return d.writer != null and slot.vision_key == 0;
+    const writer_up = d.writer != null;
+    if (!writer_up or slot.vision_key != 0) return false;
+    if (!writeThroughSpanReached(new_span, d.chunk_tokens)) {
+        if (!write_through_span_declined_logged.swap(true, .monotonic)) {
+            log.info("  [disk-cache] prefill write-through declined: {d} new tokens is under one chunk ({d}) — the end-of-request commit persists this turn\n", .{ new_span, d.chunk_tokens });
+        }
+        return false;
+    }
+    return true;
 }
 
 /// Context for `Generator.InitOptions.chunk_width_hook`: everything the
@@ -6053,7 +6078,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             else
                 null,
             // Mechanism 3, SSD-first only.
-            .write_through_hook = if (writeThroughArmed(slot))
+            .write_through_hook = if (writeThroughArmed(slot, prefill_tokens.len))
                 .{ .ctx = &write_through_ctx, .call = prefillWriteThroughCb }
             else
                 null,
@@ -7944,8 +7969,8 @@ test "SSD-first behaviour is gated on ONE arch predicate at one place per mechan
 
     // Mechanism 3 is wired only behind `writeThroughArmed`, which itself
     // demands ssd_first + a live background writer.
-    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, ".write_through_hook = if (writeThroughArmed(slot))"));
-    const gs = std.mem.indexOf(u8, source, "fn writeThroughArmed(slot: *Slot) bool {") orelse
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, ".write_through_hook = if (writeThroughArmed(slot, prefill_tokens.len))"));
+    const gs = std.mem.indexOf(u8, source, "fn writeThroughArmed(slot: *Slot, new_span: usize) bool {") orelse
         return error.MissingWriteThroughGate;
     const ge = std.mem.indexOfPos(u8, source, gs, "\n}\n") orelse return error.MissingWriteThroughGateEnd;
     const gate = source[gs..ge];
@@ -7957,6 +7982,56 @@ test "SSD-first behaviour is gated on ONE arch predicate at one place per mechan
     const cb = source[cs..ce];
     try testing.expect(std.mem.indexOf(u8, cb, "if (!hc.ssd_first) return;") != null);
     try testing.expect(std.mem.indexOf(u8, cb, "if (d.writer == null) return;") != null);
+}
+
+test "writeThroughSpanReached: a sub-chunk warm turn never persists inside the prefill" {
+    // The measured defect: on a warm turn the whole restored prefix was
+    // re-serialised INSIDE the prefill chunk loop, before the first token, for
+    // a 31-token new span. Below one chunk the write-through protects nothing
+    // a cancel could lose, so the span condition declines and the
+    // end-of-request commit (which runs AFTER the response text) owns the tail.
+    const chunk: u32 = 1024;
+    // Warm turn: a restored 32k prefix plus a 31-token instruction tail.
+    try testing.expect(!writeThroughSpanReached(31, chunk));
+    try testing.expect(!writeThroughSpanReached(0, chunk));
+    // The boundary is inclusive: one whole chunk of new tokens is progress.
+    try testing.expect(!writeThroughSpanReached(1023, chunk));
+    try testing.expect(writeThroughSpanReached(1024, chunk));
+    // A real cold/extending prefill still arms, exactly as before.
+    try testing.expect(writeThroughSpanReached(4096, chunk));
+    try testing.expect(writeThroughSpanReached(65_665, chunk));
+    // The bar is the TIER's chunk width, not a literal: a wider tier declines
+    // a span that a narrower one arms.
+    try testing.expect(writeThroughSpanReached(4096, 4096));
+    try testing.expect(!writeThroughSpanReached(4095, 4096));
+}
+
+test "the write-through span gate is the tier's chunk width, wired from this turn's un-cached span" {
+    // Scan pin: the condition is worthless if the arming site passes the WHOLE
+    // prompt (every warm turn would arm again) or if the gate compares against
+    // a hardcoded width instead of the tier's own `chunk_tokens`.
+    // Needles split so this test never matches its own literals.
+    const whole = @embedFile("scheduler.zig");
+    // Cut at the FIRST test in the file: every needle below also appears as a
+    // literal in the sibling SSD-first scan test.
+    const source = whole[0 .. std.mem.indexOf(u8, whole, "test \"SSD-first behaviour is gated") orelse whole.len];
+    const gs = std.mem.indexOf(u8, source, "fn writeThroughArmed(slot: *Slot, new_span: usize) bool {") orelse
+        return error.MissingWriteThroughGate;
+    const ge = std.mem.indexOfPos(u8, source, gs, "\n}\n") orelse return error.MissingWriteThroughGateEnd;
+    const gate = source[gs..ge];
+    try testing.expect(std.mem.indexOf(u8, gate, "writeThroughSpanReached(new_span, d.chunk" ++ "_tokens)") != null);
+    // `prefill_tokens` is the un-cached tail (`full_prompt[hot_matched..]`) —
+    // the restored prefix must NOT be counted as new span.
+    try testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, source, "prefill_" ++ "tokens = slot.full_prompt[hot_matched..];"),
+    );
+    try testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, source, ".write_through_hook = if (writeThroughArmed(slot, prefill_" ++ "tokens.len))"),
+    );
+    // Declining is announced once, not per request.
+    try testing.expect(std.mem.indexOf(u8, gate, "write_through_span_declined_logged.swap(true, .monotonic)") != null);
 }
 
 test "the digest snapshot is freed AFTER the inference thread is joined" {

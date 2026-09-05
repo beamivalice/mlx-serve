@@ -262,6 +262,14 @@ fn nbytesOf(a: mlx.mlx_array) u64 {
     return @as(u64, mlx.mlx_array_size(a)) * @as(u64, mlx.mlx_array_itemsize(a));
 }
 
+/// Batched-eval meter for the staged serializer. One relaxed increment per
+/// `materializeContiguous` call — i.e. per CHUNK FILE, never per tensor.
+/// Timing-free, so the eval-count guard is a unit test rather than a bench:
+/// the defect this replaced issued one full GPU sync PER TENSOR (72 per 1024-
+/// token chunk at 12 KV layers x 6 affine buffers), which flattened the staged
+/// persist to ~1.13 GB/s against the 7-8 GB/s the batched path reaches.
+pub var serialize_eval_count = std.atomic.Value(u64).init(0);
+
 /// safetensors dtype spelling, matching `mlx::core::dtype_to_safetensor_str`.
 /// Only the dtypes a KV chunk can hold are named; anything else refuses the
 /// staged write rather than guessing at a spelling the loader would reject.
@@ -1558,16 +1566,19 @@ pub const DiskTier = struct {
         try list.append(self.allocator, .{ .key = key, .arr = sliced });
     }
 
-    /// Serialize a tensor list into one safetensors byte image, exactly as
-    /// `mlx::core::save_safetensors` does (8-byte LE header length, JSON
-    /// header carrying `__metadata__` + per-tensor dtype/shape/data_offsets,
-    /// then the tensors' bytes in header order).
+    /// Make every tensor in `tensors` contiguous IN PLACE and materialize the
+    /// whole list with exactly ONE batched `mlx_eval`, mirroring
+    /// `mlx::core::save_safetensors` (which pushes every array into one vector and
+    /// calls `eval` once).
     ///
-    /// Every array is made CONTIGUOUS and evaluated first: mlx `Copy`/slice
-    /// results are VIEWS, and a raw data-pointer read must prove row-major
-    /// contiguity before it can be trusted.
-    fn serializeSafetensors(self: *DiskTier, tensors: []NamedTensor, s: mlx.mlx_stream) ![]u8 {
-        var data_len: u64 = 0;
+    /// mlx `Copy`/slice results are VIEWS, and a raw data-pointer read must prove
+    /// row-major contiguity before it can be trusted — hence the contiguous pass.
+    /// The eval belongs OUTSIDE that loop: each `mlx_array_eval` is a full GPU
+    /// sync, so a per-tensor eval prices the write-through per tensor instead of
+    /// per byte.
+    fn materializeContiguous(tensors: []NamedTensor, s: mlx.mlx_stream) !void {
+        const vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
         for (tensors) |*t| {
             var cont = mlx.mlx_array_new();
             // Own it before anything can fail: a mid-loop error used to leak
@@ -1576,9 +1587,33 @@ pub const DiskTier = struct {
             try mlx.check(mlx.mlx_contiguous(&cont, t.arr, false, s));
             _ = mlx.mlx_array_free(t.arr);
             t.arr = cont;
-            try mlx.check(mlx.mlx_array_eval(t.arr));
-            data_len += nbytesOf(t.arr);
+            try mlx.check(mlx.mlx_vector_array_append_value(vec, t.arr));
         }
+        _ = serialize_eval_count.fetchAdd(1, .monotonic);
+        try mlx.check(mlx.mlx_eval(vec));
+    }
+
+    /// Serialize a tensor list into one safetensors byte image, exactly as
+    /// `mlx::core::save_safetensors` does (8-byte LE header length, JSON
+    /// header carrying `__metadata__` + per-tensor dtype/shape/data_offsets,
+    /// then the tensors' bytes in header order).
+    ///
+    /// Every array is made CONTIGUOUS and materialized first (mlx `Copy`/slice
+    /// results are VIEWS, and a raw data-pointer read must prove row-major
+    /// contiguity before it can be trusted) — with ONE batched eval for the
+    /// whole chunk, in `materializeContiguous`.
+    fn serializeSafetensors(self: *DiskTier, tensors: []NamedTensor, s: mlx.mlx_stream) ![]u8 {
+        try materializeContiguous(tensors, s);
+        return self.encodeSafetensors(tensors);
+    }
+
+    /// Header + payload encode over an ALREADY-materialized tensor list.
+    /// Touches no stream and evaluates nothing: the byte image is a function
+    /// of the tensors' names, dtypes, shapes and buffers alone, which is what
+    /// makes the eval STRATEGY (batched vs per-tensor) byte-invisible.
+    fn encodeSafetensors(self: *DiskTier, tensors: []const NamedTensor) ![]u8 {
+        var data_len: u64 = 0;
+        for (tensors) |*t| data_len += nbytesOf(t.arr);
 
         var header = std.ArrayList(u8).empty;
         defer header.deinit(self.allocator);
@@ -4121,4 +4156,117 @@ test "DiskTier: SSM retention spacing is priced against the tier, not just cappe
     // The front is un-anchored — the whole point of the policy: the lowest
     // capture survives and the gap above it is many strides wide.
     try testing.expect(kept[1] - kept[0] > 4 * 4096);
+}
+
+/// The PRE-FIX materializer, kept ONLY as the byte-identity golden below:
+/// contiguous + one `mlx_array_eval` PER TENSOR (one full GPU sync each).
+/// It must produce the same buffers as the batched path — the eval STRATEGY
+/// is a latency decision, never a format one.
+fn materializeLegacyPerTensorForTest(tensors: []DiskTier.NamedTensor, s: mlx.mlx_stream) !void {
+    for (tensors) |*t| {
+        var cont = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(cont);
+        try mlx.check(mlx.mlx_contiguous(&cont, t.arr, false, s));
+        _ = mlx.mlx_array_free(t.arr);
+        t.arr = cont;
+        try mlx.check(mlx.mlx_array_eval(t.arr));
+    }
+}
+
+test "DiskTier: the staged serializer evals ONCE per chunk, byte-identically to the per-tensor path" {
+    // The SSD-first write-through runs INSIDE the prefill chunk loop, on the
+    // inference thread, so its cost is inside TTFT. `serializeSafetensors`
+    // used to eval once per tensor — 12 KV layers x 6 affine buffers x 32
+    // chunks = ~2,300 GPU syncs on a 32k warm turn, a flat ~1.13 GB/s where
+    // `mlx_save_safetensors` (one batched eval) reaches 7-8 GB/s on the same
+    // data. Two bars, both timing-free: ONE eval per chunk file, and the
+    // bytes are unchanged.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-eval", 0, 128);
+    defer tier.deinit();
+
+    // Affine quant: six buffers per layer is the production shape and the one
+    // the per-tensor eval priced 72 syncs per 1024-token chunk against.
+    const qcfg = kv_quant.KVQuantConfig.affine(4);
+    var cache = try KVCache.initWithConfig(testing.allocator, 3, qcfg);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 256, 64, 0.0, .bfloat16);
+
+    // Two independent NamedTensor lists over the SAME cache slices.
+    var a = std.ArrayList(DiskTier.NamedTensor).empty;
+    defer tier.freeNamed(&a);
+    var b = std.ArrayList(DiskTier.NamedTensor).empty;
+    defer tier.freeNamed(&b);
+    for ([_]*std.ArrayList(DiskTier.NamedTensor){ &a, &b }) |list| {
+        for (cache.entries, 0..) |*e, li| {
+            try testing.expect(e.initialized);
+            try tier.appendSlice(list, li, "k", e.keys, 0, 128, s);
+            try tier.appendSlice(list, li, "v", e.values, 0, 128, s);
+            try tier.appendSlice(list, li, "ks", e.keys_scales, 0, 128, s);
+            try tier.appendSlice(list, li, "kb", e.keys_biases, 0, 128, s);
+            try tier.appendSlice(list, li, "vs", e.values_scales, 0, 128, s);
+            try tier.appendSlice(list, li, "vb", e.values_biases, 0, 128, s);
+        }
+    }
+    try testing.expectEqual(@as(usize, 18), a.items.len);
+
+    // Bar 1: one batched eval for the whole list, however many tensors it holds.
+    const before = serialize_eval_count.load(.monotonic);
+    const got = try tier.serializeSafetensors(a.items, s);
+    defer testing.allocator.free(got);
+    try testing.expectEqual(@as(u64, 1), serialize_eval_count.load(.monotonic) - before);
+
+    // Bar 2: the pre-fix per-tensor materializer through the SAME encoder
+    // yields the SAME image. The encode itself evals nothing.
+    try materializeLegacyPerTensorForTest(b.items, s);
+    const mid = serialize_eval_count.load(.monotonic);
+    const want = try tier.encodeSafetensors(b.items);
+    defer testing.allocator.free(want);
+    try testing.expectEqual(mid, serialize_eval_count.load(.monotonic));
+    try testing.expect(got.len > 4096);
+    try testing.expectEqualSlices(u8, want, got);
+}
+
+test "DiskTier: the staged serializer's eval is batched — ONE eval, outside the per-tensor loop" {
+    // Scan pin for the shape, not just the output: a future edit that moves
+    // an eval back inside the loop is byte-identical and therefore invisible
+    // to every round-trip test in this file. Scan the CODE, function-scoped,
+    // so this test's own literals are never the match.
+    const source = @embedFile("kv_disk_cache.zig");
+    const fs = std.mem.indexOf(u8, source, "fn materializeContiguous(") orelse
+        return error.MissingMaterializer;
+    const fe = std.mem.indexOfPos(u8, source, fs, "\n    }\n") orelse
+        return error.MissingMaterializerEnd;
+    const body = source[fs..fe];
+    // Exactly one eval call site, and it is the BATCHED vector form.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "mlx_eval("));
+    try testing.expectEqual(@as(usize, 0), std.mem.count(u8, body, "mlx_array" ++ "_eval("));
+    // ...at FUNCTION-body indent (8), i.e. AFTER the per-tensor loop closes.
+    // Inside the loop it would sit at 12, like the append that feeds it.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "\n        try mlx.check(mlx.mlx_eval(vec));"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "\n            try mlx.check(mlx.mlx_vector_array_append_value(vec, t.arr));"));
+    try testing.expect(
+        std.mem.indexOf(u8, body, "mlx_vector_array_append_value").? <
+            std.mem.indexOf(u8, body, "mlx_eval(vec)").?,
+    );
+
+    // And the serializer delegates: neither it nor the encoder evals at all.
+    const ss = std.mem.indexOf(u8, source, "fn serializeSafetensors(") orelse
+        return error.MissingSerializer;
+    const se = std.mem.indexOfPos(u8, source, ss, "\n    }\n") orelse
+        return error.MissingSerializerEnd;
+    const ser = source[ss..se];
+    try testing.expectEqual(@as(usize, 0), std.mem.count(u8, ser, "_eval("));
+    try testing.expect(std.mem.indexOf(u8, ser, "try materializeContiguous(tensors, s);") != null);
+    const es = std.mem.indexOf(u8, source, "fn encodeSafetensors(") orelse
+        return error.MissingEncoder;
+    const ee = std.mem.indexOfPos(u8, source, es, "\n    }\n") orelse
+        return error.MissingEncoderEnd;
+    try testing.expectEqual(@as(usize, 0), std.mem.count(u8, source[es..ee], "_eval("));
 }
