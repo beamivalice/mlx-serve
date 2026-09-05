@@ -3466,8 +3466,14 @@ test "the load-time budget is reproducible: free RAM at load does not move it" {
     const kv_bits: u64 = 8;
     const GB: u64 = 1000 * 1000 * 1000;
     const weights: u64 = 70 * GB;
-    const ctx_tokens: u64 = 262144;
+    const ctx_tokens: u64 = 1_048_576; // the deployed --ctx-size
     const static_ceiling: u64 = 120_000 * 1024 * 1024; // the wired limit, both boots
+    // `requested == 0` is the no-flag boot AND the arm where the clamp is the
+    // only thing deciding: the budget IS the headroom, so any difference in
+    // the headroom shows up in it. (An ask small enough to fit both arms
+    // returns the ask in both and hides the defect — that is how this test
+    // first passed a build it should have failed.)
+    const uncapped: u64 = 0;
 
     // The live ceiling really did differ between the two boots...
     const busy = physicalMemoryCeiling(static_ceiling, weights, 108_700 * 1000 * 1000 -| weights);
@@ -3475,15 +3481,23 @@ test "the load-time budget is reproducible: free RAM at load does not move it" {
     try t.expect(busy < quiet);
 
     // ...and billing the budget against it produced two different answers.
-    const on_busy = planHotCache(&cfg, kv_bits, busy, weights, ctx_tokens, 0, 10 * GB, 0);
-    const on_quiet = planHotCache(&cfg, kv_bits, quiet, weights, ctx_tokens, 0, 10 * GB, 0);
+    const on_busy = planHotCache(&cfg, kv_bits, busy, weights, ctx_tokens, 0, uncapped, 0);
+    const on_quiet = planHotCache(&cfg, kv_bits, quiet, weights, ctx_tokens, 0, uncapped, 0);
     try t.expect(on_busy.budget != on_quiet.budget);
+    try t.expect(on_quiet.budget > on_busy.budget);
 
     // Billed against the STATIC term, both boots agree — that is the fix.
-    const a = planHotCache(&cfg, kv_bits, static_ceiling, weights, ctx_tokens, 0, 10 * GB, 0);
-    const b = planHotCache(&cfg, kv_bits, static_ceiling, weights, ctx_tokens, 0, 10 * GB, 0);
+    const a = planHotCache(&cfg, kv_bits, static_ceiling, weights, ctx_tokens, 0, uncapped, 0);
+    const b = planHotCache(&cfg, kv_bits, static_ceiling, weights, ctx_tokens, 0, uncapped, 0);
     try t.expectEqual(a.budget, b.budget);
-    try t.expect(a.budget >= on_busy.budget);
+    try t.expect(a.budget >= on_quiet.budget);
+
+    // A capped ask is bounded by the same headroom, so it inherits the
+    // reproducibility: same ceiling, same answer, whatever the box was doing.
+    const capped_a = planHotCache(&cfg, kv_bits, static_ceiling, weights, ctx_tokens, 0, 24 * GB, 0);
+    const capped_b = planHotCache(&cfg, kv_bits, static_ceiling, weights, ctx_tokens, 0, 24 * GB, 0);
+    try t.expectEqual(capped_a.budget, capped_b.budget);
+    try t.expect(capped_a.budget <= a.budget);
 
     // And the static term is the one that does not read free RAM: same limit
     // and footprint, any free-RAM figure, same answer.
