@@ -632,6 +632,83 @@ pub const HotPrefixCache = struct {
         return total;
     }
 
+    /// Positions printed by the trim-inputs line before it elides; the COUNT
+    /// is always exact.
+    const TRIM_LOG_MAX_POS: usize = 32;
+
+    fn appendTrimFmt(buf: []u8, n: *usize, comptime fmt: []const u8, args: anytype) void {
+        const s = std.fmt.bufPrint(buf[n.*..], fmt, args) catch return;
+        n.* += s.len;
+    }
+
+    /// The trim decision's INPUTS as one line. A live trim that lands far
+    /// below the budget cannot be diagnosed from its outcome: the price the
+    /// walk used (`row_bytes`), the positions it had to choose among, and the
+    /// per-checkpoint bytes it billed for its answer are what separate "the
+    /// list stopped there" from "the price was wrong". Pure so the format is
+    /// pinned by a test rather than by reading a log.
+    fn formatTrimInputs(
+        buf: []u8,
+        tokens_len: usize,
+        row_bytes: u64,
+        budget: u64,
+        positions: []const usize,
+        cp_bytes: []const u64,
+        chosen: ?usize,
+    ) []const u8 {
+        var n: usize = 0;
+        appendTrimFmt(buf, &n, "  [hot-cache] trim inputs: tokens={d} row_bytes={d} budget={d:.2} MB survivors=[", .{
+            tokens_len,
+            row_bytes,
+            @as(f64, @floatFromInt(budget)) / (1024.0 * 1024.0),
+        });
+        const shown = @min(positions.len, TRIM_LOG_MAX_POS);
+        for (positions[0..shown], 0..) |p, i| {
+            if (i > 0) appendTrimFmt(buf, &n, ",", .{});
+            appendTrimFmt(buf, &n, "{d}", .{p});
+        }
+        if (shown < positions.len) appendTrimFmt(buf, &n, ",...", .{});
+        appendTrimFmt(buf, &n, "] ({d} of {d})", .{ shown, positions.len });
+        if (chosen) |tl| {
+            appendTrimFmt(buf, &n, " chosen={d}", .{tl});
+            var chosen_cp: u64 = 0;
+            for (positions, 0..) |p, i| {
+                if (p == tl and i < cp_bytes.len) {
+                    chosen_cp = cp_bytes[i];
+                    break;
+                }
+            }
+            appendTrimFmt(buf, &n, " chosen_cp_bytes={d}", .{chosen_cp});
+        } else {
+            appendTrimFmt(buf, &n, " chosen=none", .{});
+        }
+        appendTrimFmt(buf, &n, "\n", .{});
+        return buf[0..n];
+    }
+
+    /// Build the two parallel arrays from a checkpoint list and emit the line.
+    /// Fires ONCE per oversized commit (the caller latches it), so it costs
+    /// nothing on the path that never trims.
+    fn logTrimInputs(
+        tokens_len: usize,
+        row_bytes: u64,
+        budget: u64,
+        cps: ?[]const SSMCheckpoint,
+        chosen: ?usize,
+    ) void {
+        var pos_buf: [SHED_SIM_MAX]usize = undefined;
+        var byte_buf: [SHED_SIM_MAX]u64 = undefined;
+        var k: usize = 0;
+        if (cps) |list| {
+            while (k < list.len and k < SHED_SIM_MAX) : (k += 1) {
+                pos_buf[k] = list[k].pos;
+                byte_buf[k] = ssmCheckpointBytes(&list[k]);
+            }
+        }
+        var line: [768]u8 = undefined;
+        log.info("{s}", .{formatTrimInputs(&line, tokens_len, row_bytes, budget, pos_buf[0..k], byte_buf[0..k], chosen)});
+    }
+
     /// Stack bound for the shed simulation. A committed checkpoint list is
     /// capped by `ssm_checkpoint_max` (32 by default), so this never binds in
     /// practice; a longer list falls back to billing every lower checkpoint,
@@ -1207,8 +1284,15 @@ pub const HotPrefixCache = struct {
             var decline: TrimDecline = .no_restorable_prefix;
             var decline_err: ?anyerror = null;
             var limit = if (eff_media_start) |ms| @min(tokens.len, ms) else tokens.len;
+            var inputs_logged = false;
             trim_blk: while (true) {
-                const tl = trimLenForBudget(self.max_kv_bytes, limit, snapshotRowBytes(&new_snap), eff_cps) orelse break :trim_blk;
+                const row_bytes = snapshotRowBytes(&new_snap);
+                const tl_opt = trimLenForBudget(self.max_kv_bytes, limit, row_bytes, eff_cps);
+                if (!inputs_logged) {
+                    inputs_logged = true;
+                    logTrimInputs(tokens.len, row_bytes, self.max_kv_bytes, eff_cps, tl_opt);
+                }
+                const tl = tl_opt orelse break :trim_blk;
                 // One-shot: when the resident covered entry already retains
                 // the trim target, keep it and drop the candidate — the
                 // target is budget-derived and stable, so replacing would
@@ -4595,4 +4679,63 @@ test "prefix cache: every ssm checkpoint retention site thins span-preserving" {
     const disk = @embedFile("kv_disk_cache.zig");
     try testing.expect(std.mem.indexOf(u8, disk, "transformer_mod.positionDropIndex(set.items)") != null);
     try testing.expect(std.mem.indexOf(u8, disk, "std.mem.copyForwards(u32, set.items") == null);
+}
+
+test "prefix cache: the trim-inputs line carries the price, the positions and the chosen bill" {
+    // The instrument the 36,864-token live trim asked for. The outcome line
+    // alone cannot say whether the walk ran out of POSITIONS or was quoted a
+    // wrong PRICE, so the inputs are logged once per oversized commit. Format
+    // pinned here on the live 383k fixture rather than by reading a log.
+    const row_bytes: u64 = 13_056;
+    const per_cp: u64 = 26 * 1024 * 1024;
+    const budget: u64 = 3873 * 1024 * 1024;
+
+    var all_pos: [94]usize = undefined;
+    for (all_pos[0..93], 0..) |*p, i| p.* = (i + 1) * 4096;
+    all_pos[93] = 383_039;
+    var bytes: [94]u64 = undefined;
+    for (&bytes) |*b| b.* = per_cp;
+
+    var buf: [768]u8 = undefined;
+    // Long list: elided at TRIM_LOG_MAX_POS, but the COUNT stays exact.
+    {
+        const line = HotPrefixCache.formatTrimInputs(&buf, 383_069, row_bytes, budget, &all_pos, &bytes, 126_976);
+        try testing.expect(std.mem.startsWith(u8, line, "  [hot-cache] trim inputs: tokens=383069 row_bytes=13056 budget=3873.00 MB survivors=["));
+        try testing.expect(std.mem.endsWith(u8, line, "\n"));
+        try testing.expect(std.mem.indexOf(u8, line, "[4096,8192,12288,") != null);
+        try testing.expect(std.mem.indexOf(u8, line, ",...] (32 of 94)") != null);
+        try testing.expect(std.mem.indexOf(u8, line, " chosen=126976") != null);
+        // The bill for the CHOSEN position, not for the list.
+        try testing.expect(std.mem.indexOf(u8, line, " chosen_cp_bytes=27262976") != null);
+        // One line, and it fits the site's buffer.
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, line, "\n"));
+        try testing.expect(line.len < buf.len);
+    }
+    // A short list prints whole, with no elision marker.
+    {
+        const line = HotPrefixCache.formatTrimInputs(&buf, 900, row_bytes, budget, all_pos[0..3], bytes[0..3], 8192);
+        try testing.expect(std.mem.indexOf(u8, line, "survivors=[4096,8192,12288] (3 of 3)") != null);
+        try testing.expect(std.mem.indexOf(u8, line, "...") == null);
+    }
+    // A decline says so, and a plain-attention entry has no positions at all.
+    {
+        const line = HotPrefixCache.formatTrimInputs(&buf, 900, row_bytes, budget, all_pos[0..2], bytes[0..2], null);
+        try testing.expect(std.mem.indexOf(u8, line, " chosen=none") != null);
+        try testing.expect(std.mem.indexOf(u8, line, "chosen_cp_bytes") == null);
+    }
+    {
+        const line = HotPrefixCache.formatTrimInputs(&buf, 900, row_bytes, budget, all_pos[0..0], bytes[0..0], 512);
+        try testing.expect(std.mem.indexOf(u8, line, "survivors=[] (0 of 0)") != null);
+        try testing.expect(std.mem.indexOf(u8, line, " chosen=512 chosen_cp_bytes=0") != null);
+    }
+    // The site emits it ONCE per oversized commit, before any decision.
+    const source = @embedFile("prefix_cache.zig");
+    const at = std.mem.indexOf(u8, source, "var inputs_logged = false;") orelse return error.MissingLatch;
+    const site = source[at..@min(source.len, at + 500)];
+    try testing.expect(std.mem.indexOf(u8, site, "inputs_logged = true;") != null);
+    try testing.expect(std.mem.indexOf(u8, site, "logTrimInputs(tokens.len, row_bytes, self.max_kv_bytes, eff_cps, tl_opt)") != null);
+    // Before the decision: the latch sits above the `orelse break`.
+    const log_at = std.mem.indexOf(u8, site, "logTrimInputs(").?;
+    const decide_at = std.mem.indexOf(u8, site, "orelse break :trim_blk").?;
+    try testing.expect(log_at < decide_at);
 }
