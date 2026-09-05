@@ -787,8 +787,14 @@ pub const ModelConfig = struct {
     /// qwen4_exp only, on purpose. It is the arch with a 1M advertised context
     /// and the QSA terms that make the load-time bill so lopsided; every other
     /// arch keeps the load-time pin exactly, unmeasured.
+    ///
+    /// DELEGATES, and does not re-spell the arch: this predicate is the ONLY
+    /// gate on the admission re-ask, the tail-merge bound and the per-chunk
+    /// adapter, so a second spelling of the same condition is three mechanisms
+    /// that can silently disagree with the other five about which archs are
+    /// in. `longCtxGated` is the ONE body (scan-pinned below).
     pub fn perRequestPrefillChunk(self: *const ModelConfig) bool {
-        return std.mem.eql(u8, self.model_type, "qwen4_exp");
+        return self.longCtxGated();
     }
 
     pub fn kvBytesPerToken(self: *const ModelConfig) u64 {
@@ -6991,5 +6997,55 @@ test "ModelConfig.longCtxGated: ONE body — ssdFirstCapable delegates, nothing 
     // reads it.
     const gate = "pub fn longCtxGated(self: *const ModelConfig) bool {";
     const gat = std.mem.indexOf(u8, src, gate) orelse return error.PredicateMoved;
-    try t.expect(std.mem.indexOf(u8, src[gat .. gat + 120], "self.isQwen4()") != null);
+    try t.expect(std.mem.indexOf(u8, src[gat .. gat + 400], "self.isQwen4()") != null);
+    // ...and `perRequestPrefillChunk` — the ONLY gate on the admission re-ask,
+    // the tail-merge bound and the per-chunk adapter — delegates too, rather
+    // than spelling the arch a second time.
+    const prc = "pub fn perRequestPrefillChunk(self: *const ModelConfig) bool {";
+    const pat = std.mem.indexOf(u8, src, prc) orelse return error.PredicateMoved;
+    try t.expect(std.mem.indexOf(u8, src[pat .. pat + 120], "self.longCtxGated()") != null);
+}
+
+test "ModelConfig: no policy predicate hand-rolls the qwen4_exp literal" {
+    // The real class pin. Counting predicate CALLS cannot catch this — a new
+    // gate that writes `std.mem.eql(u8, self.model_type, "qwen4_exp")` inline
+    // adds no call and reads identically today, then drifts the moment the
+    // family gains a second `model_type` (the `_text` sibling the PARSER
+    // already collapses, a rename, a second Flash-Next pack). PR #363 shipped
+    // exactly that: `perRequestPrefillChunk` spelled the arch itself and was
+    // the only gate on three mechanisms.
+    //
+    // The literal has three legitimate homes and they are not predicates: the
+    // arch's NAME (`isQwen4`), the sampling-defaults FAMILY list, and the
+    // config parser's dispatch/canonicalization. So the bar is scoped to what
+    // it is about — every `bool` predicate on ModelConfig except `isQwen4`
+    // must be free of it.
+    const t = std.testing;
+    const whole = @embedFile("model.zig");
+    const prod = whole[0 .. std.mem.indexOf(u8, whole, "\ntest \"") orelse whole.len];
+    const lit = "\"qwen4" ++ "_exp\"";
+    const sig = "(self: *const ModelConfig) bool {";
+
+    var decls = std.mem.splitSequence(u8, prod, "\n    pub fn ");
+    _ = decls.next(); // everything before the first declaration
+    var checked: usize = 0;
+    while (decls.next()) |decl| {
+        if (std.mem.indexOf(u8, decl, sig) == null) continue;
+        // The body ends at this declaration's closing brace (column 4).
+        const body = decl[0 .. std.mem.indexOf(u8, decl, "\n    }") orelse decl.len];
+        if (std.mem.indexOf(u8, body, lit) == null) continue;
+        const name = body[0 .. std.mem.indexOfScalar(u8, body, '(') orelse body.len];
+        checked += 1;
+        try t.expectEqualStrings("isQwen4", name);
+    }
+    // The scan found something, i.e. the split/sig shape still matches this
+    // file: a silently-zero scan is the failure mode of every source pin.
+    try t.expectEqual(@as(usize, 1), checked);
+
+    // Every other file that gates on this family goes through a predicate, so
+    // none of them carries the literal in production code at all.
+    for ([_][]const u8{ @embedFile("server.zig"), @embedFile("scheduler.zig"), @embedFile("generate.zig"), @embedFile("prefix_cache.zig"), @embedFile("kv_disk_cache.zig") }) |file| {
+        const impl = file[0 .. std.mem.indexOf(u8, file, "\ntest \"") orelse file.len];
+        try t.expectEqual(@as(usize, 0), std.mem.count(u8, impl, lit));
+    }
 }
