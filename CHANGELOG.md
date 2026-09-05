@@ -70,6 +70,8 @@
 
 ### Fixes
 
+- A large `--prefix-cache-mem` could cut the context the server advertises to under a thousand tokens. On a boot with no `--ctx-size`, the cache budget is settled while the model loads but the context is sized afterwards, so the budget was computed against a placeholder context of 1,024 tokens: asking for 60 GB of prefix cache handed the cache 48 GB and left the context sizer nothing, and the server then advertised an 870-token context for the rest of its life. Agent CLIs read that number once and budget against it for a whole session. Both the RAM and SSD paths now size the context the same way before the budget is settled, against a fixed reserve rather than whatever was asked for. Boots that pass `--ctx-size` were never affected.
+
 - Chat templates using `|min` or `|max` on a real array failed to render and silently fell back to the wrong prompt format, so the model lost its stop token. Hit every MiniCPM5 multi-turn tool conversation (#335, thanks @uncle9x9).
 - JSON-schema output with thinking enabled returned the JSON as `reasoning_content` with empty `content` on `/v1/chat/completions` and `/v1/responses` (#331, thanks @perretv). A schema request now forces thinking off on every surface, matching `/v1/messages`.
 - Qwen 3.8 Flash Next packs converted with `--ngram-bits 3/5/6` served a noise n-gram table (#305, thanks @Sinojen). 2/4/8-bit packs are unchanged.

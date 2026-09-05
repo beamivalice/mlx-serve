@@ -2245,14 +2245,49 @@ the judge at chunk 4096 peaked 90.3 GB of a ~93 GiB ceiling at 384k, so the
 estimator is not loose, and the share is what stops one forward from trading
 the whole session for its own speed at LOAD time.
 
-**One ordering wrinkle, deliberately left standing.**
-`prefixCacheMemForLoad` calls `getEffectiveContextLength`, which on an
-un-pinned auto-context computes through `resolvedPrefixCacheMem()` — i.e. the
-PREVIOUS model's resolved value, or the raw ask on a first load. So on an
-auto-context boot the clamp's ctx term and the context that eventually gets
-pinned can differ by one iteration. It predates this fix, the direction is
-bounded, and it is moot once the SSD-first branch removes the full-context bill
-from the clamp entirely — at which point there is no ctx term to be stale.
+**The ordering wrinkle was NOT moot — it was the whole of live check #6.**
+An earlier draft of this section said the clamp reading a stale context was
+"bounded, and moot once the SSD-first branch removes the full-context bill."
+Both halves were wrong, and the live check found it:
+
+    # auto-context boot (no --ctx-size), --prefix-cache-mem 60GB
+    [hot-cache] budget clamped 61440 -> 48673 MB (chunk 4096, reserve at width 512 = 1474 MB, ctx KV 26 MB)
+    Context size: 870 tokens (auto: 85% of the 1024-token memory ceiling)
+    # the same boot at the default ask
+    Context size: 1048576 tokens (auto: the model's maximum; memory would allow 1113088)
+
+`ctx KV 26 MB` is the tell. The clamp runs during the load and `pinAutoContext`
+runs after it, so `getEffectiveContextLength` answers with the 1024-token floor;
+the clamp subtracts ~26 MB of "context" instead of ~20.7 GB, grants almost the
+whole ask, and the sizer that runs afterwards has nothing left. An
+over-generous `--prefix-cache-mem` therefore pinned an **870-token advertised
+context** for the life of the process — and agent CLIs read that number once
+per session. Publishing the RESOLVED budget rather than the raw ask made it
+48,673 instead of 61,440, which is smaller and still fatal: **an ORDER bug is
+not fixed by better arithmetic on the wrong input.**
+
+It is also not SSD-first's to fix. Both arms of the load-time bill had it, and
+both now read ONE pure resolver, `resolvedContextForLoad` — explicit
+`--ctx-size` wins, else a pinned context, else a sized one that mirrors
+`autoContextFor`'s margin-then-cap WITHOUT calling the accessor it works
+around. The arms differ in exactly one argument, the cache reserve:
+
+- **SSD-first passes 0.** Its resident entry IS the live KV, so the honest
+  load-time reserve genuinely is zero and no fixpoint exists.
+- **RAM-first passes `CTX_SIZING_CACHE_RESERVE`**, a fixed 2 GiB. It holds cache
+  in ADDITION to the live KV, so it has no such out — which is why the
+  parameter exists at all.
+
+That constant must never be derived from the ask, and passing the ask itself is
+the same bug one level in: `ceiling - active` is 39,568 MiB against a 61,440 MiB
+ask, so sizing the context against it saturates to zero usable and returns the
+1024-token floor — the 870 boot again. **Context is the primary claimant and the
+cache is the residual**, the same order the prefill chunk follows. An ask must
+never be able to shrink the context that is then used to bill that ask.
+
+The manual path is untouched by all of it: `--ctx-size` wins in the resolver's
+first branch, before any memory arithmetic runs, so a pinned boot bills exactly
+what it billed before.
 
 ### Rules this produced
 

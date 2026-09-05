@@ -3287,6 +3287,47 @@ fn ssdFirstBudgetForLoad(
 /// `mlx_get_active_memory` is honest. Logs one line when the clamp bites, and
 /// PUBLISHES the answer (`hot_cache_mem_resolved`) so the auto-context sizer
 /// and the ANE gate stop reserving a budget the cache was never given.
+/// The hot-cache reserve the CONTEXT is sized against at load time on the
+/// RAM-first arm — a CONSTANT (the server's own `--prefix-cache-mem` default),
+/// and never the ask.
+///
+/// This is the whole ordering rule in one value. The clamp runs during the
+/// load and `pinAutoContext` runs after it, so on an auto boot the effective
+/// context is still a placeholder when the clamp reads it: measured live
+/// 2026-09-05, no `--ctx-size`, `--prefix-cache-mem 60GB`, the clamp billed
+/// `ctx KV 26 MB` instead of ~20.7 GB, granted 48,673 of the 61,440 MB ask,
+/// and the sizer that ran afterwards published `Context size: 870 tokens`.
+/// The same boot at the default ask reports 1,048,576. An agent CLI reads that
+/// number ONCE per session.
+///
+/// It must not be derived from the ask, and passing the ask itself is the same
+/// bug one level in: at this box `ceiling - active` is 39,568 MiB against a
+/// 61,440 MiB ask, so sizing the context against it saturates to zero usable
+/// and returns the 1024-token floor — the 870 boot again. CONTEXT is the
+/// primary claimant and the cache is the RESIDUAL, the same order the prefill
+/// chunk follows; an ask must never be able to shrink the context that is then
+/// used to bill that ask.
+const CTX_SIZING_CACHE_RESERVE: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Impure twin of the SSD arm's wrapper: the context the RAM-first clamp bills,
+/// read through the ONE shared pure resolver so the two arms cannot drift.
+/// They differ in exactly one argument — the cache reserve. SSD-first passes 0
+/// because its resident entry IS the live KV, so the honest load-time reserve
+/// really is zero and no fixpoint exists; RAM-first holds cache in ADDITION to
+/// the live KV, which is why the parameter has to exist at all.
+fn ramFirstContextForLoad(config: *const model_mod.ModelConfig, kv_bits: u64, active_mem: u64, chunk: u32) u32 {
+    return resolvedContextForLoad(
+        server_config.max_context_size,
+        config.pinned_context,
+        currentGpuMemoryCeiling(active_mem),
+        active_mem,
+        CTX_SIZING_CACHE_RESERVE,
+        prefillTransientReserve(config, kv_bits, chunk),
+        kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config),
+        config.contextCap(),
+    );
+}
+
 pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64) u64 {
     var active_mem: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_mem);
@@ -3321,7 +3362,10 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64) u64
         kv_bits,
         staticGpuMemoryCeiling(),
         active_mem,
-        getEffectiveContextLength(config),
+        // NOT `getEffectiveContextLength`: on an auto boot it is still a
+        // placeholder here (the clamp runs before `pinAutoContext`), and
+        // billing it granted almost the whole ask — live check #6.
+        ramFirstContextForLoad(config, kv_bits, active_mem, pinned),
         sizerCtxKvBytes(config, kv_bits),
         requested,
         pinned,
@@ -3702,6 +3746,96 @@ test "free RAM still binds where it can be acted on: request-time admission" {
     // Exactly one static-ceiling reader outside the helper itself and the
     // pressure note beside it.
     try t.expectEqual(@as(usize, 1), countDecls(src, "pub fn " ++ static_c[0 .. static_c.len - 2] ++ "("));
+}
+
+test "an auto boot sizes the SAME context whatever the cache ask (live check #6)" {
+    // The collapse, as arithmetic. 2026-09-05, no `--ctx-size`, wired 120000,
+    // qwen4_exp, weights ~69,827 MiB resident:
+    //   --prefix-cache-mem 60GB -> budget clamped 61440 -> 48673 MB (ctx KV 26 MB)
+    //                           -> Context size: 870 tokens
+    //   default ask             -> Context size: 1048576 (memory would allow 1113088)
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const MiB: u64 = 1 << 20;
+    const active: u64 = 69_827 * MiB; // backed out of the live clamp line
+    const live_ceiling: u64 = 109_395 * MiB;
+    const per_tok: u64 = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(&cfg);
+    const transient: u64 = prefillTransientReserve(&cfg, kv_bits, 4096);
+    const cap: u32 = cfg.contextCap();
+
+    // The fix: the sizing reserve is a CONSTANT, so the answer cannot move
+    // with the ask. Same call, two very different asks, one answer.
+    const ctx_default = resolvedContextForLoad(0, 0, live_ceiling, active, CTX_SIZING_CACHE_RESERVE, transient, per_tok, cap);
+    const ctx_big_ask = resolvedContextForLoad(0, 0, live_ceiling, active, CTX_SIZING_CACHE_RESERVE, transient, per_tok, cap);
+    try t.expectEqual(ctx_default, ctx_big_ask);
+    try t.expect(ctx_default > 900_000); // a real context, not the floor
+
+    // THE DEFECT, both spellings. Sizing against the GRANTED budget...
+    const vs_granted = resolvedContextForLoad(0, 0, live_ceiling, active, 48_673 * MiB, transient, per_tok, cap);
+    try t.expect(vs_granted <= 1024);
+    // ...and sizing against the RAW ASK, which is the trap one level in: the
+    // ask exceeds `ceiling - active`, so usable saturates to zero.
+    const vs_raw_ask = resolvedContextForLoad(0, 0, live_ceiling, active, 60 * 1024 * MiB, transient, per_tok, cap);
+    try t.expect(vs_raw_ask <= 1024);
+    try t.expect(ctx_default > vs_granted * 500);
+}
+
+test "the clamp bills the context that will be SERVED, not the placeholder" {
+    // The other half: with a placeholder context the clamp hands back nearly
+    // the whole ask; with the real context it bills ~20.7 GB and the cache
+    // gets only the remainder.
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const MiB: u64 = 1 << 20;
+    const active: u64 = 69_827 * MiB;
+    const static_ceiling: u64 = 120_000 * MiB;
+    const ask: u64 = 60 * 1024 * MiB;
+
+    const placeholder = planHotCache(&cfg, kv_bits, static_ceiling, active, 1024, 0, ask, 4096);
+    const real = planHotCache(&cfg, kv_bits, static_ceiling, active, 1_048_576, 0, ask, 4096);
+
+    try t.expect(placeholder.budget > 45_000 * MiB); // reproduces the live 48,673
+    try t.expectEqual(@as(u64, 1_048_576) * (13_056 + 7_680), real.ctx_kv);
+    try t.expect(real.budget < placeholder.budget / 2);
+    try t.expect(real.budget > 0);
+}
+
+test "an explicit --ctx-size keeps the load-time context byte-identical" {
+    // The manual path must not move: the operator's number wins in the
+    // resolver's FIRST branch, before any memory arithmetic runs.
+    const t = std.testing;
+    const MiB: u64 = 1 << 20;
+    const per_tok: u64 = 20_736;
+    // Asserts the RETURN VALUE, not a downstream number: `explicit_ctx` is the
+    // resolver's FIRST early return and never reaches the sizer, so this stays
+    // true if the sizing arithmetic changes underneath it. Every memory
+    // argument is deliberately hostile — zero ceiling, huge reserves, and a
+    // `ctx_cap` BELOW the answer — and the operator's number still wins.
+    try t.expectEqual(@as(u32, 1_048_576), resolvedContextForLoad(1_048_576, 0, 0, 0, 99_000 * MiB, 99_000 * MiB, per_tok, 262_144));
+    // A pinned context wins next, over any sizing.
+    try t.expectEqual(@as(u32, 262_144), resolvedContextForLoad(0, 262_144, 0, 0, 99_000 * MiB, 0, per_tok, 1_048_576));
+}
+
+test "the RAM-first clamp's context comes from the shared resolver, ask-independent" {
+    // Scan. Two claims: the clamp reads the resolver rather than the
+    // placeholder accessor, and the reserve it sizes against cannot be derived
+    // from the ask (that is the same loop one level in). Needles split so this
+    // scan's own source cannot satisfy them.
+    const t = std.testing;
+    const src = @embedFile("server.zig");
+    const body = declBody(src, "pub fn prefixCacheMemForLoad(") orelse return error.CallSiteMoved;
+    const resolver = "ramFirstContextFor" ++ "Load(config, kv_bits, active_mem, pinned)";
+    try t.expect(std.mem.indexOf(u8, body, resolver) != null);
+
+    // The wrapper passes the CONSTANT, never `requested`.
+    const wrap = declBody(src, "fn ramFirstContextForLoad(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, wrap, "CTX_SIZING_CACHE_RESERVE") != null);
+    try t.expect(std.mem.indexOf(u8, wrap, "requested") == null);
+    try t.expect(std.mem.indexOf(u8, wrap, "resolvedPrefixCache" ++ "Mem()") == null);
+    // ONE shared resolver: both arms reach it.
+    try t.expect(std.mem.indexOf(u8, wrap, "resolvedContextFor" ++ "Load(") != null);
 }
 
 test "clampReserveWidth: the load-time reserve is a promise to the FIRST request" {
