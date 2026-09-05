@@ -826,6 +826,24 @@ pub fn errorPending() bool {
     return mlx_error_latched.load(.acquire);
 }
 
+/// PEEK the latch WITHOUT consuming it: the NAME of the Zig error a
+/// `checkError`/`checkErrorDecode` call would raise right now, or null when
+/// nothing is latched. The names are `@errorName`'s own, so
+/// `scheduler.Slot.errorNameIsMemory` classifies a peeked failure exactly as
+/// it classifies a consumed one and the client still gets the memory 503.
+///
+/// It exists because a slot FINISH must not answer 200 over a forward that
+/// failed (external review of PR #363, item 3) and yet must not STEAL the
+/// latch from the decode-tick wrapper, whose job is to fail every OTHER slot
+/// in a batched group from that same failure. Peek here, mark this slot, let
+/// the wrapper consume.
+pub fn peekErrorName() ?[]const u8 {
+    if (!mlx_error_latched.load(.acquire)) return null;
+    lockErrBuf();
+    defer unlockErrBuf();
+    return if (mlxErrorIsMemory(mlx_error_buf[0..mlx_error_len])) "OutOfMemory" else "MlxFailure";
+}
+
 /// Consume the latched message into `buf`, clearing the latch. Returns null
 /// when nothing is latched. The message is COPIED so the caller can format it
 /// after another MLX call has run.
@@ -1012,6 +1030,35 @@ test "the injected MLX error costs ONE checkError and the engine keeps working a
     _ = mlx_array_item_float32(&out, sum);
     try t.expectApproxEqAbs(@as(f32, 4.0), out, 1e-6);
     try checkError();
+}
+
+test "peekErrorName names the class WITHOUT consuming the latch" {
+    const t = std.testing;
+    // The slot-finish guard (external review of PR #363, item 3) has to know
+    // whether the last forward failed before it publishes a terminator, and
+    // has to leave the latch for the tick wrapper that fails the rest of a
+    // batched group from the same failure. Consuming here would answer this
+    // slot correctly and let its siblings finish 200 on the same dead buffers.
+    resetFaultChunkForTest();
+    defer resetFaultChunkForTest();
+
+    try t.expect(peekErrorName() == null);
+
+    latchErrorForTest("[METAL] Command buffer execution failed: Insufficient Memory. at transforms.cpp:15");
+    // Same name the consuming path raises, so the memory classification (and
+    // with it the 503) survives the peek.
+    try t.expectEqualStrings("OutOfMemory", peekErrorName().?);
+    // ...and the latch is STILL there, twice over.
+    try t.expectEqualStrings("OutOfMemory", peekErrorName().?);
+    try t.expect(errorPending());
+    try t.expectError(error.OutOfMemory, checkErrorDecode());
+    try t.expect(peekErrorName() == null);
+
+    // A shape bug is not a memory failure and must not be reported as one.
+    latchErrorForTest("[matmul] Last dimension of first input must match.");
+    try t.expectEqualStrings("MlxFailure", peekErrorName().?);
+    try t.expectError(error.MlxFailure, checkErrorDecode());
+    try t.expect(peekErrorName() == null);
 }
 
 test "a DECODE-time MLX failure is attributed to the decoding request, not the next one" {

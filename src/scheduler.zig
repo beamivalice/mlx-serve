@@ -5127,6 +5127,32 @@ pub fn loopTrimEnabled() bool {
     return enabled;
 }
 
+/// THE terminator a finishing slot publishes, and the ONLY caller of
+/// `Slot.markFinished` in this file.
+///
+/// External review of PR #363, item 3. `runSingleDecodeTickInner` reaches
+/// `finishSlot` on an EOS the FAILING forward itself produced — Metal returns
+/// ZEROS before it aborts, so a plausible EOS sampled out of buffers it never
+/// wrote is exactly what that failure looks like — and it gets there BEFORE
+/// the tick wrapper's `checkErrorDecode` reads the latch and stamps
+/// `error_code`. S20 stopped the hot-cache COMMIT from swallowing that
+/// garbage. The CLIENT RESPONSE was not guarded at all: the request finished
+/// 200, `finish_reason` "stop", with fabricated text, and the wrapper's
+/// `markError` a moment later hit `if (... or self.finished) return` and did
+/// nothing.
+///
+/// `latched` is a PEEK (`mlx.peekErrorName`), never a consume: the wrapper
+/// still owns the latch, and on a batched group that is what fails every other
+/// slot that shared the failed forward. Generic over the slot so the decision
+/// is provable without an mlx-backed `Slot`.
+fn publishSlotTerminator(slot: anytype, reason: []const u8, latched: ?[]const u8) void {
+    if (latched) |name| {
+        slot.markError(name);
+        return;
+    }
+    slot.markFinished(reason);
+}
+
 fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // Emit the `[spec-stats]` summary (no-op for non-speculative slots).
     // The legacy generate() path logs this itself; scheduler-driven slots
@@ -5138,6 +5164,15 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
         // legacy/CLI path) makes it dead on every served request.
         g.logQsaArms();
         g.persistRoundCost();
+    }
+    // The last forward's failure, read BEFORE anything finalizes this request
+    // (external review of PR #363, item 3). A PEEK: `commitSlotIfApplicable`
+    // below still asks `mlx.errorPending()` for S20's own guard, and the
+    // decode-tick wrapper still consumes the latch and still fails the rest of
+    // a batched group with it.
+    const latched: ?[]const u8 = mlx.peekErrorName();
+    if (latched) |name| {
+        log.err("[scheduler] finish suppressed: the last forward failed ({s}) but produced a \"{s}\" — failing this request rather than answering 200 with what Metal never wrote\n", .{ name, reason });
     }
     commitSlotIfApplicable(sch, slot);
     // RESTORE BY MOVE: whatever the commit above did or did not do, this slot
@@ -5166,7 +5201,9 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // e2e = first_token_ns + decode_ns.
     if (sch.metrics) |m| {
         m.recordRequest(
-            reason,
+            // A poisoned finish is an error, not a "stop": billing it under
+            // the reason it never earned is the same lie one layer down.
+            if (latched != null) "error" else reason,
             slot.first_token_ns,
             slot.prefill_ns,
             slot.decode_ns,
@@ -5175,7 +5212,7 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
             slot.cached_tokens,
         );
     }
-    slot.markFinished(reason);
+    publishSlotTerminator(slot, reason, latched);
     if (hc_opt) |hc| {
         if (stream_opt) |s| {
             hc.flushPendingDisk(s);
@@ -6732,6 +6769,91 @@ test "DFlash cache payload is committed only when it spans the trunk prefix" {
     const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn finishSlot(") orelse return error.MissingFinishSlot;
     const body = source[start..end];
     try testing.expect(std.mem.indexOf(u8, body, "dflashContextCoversPrefix(dc.absLen(), total_len)") != null);
+}
+
+test "a finish over a latched MLX failure ends the request as an ERROR, never a 200" {
+    // External review of PR #363, item 3. A decode forward that failed can
+    // still hand back an EOS — Metal returns ZEROS before it aborts, and a
+    // plausible EOS sampled out of buffers it never wrote is what that looks
+    // like. `runSingleDecodeTickInner` finishes the slot on that EOS BEFORE
+    // the tick wrapper reads the latch, so the request answered 200 with
+    // fabricated text and `finish_reason` "stop", and the wrapper's later
+    // `markError` was a no-op against an already-finished slot. S20 guarded
+    // the hot-cache COMMIT against exactly this; the client response was not
+    // guarded at all.
+    //
+    // Stubbed rather than run against a real Slot: the decision is which
+    // terminator gets published, and that needs no mlx.
+    const Stub = struct {
+        finished: ?[]const u8 = null,
+        errored: ?[]const u8 = null,
+        fn markFinished(self: *@This(), reason: []const u8) void {
+            self.finished = reason;
+        }
+        fn markError(self: *@This(), name: []const u8) void {
+            self.errored = name;
+        }
+    };
+
+    // Nothing latched: the ordinary finish, unchanged.
+    var clean = Stub{};
+    publishSlotTerminator(&clean, "stop", null);
+    try testing.expectEqualStrings("stop", clean.finished.?);
+    try testing.expect(clean.errored == null);
+
+    // Latched: no "stop" is published at all. Reverting to an unconditional
+    // `markFinished` turns this red.
+    var poisoned = Stub{};
+    publishSlotTerminator(&poisoned, "stop", "OutOfMemory");
+    try testing.expect(poisoned.finished == null);
+    try testing.expectEqualStrings("OutOfMemory", poisoned.errored.?);
+    // ...and the name carries the CLASS, so the surface answers the memory
+    // 503 rather than a generic engine fault.
+    try testing.expect(Slot.errorNameIsMemory(poisoned.errored.?));
+
+    // A shape bug mid-decode is still a failed request, just not a 503.
+    var shape = Stub{};
+    publishSlotTerminator(&shape, "length", "MlxFailure");
+    try testing.expect(shape.finished == null);
+    try testing.expectEqualStrings("MlxFailure", shape.errored.?);
+    try testing.expect(!Slot.errorNameIsMemory(shape.errored.?));
+}
+
+test "the slot terminator reads the MLX latch BEFORE it publishes, and is the only publisher" {
+    // Two halves, both load-bearing. (a) The latch is read before the
+    // response is finalized — a read after `markFinished` is the defect, since
+    // `markError` declines an already-finished slot. (b) The read is a PEEK:
+    // consuming it here would answer THIS slot and let every sibling in a
+    // batched group finish 200 on the same failed forward, because the tick
+    // wrapper would find the latch already clear.
+    const whole = @embedFile("scheduler.zig");
+    const self_test = "\ntest \"the slot terminator reads the MLX latch BEFORE it publishes";
+    const src = whole[0 .. std.mem.indexOf(u8, whole, self_test) orelse whole.len];
+
+    // ONE publisher, and it is the guarded one.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "slot.markFinished" ++ "("));
+    const pub_at = std.mem.indexOf(u8, src, "fn publishSlot" ++ "Terminator(") orelse
+        return error.MissingPublisher;
+    const pub_end = std.mem.indexOfPos(u8, src, pub_at, "\n}\n") orelse return error.MissingPublisherEnd;
+    const pub_body = src[pub_at..pub_end];
+    try testing.expect(std.mem.indexOf(u8, pub_body, "slot.markFinished" ++ "(reason);") != null);
+    try testing.expect(std.mem.indexOf(u8, pub_body, "slot.markError" ++ "(name);") != null);
+
+    const start = std.mem.indexOf(u8, src, "fn finishSlot(") orelse return error.MissingFinishSlot;
+    const end = std.mem.indexOfPos(u8, src, start + 1, "\nfn ") orelse return error.MissingFinishSlotEnd;
+    const body = src[start..end];
+    const peek = std.mem.indexOf(u8, body, "mlx.peekError" ++ "Name();") orelse
+        return error.FinishSlotDoesNotReadTheLatch;
+    const publish = std.mem.indexOf(u8, body, "publishSlot" ++ "Terminator(slot, reason, latched);") orelse
+        return error.FinishSlotDoesNotPublishThroughTheGuard;
+    try testing.expect(peek < publish);
+    // A CONSUME here would take the latch away from the tick wrapper.
+    try testing.expect(std.mem.indexOf(u8, body, "mlx.checkError" ++ "Decode()") == null);
+    // S20's own guard still reads the (unconsumed) latch on the commit path.
+    const commit_at = std.mem.indexOf(u8, src, "fn commitSlotIfApplicable(") orelse
+        return error.MissingCommitSlot;
+    const commit_end = std.mem.indexOfPos(u8, src, commit_at, "\nfn ") orelse return error.MissingCommitEnd;
+    try testing.expect(std.mem.indexOf(u8, src[commit_at..commit_end], "mlx.errorPending" ++ "()") != null);
 }
 
 test "every slot-end path releases a checked-out hot-cache entry" {

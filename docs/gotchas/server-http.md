@@ -3740,3 +3740,43 @@ in a client-visible frame; a count of the surfaces routing through the sender;
 and arm [6] of `tests/test_mlx_error_recovery.sh`, which fires
 `MLX_SERVE_MLX_FAULT_STEP` at a STREAMING request and asserts the 503 message
 and `finish_reason: "error"` on the wire, with the raw name absent.
+
+## A finish is not a finish when the last forward failed (external review of PR #363, item 3, 2026-09-06)
+
+S20 already knew that `runSingleDecodeTickInner` can reach `finishSlot` — and
+so the hot-cache commit — on an EOS the FAILING forward itself produced. Metal
+returns ZEROS before it aborts, so a plausible EOS sampled out of buffers it
+never wrote is exactly what that failure looks like, and the tick wrapper's
+`checkErrorDecode` has not run yet. S20's guard (`if (mlx.errorPending())
+return;` inside `commitSlotIfApplicable`) keeps that garbage out of the prefix
+cache.
+
+It does nothing for the client. The same EOS ran on through `finishSlot` to
+`slot.markFinished("stop")`, the connection thread's `waitNext` returned
+`.done`, and the request answered **200 with fabricated text**. The wrapper's
+`markError` a moment later hit `if (self.error_code != null or self.finished)
+return` and was a no-op. The commit was guarded; the response was not.
+
+`finishSlot` now reads the latch BEFORE anything finalizes the request and
+publishes its terminator through `publishSlotTerminator`, the only caller of
+`Slot.markFinished` in the file: latched → `markError(name)`, clean →
+`markFinished(reason)`. The name is `@errorName`'s, so `errorNameIsMemory`
+classifies it exactly as a consumed failure and the client gets the memory 503
+through item 2's mapping — on the streaming surfaces too, which is why the two
+items ship together. The metrics sink is billed `"error"` rather than the reason
+the request never earned.
+
+The read is a PEEK (`mlx.peekErrorName`), never a consume, and that is the
+subtle half. The decode-tick wrapper still owns the latch: on a BATCHED group
+one forward serves every slot, and the wrapper's `checkErrorDecode` is what
+fails all of them. A slot that consumed the latch on its way out would answer
+itself correctly and leave its siblings finishing 200 on the same dead buffers —
+the original bug, minus one victim.
+
+Tests: `publishSlotTerminator` against a stub slot (clean finishes, latched
+never publishes a reason at all, and the published name carries the memory
+class); a scan that the latch read precedes the publish, that the publish is the
+only `markFinished` caller, that `finishSlot` does not CONSUME, and that S20's
+own `errorPending` guard is still on the commit path; and `peekErrorName`'s own
+test in mlx.zig — same name as the consuming path, latch still pending
+afterwards.
