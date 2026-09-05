@@ -2482,6 +2482,50 @@ rule that can only disagree with itself, so there is exactly ONE: the
 per-request one. SSD-first buys a whole-session hot cache, and nothing about
 the forward's width.
 
+**How one-session-resident meets evict-to-admit.** The load-time clamp reserves
+only the ladder FLOOR once the per-request width gate is on, so a wide request
+depends on request-time admission and, when it does not fit outright, on
+evict-to-admit: `fitsAfterEviction` credits `reclaimableBytes`, which is
+residency minus the LARGEST entry. Under SSD-first the steady state is exactly
+ONE resident entry, so that credit is 0. Two cases, and they are not the same
+case.
+
+*The prompt EXTENDS the resident session.* Then the resident entry is the
+request's own KV: the restore refcount-SHARES those buffers into the slot's
+cache, so evicting the entry would return nothing live, and `active_mem` already
+counts the bytes so the guard must not add them again. A credit of 0 is not a
+conservatism here, it is the correct number — and it is the same number the
+#353 follow-up already established for a matching prompt. Nothing to reclaim,
+nothing double-billed.
+
+*A DIFFERENT session's request arrives.* Now the resident entry belongs to
+someone else. Its disk copy is COMPLETE — its own turn flushed it, and
+mechanisms 1–4 are what make that true — so evicting it costs restore time and
+nothing else. The inference thread can in fact evict it: `last_restored_used` is
+cleared at the start of every lookup and only set by a restore, so a
+non-matching prompt protects nothing and `evictLruToAdmit` will take it.
+
+**But the connection thread cannot see that, and that is a gap worth naming.**
+`reclaimableBytes` subtracts the largest entry because the guard cannot know
+WHICH entry a prompt will match, only that a restore pins at most one. With one
+resident entry that rule always subtracts the whole cache, so a wide request for
+a different session is judged as if a fully-flushed 24 GB entry were immovable:
+it must fit beside the resident session, step down the ladder, or be refused by
+name — even though the eviction it needed was available all along. The refusal
+text ("the entry a restore would share is not evictable") is actively
+misleading in this case, because no restore would have shared it.
+
+The obvious repair is not obviously right. Crediting residency outright is wrong:
+for a MATCHING prompt the shared buffers really do return nothing, and a complete
+disk copy does not change that — durability is not liveness. Crediting the entry
+only when the incoming prompt does not match it is the correct rule, but the
+guard runs on the connection thread and would have to do a prefix comparison to
+know. So this ships as a known asymmetry: the mechanism to reclaim exists, and
+the admission guard is blind to it in exactly the state SSD-first makes normal.
+What bounds the damage is that the refusal is by NAME and the request is not
+lost — and that a session switch spills the idle entry at the END of the
+switching request, so the pessimism lasts one request, not a session.
+
 **What SSD-first cannot do: serve a 1M prompt on this box.** The live KV must
 be resident — that is the one thing no tier can move — so the longest prompt
 this machine can serve is set by the prefill peak, not by the cache. At kv8 a
