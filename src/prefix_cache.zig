@@ -2019,15 +2019,23 @@ pub const HotPrefixCache = struct {
             // agree: an entry at this key whose `kv_len` reaches the persist
             // target and whose chunk array has one non-zero size per chunk that
             // length implies.
-            if (!d.holdsFullPrefix(e.snapshot.entries, e.snapshot.step, e.tokens, e.has_tools, e.snapshot.config)) {
+            const disk_id = d.fullPrefixEntryId(e.snapshot.entries, e.snapshot.step, e.tokens, e.has_tools, e.snapshot.config) orelse {
                 log.warn("  [hot-cache] idle spill: the tier does not hold the full prefix — entry stays resident\n", .{});
                 continue;
-            }
+            };
             // ...and a STAGED copy is not a durable one. `appendCommit` reports
             // what it handed the writer, not what reached the disk: the writer
             // logs a failed blob, counts it, and drops it, so discarding RAM on
             // that promise loses the session outright. (audit S3)
-            d.drainWriter();
+            //
+            // But the check must NOT be a drain. `drainWriter` waits on the
+            // whole queue, and this runs on the INFERENCE thread at the end of
+            // every request — a decode stall on every finished turn with a
+            // flush outstanding, which is precisely what the background writer
+            // exists to remove. An entry whose files are still in flight is
+            // simply not evictable on THIS pass; the next pass asks again, and
+            // meanwhile the entry is safe in RAM. (external review item 6)
+            if (d.entryWritesPending(disk_id)) continue;
             if (d.writeErrors() != errs_before) {
                 log.warn("  [hot-cache] idle spill: background write failed — entry stays resident\n", .{});
                 continue;
@@ -4812,6 +4820,89 @@ test "SSD-first: an idle entry spills to disk and leaves RAM; the active session
         hc.spillIdleEntries(s);
         try testing.expectEqual(@as(usize, 2), hc.entryCount());
     }
+}
+
+test "SSD-first: an in-flight write does not stall the tick — the entry is re-checked next pass" {
+    // External review item 6. The durability check was `drainWriter()` + a
+    // write-error comparison, and `drainWriter` WAITS on the whole queue. It
+    // runs on the INFERENCE thread inside `finishSlot`, so every finished
+    // request with a flush outstanding parked decode until the background
+    // writer caught up — the exact stall the writer was added to remove.
+    //
+    // The bar is behavioural, with a writer held deliberately: an entry whose
+    // files are still staged is NOT evictable, the pass returns anyway, and
+    // the next pass evicts once the files have landed.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+
+    var tok_a: [600]u32 = undefined;
+    for (&tok_a, 0..) |*t, i| t.* = @intCast(i + 7);
+    var tok_b: [600]u32 = undefined;
+    for (&tok_b, 0..) |*t, i| t.* = @intCast(i + 90_000);
+
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 1, 600);
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 8, 0);
+    hc.ssd_first = true;
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, buf[0..root_len], "fp-inflight", 0, 128);
+    defer hc.deinit();
+    hc.disk.?.ssd_first = true;
+    hc.disk.?.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
+    hc.disk.?.enableBackgroundWriter();
+    // Generous allowance: this test is about the WRITE state, not the cap
+    // (tier 3 would otherwise drop the entry for a different, named reason).
+    hc.ssd_idle_mem = 64 * 1024 * 1024 * 1024;
+
+    try hc.commit(&cache, &tok_a, false);
+    try hc.commit(&cache, &tok_b, false);
+
+    // The writer is held: everything the spill stages stays in flight.
+    hc.disk.?.writer.?.setPaused(true);
+    hc.spillIdleEntries(s);
+    // It RETURNED (a drain would have deadlocked against the paused writer),
+    // the index knows the entry, and RAM still holds it.
+    try testing.expect(hc.disk.?.writer.?.pendingBytes() > 0);
+    try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+    try testing.expectEqual(@as(usize, 2), hc.entryCount());
+
+    // Let the writer run, and drop the allowance so eviction is permitted at
+    // all. The NEXT pass sees the files on disk and evicts.
+    hc.disk.?.writer.?.setPaused(false);
+    hc.disk.?.drainWriter(); // test-side only: the engine never waits here
+    hc.ssd_idle_mem = 0;
+    hc.spillIdleEntries(s);
+    try testing.expectEqual(@as(usize, 1), hc.entryCount());
+    try testing.expectEqualSlices(u32, &tok_b, hc.entries.items[0].tokens);
+}
+
+test "the end-of-request path never WAITS on the background writer" {
+    // Scan half of item 6. The inference thread runs `flushPendingDisk` then
+    // `spillIdleEntries` inside `finishSlot`; neither may block on a write.
+    // Needles split so this test's own source cannot satisfy them.
+    const src = @embedFile("prefix_cache.zig");
+    const waits = [_][]const u8{ "drain" ++ "Writer()", "drain" ++ "Prefix(", ".drain(" };
+    for ([_][]const u8{ "pub fn spillIdleEntries(", "pub fn flushPendingDisk(" }) |decl| {
+        const at = std.mem.indexOf(u8, src, decl) orelse return error.CallSiteMoved;
+        const body = src[at..];
+        const end = std.mem.indexOf(u8, body, "\n    }\n") orelse body.len;
+        for (waits) |w| {
+            if (std.mem.indexOf(u8, body[0..end], w) != null) return error.EndOfRequestPathWaitsOnTheWriter;
+        }
+    }
+    // ...and the non-blocking query it uses instead really is non-blocking:
+    // `Writer.pendingPrefix` takes the mutex, reads, and returns — no wait.
+    const wsrc = @embedFile("kv_disk_writer.zig");
+    const at = std.mem.indexOf(u8, wsrc, "pub fn pendingPrefix(") orelse return error.QueryMissing;
+    const body = wsrc[at..];
+    const end = std.mem.indexOf(u8, body, "\n    }\n") orelse body.len;
+    try testing.expect(std.mem.indexOf(u8, body[0..end], "waitUncancelable") == null);
 }
 
 test "SSD-first: the idle ALLOWANCE bounds eviction, not the fact of being idle" {

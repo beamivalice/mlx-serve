@@ -529,6 +529,22 @@ pub const DiskTier = struct {
         return w.writeErrorCount();
     }
 
+    /// NON-BLOCKING: does entry `id` still have files staged or in flight?
+    ///
+    /// The eviction bar (`spillIdleEntries`) used `drainWriter`, a WAIT on the
+    /// whole queue, on the inference thread at the end of every request. This
+    /// is the same question asked without blocking: an entry with writes
+    /// outstanding is not evictable on this pass, and the next pass asks
+    /// again. True when the writer is not armed is WRONG — with no writer the
+    /// write was synchronous and is already done — so an unarmed tier answers
+    /// false. (external review item 6)
+    pub fn entryWritesPending(self: *DiskTier, id: u64) bool {
+        const w = self.writer orelse return false;
+        const pre = std.fmt.allocPrint(self.allocator, "{s}/e{d}/", .{ self.root, id }) catch return true;
+        defer self.allocator.free(pre);
+        return w.pendingPrefix(pre);
+    }
+
     /// Wait only for the files of entry `id` (audit S12): a restore needs ITS
     /// chunks on disk, not the previous turn's tail.
     fn drainEntry(self: *DiskTier, id: u64) void {
@@ -1340,8 +1356,22 @@ pub const DiskTier = struct {
         has_tools: bool,
         config: kv_quant.KVQuantConfig,
     ) bool {
+        return self.fullPrefixEntryId(kv_entries, step, tokens, has_tools, config) != null;
+    }
+
+    /// `holdsFullPrefix`, returning the entry's id so the caller can ask
+    /// whether that entry's files have actually reached the disk yet
+    /// (`entryWritesPending`) without draining the writer.
+    pub fn fullPrefixEntryId(
+        self: *const DiskTier,
+        kv_entries: []const transformer_mod.KVCacheEntry,
+        step: usize,
+        tokens: []const u32,
+        has_tools: bool,
+        config: kv_quant.KVQuantConfig,
+    ) ?u64 {
         const target = persistTargetLen(kv_entries, step, tokens.len);
-        if (target == 0) return false;
+        if (target == 0) return null;
         for (self.entries.items) |*e| {
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant, config)) continue;
@@ -1354,9 +1384,9 @@ pub const DiskTier = struct {
             for (e.chunk_bytes[0..want]) |b| {
                 if (b == 0) whole = false;
             }
-            if (whole) return true;
+            if (whole) return e.id;
         }
-        return false;
+        return null;
     }
 
     /// Sidecar-only append: KV chunks are already fully on disk (superseded

@@ -200,6 +200,28 @@ pub const Writer = struct {
         }
     }
 
+    /// NON-BLOCKING twin of `drainPrefix`: is any blob for `path_prefix` still
+    /// staged or in the writer's hands?
+    ///
+    /// `drainPrefix` is a WAIT, and the inference thread must never wait on a
+    /// write it is not reading. The idle spill's durability check used
+    /// `drainWriter` (the whole-queue form), which parked decode at the end of
+    /// every request that had a flush outstanding — the exact stall the
+    /// background writer exists to remove. An entry with writes in flight is
+    /// simply not evictable YET; the next pass asks again. (external review
+    /// item 6)
+    pub fn pendingPrefix(self: *Writer, path_prefix: []const u8) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.inflight_path) |p| {
+            if (std.mem.startsWith(u8, p, path_prefix)) return true;
+        }
+        for (self.queue.items) |b| {
+            if (std.mem.startsWith(u8, b.path, path_prefix)) return true;
+        }
+        return false;
+    }
+
     /// Wait until every staged file has been written (or dropped).
     pub fn drain(self: *Writer) void {
         self.mutex.lockUncancelable(self.io);
