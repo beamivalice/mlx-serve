@@ -5204,3 +5204,106 @@ an A/B whose two arms report the SAME op count is not measuring two arms. The
 engaged-line census caught it on the first boot; without those two columns it
 would have read as "split-K is a wash at S=1" and been believed.
 
+## CLOSED: split-K QSA was exonerated by a control the first check never ran (2026-09-05, qwen4_exp)
+
+The fused sparse-attn kernel cleared cos > 0.99999, a two-ulp max-abs bar on
+sixteen N(0,1) fixture cases and NSPLIT invariance at 1/8/16/64 — and then went
+over the 0.15-nat greedy bar on 2 of 8 end-to-end nonces (62.7k prompt, S=6,
+8-bit KV) where the union gather was 0/8. That reads as a kernel bug, and it was
+filed as one. It was not. **The instrument had never been run against a control
+on this prompt.**
+
+### The four-arm table (one boot per arm, same 8 nonces, same harness)
+
+MTP vs its OWN serial, greedy, `--kv-quant 8 --prefix-cache-entries 0 --no-pld
+--mtp`, `MLX_SERVE_MTP_FORCE_DEPTH=5` (S=6), top-2 gap read off the serial arm's
+logprobs at the first differing character:
+
+| nonce | main (a93e2c0, no bundle) | kernel off | NSPLIT=1 | NSPLIT=16 |
+|---|---|---|---|---|
+| n1 | **0.375** @361 | **0.246** @361 | **0.246** @361 | **0.258** @257 |
+| n2 | **0.254** @361 | 0.000 @361 | 0.000 @778 | 0.000 @584 |
+| n3 | **0.375** @662 | 0.125 @520 | 0.125 @520 | 0.125 @520 |
+| n4 | **0.246** @587 | **0.250** @361 | **0.250** @361 | **0.250** @361 |
+| n5 | 0.000 @361 | 0.000 @361 | 0.000 @361 | 0.125 @584 |
+| n6 | 0.000 @648 | **0.246** @295 | 0.000 @361 | **0.375** @36 |
+| n7 | 0.000 @386 | 0.125 @648 | 0.121 @587 | 0.125 @649 |
+| n8 | 0.121 @831 | 0.000 @584 | 0.000 @361 | 0.000 @584 |
+| **over 0.15** | **4/8** | **3/8** | **2/8** | **3/8** |
+
+Upstream main — no bundle, no kernel, no split-K — is 4/8, with two 0.375s. The
+~0.38-class flip that the kernel was accused of introducing is the PROMPT's own
+near-tie landscape at 62.7k, and the character positions give it away: 361, 584,
+520, 648 recur across arms that share no code path. The mega tree's off = 0/8
+was the outlier, not the kernel's 2/8.
+
+### The per-element certification that settles it
+
+A one-shot dump lever (`MLX_SERVE_QSA_ATTN_DUMP=<dir>`, written for this
+measurement and parked as a patch rather than shipped — the branch was frozen
+for the fold) captures one live engaging verify forward: q, the packed K/V
+triples with scales and biases, and the block selection. On those bit-identical
+operands it runs THREE arms — the kernel at the boot's NSPLIT, the same kernel
+body at NSPLIT=1 (one split, the merge an identity), and the union gather — and
+an offline f32 reference rebuilds each row's own visible set from the same
+dequantized K/V. Reproducing it needs the patch re-applied and one boot; the
+arms are `qsa_attn_arm.sh` at `MLX_SERVE_MTP_FORCE_DEPTH=5`. At S=6, kv 62754, kb 512 saturated, 8-bit gs64, over all
+144 (row, head) pairs, in bf16 ULPs of that pair's own scale:
+
+| arm | max | mean of row maxima | max rel on \|o\| > 1e-3 |
+|---|---|---|---|
+| fused (NSPLIT=16) | 1.580 | 0.455 | 0.555 |
+| fused (NSPLIT=1) | 1.580 | 0.455 | 0.555 |
+| union gather | 1.580 | 0.468 | 0.497 |
+
+No element of any arm exceeds 2 ulp. **Row classes where the kernel is worse
+than the union gather by more than 2 ulp: zero** — the worst fused-minus-gather
+delta over all 144 pairs is +0.355 ulp and the best is −0.630 (the gather
+worse). NSPLIT=16 and NSPLIT=1 differ on 0.01% of elements, all sub-ulp, and
+move no row's error at all.
+
+The merge's three named risks were measured rather than argued: the correlation
+between the spread of partial maxima across splits and |NSPLIT=16 − NSPLIT=1| is
+−0.015 (none); the smallest `l` over every non-empty split of every row is
+1.0137, so the `l == 0` empty-split flag never collides with a real split; and
+at this shape every row has 15 non-empty splits of 16 with the ragged tail
+always in the last one, so the empty-split path is exercised on every row and
+costs nothing.
+
+**The rule. An end-to-end greedy tally is not a bar until its CONTROL has been
+measured on the same prompt.** A long-context near-tie landscape produces
+0.25–0.38-nat flips with no code change at all, so an arm's 2/8 means nothing
+until upstream's own number is known — and here upstream was worse than every
+arm under test. The kernel's real bar is the per-element one against the arm it
+replaces, on operands captured from a live forward: a kernel that decides WHICH
+keys to read fails by reading a wrong key set, and a random fixture has no ties
+to break, no real selection, and no row whose visible-block count sits at the
+budget (all six rows here are at kb = 512 exactly).
+
+### The other thing that moved: M12 changed the S=1 baseline through PREFILL
+
+Before any of the above could be read, the serial reference had to be
+re-established, because it is not the same text on this branch. Bisecting the
+n1 serial output (S=1, greedy, one boot per point — the kernel arm is irrelevant
+at S=1):
+
+| point | commit | n1 serial |
+|---|---|---|
+| ctl2 | `0af2a49` (bundle-fix base) | 931 chars |
+| k7 | the seven kernel commits | 931 chars |
+| b2 | M11 + M17/M18 | 931 chars |
+| b3 | + L20/L25 + **M12** | **1004 chars** |
+| b4 | b3 with M12 undone | 931 chars |
+
+M12 — the dense-MASK arm's block selection moving from the 1e-7-bias
+argpartition chain to the exact select kernel — changes S=1 output, and it does
+it through PREFILL, not decode. `want_blocks` requires `seq_len >= 16`
+(`FUSED256_MIN_Q_LEN`), so a ragged TAIL prefill chunk of 2..15 tokens sits below
+the verify-gather floor and takes the mask arm; its selection now follows the
+exact rule, and a 0.125-nat near-tie at byte 361 flips — 931 chars becomes 1004.
+
+That is the unification M12 was written to make, not a regression: two tie rules
+must not be live in one process, and the fused select is the reference arm (the
+bias chain rounds away from `torch.topk`'s lower-index-wins past |score| ~ 0.84).
+**So the bar for any arm on this branch is within-tree MTP against its OWN
+serial. A cross-tree byte comparison here measures M12, not the kernel.**
