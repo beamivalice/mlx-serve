@@ -1240,6 +1240,8 @@ pub fn serve(
     // this module owns, and the scheduler deliberately has no server import.
     scheduler_mod.prefill_admission_fits = &prefillFitsNow;
     defer scheduler_mod.prefill_admission_fits = null;
+    scheduler_mod.prefill_admission_refused_log = &logPrefillRefusal;
+    defer scheduler_mod.prefill_admission_refused_log = null;
 
     // Gauge sampler: samples instantaneous system + queue state every 2 s and
     // writes the metrics gauges. Only runs when --metrics is on. Trivial cost
@@ -3359,6 +3361,10 @@ pub const QSA_HISTORY_GROWS_IN_PLACE: bool = true;
 /// failure the operator can act on, not a generic engine fault. ONE helper so
 /// the three slot-drain sites cannot answer differently.
 fn slotFailure(slot: *scheduler_mod.Slot) anyerror {
+    // A pre-prefill admission refusal is NOT an abandoned generation: nothing
+    // ran, and the client gets the 400 the connection-thread guard would have
+    // sent (#353 follow-up). Distinguished by NAME, like every slot error.
+    if (slot.errorNameIs("PrefillDoesNotFit")) return error.PrefillDoesNotFit;
     if (slot.errorIsMemory()) return error.GenerationOutOfMemory;
     return error.GenerationFailed;
 }
@@ -3368,6 +3374,15 @@ fn slotFailure(slot: *scheduler_mod.Slot) anyerror {
 /// line, the only place that knows which allocation failed.
 const GEN_OOM_MSG = "The engine ran out of GPU memory during this request and it was abandoned. The server is still running. Reduce the prompt length, lower --ctx-size, or free memory on the machine.";
 
+/// The message every `error.PrefillDoesNotFit` arm sends. The request was
+/// refused BEFORE its first forward, by the same estimator the connection
+/// thread's guard uses, re-asked after the hot prefix cache gave back
+/// everything it could — so it is the client's request that is too large, not
+/// the engine that failed. The compared byte counts are in the server log's
+/// "refused before prefill" line (the connection thread cannot re-read the
+/// inference thread's live memory to repeat them here honestly).
+const PREFILL_NOFIT_MSG = "This prompt does not fit in GPU memory even after freeing the prefix cache; it was refused before any work started. Reduce the prompt length, lower --ctx-size, or free memory on the machine (the server log quotes the byte counts it compared).";
+
 /// The admission bill and the headroom it is compared against, as ONE number
 /// each. Extracted so the connection thread's guard and the inference
 /// thread's evict-or-refuse decision cannot compute the bill differently
@@ -3376,19 +3391,33 @@ const GEN_OOM_MSG = "The engine ran out of GPU memory during this request and it
 pub const AdmissionBill = struct {
     needed: u64 = 0,
     available: u64 = 0,
-    /// Bytes the hot prefix cache is holding that could be given back. A
-    /// racy hint on the connection thread; exact on the inference thread.
+    /// Bytes the hot prefix cache is holding. A racy hint on the connection
+    /// thread; exact on the inference thread. REPORTED in a refusal, never
+    /// credited toward admission — see `reclaimable`.
     evictable: u64 = 0,
+    /// The part of `evictable` an eviction can PROVE it will return: the
+    /// residency minus the largest entry
+    /// (`HotPrefixCache.reclaimableBytes`). A prefix restore refcount-shares
+    /// the matched entry's buffers with the slot's cache, so evicting THAT
+    /// entry returns nothing and `evictLruToAdmit` will not even try. A
+    /// restore pins at most one entry, so this is the provable credit.
+    reclaimable: u64 = 0,
 
     pub fn fits(self: AdmissionBill) bool {
         return self.needed <= self.available;
     }
 
-    /// Fits once the cache has given back everything it holds. The guard
+    /// Fits once the cache has given back what it PROVABLY can. The guard
     /// admits on THIS and the inference thread then evicts only as much as it
     /// has to — a cached prefix is an optimization, the request is the work.
+    ///
+    /// Credits `reclaimable`, not `evictable`: a 383k-token prompt was
+    /// admitted on 1,564 MB of cache that was one entry — the one the prompt
+    /// then restored from — and refused after the eviction pass returned
+    /// nothing (guards run 2026-09-05, #353 follow-up). A guard that admits on
+    /// memory it cannot get back is a 503 with extra steps.
     pub fn fitsAfterEviction(self: AdmissionBill) bool {
-        return self.needed <= self.available +| self.evictable;
+        return self.needed <= self.available +| self.reclaimable;
     }
 };
 
@@ -3454,7 +3483,11 @@ pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: us
         sch.resident_hot_cache_bytes.load(.monotonic)
     else
         0;
-    return .{ .needed = needed, .available = available, .evictable = evictable };
+    const reclaimable: u64 = if (global_scheduler) |sch|
+        sch.reclaimable_hot_cache_bytes.load(.monotonic)
+    else
+        0;
+    return .{ .needed = needed, .available = available, .evictable = evictable, .reclaimable = reclaimable };
 }
 
 /// Inference-thread predicate behind `Scheduler`'s admission hook: does this
@@ -3472,6 +3505,18 @@ pub fn prefillFitsNow(config: *const model_mod.ModelConfig, prompt_len: usize, m
     return prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill).fits();
 }
 
+/// The inference thread's refusal, quoting the numbers it COMPARED — the same
+/// estimator, re-read after the eviction pass gave back everything it could.
+/// The scheduler calls this through `prefill_admission_refused_log`; it cannot
+/// format a bill it has no estimator for.
+pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, unchunked_prefill: bool) void {
+    const bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill);
+    const mb = 1024 * 1024;
+    log.warn("  prompt {d} tokens needs ~{d}MB, ~{d}MB available after evicting ~{d}MB of hot cache — refused before prefill\n", .{
+        prompt_len, bill.needed / mb, bill.available / mb, bill.evictable / mb,
+    });
+}
+
 fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_len: usize, max_tokens: u32, config: *const model_mod.ModelConfig, is_anthropic: bool, kv_override: ?transformer_mod.KVQuantConfig, lm: *const LoadedModel, unchunked_prefill: bool) !bool {
     if (!mlxMemoryGuardApplies(lm.ds4_engine != null, lm.llama_engine != null)) return true;
     if (config.num_attention_heads == 0) return true; // unknown architecture, skip check
@@ -3486,20 +3531,20 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_len:
     // the cache is empty and it still does not fit. Refusing here would trade
     // a request the machine can serve for a cache hit nobody asked for.
     if (needed > available and bill.fitsAfterEviction()) {
-        log.info("  prompt {d} tokens needs ~{d}MB, ~{d}MB available + ~{d}MB evictable hot cache — admitting, the prefill will evict\n", .{
-            prompt_len, needed / (1024 * 1024), available / (1024 * 1024), bill.evictable / (1024 * 1024),
+        log.info("  prompt {d} tokens needs ~{d}MB, ~{d}MB available + ~{d}MB reclaimable hot cache (of ~{d}MB resident) — admitting, the prefill will evict\n", .{
+            prompt_len, needed / (1024 * 1024), available / (1024 * 1024), bill.reclaimable / (1024 * 1024), bill.evictable / (1024 * 1024),
         });
         return true;
     }
     if (needed > available) {
         const needed_mb = needed / (1024 * 1024);
         const avail_mb = available / (1024 * 1024);
-        log.warn("  prompt {d} tokens needs ~{d}MB (KV+working+margin), ~{d}MB available — rejecting\n", .{ prompt_len, needed_mb, avail_mb });
+        log.warn("  prompt {d} tokens needs ~{d}MB (KV+working+margin), ~{d}MB available + ~{d}MB reclaimable of ~{d}MB resident hot cache — rejecting\n", .{ prompt_len, needed_mb, avail_mb, bill.reclaimable / (1024 * 1024), bill.evictable / (1024 * 1024) });
         // A refusal quotes the numbers it COMPARED — including the hot cache,
         // because the operator's first question is "why didn't it just drop a
         // cache entry?" and the honest answer here is that there was nothing
         // left to drop (issue #353).
-        const msg = try std.fmt.allocPrint(allocator, "Prompt ({d} tokens) requires ~{d}MB GPU memory but only ~{d}MB is available and the hot prefix cache holds ~{d}MB more, which is not enough. Reduce prompt size, lower --ctx-size, or use a smaller model.", .{ prompt_len, needed_mb, avail_mb, bill.evictable / (1024 * 1024) });
+        const msg = try std.fmt.allocPrint(allocator, "Prompt ({d} tokens) requires ~{d}MB GPU memory but only ~{d}MB is available and the hot prefix cache holds ~{d}MB more, of which ~{d}MB can be reclaimed (the entry a restore would share is not evictable), which is not enough. Reduce prompt size, lower --ctx-size, or use a smaller model.", .{ prompt_len, needed_mb, avail_mb, bill.evictable / (1024 * 1024), bill.reclaimable / (1024 * 1024) });
         defer allocator.free(msg);
         if (is_anthropic) {
             try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
@@ -6202,6 +6247,7 @@ fn handleNonStreamingCompletion(
 
     var result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_pld, use_drafter, use_mtp, getTimeoutNs(), null, 0, .{}, logprobs_n, null, null, stream) catch |err| switch (err) {
         error.GenerationOutOfMemory => return sendErrorResponse(allocator, stream, "503 Service Unavailable", "server_error", GEN_OOM_MSG, 503),
+        error.PrefillDoesNotFit => return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", PREFILL_NOFIT_MSG, 400),
         error.GenerationFailed => return sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null),
         else => return err,
     };
@@ -6685,6 +6731,10 @@ fn handleNonStreamingGeneration(
     const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, vision_key, mrope, logprobs_n, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
         error.GenerationOutOfMemory => {
             try sendErrorResponse(allocator, stream, "503 Service Unavailable", "server_error", GEN_OOM_MSG, 503);
+            return;
+        },
+        error.PrefillDoesNotFit => {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", PREFILL_NOFIT_MSG, 400);
             return;
         },
         error.GenerationFailed => {
@@ -12380,6 +12430,7 @@ fn handleAnthropicNonStreaming(
     // still decode correctly — M-RoPE refines spatial grounding only.
     const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, vision_key, .{}, 0, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
         error.GenerationOutOfMemory => return sendAnthropicError(allocator, stream, "api_error", GEN_OOM_MSG, 503),
+        error.PrefillDoesNotFit => return sendAnthropicError(allocator, stream, "invalid_request_error", PREFILL_NOFIT_MSG, 400),
         error.GenerationFailed => return sendAnthropicError(allocator, stream, "api_error", "generation failed", 500),
         else => return err,
     };
@@ -14382,6 +14433,7 @@ fn handleResponses(
         };
         result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve_ns, vis_key, .{}, 0, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
             error.GenerationOutOfMemory => return sendErrorResponse(allocator, stream, "503 Service Unavailable", "server_error", GEN_OOM_MSG, 503),
+            error.PrefillDoesNotFit => return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", PREFILL_NOFIT_MSG, 400),
             error.GenerationFailed => return sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null),
             else => return err,
         };
@@ -19194,8 +19246,13 @@ test "the reservation is bounded by the CONTEXT: an omitted max_tokens cannot bi
     // (1) The cache clamps: the generation cannot exceed what is left of the
     //     context, so the reservation cannot exceed the context plus a chunk.
     const reserved = KVCache.reservedTokens(seq, sentinel, 4096, ctx);
-    try t.expectEqual(ctx + 4096, reserved);
-    try t.expect(reserved < ctx * 2);
+    // Bounded twice over since the guards run of 2026-09-05: by the generation
+    // HEADROOM first (see "an omitted max_tokens reserves a generation
+    // HEADROOM" below) and by the context second. The context bound is what
+    // keeps a caller that names a huge-but-finite max_tokens honest; the
+    // headroom is what keeps an OMITTED one from billing the whole window.
+    try t.expectEqual(seq + KVCache.RESERVE_GEN_HEADROOM + 4096, reserved);
+    try t.expect(reserved < ctx);
     // (2) The four surfaces clamp FIRST and hand the guard the clamped value.
     const clamped: u64 = clampMaxTokens(@intCast(sentinel), @intCast(seq), @intCast(ctx));
     try t.expectEqual(ctx - seq, clamped);
@@ -19204,7 +19261,10 @@ test "the reservation is bounded by the CONTEXT: an omitted max_tokens cannot bi
     // An explicit max_tokens under the remaining window is untouched, and a
     // caller that names no context (unit tests) is not clamped at all.
     try t.expectEqual(seq + 2048 + 4096, KVCache.reservedTokens(seq, 2048, 4096, ctx));
-    try t.expectEqual(seq + sentinel + 4096, KVCache.reservedTokens(seq, sentinel, 4096, 0));
+    // A caller that names no context (unit tests) is not context-clamped, but
+    // the headroom bound still applies — it is a property of the RESERVATION,
+    // not of the context.
+    try t.expectEqual(seq + KVCache.RESERVE_GEN_HEADROOM + 4096, KVCache.reservedTokens(seq, sentinel, 4096, 0));
     // A prompt that already fills the context reserves no generation headroom.
     try t.expectEqual(ctx + 4096, KVCache.reservedTokens(ctx, sentinel, 4096, ctx));
 
@@ -19213,6 +19273,124 @@ test "the reservation is bounded by the CONTEXT: an omitted max_tokens cannot bi
     const cfg = qwen4ExpOomConfig();
     const terms = prefillRequestTerms(&cfg, seq, clamped, 8, 4096);
     try t.expect(terms.reserved_kv_bytes < 4 * 1024 * 1024 * 1024);
+}
+
+/// The generic (non-dsv4) admission bill for `qwen4ExpOomConfig`, minus the
+/// live-memory read a unit test cannot make. Same expression as
+/// `prefillAdmissionBill`'s generic arm, so a test can move the per-request
+/// terms and read the WHOLE bill move.
+fn oomBillFor(cfg: *const model_mod.ModelConfig, seq: u64, chunk: u64, terms: PrefillRequestTerms) u64 {
+    return prefillMemoryNeeded(seq, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.kvBytesPerToken(), cfg.head_dim, cfg.prefillScoreHeadDim(), cfg.hidden_size, prefillFfnWidth(cfg), 8, chunk, cfg.prefillAttnKeys(seq), prefillStreamBytesPerToken(cfg), prefillDequantWeightBytes(cfg), terms) +
+        qsaMaskBytes(cfg, @min(chunk, @max(seq, 1)), seq);
+}
+
+test "an omitted max_tokens reserves a generation HEADROOM, not the rest of the context" {
+    const t = std.testing;
+    // LIVE DEFECT (guards run 2026-09-05, candidate `longctx-mega-cand-nk`,
+    // `--ctx-size 1048576 --kv-quant 8 --prefill-chunk 4096`): a 383,067-token
+    // prompt with NO `max_tokens` field was admitted — "prompt 383067 tokens
+    // needs ~37394MB, ~37130MB available + ~1564MB evictable hot cache —
+    // admitting, the prefill will evict" — and then refused on the inference
+    // thread ("do not fit even with an empty hot cache") and answered 503.
+    // The same boot served 524,253 tokens with `max_tokens: 16`.
+    //
+    // `clampMaxTokens` turns an omitted max_tokens into `ctx - prompt` =
+    // 665,509 tokens, so the reservation covered the WHOLE context: ~8.3 GB of
+    // KV headroom plus ~4.8 GB of indexer history for a generation the request
+    // will almost certainly never run. The reservation exists to stop the
+    // old+new buffer coexistence DURING PREFILL (#353), not to pre-buy an
+    // unbounded generation — past the headroom the +25% growth policy takes
+    // over, which is amortized and never mid-prefill.
+    const KVCache = transformer_mod.KVCache;
+    const MB: u64 = 1024 * 1024;
+    const cfg = qwen4ExpOomConfig();
+    const ctx: u64 = getEffectiveContextLength(&cfg);
+    try t.expectEqual(@as(u64, 1_048_576), ctx);
+    const seq: u64 = 383_067;
+    const chunk: u64 = 4096;
+    const clamped: u64 = clampMaxTokens(@intCast(omittedMaxTokensDefault(@intCast(ctx))), @intCast(seq), @intCast(ctx));
+    try t.expectEqual(ctx - seq, clamped); // 665,509 — the live number
+
+    // The reservation is bounded by the HEADROOM, not by the context.
+    const reserved = KVCache.reservedTokens(seq, clamped, chunk, ctx);
+    try t.expectEqual(seq + KVCache.RESERVE_GEN_HEADROOM + chunk, reserved);
+    try t.expect(reserved < seq + ctx / 8);
+    // An explicit max_tokens under the headroom is honoured exactly: a client
+    // that names its budget still gets exactly that reserved.
+    try t.expectEqual(seq + 512 + chunk, KVCache.reservedTokens(seq, 512, chunk, ctx));
+    // And the context bound still binds when it is the tighter of the two.
+    try t.expectEqual(ctx + chunk, KVCache.reservedTokens(ctx - 16, clamped, chunk, ctx));
+
+    // The bill follows: only the headroom terms move.
+    const kv_per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8);
+    const terms = prefillRequestTerms(&cfg, seq, clamped, 8, chunk);
+    try t.expectEqual((KVCache.RESERVE_GEN_HEADROOM + chunk) * kv_per_tok, terms.reserved_kv_bytes);
+    try t.expectEqual(reserved * statePerTokenBilled(&cfg), terms.state_bytes);
+
+    // ... and the whole bill drops by more than 10 GB: from ABOVE the live
+    // headroom (37,394 MB needed against 37,130 MB available, which is why the
+    // request could only be admitted by eviction) to comfortably under it.
+    const ctx_bounded: PrefillRequestTerms = .{
+        .reserved_kv_bytes = (ctx + chunk - seq) * kv_per_tok,
+        .state_bytes = (ctx + chunk) * statePerTokenBilled(&cfg),
+        .checkpoint_bytes = terms.checkpoint_bytes,
+    };
+    const bill = oomBillFor(&cfg, seq, chunk, terms);
+    const old_bill = oomBillFor(&cfg, seq, chunk, ctx_bounded);
+    try t.expect(old_bill > bill + 10 * 1024 * MB);
+    try t.expect(old_bill > 37_000 * MB); // the live "needs ~37394MB"
+    try t.expect(bill < 30_000 * MB); // under the live "~37130MB available"
+}
+
+test "the guard credits only PROVABLY reclaimable cache bytes, never the entry a restore will pin" {
+    const t = std.testing;
+    // The second half of the same live defect. The guard admitted on
+    // `available + evictable >= needed` (37,130 + 1,564 >= 37,394), but the
+    // 1,564 MB was ONE entry — the one this very prompt then restored from. A
+    // restore refcount-shares that entry's buffers with the slot's cache, so
+    // `evictLruToAdmit` protects it by construction and evicting returns
+    // NOTHING: the inference thread refused a request the connection thread
+    // had already promised. A single restore can pin at most one entry, so the
+    // provable credit is the residency MINUS the largest entry
+    // (`HotPrefixCache.reclaimableBytes`), published beside it.
+    const MB: u64 = 1024 * 1024;
+    var bill = AdmissionBill{ .needed = 37_394 * MB, .available = 37_130 * MB, .evictable = 1_564 * MB, .reclaimable = 0 };
+    try t.expect(!bill.fits());
+    try t.expect(!bill.fitsAfterEviction()); // it DID, before this fix
+    // Bytes held by other conversations' entries are reclaimable and still buy
+    // admission — that is what evict-to-admit is for (#353).
+    bill.reclaimable = 1_564 * MB;
+    try t.expect(bill.fitsAfterEviction());
+
+    // And the guard reads the PUBLISHED number, never the inference thread's
+    // cache pointer (same discipline as `evictable`).
+    const src = @embedFile("server.zig");
+    const start = std.mem.indexOf(u8, src, "pub fn prefillAdmission" ++ "Bill(") orelse return error.CallSiteMoved;
+    const tail = src[start..];
+    const end = std.mem.indexOf(u8, tail, "\nextern \"c\" fn sysctlbyname") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, tail[0..end], "reclaimable_hot_cache_bytes.load(.monotonic)") != null);
+}
+
+test "the admission bill and the engine's reservation read ONE function" {
+    // #126 discipline, applied to the reservation: the guard bills what the
+    // cache allocates because both call `KVCache.reservedTokens`. A second
+    // copy of the arithmetic anywhere is how the two drift, and a drift here
+    // is either an OOM (guard low) or a false refusal (guard high).
+    const t = std.testing;
+    const srv = @embedFile("server.zig");
+    const gen = @embedFile("generate.zig");
+    const call = "KVCache.reserved" ++ "Tokens(";
+    // server: exactly one non-test caller, `reservedCacheTokens`, and it
+    // delegates (the rest of the hits are this file's tests).
+    try t.expect(std.mem.indexOf(u8, srv, "pub fn reservedCacheTokens(seq: u64, max_tokens: u64, chunk: u64, ctx: u64) u64 {\n" ++
+        "    // Delegates: the cache's own definition is the authority, so the number\n") != null);
+    // generate: the engine reserves through the same function, once.
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, gen, "transformer_mod." ++ call));
+    // and the headroom constant lives with the function that applies it.
+    const xfm = @embedFile("transformer.zig");
+    try t.expect(std.mem.indexOf(u8, xfm, "pub const RESERVE_GEN_" ++ "HEADROOM: u64 =") != null);
+    try t.expectEqual(@as(usize, 0), std.mem.count(u8, srv, "RESERVE_GEN_" ++ "HEADROOM: u64 ="));
+    try t.expectEqual(@as(usize, 0), std.mem.count(u8, gen, "RESERVE_GEN_" ++ "HEADROOM: u64 ="));
 }
 
 test "every text surface clamps max_tokens BEFORE it bills the memory guard" {

@@ -5187,9 +5187,29 @@ pub const KVCache = struct {
         // subsystems must agree on, and neither may trust its caller for it.
         // `ctx == 0` means "unknown" and imposes no clamp (unit tests, and
         // any future caller with no context to name).
-        const head_room: u64 = if (ctx > seq) @min(max_tokens, ctx - seq) else if (ctx > 0) 0 else max_tokens;
+        // ... and it is bounded a SECOND time, by the headroom below. The
+        // context bound alone still billed the whole window for an omitted
+        // max_tokens (`clampMaxTokens` hands us `ctx - prompt`): 13 GB at
+        // 383k tokens on a 1M-context qwen4_exp, which turned an admissible
+        // prompt into a refusal. The reservation's job is the PREFILL's
+        // coexistence, not pre-buying a generation nobody asked for.
+        const want: u64 = @min(max_tokens, RESERVE_GEN_HEADROOM);
+        const head_room: u64 = if (ctx > seq) @min(want, ctx - seq) else if (ctx > 0) 0 else want;
         return seq +| head_room +| @max(chunk, 1);
     }
+
+    /// Tokens of GENERATION the reservation pre-buys. Past it a decode grow
+    /// takes the ordinary proportional policy (`nextCapacityPolicy`, +25%):
+    /// amortized — one grow per quarter of the cache, ~94k tokens at 374k —
+    /// and, unlike a prefill grow, it happens between decode steps rather
+    /// than inside a chunk's lazy graph, so the old+new pair the reservation
+    /// exists to prevent (issue #353) never forms there.
+    ///
+    /// 8192 covers the generation of essentially every real request (a long
+    /// reasoning answer is a few thousand tokens) at a bill of ~100 MB of KV
+    /// on qwen4_exp at 8-bit, against the 13 GB an omitted `max_tokens` used
+    /// to reserve at 383k tokens (guards run 2026-09-05).
+    pub const RESERVE_GEN_HEADROOM: u64 = 8192;
 
     /// Prompt length at or above which a request reserves its capacity. Below
     /// it the flat runtime floor already covers the transient and the
@@ -6122,6 +6142,13 @@ pub fn ssmRollbackFromCapture(entry: *SSMCacheEntry, accepted: u32, verify_len: 
     // window + token history slice at 1+accepted (same shape as conv_state
     // below). Attention layer: the QSA raw-key history is positional — keep
     // the rows up to the accepted verify prefix.
+    //
+    // The two arms are EXCLUSIVE by construction, not by luck: `aux_state`
+    // holds the PLE window on the PLE layer and the QSA key history on a
+    // full-attention layer, and one array cannot be both. The PLE arm
+    // therefore replaces `aux_state` and drops every QSA accelerator through
+    // `ssmFreeQsaState` — which frees AND nulls each handle, so nothing is
+    // left dangling for a second free (pinned by the test below).
     if (entry.spec_ple_input.ctx != null) {
         const ci_shape = mlx.getShape(entry.spec_ple_input); // [B, state_len+T, hc*H]
         const state_len = ci_shape[1] - @as(c_int, @intCast(verify_len));
@@ -44424,6 +44451,64 @@ test "the fused QSA select ships a kill switch, a GPU-stream guard, a one-shot e
     // Threadgroup memory is an OCCUPANCY decision: the histogram is 2048
     // uints (8 KiB) and the whole kernel must stay under ~10 KiB.
     try testing.expect(std.mem.indexOf(u8, QSA_SELECT_KERNEL_SOURCE, "BINS  = 2048u") != null);
+}
+
+test "generation past the reserved headroom takes the +25% growth policy, never a mid-prefill grow" {
+    const t = std.testing;
+    // The reservation is bounded at `RESERVE_GEN_HEADROOM` tokens of
+    // generation (#353 follow-up: an omitted `max_tokens` clamps to
+    // `ctx - prompt`, and reserving THAT billed the whole context up front —
+    // 13 GB on a 383k-token qwen4_exp request, which turned an admissible
+    // prompt into a 503). What the bound gives up is pre-buying a long
+    // generation; what takes over past it is the ordinary proportional policy,
+    // whose grows are amortized (~one per 25% of the cache) and, crucially,
+    // happen between DECODE steps and never inside a prefill chunk's graph.
+    const reserve_headroom = KVCache.RESERVE_GEN_HEADROOM;
+    const chunk: usize = 4096;
+    const seq: usize = 40_000;
+    const reserved: usize = @intCast(KVCache.reservedTokens(seq, 1_000_000, chunk, 0));
+    try t.expectEqual(seq + reserve_headroom + chunk, reserved);
+
+    const s_gpu = mlx.gpuStream();
+    var cache = try KVCache.init(t.allocator, 1);
+    defer cache.deinit();
+    cache.reserve(reserved);
+    var written: usize = 0;
+    var allocs: usize = 0;
+    var last_cap: usize = 0;
+    var cap_at_prefill_end: usize = 0;
+    // Walk the whole prompt, then keep writing past the reservation — the
+    // generation this request was never billed for.
+    const total: usize = reserved + reserve_headroom;
+    while (written < total) {
+        const n: c_int = @intCast(@min(chunk, total - written));
+        var flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(flat);
+        const count: f64 = @floatFromInt(n * 8);
+        try mlx.check(mlx.mlx_arange(&flat, 0.0, count, 1.0, .float32, s_gpu));
+        var k = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(k);
+        const shape = [_]c_int{ 1, 1, n, 8 };
+        try mlx.check(mlx.mlx_reshape(&k, flat, &shape, 4, s_gpu));
+        var view = try cache.update(0, k, k, s_gpu, 0);
+        view.deinit();
+        const cap_now: usize = KVCache.bufferCapacity(cache.entries[0].keys);
+        if (cap_now != last_cap) {
+            allocs += 1;
+            last_cap = cap_now;
+        }
+        written += @intCast(n);
+        if (written <= seq) cap_at_prefill_end = last_cap;
+    }
+    // The PREFILL never grew: one allocation covered the prompt AND the
+    // headroom, which is the whole point of the reservation.
+    try t.expect(cap_at_prefill_end >= reserved);
+    try t.expectEqual(total, cache.entries[0].offset);
+    // Past it, growth is the ordinary policy — bounded, amortized, and the
+    // same number `nextCapacityPolicy` promises for a cache of that size.
+    try t.expect(allocs >= 2);
+    try t.expectEqual(KVCache.nextCapacityPolicy(cap_at_prefill_end, cap_at_prefill_end + 1, false), cache.nextCapacityReserved(cap_at_prefill_end, cap_at_prefill_end + 1));
+    try t.expect(last_cap >= total);
 }
 
 test "a reserved KV cache grows ONCE: no old+new buffer coexists during a long prefill" {

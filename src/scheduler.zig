@@ -305,6 +305,11 @@ pub const SubmitParams = struct {
 /// evict-to-admit path entirely (behaviour identical to before #353).
 pub var prefill_admission_fits: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool) bool = null;
 
+/// Twin of the above for the REFUSAL: logs the numbers the estimator
+/// compared, from the module that owns them. A refusal quotes the number it
+/// compared, and the scheduler cannot format a bill it has no estimator for.
+pub var prefill_admission_refused_log: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool) void = null;
+
 pub const SlotState = enum { pending_prefill, decoding, finished, errored };
 
 /// Result of `Slot.waitNext`. Driven by the inference thread; consumed by
@@ -796,6 +801,17 @@ pub const Slot = struct {
             std.mem.eql(u8, name, "InsufficientMemory");
     }
 
+    /// Whether the slot's latched error name is exactly `name`. The error
+    /// class crosses the thread boundary as a NAME (the connection thread
+    /// never sees the inference thread's error value), so a caller that needs
+    /// one specific class asks for it by name.
+    pub fn errorNameIs(self: *Slot, name: []const u8) bool {
+        self.out_mu.lockUncancelable(self.io);
+        defer self.out_mu.unlock(self.io);
+        const have = self.error_code orelse return false;
+        return std.mem.eql(u8, have, name);
+    }
+
     /// Live form of the above: reads the slot's latched error name.
     pub fn errorIsMemory(self: *Slot) bool {
         self.out_mu.lockUncancelable(self.io);
@@ -1235,6 +1251,14 @@ pub const Scheduler = struct {
     /// that matters is re-asked on the inference thread against live memory.
     resident_hot_cache_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
+    /// The part of the above an eviction can PROVE it will return: residency
+    /// minus the largest entry, because a prefix restore refcount-shares the
+    /// matched entry and eviction protects it (`HotPrefixCache.reclaimableBytes`).
+    /// The guard credits THIS toward admission and reports the other number in
+    /// its refusal — admitting on bytes that are already spoken for is how a
+    /// request gets promised and then refused (guards run 2026-09-05).
+    reclaimable_hot_cache_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
     max_concurrent: u32,
     /// Phase A7 test hook: when true, `runDecodeTick` forces the batched
     /// kernel even at `active.len == 1`. Set via the `MLX_SERVE_FORCE_BATCHED`
@@ -1545,6 +1569,7 @@ pub const Scheduler = struct {
         self.dflash = null;
         self.hot_prefix_cache = null;
         self.resident_hot_cache_bytes.store(0, .monotonic);
+        self.reclaimable_hot_cache_bytes.store(0, .monotonic);
         if (self.load_error_name) |n| self.allocator.free(n);
 
         self.allocator.destroy(self);
@@ -3899,6 +3924,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
 pub fn publishHotCacheResidency(sch: *Scheduler) void {
     const bytes: u64 = if (sch.hot_prefix_cache) |hc| hc.residentBytes() else 0;
     sch.resident_hot_cache_bytes.store(bytes, .monotonic);
+    const reclaimable: u64 = if (sch.hot_prefix_cache) |hc| hc.reclaimableBytes() else 0;
+    sch.reclaimable_hot_cache_bytes.store(reclaimable, .monotonic);
 }
 
 /// Caller holds `queue_mu`. Shared with the wait condition below.
@@ -5476,7 +5503,19 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                     // than a dead connection (or, before the MLX error latch,
                     // a dead server).
                     log.warn("[scheduler] prefill refused: {d} tokens do not fit even with an empty hot cache\n", .{slot.full_prompt.len});
-                    return error.OutOfMemory;
+                    // A refusal quotes the numbers it COMPARED (the estimator
+                    // lives in server.zig, so it does the formatting).
+                    if (prefill_admission_refused_log) |report_fn| {
+                        report_fn(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, probe.unchunked);
+                    }
+                    // NOT `error.OutOfMemory`: nothing ran out of anything.
+                    // That name is the MLX working-set latch's, and it sends
+                    // the client a 503 saying the engine "ran out of GPU
+                    // memory during this request and it was abandoned" — for a
+                    // request that was refused before its first forward. This
+                    // one is a request the machine cannot hold: a named 400,
+                    // like the connection thread's own refusal (#353 follow-up).
+                    return error.PrefillDoesNotFit;
                 }
             }
         }

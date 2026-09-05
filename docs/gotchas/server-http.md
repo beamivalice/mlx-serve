@@ -1827,3 +1827,70 @@ either way it is cleared before the next tick.
 have its count eaten by the prefill's chunks); `tests/test_mlx_error_recovery.sh`
 arms it, asserts the faulting request fails and the next succeeds, and sends
 one long prompt with **no** `max_tokens` field — the class defect 1 belongs to.
+
+### The reservation bought a generation nobody asked for (#353 follow-up, 2026-09-05)
+
+Functional check on the mega candidate (`longctx-mega-cand-nk` @ de41ffc,
+`--ctx-size 1048576 --kv-quant 8 --mtp --prefix-cache-mem 24GB
+--prefill-chunk 4096 --prefix-cache-disk 100GB`), three rows:
+
+- 50k prompt, no `max_tokens` → **200**.
+- 512k prompt, `max_tokens: 16` → **200** (524,253 tokens, 862 tok/s prefill,
+  peak 100.7 GB, liveness after it 200).
+- **374k prompt, no `max_tokens` → 503**, with the abandoned-generation
+  message. The log:
+
+      generation budget squeezed: 665509/1073741823 tokens remaining (prompt=383067, ctx=1048576)
+      prompt 383067 tokens needs ~37394MB, ~37130MB available + ~1564MB evictable hot cache — admitting, the prefill will evict
+      [hot-cache] reused 51662/383067 tokens (matched 51662; entry 1/1)
+      [scheduler] prefill refused: 383067 tokens do not fit even with an empty hot cache
+
+No `[mlx]` line: nothing ran out of anything, and nothing was abandoned. Two
+defects, and it took both to produce that 503.
+
+**1. The reservation was sized by the CONTEXT, not by a generation.**
+`clampMaxTokens` turns an omitted `max_tokens` into `ctx - prompt` — here
+665,509 tokens — and `reservedTokens` reserved every one of them: ~8.3 GB of
+8-bit KV headroom plus ~4.8 GB of QSA indexer history (billed at both copies),
+**13 GB** of a 37.4 GB bill, for a generation the request would never run. The
+context bound added by the previous audit is the right bound for a caller who
+NAMES a huge `max_tokens`; it is the wrong bound for one who names none.
+
+What the reservation is for is the prefill's old+new coexistence: a grow
+allocates the new capacity beside the old one and both stay live in the
+chunk's lazy graph. That is a PREFILL property. Past the prompt, a decode grow
+takes the ordinary +25% policy — one grow per quarter of the cache (~94k
+tokens at 374k), between decode steps, with nothing else live. So the
+reservation now buys `seq + min(max_tokens, RESERVE_GEN_HEADROOM) + chunk`,
+with the headroom at 8192 tokens (~100 MB of KV here): more than any real
+answer, and 130x less than the window. The same `KVCache.reservedTokens` is
+still the ONE definition the guard bills and the engine allocates.
+
+**2. "Fits after eviction" credited memory eviction would never return.**
+The bill was 264 MB over the headroom and was admitted only because the hot
+cache held 1,564 MB. That was ONE entry — the one this very prompt then
+restored from. A restore refcount-shares the entry's buffers with the slot's
+cache, so `evictLruToAdmit` protects it by construction (`protect_mru`) and
+evicting it would return nothing anyway; `lruIndexExcluding` had nothing else
+to offer and the request was refused after being promised.
+
+The connection thread cannot know which entry a prompt will match, but it
+knows a restore pins at most ONE, so the provable credit is the residency
+minus the largest entry: `HotPrefixCache.reclaimableBytes`, published beside
+`residentBytes` and read by the guard as `AdmissionBill.reclaimable`.
+`fitsAfterEviction` credits that; `evictable` stays in the message, because
+the operator's question is still "why didn't it drop a cache entry?".
+
+**3. And the refusal was dishonest.** The scheduler returned
+`error.OutOfMemory`, which is the MLX latch's name, so the client was told the
+engine "ran out of GPU memory during this request and it was abandoned" for a
+request that never ran a forward. It is now `error.PrefillDoesNotFit` — a
+named **400** on all four surfaces, with the compared byte counts logged
+(`refused before prefill`) by the estimator that owns them.
+
+**Also seen in the same boot, and expected:** `[hot-cache] budget clamped
+24576 -> 5703 MB (weights + ctx KV + prefill reserve vs GPU ceiling)` and
+`[hot-cache] skipped oversized entry (524269 tokens, 11349.42 MB > 5703.95 MB
+budget)`. At 1M context the clamp reserves the whole context's KV, and an
+entry is billed at the QSA history's two copies — 11.3 GB for 524k tokens. The
+entry lands on the SSD tier instead; that is the cap working, not a defect.

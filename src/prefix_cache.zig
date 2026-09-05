@@ -1656,6 +1656,24 @@ pub const HotPrefixCache = struct {
         return self.current_kv_bytes;
     }
 
+    /// Bytes an eviction pass can PROVE it will get back: the residency minus
+    /// the largest single entry.
+    ///
+    /// A prefix restore refcount-shares the matched entry's buffers with the
+    /// slot's cache, so evicting it returns nothing — `evictLruToAdmit`
+    /// protects it by construction (`protect_restored`). The connection
+    /// thread's guard cannot know WHICH entry a prompt will match, but it
+    /// knows a restore pins at most ONE, so the largest is the provable
+    /// discount. Without it the guard admitted a 383k-token prompt on 1,564
+    /// MB of "evictable" bytes that were exactly the entry the prompt then
+    /// restored from, and the inference thread refused what the connection
+    /// thread had promised (guards run 2026-09-05, issue #353 follow-up).
+    pub fn reclaimableBytes(self: *const HotPrefixCache) u64 {
+        var largest: u64 = 0;
+        for (self.entries.items) |*e| largest = @max(largest, e.kv_bytes);
+        return self.current_kv_bytes -| largest;
+    }
+
     /// LIMIT THE CACHE WHILE MEMORY IS LEFT. Evict least-recently-used
     /// entries until `fits()` says the request fits, and report what it cost.
     ///
