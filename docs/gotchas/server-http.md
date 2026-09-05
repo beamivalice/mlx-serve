@@ -2661,6 +2661,38 @@ negative arm therefore cannot be "reserve more than the donor" (that also
 counts zero, which is why the first version of the test failed); it has to be a
 write that genuinely runs past the donor's capacity.
 
+### The JSON grammar's token->bytes table was a process singleton (relocated from CLAUDE.md, 2026-09-05)
+
+The table is derived from a MODEL's vocabulary, but it was built once per process. A second model
+loaded into the same server then masked with a foreign vocab — the grammar was right and the bytes
+it matched belonged to someone else. It lives on `LoadedModel` now (`grammarTokenBytes`), which is
+the general rule: a cache derived from a model is per-model, never per-process.
+
+### Three audit findings that stayed stories (2026-09-05)
+
+These three came out of the bundle audit. They are rules in spirit, but CLAUDE.md was at its
+byte floor when they landed, and the growth policy's own answer to that is a story here rather
+than a symbol dropped there. Named so the next reader can find them.
+
+**A published snapshot is freed by the PUBLISHER, below the join** (`hot_cache_digests`, audit
+B0). The inference thread publishes an immutable digest slice and frees the one it supersedes,
+once per request. A `deinit` that frees it *above* `t.join()` therefore races the publisher: either
+a double free, or a connection thread reading a slice that has already gone. The ordering is the
+invariant — the free belongs below the join, in the same thread that publishes — and it is
+scan-pinned, because the wrong order compiles and serves correctly until the one interleaving.
+
+**A "complete" disk commit is STAGED, not durable** (audit S3). The background writer logs a failed
+blob, counts it and drops it; the entry is still "committed" from the caller's point of view. So
+anything that discards the RAM copy on the strength of a disk commit must first drain the writer
+and re-read `writeErrors()`. Treating the commit itself as durability is how a cache entry that
+exists in neither tier gets created.
+
+**An index-less entry directory is another process's flush in progress until proven old** (audit
+S4). Meta lands last by design, so a directory without it is indistinguishable from a partial
+write — and our epoch fence is per-process, so it cannot tell a *second* server's in-flight flush
+from our own debris. The sweep therefore only reclaims past `STRAY_MIN_AGE_NS`, and treats
+unreadable as young rather than as garbage.
+
 ## The prefill width, re-chosen per chunk (2026-09-05)
 
 The per-request width above answers "how wide may this prompt prefill?" once,
