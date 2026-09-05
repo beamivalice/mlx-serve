@@ -1929,9 +1929,23 @@ pub const Generator = struct {
         /// that chunk's `mlx_clear_cache` and BEFORE the interleave tick, so
         /// the probe behind it reads the steady state the next chunk starts
         /// from and not the tick's allocations. Null keeps the request's
-        /// admitted width for the whole prefill — which is every arch but
-        /// qwen4_exp, every unit test, and every host without the HTTP server.
+        /// admitted width for the whole prefill — which is every unit test and
+        /// every host without the HTTP server.
+        ///
+        /// PRESENCE IS NOT THE ARCH GATE. `serve` installs the policy
+        /// unconditionally and process-wide, so under a real server this is
+        /// non-null on EVERY arch; the width then holds because the policy
+        /// itself declines (`server.adaptivePrefillChunkEnabled`), not because
+        /// the hook is absent. Anything that needs to know whether the
+        /// per-chunk width is LIVE reads `adaptive_chunk_width`. (audit B-A2)
         chunk_width_hook: ?ChunkWidthHook = null,
+        /// Is the per-chunk adaptive width live for THIS request — the ARCH
+        /// predicate (`server.adaptivePrefillChunkEnabled`: qwen4_exp, its two
+        /// kill switches, and no operator pin), delivered per model by
+        /// `scheduler.adaptiveChunkWidthFor`. False on every other arch, in
+        /// every unit test and on every host without the HTTP server, and the
+        /// only thing that may widen `tailMergeMaxFor`'s bound.
+        adaptive_chunk_width: bool = false,
     };
 
     pub const InterleaveHook = struct {
@@ -2295,11 +2309,16 @@ pub const Generator = struct {
             // checkpointing still never sub-divides a chunk.
             const adapt_chunked = !(has_vision and !vision_chunked);
             // S18/BL-5: the scaled tail-merge bound belongs to the per-chunk
-            // adaptive width and to nothing else. The hook is installed only
-            // under `server.adaptivePrefillChunkEnabled` (qwen4_exp + its kill
-            // switches + no operator pin), so this is that gate, read where the
-            // loop can see it. Every other arch keeps the flat TAIL_MERGE_MAX.
-            const width_is_adaptive = adapt_chunked and options.chunk_width_hook != null;
+            // adaptive width and to nothing else — so it reads the ARCH
+            // predicate, delivered per model on `adaptive_chunk_width`.
+            //
+            // NOT `chunk_width_hook != null` (audit B-A2): `serve` installs
+            // `prefill_chunk_adapt` unconditionally and process-wide, so under
+            // a real server the hook is non-null on every arch and that
+            // spelling put the scaled bound back on all of them — the exact
+            // defect the gate exists to prevent, with two green tests over it
+            // because they exercised the flag and not the wiring.
+            const width_is_adaptive = adapt_chunked and options.adaptive_chunk_width;
             const cap_adapt: u32 = if (!adapt_chunked) 0 else @intCast(effectivePrefillChunk(
                 xfm.config.prefillScoreHeadDim(),
                 xfm.config.num_attention_heads,
@@ -12313,15 +12332,19 @@ test "the scaled tail-merge bound is gated on the per-chunk adaptive width" {
     try t.expectEqual(@as(usize, 1), prefillChunkCount(812, PREFILL_CHUNK_FLOOR, false, 0, 0, false));
     try t.expectEqual(@as(usize, 2), prefillChunkCount(812, PREFILL_CHUNK_FLOOR, false, 0, 0, true));
 
-    // The gate the loop reads is the per-chunk adaptive width being LIVE, not
-    // the arch spelled out a second time: `chunk_width_hook` is installed only
-    // under `server.adaptivePrefillChunkEnabled` (qwen4_exp + its kill
-    // switches + no operator pin). Scanned inside the implementation's own
-    // body so the needles cannot fall through to this test's bytes.
+    // The gate the loop reads is the ARCH predicate, delivered per model on
+    // `InitOptions.adaptive_chunk_width` — NEVER the presence of
+    // `chunk_width_hook`, which `serve` installs unconditionally and
+    // process-wide, so it is non-null on every arch (audit B-A2). The wiring
+    // itself is pinned in server.zig, "the tail-merge gate reads the ARCH, not
+    // the installed hook"; this half pins what the loop asks. Scanned inside
+    // the implementation's own body so the needles cannot fall through to this
+    // test's bytes.
     const src = @embedFile("generate.zig");
     const impl = productionDeclSource(src, "    pub fn initWithOptions(") orelse return error.CallSiteMoved;
     try t.expect(windowHasNoTestBlock(impl));
-    try t.expect(std.mem.indexOf(u8, impl, "const width_is_adaptive = " ++ "adapt_chunked and options.chunk_width_hook != null;") != null);
+    try t.expect(std.mem.indexOf(u8, impl, "const width_is_adaptive = " ++ "adapt_chunked and options.adaptive_chunk_width;") != null);
+    try t.expect(std.mem.indexOf(u8, impl, "adapt_chunked and options.chunk_width" ++ "_hook != null") == null);
     try t.expect(std.mem.indexOf(u8, impl, "ssm_cp_offset, width" ++ "_is_adaptive);") != null);
     // And the scaling is reachable ONLY through the gated helper.
     try t.expectEqual(@as(usize, 1), std.mem.count(u8, src, "tailMergeMax(default" ++ "_chunk)"));
