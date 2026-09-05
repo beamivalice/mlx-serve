@@ -2601,10 +2601,22 @@ fn safeAutoContext(raw: u32) u32 {
 /// a YaRN-scaled checkpoint — the same derivation vLLM applies to
 /// `max_model_len`, because a position past the scaled window aliases back
 /// inside the ramp rather than reading as a longer distance.
+/// PURE: the context the server ADVERTISES, from the largest context memory
+/// alone allows. The margin applies to the MEMORY number and the checkpoint cap
+/// is taken afterwards, un-margined — see `safeAutoContext`.
+///
+/// Extracted so the LOAD-TIME session bill and the boot-time sizer cannot spell
+/// the same relation two ways. `resolvedContextForLoad` bills the session the
+/// hot-cache budget floor is built for and `autoContextFor` publishes the one an
+/// agent CLI reads out of `/v1/models`; those are the same session, so they are
+/// the same expression over the same inputs, in one place.
+fn autoContextFrom(memory_ctx: u32, ctx_cap: u32) u32 {
+    const with_headroom = safeAutoContext(memory_ctx);
+    return if (ctx_cap > 0) @min(with_headroom, ctx_cap) else with_headroom;
+}
+
 fn autoContextFor(config: *const model_mod.ModelConfig) u32 {
-    const with_headroom = safeAutoContext(computeMemoryContext(config));
-    const max_pos = config.contextCap();
-    return if (max_pos > 0) @min(with_headroom, max_pos) else with_headroom;
+    return autoContextFrom(computeMemoryContext(config), config.contextCap());
 }
 
 /// Freeze this model's auto-context at load time. Idempotent; a no-op (and
@@ -3262,8 +3274,8 @@ pub fn ssdFirstPrefixCacheMem(
 ///     that can shrink the context is an ask that shrinks the bill computed
 ///     against it — #6 again, one level in.
 ///
-/// Mirrors `autoContextFor` (margin, then the checkpoint cap) WITHOUT calling
-/// it, so it cannot depend on the accessor it works around.
+/// Runs `autoContextFrom` — the SAME helper `autoContextFor` runs — rather than
+/// re-spelling the margin, so it cannot depend on the accessor it works around.
 pub fn resolvedContextForLoad(
     explicit_ctx: u32,
     pinned_ctx: u32,
@@ -3276,14 +3288,16 @@ pub fn resolvedContextForLoad(
 ) u32 {
     if (explicit_ctx > 0) return explicit_ctx;
     if (pinned_ctx > 0) return pinned_ctx;
-    const sized = safeAutoContext(safeContextForBudget(
+    // The SAME two steps `autoContextFor` runs, through the same helper: the
+    // number billed here and the number advertised after `pinAutoContext` are
+    // one session, so they are one expression.
+    return autoContextFrom(safeContextForBudget(
         ceiling,
         active_mem,
         cache_reserve +| transient_reserve,
         per_tok,
         0,
-    ));
-    return if (ctx_cap > 0) @min(sized, ctx_cap) else sized;
+    ), ctx_cap);
 }
 
 /// The SSD-first call site. Takes the ceiling rather than reading it: the
@@ -3905,6 +3919,170 @@ test "the clamp bills the context that will be SERVED, not the placeholder" {
     try t.expect(placeholder.ctx_kv < 30 * MiB);
     try t.expect(real.ctx_kv > 20_000 * MiB);
     try t.expect(real.budget > 0);
+}
+
+test "an auto boot advertises the session the SSD-first budget floor was billed for" {
+    // The load-time bill and the pinned context are ONE session, and until this
+    // they were two numbers on the SSD-first arm.
+    //
+    // `ssdFirstSessionTokensNow` billed the session with `cache_reserve = 0`
+    // (its resident entry IS the live KV, so the cache reserves nothing beyond
+    // the session), the budget floored at that session's KV, and then
+    // `pinAutoContext` -> `computeMemoryContext` sized the ADVERTISED context
+    // against `CTX_SIZING_CACHE_RESERVE`. Same box, same instant, two reserves,
+    // two sessions — and an agent CLI reads the smaller one out of
+    // `/v1/models` once and budgets against it for the whole session while the
+    // cache floor holds RAM for the larger one.
+    //
+    // THE RELATION, stated exactly (the 85% memory margin lives inside
+    // `autoContextFrom`, and the checkpoint cap is applied AFTER it,
+    // un-margined — see `safeAutoContext`):
+    //
+    //   advertised = autoContextFrom(
+    //       safeContextForBudget(ceiling, active,
+    //                            CTX_SIZING_CACHE_RESERVE + transient,
+    //                            per_tok, 0),
+    //       ctx_cap)
+    //
+    // and the billed session must be that same value, for the same ceiling,
+    // the same live memory and the same prefill chunk.
+    const t = std.testing;
+    var cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const MiB: u64 = 1 << 20;
+    const active: u64 = 69_827 * MiB;
+    const ceiling: u64 = 109_395 * MiB;
+
+    // Auto boot: nothing explicit, nothing pinned yet (the resolver runs during
+    // the load, before `pinAutoContext`).
+    const original = server_config.max_context_size;
+    defer server_config.max_context_size = original;
+    server_config.max_context_size = 0;
+    cfg.pinned_context = 0;
+
+    // The chunk the sizer resolves, so the two sides differ in the RESERVE and
+    // in nothing else.
+    const chunk: u32 = @intCast(generate_mod.effectivePrefillChunk(
+        cfg.prefillScoreHeadDim(),
+        cfg.num_attention_heads,
+        0,
+        cfg.has_sliding_window,
+        cfg.isMoe(),
+        cfg.pinned_prefill_chunk,
+    ));
+    const per_tok: u64 = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(&cfg);
+    const transient: u64 = prefillTransientReserve(&cfg, kv_bits, chunk);
+
+    const advertised = autoContextFrom(
+        safeContextForBudget(ceiling, active, CTX_SIZING_CACHE_RESERVE +| transient, per_tok, 0),
+        cfg.contextCap(),
+    );
+    const billed = ssdFirstSessionTokensNow(&cfg, kv_bits, ceiling, active, chunk);
+    try t.expectEqual(advertised, billed);
+
+    // The defect, as the number it was: sizing the session against a reserve of
+    // its own hands back a BIGGER session than the box will ever be asked to
+    // serve, so the floor holds KV for tokens nobody can send.
+    const old_billed = resolvedContextForLoad(0, 0, ceiling, active, 0, transient, per_tok, cfg.contextCap());
+    try t.expect(old_billed > billed);
+    // Both are real contexts — this is a disagreement, not a collapse, which is
+    // why it survived: neither number looks wrong on its own.
+    try t.expect(billed > 500_000);
+
+    // ...and what the disagreement costs, in the one place it lands: the budget
+    // floor is one session's KV, so an over-billed session over-reserves RAM
+    // for a context the server never advertises.
+    const idle: u64 = 4 * 1024 * MiB;
+    const floor_now = ssdFirstPrefixCacheMem(idle, ceiling, active, per_tok *| @as(u64, billed), transient);
+    const floor_old = ssdFirstPrefixCacheMem(idle, ceiling, active, per_tok *| @as(u64, old_billed), transient);
+    try t.expect(floor_old > floor_now);
+    try t.expectEqual(per_tok *| @as(u64, old_billed - billed), floor_old - floor_now);
+}
+
+test "an explicit --ctx-size boot never consults the session reserve" {
+    // The deployed shape. `--ctx-size` wins in the resolver's FIRST branch and
+    // `pinAutoContext`/`getEffectiveContextLength` return it before any sizing
+    // runs, so changing what the auto arm reserves cannot move it by a byte.
+    // Asserted as INVARIANCE in the reserve rather than against a recorded
+    // constant: that is the property the change has to preserve.
+    const t = std.testing;
+    var cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const MiB: u64 = 1 << 20;
+    const per_tok: u64 = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(&cfg);
+
+    const original = server_config.max_context_size;
+    defer server_config.max_context_size = original;
+
+    server_config.max_context_size = 262_144;
+    cfg.pinned_context = 0;
+    // Every ceiling / live-memory / chunk combination the box can present, and
+    // the operator's number regardless.
+    for ([_]u64{ 0, 40_000 * MiB, 109_395 * MiB, 900_000 * MiB }) |ceiling| {
+        for ([_]u64{ 0, 69_827 * MiB }) |active| {
+            for ([_]u32{ 512, 1024, 4096, 8192 }) |chunk| {
+                try t.expectEqual(@as(u32, 262_144), ssdFirstSessionTokensNow(&cfg, kv_bits, ceiling, active, chunk));
+            }
+        }
+    }
+    // The reserve argument itself is unreachable on this path: same answer with
+    // no reserve, with the constant, and with an absurd one.
+    for ([_]u64{ 0, CTX_SIZING_CACHE_RESERVE, 99_000 * MiB }) |reserve| {
+        try t.expectEqual(
+            @as(u32, 262_144),
+            resolvedContextForLoad(262_144, 0, 109_395 * MiB, 69_827 * MiB, reserve, 3 * 1024 * MiB, per_tok, cfg.contextCap()),
+        );
+    }
+
+    // A pinned context (a second load of an already-sized model) is the same
+    // story one branch down.
+    server_config.max_context_size = 0;
+    cfg.pinned_context = 131_072;
+    try t.expectEqual(@as(u32, 131_072), ssdFirstSessionTokensNow(&cfg, kv_bits, 109_395 * MiB, 69_827 * MiB, 4096));
+}
+
+test "the session bill and the advertised context read ONE reserve and ONE margin" {
+    // Scan. The equality above is only stable if neither side can respell the
+    // relation, and the two sides live in different functions — which is
+    // exactly how one of them drifts. Needles split so this scan's own source
+    // cannot satisfy it.
+    const t = std.testing;
+    const src = @embedFile("server.zig");
+    const reserve = "CTX_SIZING_CACHE_" ++ "RESERVE";
+
+    // ONE reserve, at all three sites: both load-time arms and the sizer.
+    for ([_][]const u8{
+        "fn ramFirstContextForLoad(",
+        "fn ssdFirstSessionTokensNow(",
+        "fn computeMemoryContext(",
+    }) |decl| {
+        const body = declBody(src, decl) orelse return error.CallSiteMoved;
+        std.testing.expect(std.mem.indexOf(u8, body, reserve) != null) catch |err| {
+            std.debug.print("site does not reserve the shared constant: {s}\n", .{decl});
+            return err;
+        };
+        // ...and none of them may reach for the ask or the resolved budget,
+        // which is live check #6 and audit S6 respectively.
+        try t.expect(std.mem.indexOf(u8, body, "resolvedPrefixCache" ++ "Mem()") == null);
+        try t.expect(std.mem.indexOf(u8, body, "prefix_cache_mem" ++ "_bytes") == null);
+    }
+
+    // ONE margin: both consumers apply it through the shared helper rather than
+    // spelling `safeAutoContext` + the cap themselves, so the 85% and the
+    // un-margined checkpoint cap cannot land in one and not the other.
+    const helper = "autoContext" ++ "From(";
+    for ([_][]const u8{ "fn autoContextFor(", "pub fn resolvedContextForLoad(" }) |decl| {
+        const body = declBody(src, decl) orelse return error.CallSiteMoved;
+        try t.expect(std.mem.indexOf(u8, body, helper) != null);
+        try t.expect(std.mem.indexOf(u8, body, "safeAuto" ++ "Context(") == null);
+    }
+    // The helper is the only place the two steps are written down.
+    var defs: usize = 0;
+    var lines = std.mem.splitScalar(u8, src, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "fn autoContext" ++ "From(")) defs += 1;
+    }
+    try t.expectEqual(@as(usize, 1), defs);
 }
 
 test "an explicit --ctx-size keeps the load-time context byte-identical" {
@@ -21898,6 +22076,13 @@ test "resolvedContextForLoad: an auto boot bills the session it will serve, not 
 
     // Auto boot, nothing pinned: the session is what the machine can serve —
     // NOT the 1024-token placeholder.
+    //
+    // `cache_reserve = 0` here is a test isolation, not the arm's value: this
+    // test is about the placeholder-vs-real session, so it holds the reserve
+    // out of the comparison. The reserve the SSD arm actually passes (the same
+    // constant the sizer reserves, so the billed session IS the advertised one)
+    // is pinned by "an auto boot advertises the session the SSD-first budget
+    // floor was billed for".
     const auto = resolvedContextForLoad(0, 0, ceiling, active, 0, transient, per_tok, cap);
     try t.expect(auto > 100_000);
     try t.expect(auto <= cap);
@@ -21957,20 +22142,27 @@ test "the advertised context does not move with the cache ask (live check #6 / a
     const per_tok: u64 = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(&cfg);
     const transient: u64 = prefillTransientReserve(&cfg, kv_bits, 4096);
 
-    // What the sizer now does, for any ask.
-    const ctx = safeContextForBudget(live_ceiling, active, CTX_SIZING_CACHE_RESERVE +| transient, per_tok, cfg.contextCap());
-    try t.expect(ctx > 900_000);
+    // What the sizer now does, for any ask. `max_pos` is 0 here for the reason
+    // `computeMemoryContext` gives: the checkpoint cap is applied by the caller
+    // AFTER the safety margin, never before it.
+    const memory_ctx = safeContextForBudget(live_ceiling, active, CTX_SIZING_CACHE_RESERVE +| transient, per_tok, 0);
+    try t.expect(memory_ctx > 900_000);
 
     // The two defect spellings, both of which this replaces.
-    const vs_ask = safeContextForBudget(live_ceiling, active, 60 * 1024 * MiB +| transient, per_tok, cfg.contextCap());
-    const vs_resolved = safeContextForBudget(live_ceiling, active, 48_673 * MiB +| transient, per_tok, cfg.contextCap());
+    const vs_ask = safeContextForBudget(live_ceiling, active, 60 * 1024 * MiB +| transient, per_tok, 0);
+    const vs_resolved = safeContextForBudget(live_ceiling, active, 48_673 * MiB +| transient, per_tok, 0);
     try t.expect(vs_ask <= 1024);
     try t.expect(vs_resolved <= 1024);
 
-    // And the pair AGREES: the clamp's context and the sizer's context are the
-    // same call with the same constant, so there is no second pass to drift.
+    // And the pair AGREES, at the ADVERTISED number rather than the raw one:
+    // the sizer's output goes through `autoContextFrom` (85% margin, then the
+    // checkpoint cap un-margined) on its way to `/v1/models`, and the clamp's
+    // resolver runs the same helper. Comparing the raw memory context against
+    // the clamp's answer compares two different quantities and is off by
+    // exactly the margin.
+    const advertised = autoContextFrom(memory_ctx, cfg.contextCap());
     const clamp_ctx = resolvedContextForLoad(0, 0, live_ceiling, active, CTX_SIZING_CACHE_RESERVE, transient, per_tok, cfg.contextCap());
-    try t.expectEqual(ctx, clamp_ctx);
+    try t.expectEqual(advertised, clamp_ctx);
 }
 
 test "the sizer's cache reserve is a constant, not the ask or the resolved budget" {
