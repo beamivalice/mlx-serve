@@ -3605,6 +3605,74 @@ waste is exactly 2x (a 1-token slot beside a 200k one), so at a bar of 2.0 a
 pair can never be vetoed — which is the pathological case the cap was written
 for.
 
+## ...and the cap read the one length that is zero forever on a GDN trunk (2026-09-05)
+
+The cap above shipped correct and was then dead for two weeks on exactly the
+archs it was written for. Found by audit, not by a crash — which is the point.
+
+`batchedKvKeepCount` was fed `slot.cache.step`, and the group was sorted by it
+too. `KVCache.step` is maintained inside `update` under `if (layer == 0)`. The
+slot cache is allocated with the FULL layer count and the forward passes the
+GLOBAL layer index, so `step` is the sequence position only where global layer 0
+is an ATTENTION layer. It is zero forever on every trunk whose layer 0 is a
+LINEAR block, which never touches this cache at all:
+
+| family | model_type | layer 0 |
+|---|---|---|
+| GatedDeltaNet | `qwen3_5`, `qwen3_5_moe`, `qwen4_exp`, `qwen3_next` | GDN |
+| gated conv | `lfm2`, `lfm2_moe`, `lfm2_vl` | short conv |
+| Mamba2 | `nemotron_h` | mamba |
+| KDA | `bailing_hybrid` | KDA |
+
+So every slot reported kv_len 0. `batchedKvKeepCount` returns early on
+`sum == 0` ("nothing prefilled yet: no padding to waste") — and even without
+that early-out, a group of zeros has a padded/useful ratio of 1.0. Either way
+`MAX_PAD_WASTE` could never fire: the cap kept the whole group, always, on
+every arch that batches a GDN/conv/mamba/KDA kernel. A 1k-token slot batched
+beside a 60k one padded 59k rows per full-attention layer per tick — the exact
+unbilled transient the previous entry exists to bound, with the cap sitting
+right there reporting a healthy 1.0.
+
+This is the same root as "a GDN trunk's `KVCache.step` is 0 forever", which was
+found through the ROPE offsets and fixed there by reading `slot.moe_seq_offset`
+instead. That fix was correct and local; it did not generalize, because
+`moe_seq_offset` is a GDN/MoE-path field and would have said nothing about
+lfm2 or nemotron_h. Two consumers of "how long is this slot?" had two different
+wrong answers available, and only one of them had a symptom.
+
+Fix: `KVCache.kvLenForBatching()` — one accessor, arch-independent, deriving the
+answer from the cache itself rather than from an arch list. Only attention
+layers are ever `initialized`, so:
+
+* `entries[0].initialized` → layer 0 is attention → return `step`, the exact
+  field the cap read before, so those archs are provably unchanged;
+* otherwise → the first initialized entry's `offset`, which IS the attention KV
+  length on a linear-layer-0 trunk;
+* nothing initialized → 0, and the readiness gate keeps that slot out anyway.
+
+`scheduler.batchKvLenOf` / `Slot.batchKvLen` wrap it, and the group builder
+reads each slot ONCE into an array that it then insertion-sorts alongside the
+slots — the sort key and the waste ratio are now literally the same numbers,
+where before they were two separate reads of the same wrong field.
+
+The cap also now says what it compared, not just what it decided:
+`[batched] pad-waste cap: kept K of N slots (waste W x, kv_len lo..hi)`. A log
+line reading "kept 4 of 4" is indistinguishable from a dead cap; one carrying
+the ratio is not.
+
+**Bars.** Attention-first archs are byte-identical (the length source is still
+`step` for them, asserted directly). On the four newly-fixed families the
+batching decisions CHANGE BY DESIGN, so byte-equality across a changed group is
+the wrong bar: `MLX_SERVE_FORCE_BATCHED=1` at N=1 stays byte-identical and the
+real N=2 arm acquits near-ties at a serial top-2 gap <= 0.15 nats. The new
+`MLX_SERVE_PADWASTE_ARM=1` arm in `tests/test_batched_equivalence.sh` proves the
+SPLIT: a ~1k stream and a ~64k one, concurrent, must produce the cap line and
+must NOT produce `engaged (slots=2)`.
+
+**Class.** A length that is maintained by one layer's bookkeeping is not a
+property of the slot. Any second consumer of it inherits the first consumer's
+arch assumptions silently, and a guard fed a constant does not fail — it passes.
+
 ## A batched-decode guard that only runs at N=1 pins a shape that never ships (2026-08-20)
 
 `MLX_SERVE_FORCE_BATCHED=1` routes a single slot through the batched kernel, and
