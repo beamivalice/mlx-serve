@@ -3749,7 +3749,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         // other arch keeps the six-bucket `rc1` table 26.9.1 wrote, so an
         // upgrading user boots WARM and the EV plan keeps pricing extension
         // from measurements instead of the always-open prior valve.
-        const rc_layout: round_cost_mod.Layout = if (params.config.isQwen4()) .long else .legacy;
+        const rc_layout: round_cost_mod.Layout = round_cost_mod.layoutFor(params.config);
         xfm_ptr.round_cost.layout = rc_layout;
         const rc_key = round_cost_mod.cacheKey(&xfm_ptr.round_cost_key_buf, ane_mod.chipBrand(), params.model_dir, quant, os_build, rc_layout);
         xfm_ptr.round_cost_key_len = @intCast(rc_key.len);
@@ -8563,4 +8563,39 @@ test "hot-cache commit hands the live QSA history to the newest checkpoint BEFOR
     // The failure arm commits without the history rather than aborting the
     // commit (a QSA arch treats "no history" as a miss).
     try testing.expect(std.mem.indexOf(u8, body, "QSA history handoff failed") != null);
+}
+
+
+test "every round-cost layout assignment routes through the ONE resolver" {
+    // audit addendum 3 (non-blocker). Two sites own a Transformer at load: the
+    // inference thread's loader here, and `main.zig`'s offline `--prompt`
+    // path. The first spelled the arch conditional inline; the second never
+    // resolved a layout at all and kept the struct default, so the same
+    // qwen4_exp checkpoint planned MTP on the nine-bucket grid under `serve`
+    // and on the six-bucket legacy one offline — different bucket EDGES and no
+    // serial row, from the same weights.
+    //
+    // Scanned in the PRODUCTION WINDOW of each site (`productionDeclSource`),
+    // never the whole file: a test in either file may legitimately build a
+    // table at a chosen layout. Needles ++-split so this test's own source
+    // cannot satisfy them.
+    const Site = struct { src: []const u8, decl: []const u8 };
+    const sites = [_]Site{
+        .{ .src = @embedFile("scheduler.zig"), .decl = "fn doLoadOnInferenceThread(" },
+        .{ .src = @embedFile("main.zig"), .decl = "pub fn main(" },
+    };
+    for (sites) |site| {
+        const window = generate_mod.productionDeclSource(site.src, site.decl) orelse
+            return error.LoadSiteMoved;
+        try testing.expect(generate_mod.windowHasNoTestBlock(window));
+        // The window assigns a layout, and the value is the resolver's.
+        const assign = std.mem.indexOf(u8, window, "round_cost" ++ "_mod.layoutFor(") orelse
+            return error.LoadSiteBypassesTheResolver;
+        _ = assign;
+        // ...and nothing in it spells a Layout tag by hand, which is how the
+        // two paths came to disagree.
+        try testing.expect(std.mem.indexOf(u8, window, "layout" ++ " = .long") == null);
+        try testing.expect(std.mem.indexOf(u8, window, "layout" ++ " = .legacy") == null);
+        try testing.expect(std.mem.indexOf(u8, window, "Layout = if (") == null);
+    }
 }
