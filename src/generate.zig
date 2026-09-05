@@ -12090,17 +12090,22 @@ test "every ladder rung the adaptive width can take divides the checkpoint strid
 /// The source of ONE named declaration: from `decl` to the `}` that closes it
 /// at the declaration's OWN indentation. zig fmt puts that closer alone on its
 /// line, so it is the one brace that cannot also appear inside the body, a
-/// string literal or a comment.
+/// string literal or a comment. `decl` must START a line — a mid-line
+/// occurrence is a MENTION (a doc comment, a call, a scan's own needle
+/// literal) and is skipped, so a window never anchors on one.
 ///
-/// Every ORDERING scan in this file resolves its needles inside this window.
-/// `indexOfPos` over the whole embedded file searches FORWARD from a
-/// production offset, so deleting the very line a scan pins lets the needle
-/// fall through to the TEST'S OWN literal further down the file — the
-/// assertion then holds on a full revert (the B0c class). A window that stops
-/// above the tests cannot do that, whether or not the individual needle
-/// happens to be `++`-split.
-fn productionDeclSource(src: []const u8, decl: []const u8) ?[]const u8 {
-    const start = std.mem.indexOf(u8, src, decl) orelse return null;
+/// The ONE source-window extractor for scans across the codebase;
+/// `server.declBody` delegates here rather than keeping a second copy.
+///
+/// Every ORDERING scan resolves its needles inside a window like this.
+/// `indexOfPos` over a whole embedded file searches FORWARD from a production
+/// offset, so deleting the very line a scan pins lets the needle fall through
+/// to the TEST'S OWN literal further down the file — the assertion then holds
+/// on a full revert (the B0c class). A window holding no test cannot do that,
+/// whether or not the individual needle happens to be `++`-split. Same for a
+/// bare `indexOf(whole_file, literal) != null` presence check: the test's own
+/// copy of the literal keeps it green after the production line is gone.
+pub fn productionDeclSource(src: []const u8, decl: []const u8) ?[]const u8 {
     var indent: usize = 0;
     while (indent < decl.len and decl[indent] == ' ') indent += 1;
     var closer_buf: [40]u8 = undefined;
@@ -12110,15 +12115,21 @@ fn productionDeclSource(src: []const u8, decl: []const u8) ?[]const u8 {
     closer_buf[1 + indent] = '}';
     closer_buf[2 + indent] = '\n';
     const closer = closer_buf[0 .. indent + 3];
-    const end = std.mem.indexOfPos(u8, src, start, closer) orelse return null;
-    return src[start .. end + closer.len];
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, src, i, decl)) |at| {
+        i = at + 1;
+        if (at != 0 and src[at - 1] != '\n') continue; // a mention, not a declaration
+        const end = std.mem.indexOfPos(u8, src, at, closer) orelse continue;
+        return src[at .. end + closer.len];
+    }
+    return null;
 }
 
-/// True when `window` holds no test block at all — the property that makes an
-/// ordering scan resolved inside it red on a revert. `generate.zig` has test
-/// blocks ABOVE some implementations, so "ends before the first test" is not
-/// the question; "contains no test" is.
-fn windowHasNoTestBlock(window: []const u8) bool {
+/// True when `window` holds no test block at all — the property that makes a
+/// scan resolved inside it red on a revert. `generate.zig` has test blocks
+/// ABOVE some implementations, so "ends before the first test" is not the
+/// question; "contains no test" is.
+pub fn windowHasNoTestBlock(window: []const u8) bool {
     return std.mem.indexOf(u8, window, "\n" ++ "test \"") == null;
 }
 
@@ -12158,6 +12169,22 @@ test "a widen is committed only after the interleave tick, a step-down before it
     try t.expect(down < tick);
     try t.expect(std.mem.indexOfPos(u8, impl, down, "commitAdaptive" ++ "Width(").? < tick);
     try t.expect(std.mem.indexOfPos(u8, impl, confirm, "commitAdaptive" ++ "Width(") != null);
+
+    // The confirm itself is a SERVER-side install, and nothing pinned it. Drop
+    // `scheduler_mod.prefill_chunk_widen_ok` and
+    // `adaptivePrefillWidenStillFits` becomes unreachable: the scheduler side
+    // takes its `orelse return false`, every widen is silently refused, and
+    // the whole post-tick half above is a no-op with no red test. Read through
+    // `serve`'s OWN body — cross-file already, so it cannot fall through to a
+    // literal in this test, and the window stops it falling through to a
+    // server-side test's either.
+    const srv = @embedFile("server.zig");
+    const serve_body = productionDeclSource(srv, "pub fn serve(") orelse return error.CallSiteMoved;
+    try t.expect(windowHasNoTestBlock(serve_body));
+    try t.expect(std.mem.indexOf(u8, serve_body, "scheduler_mod.prefill_chunk_widen_ok = &adaptivePrefillWiden" ++ "StillFits;") != null);
+    // ...and the scheduler consults it rather than assuming a widen fits.
+    const sched = @embedFile("scheduler.zig");
+    try t.expect(std.mem.indexOf(u8, sched, "const ok = prefill_chunk_widen" ++ "_ok orelse return false;") != null);
 }
 
 test "commitAdaptiveWidth: the summary follows the running width from both commit sites" {
