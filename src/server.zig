@@ -3136,6 +3136,32 @@ pub fn planHotCache(
     };
 }
 
+/// SSD-first (qwen4_exp) budget semantics — mechanism 5.
+///
+/// The RAM-first formula treats the hot cache as what is LEFT OVER after the
+/// live session's KV reserve, which double-counts: a cache entry's arrays are
+/// refcount-SHARED with the live KV, so the resident entry for the session
+/// being served costs nothing beyond the reserve already billed. At 1M ctx
+/// that clamp cut a 24 GB entry's budget to a few GB and every warm turn
+/// cold-prefilled.
+///
+/// Here the entry IS the live KV: the budget FLOORS at one entry at the
+/// working context (`ctx_kv_bytes`) and `--prefix-cache-mem` becomes the RAM
+/// allowance for IDLE entries on top of it — 0 meaning "none idle", which is
+/// the mode's whole point (every other session lives on SSD).
+pub fn ssdFirstPrefixCacheMem(
+    idle_requested: u64,
+    gpu_ceiling: u64,
+    active_weights: u64,
+    ctx_kv_bytes: u64,
+    transient_reserve: u64,
+) u64 {
+    const headroom = gpu_ceiling -| (active_weights +| ctx_kv_bytes +| transient_reserve);
+    const idle = @min(idle_requested, headroom);
+    // Never 0: `initWithMem` reads 0 as "no byte cap at all".
+    return @max(ctx_kv_bytes +| idle, 1);
+}
+
 /// Impure wrapper for the model-load site (`Scheduler.doLoadOnInferenceThread`,
 /// reached through the LoadParams/LoadRequest resolver pointer — the scheduler
 /// deliberately has no server.zig import): the weights are resident there, so
@@ -3146,6 +3172,28 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64) u64
     var active_mem: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_mem);
     const kv_bits: u64 = defaultKvBits();
+    // SSD-first (qwen4_exp) takes the budget before the RAM-first plan: the
+    // resident entry IS the live KV there, so the plan's residual arithmetic
+    // would double-count it. One call site, one early return.
+    const ssd_chunk: u64 = pinPrefillChunk(config);
+    const ssd_ctx_kv: u64 = (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config)) *|
+        getEffectiveContextLength(config);
+    if (config.ssdFirstCapable() and prefix_cache_mod.ssdFirstEnabled()) {
+        const budget = ssdFirstPrefixCacheMem(
+            requested,
+            currentGpuMemoryCeiling(active_mem),
+            active_mem,
+            ssd_ctx_kv,
+            prefillTransientReserve(config, kv_bits, ssd_chunk),
+        );
+        hot_cache_mem_resolved = budget;
+        log.info("[hot-cache] SSD-first budget {d} MB = one session at the working context ({d} MB) + {d} MB for idle entries\n", .{
+            budget >> 20,
+            ssd_ctx_kv >> 20,
+            (budget -| ssd_ctx_kv) >> 20,
+        });
+        return budget;
+    }
     // Pin first, then hand the pinned width in as the override: the plan must
     // bill the width `generate.effectivePrefillChunk` will resolve to, and the
     // pin is that width (it already folded in an explicit `--prefill-chunk`).
@@ -20625,4 +20673,32 @@ test "the admission guard reads a PUBLISHED hot-cache residency, never the infer
     const publishes = std.mem.count(u8, sched, "publishHotCache" ++ "Residency(");
     // the fn itself + every set/clear + both commits + the admission eviction
     try t.expect(publishes >= sets + 3);
+}
+
+test "ssdFirstPrefixCacheMem: the active session's KV is billed ONCE and is the floor" {
+    const t = std.testing;
+    const GB: u64 = 1 << 30;
+    // The 1M qwen4 case: 107.5 GB ceiling, ~70 GB weights, ~24 GB of 1M-ctx
+    // KV, ~3 GB prefill reserve.
+    const ceiling: u64 = 107 * GB;
+    const weights: u64 = 70 * GB;
+    const ctx_kv: u64 = 24 * GB;
+    const transient: u64 = 3 * GB;
+
+    // RAM-first clamps the cache to the LEFTOVER — 10 GB, less than half an
+    // entry, so a 1M prefix cannot stay resident at all.
+    const ram_first = clampedPrefixCacheMem(0, ceiling, weights, ctx_kv, transient);
+    try t.expect(ram_first < ctx_kv);
+
+    // SSD-first floors at one entry (the SAME buffers as the live KV) and
+    // hands `--prefix-cache-mem` to IDLE entries on top.
+    try t.expectEqual(ctx_kv, ssdFirstPrefixCacheMem(0, ceiling, weights, ctx_kv, transient));
+    try t.expectEqual(ctx_kv + 4 * GB, ssdFirstPrefixCacheMem(4 * GB, ceiling, weights, ctx_kv, transient));
+    // An idle request past the headroom is clamped to the headroom, never
+    // below the one-entry floor.
+    const huge = ssdFirstPrefixCacheMem(500 * GB, ceiling, weights, ctx_kv, transient);
+    try t.expectEqual(ctx_kv + (ceiling - weights - ctx_kv - transient), huge);
+    // No headroom at all: still one entry, never 0 (0 = "no byte cap").
+    try t.expectEqual(ctx_kv, ssdFirstPrefixCacheMem(8 * GB, 80 * GB, weights, ctx_kv, transient));
+    try t.expect(ssdFirstPrefixCacheMem(0, 0, 0, 0, 0) >= 1);
 }

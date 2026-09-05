@@ -82,6 +82,66 @@ pub const SSM_DISK_MAX_PER_ENTRY: usize = 8;
 /// write-through the end-of-request flush is only the tail anyway.
 pub const SSD_FIRST_READBACK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+/// SSD-first mechanism 5: the disk budget is DERIVED from the volume, not
+/// only from the operator's cap. Never fill a user's disk to serve a cache.
+pub const DISK_RESERVE_CAP: u64 = 64 * 1024 * 1024 * 1024;
+/// Below this there is no point storing anything (one 1M entry is ~24 GB, but
+/// a short session is worth keeping and the tier evicts LRU above the budget).
+pub const DISK_STORE_FLOOR: u64 = 1024 * 1024 * 1024;
+
+/// Bytes this tier may occupy, given the operator cap (0 = no cap) and the
+/// volume's numbers. Reserve = min(64 GiB, 10% of the volume); a budget under
+/// `DISK_STORE_FLOOR` means "do not store" (null), never a silent 0 that the
+/// tier would read as UNBOUNDED.
+pub fn diskBudgetFromFreeSpace(operator_cap: u64, free_bytes: u64, volume_bytes: u64) ?u64 {
+    const reserve = @min(DISK_RESERVE_CAP, volume_bytes / 10);
+    const avail = free_bytes -| reserve;
+    const budget = if (operator_cap == 0) avail else @min(operator_cap, avail);
+    if (budget < DISK_STORE_FLOOR) return null;
+    return budget;
+}
+
+/// macOS `struct statfs` (sys/mount.h), leading fields only — the rest is
+/// slack so the kernel cannot write past the buffer even if a future release
+/// grows the struct. std has no binding for it in this Zig.
+const DarwinStatfs = extern struct {
+    f_bsize: u32,
+    f_iosize: i32,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    f_files: u64,
+    f_ffree: u64,
+    /// fsid + owner + type + flags + fssubtype + fstypename + two MAXPATHLEN
+    /// names + flags_ext + reserved, with room to spare.
+    tail: [4096]u8,
+};
+extern "c" fn statfs(path: [*:0]const u8, buf: *DarwinStatfs) c_int;
+
+pub const VolumeSpace = struct { free: u64, total: u64 };
+
+/// Free and total bytes of the volume holding `path`, or null when the query
+/// fails OR returns implausible numbers (the caller then keeps the operator
+/// cap — a failed probe must not silently disable persistence, and a wrong
+/// struct layout must not silently invent a budget). The plausibility check IS
+/// the ABI guard: `f_bsize` is a power of two in [512 B, 1 MiB] on every
+/// filesystem macOS mounts, and available never exceeds total.
+pub fn volumeSpace(path: []const u8) ?VolumeSpace {
+    var buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    if (path.len >= buf.len) return null;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    var st: DarwinStatfs = undefined;
+    if (statfs(buf[0..path.len :0].ptr, &st) != 0) return null;
+    const bsize: u64 = st.f_bsize;
+    if (bsize < 512 or bsize > (1 << 20) or !std.math.isPowerOfTwo(bsize)) return null;
+    if (st.f_blocks == 0 or st.f_bavail > st.f_blocks) return null;
+    return .{
+        .free = bsize *| st.f_bavail,
+        .total = bsize *| st.f_blocks,
+    };
+}
+
 pub const IndexEntry = struct {
     /// Directory id — the `e<id>` component.
     id: u64,
@@ -239,6 +299,14 @@ pub const DiskTier = struct {
     /// inference thread and WRITTEN off it. Null = today's synchronous
     /// `mlx_save_safetensors` path, unchanged for every other arch.
     writer: ?*disk_writer.Writer = null,
+    /// The operator's `--prefix-cache-disk` value. `max_bytes` is re-derived
+    /// from it and the volume's free space before every store (mechanism 5);
+    /// this keeps the cap itself around across those refreshes.
+    operator_cap: u64 = 0,
+    /// The volume is under `DISK_STORE_FLOOR`: no new entry persists, but
+    /// what is already there stays restorable. Latched so the warning is
+    /// logged once per transition.
+    store_declined: bool = false,
     entries: std.ArrayList(IndexEntry),
     next_id: u64,
     total_bytes: u64,
@@ -267,6 +335,7 @@ pub const DiskTier = struct {
             .io = io,
             .root = root,
             .max_bytes = max_bytes,
+            .operator_cap = max_bytes,
             .chunk_tokens = if (chunk_tokens == 0) DEFAULT_CHUNK_TOKENS else chunk_tokens,
             .entries = std.ArrayList(IndexEntry).empty,
             .next_id = 1,
@@ -333,6 +402,28 @@ pub const DiskTier = struct {
         self.allocator.free(e.chunk_bytes);
         self.allocator.free(e.ssm_positions);
         self.allocator.free(e.ssm_bytes);
+    }
+
+    /// Re-derive `max_bytes` from the volume (mechanism 5). A failed probe
+    /// keeps the operator cap; a budget under the store floor sets the tier
+    /// to "store nothing new" WITHOUT touching what is already persisted
+    /// (`store_declined`), because evicting a restorable 1M entry to free a
+    /// gigabyte is a bad trade.
+    fn refreshDiskBudget(self: *DiskTier) void {
+        const vs = volumeSpace(self.root) orelse return;
+        // Our own entries are already counted in `used`; the budget is about
+        // what the tier may occupy in total, so add what it holds back.
+        const budget = diskBudgetFromFreeSpace(self.operator_cap, vs.free +| self.total_bytes, vs.total);
+        if (budget) |b| {
+            self.store_declined = false;
+            if (b != self.max_bytes) {
+                self.max_bytes = b;
+                self.gcToBudget();
+            }
+        } else if (!self.store_declined) {
+            self.store_declined = true;
+            log.warn("[disk-cache] volume below the store floor ({d} MB free) — no new entries persist\n", .{vs.free >> 20});
+        }
     }
 
     pub fn entryCount(self: *const DiskTier) usize {
@@ -751,6 +842,7 @@ pub const DiskTier = struct {
         }
         const kv_target_u: usize = @min(@max(step, max_off), tokens.len);
         if (kv_target_u < MIN_PERSIST_TOKENS) return true;
+        if (self.store_declined) return true;
         const kv_target: u32 = @intCast(kv_target_u);
         switch (config.scheme) {
             .off, .affine => {},
@@ -771,6 +863,11 @@ pub const DiskTier = struct {
                 return true;
             }
         }
+
+        // Mechanism 5: re-derive the budget from FREE SPACE before every store.
+        // A cache must never fill the user's disk, and free space moves under
+        // us (other processes, the model downloads that share this volume).
+        if (self.ssd_first) self.refreshDiskBudget();
 
         // Superseded check: an existing entry that already covers `tokens`
         // (same key, tokens is a prefix of its tokens, kv already >= ours)
@@ -3533,4 +3630,29 @@ test "DiskTier: SSD-first write-through extends without rewriting a persisted ch
     try testing.expect(tier.writer.?.filesWritten() - written_after_first <= 2);
     try testing.expectEqual(@as(usize, 1), tier.entryCount());
     try testing.expectEqual(@as(u32, 768), tier.entries.items[0].kv_len);
+}
+
+test "diskBudgetFromFreeSpace: reserve is min(64 GiB, 10% of volume); below the floor stores nothing" {
+    const GB: u64 = 1 << 30;
+    // 4 TB volume, 1 TB free: reserve is the 64 GiB cap, not 400 GB.
+    try testing.expectEqual(@as(?u64, 1024 * GB - 64 * GB), diskBudgetFromFreeSpace(0, 1024 * GB, 4096 * GB));
+    // The operator cap still wins when it is the smaller number.
+    try testing.expectEqual(@as(?u64, 100 * GB), diskBudgetFromFreeSpace(100 * GB, 1024 * GB, 4096 * GB));
+    // Small volume: 10% is the binding reserve.
+    try testing.expectEqual(@as(?u64, 60 * GB), diskBudgetFromFreeSpace(0, 80 * GB, 200 * GB));
+    // Nearly full: under the 1 GiB store floor → refuse, never a silent 0
+    // (which the tier reads as UNBOUNDED).
+    try testing.expectEqual(@as(?u64, null), diskBudgetFromFreeSpace(0, 20 * GB, 200 * GB));
+    try testing.expectEqual(@as(?u64, null), diskBudgetFromFreeSpace(500 * GB, 20 * GB, 200 * GB));
+}
+
+test "volumeSpace: the live probe is plausible or null (statfs ABI guard)" {
+    // The plausibility check is what makes a wrong struct layout fail SAFE.
+    // On this machine the probe must SUCCEED — a null here means the layout
+    // (or the extern) broke, and the budget would silently fall back to the
+    // operator cap forever.
+    const vs = volumeSpace("/") orelse return error.VolumeSpaceProbeFailed;
+    try testing.expect(vs.total > 0);
+    try testing.expect(vs.free <= vs.total);
+    try testing.expect(vs.total > 1024 * 1024 * 1024); // a macOS root volume
 }
