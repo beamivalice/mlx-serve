@@ -2707,6 +2707,25 @@ pub fn applyMlxCacheLimit() void {
 /// regression), while external pressure — reflected in `getAvailableMemBytes`
 /// (total − wired − compressed − internal-anon) — tightens it. See
 /// `physicalMemoryCeiling`.
+/// The ceiling term that does NOT move with instantaneous free RAM: Metal's
+/// `max_recommended_working_set_size` (or the wired limit behind
+/// `getMetalBufferLimit`). The static half of `currentGpuMemoryCeiling`.
+///
+/// The LOAD-TIME hot-cache clamp bills against this, and nothing else does.
+/// Measured 2026-09-05: identical binary, flags and wired limit, two boots 11
+/// minutes apart, resolved `10240 -> 1076 MB` (13:42, straight after two
+/// suites) and `10240 -> 9757 MB` (13:53, quiet box) — `[preflight] available`
+/// 108.7 vs 116.6 GB. The live free-RAM term made the deployed shape
+/// non-reproducible boot to boot, and what the user needs is one boot that
+/// works. The free-RAM term still does its job where it can act on the answer:
+/// request-time admission (`prefillAdmissionBill` / `prefillFitsNow`, which
+/// re-reads live memory and can evict to admit) and the `active_mem` guards.
+/// A cache sized above what free RAM allows is not a crash — it is entries the
+/// admission pass evicts on the first request that needs the room.
+pub fn staticGpuMemoryCeiling() u64 {
+    return getGpuWorkingSetLimit();
+}
+
 fn currentGpuMemoryCeiling(active_mem: u64) u64 {
     // The ANE's int8 copies are wired host buffers: invisible to MLX's own
     // accounting, but genuinely gone from free RAM. Left to leak in through
@@ -3131,10 +3150,14 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64) u64
     // bill the width `generate.effectivePrefillChunk` will resolve to, and the
     // pin is that width (it already folded in an explicit `--prefill-chunk`).
     const pinned: u32 = pinPrefillChunk(config);
+    // STATIC ceiling, not the live one: the budget must not depend on how busy
+    // the box happened to be at load (see `staticGpuMemoryCeiling`). The
+    // sizer's rung above still reads live memory, and so does every
+    // request-time guard — this is the one number that must be reproducible.
     const plan = planHotCache(
         config,
         kv_bits,
-        currentGpuMemoryCeiling(active_mem),
+        staticGpuMemoryCeiling(),
         active_mem,
         getEffectiveContextLength(config),
         sizerCtxKvBytes(config, kv_bits),
@@ -3142,6 +3165,15 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64) u64
         pinned,
     );
     hot_cache_mem_resolved = plan.budget;
+    // Say so when the box is under external pressure RIGHT NOW, but do not
+    // shrink the budget for it: the pressure is a property of this minute, the
+    // budget is a property of the machine, and admission is what reconciles
+    // them per request.
+    const live_ceiling: u64 = currentGpuMemoryCeiling(active_mem);
+    if (live_ceiling < staticGpuMemoryCeiling()) {
+        const free_gb = @as(f64, @floatFromInt(live_ceiling -| active_mem)) / (1024.0 * 1024.0 * 1024.0);
+        log.info("[hot-cache] budget {d} MB (static ceiling); free at load {d:.1} GB — live admission will evict as needed\n", .{ plan.budget >> 20, free_gb });
+    }
     if (requested > 0 and plan.budget < requested) {
         log.info("[hot-cache] budget clamped {d} -> {d} MB (chunk {d}, reserve at width {d} = {d} MB, ctx KV {d} MB)\n", .{ requested >> 20, plan.budget >> 20, plan.chunk, plan.reserve_chunk, plan.reserve >> 20, plan.ctx_kv >> 20 });
     } else if (requested == 0) {
@@ -3420,6 +3452,80 @@ fn widthForRung(cfg: *const model_mod.ModelConfig, seq: u64, rung: u32) u32 {
         cfg.isMoe(),
         rung,
     ));
+}
+
+test "the load-time budget is reproducible: free RAM at load does not move it" {
+    // Measured 2026-09-05: identical binary, flags and wired limit, two boots
+    // 11 minutes apart resolved the SAME 10 GB ask to 1076 MB (13:42, straight
+    // after two suites) and 9757 MB (13:53, quiet box). `[preflight] available`
+    // read 108.7 vs 116.6 GB, and `currentGpuMemoryCeiling` is
+    // min(static, footprint + free RAM) — so the deployed shape was not
+    // reproducible boot to boot, and the user's bar is one boot that works.
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const GB: u64 = 1000 * 1000 * 1000;
+    const weights: u64 = 70 * GB;
+    const ctx_tokens: u64 = 262144;
+    const static_ceiling: u64 = 120_000 * 1024 * 1024; // the wired limit, both boots
+
+    // The live ceiling really did differ between the two boots...
+    const busy = physicalMemoryCeiling(static_ceiling, weights, 108_700 * 1000 * 1000 -| weights);
+    const quiet = physicalMemoryCeiling(static_ceiling, weights, 116_600 * 1000 * 1000 -| weights);
+    try t.expect(busy < quiet);
+
+    // ...and billing the budget against it produced two different answers.
+    const on_busy = planHotCache(&cfg, kv_bits, busy, weights, ctx_tokens, 0, 10 * GB, 0);
+    const on_quiet = planHotCache(&cfg, kv_bits, quiet, weights, ctx_tokens, 0, 10 * GB, 0);
+    try t.expect(on_busy.budget != on_quiet.budget);
+
+    // Billed against the STATIC term, both boots agree — that is the fix.
+    const a = planHotCache(&cfg, kv_bits, static_ceiling, weights, ctx_tokens, 0, 10 * GB, 0);
+    const b = planHotCache(&cfg, kv_bits, static_ceiling, weights, ctx_tokens, 0, 10 * GB, 0);
+    try t.expectEqual(a.budget, b.budget);
+    try t.expect(a.budget >= on_busy.budget);
+
+    // And the static term is the one that does not read free RAM: same limit
+    // and footprint, any free-RAM figure, same answer.
+    try t.expectEqual(static_ceiling, physicalMemoryCeiling(static_ceiling, weights, 400 * GB));
+}
+
+test "free RAM still binds where it can be acted on: request-time admission" {
+    // The live term is not deleted, it is MOVED. The load-time budget is a
+    // property of the machine; the admission bill is a property of this
+    // request at this instant, and it can evict to admit. Scan-pinned because
+    // the whole point is WHICH ceiling each site reads. Needles split so this
+    // test's own source cannot satisfy them.
+    const t = std.testing;
+    const src = @embedFile("server.zig");
+    const live = "currentGpuMemory" ++ "Ceiling(";
+    const static_c = "staticGpuMemory" ++ "Ceiling()";
+
+    // The load-time clamp bills the static term...
+    const load = declBody(src, "pub fn prefixCacheMemForLoad(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, load, static_c) != null);
+
+    // ...and every request-time guard still reads live memory.
+    for ([_][]const u8{ "pub fn prefillAdmissionBill(", "pub fn requestPrefillChunkNow(" }) |decl| {
+        const body = declBody(src, decl) orelse return error.CallSiteMoved;
+        try t.expect(std.mem.indexOf(u8, body, live) != null);
+        try t.expect(std.mem.indexOf(u8, body, static_c) == null);
+    }
+    // `prefillFitsNow` is that same bill.
+    const probe = declBody(src, "pub fn prefillFitsNow(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, probe, "prefillAdmission" ++ "Bill(") != null);
+
+    // The auto-context sizer and the chunk pin are NOT part of this change:
+    // both still read the live ceiling, so the advertised context and the
+    // memory-sized rung keep exactly the behaviour they had.
+    for ([_][]const u8{ "fn computeMemoryContext(", "pub fn pinPrefillChunk(" }) |decl| {
+        const body = declBody(src, decl) orelse return error.CallSiteMoved;
+        try t.expect(std.mem.indexOf(u8, body, live) != null);
+    }
+
+    // Exactly one static-ceiling reader outside the helper itself and the
+    // pressure note beside it.
+    try t.expectEqual(@as(usize, 1), countDecls(src, "pub fn " ++ static_c[0 .. static_c.len - 2] ++ "("));
 }
 
 test "clampReserveWidth: the load-time reserve is a promise to the FIRST request" {

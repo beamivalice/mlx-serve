@@ -2067,6 +2067,52 @@ share, which is why it is excluded; the exposure is a wide forward arriving
 against a cache that is one huge unreclaimable entry. The admission bill still
 refuses by name rather than OOMing in that case.
 
+**And the whole thing was non-reproducible anyway.** Two boots of the identical
+binary, flags and wired limit, 11 minutes apart on 2026-09-05:
+
+```
+13:42 (straight after two suites)  [preflight] available 108.7 GB -> 10240 -> 1076 MB
+13:53 (quiet box)                  [preflight] available 116.6 GB -> 10240 -> 9757 MB
+```
+
+A 9x spread on the same machine and the same ask, because
+`currentGpuMemoryCeiling` is `min(recommendedMaxWorkingSet, footprint + free
+RAM)` and the load-time clamp read it. The free-RAM half is a property of the
+minute the server happened to start in; the budget it produced was therefore
+whatever the box was doing at the time, and the user's bar is one boot that
+works.
+
+So the LOAD-TIME clamp bills the STATIC term only — `staticGpuMemoryCeiling()`,
+Metal's `max_recommended_working_set_size` or the wired limit:
+
+```
+budget = staticGpuMemoryCeiling() - weights - ctx_kv - reserve(floor|explicit)
+```
+
+Every term is a property of the machine and the model, so two boots agree.
+
+**The free-RAM term is moved, not deleted.** It stays exactly where it can be
+acted upon: request-time admission (`prefillAdmissionBill`, and `prefillFitsNow`
+re-asking it after every eviction) and the `active_mem` guards. A cache sized
+above what free RAM currently allows is not a crash — it is entries the
+admission pass evicts on the first request that needs the room, which is the
+#353 machinery doing its job. What it must never be is a budget that silently
+shrinks 9x because a test suite was running.
+
+Deliberately NOT changed: `computeMemoryContext` (the auto-context sizer) and
+`pinPrefillChunk` (the memory-sized rung) both still read the live ceiling. The
+advertised context is pinned once and read by agent CLIs that never re-read it,
+and the rung feeds the boot log and non-gated archs; neither is the hot-cache
+budget, and neither was the thing that was irreproducible in a way anyone felt.
+The registry's eviction gate (`--max-resident-mem`, `gateEstimateBytes`) never
+touched this helper at all.
+
+Under external pressure the load line says so without acting on it:
+
+```
+[hot-cache] budget 9757 MB (static ceiling); free at load 38.6 GB — live admission will evict as needed
+```
+
 **CORRECTED BY MEASUREMENT.** I first wrote here that the wide rung would
 arrive when the SSD-first branch removed this bill. It does not need to, and
 the arithmetic I used to say so was wrong in two ways: I was comparing a full
