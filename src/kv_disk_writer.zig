@@ -52,12 +52,17 @@ pub const Writer = struct {
     pending_bytes: u64 = 0,
     /// In flight in the writer thread right now (0 or 1 blob's worth).
     inflight_bytes: u64 = 0,
+    /// The in-flight blob's path, so a prefix-scoped drain can see it. Valid
+    /// only while `inflight_bytes > 0`; the blob owns the memory.
+    inflight_path: ?[]const u8 = null,
     permit_bytes: u64 = DEFAULT_PERMIT_BYTES,
     epoch: u64 = 1,
     running: bool = false,
     /// Test-only: hold the queue so a caller can inspect submission ORDER
     /// (the "index file lands last" guarantee) deterministically.
     paused: bool = false,
+    /// `deinit` ran. Makes its "safe to call twice" doc claim true.
+    deinited: bool = false,
     thread: ?std.Thread = null,
     /// Diagnostics / test bars. Written under the mutex.
     files_written: u64 = 0,
@@ -85,8 +90,18 @@ pub const Writer = struct {
         };
     }
 
-    /// Drain, stop the thread, free anything left. Safe to call twice.
+    /// Drain, stop the thread, free anything left. Safe to call twice — and now
+    /// actually is: the second call used to re-`deinit` an already-deinited
+    /// `queue` and re-join a null thread. The claim was in the doc comment
+    /// before it was in the code. (audit S13)
     pub fn deinit(self: *Writer) void {
+        self.mutex.lockUncancelable(self.io);
+        if (self.deinited) {
+            self.mutex.unlock(self.io);
+            return;
+        }
+        self.deinited = true;
+        self.mutex.unlock(self.io);
         self.mutex.lockUncancelable(self.io);
         self.running = false;
         self.paused = false;
@@ -115,7 +130,15 @@ pub const Writer = struct {
     /// Blocks while the unwritten queue is over the permit. That block is the
     /// designed back-pressure and is the ONLY place the inference thread waits
     /// on the writer.
+    ///
+    /// SINGLE PRODUCER. Every caller is the inference thread (commit flush,
+    /// prefill write-through, index write), which is also the only caller of
+    /// `deinit` — so a `submit` can never race the post-join `queue.deinit`
+    /// and append into freed memory. True by construction today; asserted
+    /// because nothing else enforces it if a second producer appears.
+    /// (audit N10)
     pub fn submit(self: *Writer, path: []u8, bytes: []u8) void {
+        std.debug.assert(!self.deinited);
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (!self.running) {
@@ -143,6 +166,38 @@ pub const Writer = struct {
         };
         self.pending_bytes += bytes.len;
         self.work.signal(self.io);
+    }
+
+    /// Wait until the files staged for `path_prefix` have been written (or
+    /// dropped); null = all of them.
+    ///
+    /// A restore only needs ITS entry on disk. Draining the whole queue made
+    /// the next turn's head wait on the previous turn's tail — the inference
+    /// thread blocking on writes that no one was reading, which is the stall
+    /// the background writer exists to remove. (audit S12)
+    pub fn drainPrefix(self: *Writer, path_prefix: ?[]const u8) void {
+        const pre = path_prefix orelse {
+            self.drain();
+            return;
+        };
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        while (self.running) {
+            var waiting = false;
+            if (self.inflight_path) |p| {
+                if (std.mem.startsWith(u8, p, pre)) waiting = true;
+            }
+            if (!waiting) {
+                for (self.queue.items) |b| {
+                    if (std.mem.startsWith(u8, b.path, pre)) {
+                        waiting = true;
+                        break;
+                    }
+                }
+            }
+            if (!waiting) return;
+            self.done.waitUncancelable(self.io, &self.mutex);
+        }
     }
 
     /// Wait until every staged file has been written (or dropped).
@@ -193,17 +248,27 @@ pub const Writer = struct {
         self.mutex.unlock(self.io);
     }
 
-    /// Test-only: the staged paths, in submission (write) order.
+    /// Test-only: the staged paths, in submission (write) order. The strings are
+    /// DUPED into `a` — handing out `b.path` borrowed the queue's memory, which
+    /// the writer frees the moment the mutex is released. Test-only, but a
+    /// use-after-free shape in a shipped file is one a future caller inherits.
+    /// Caller frees each item. (audit N11)
     pub fn stagedPaths(self: *Writer, out: *std.ArrayList([]const u8), a: std.mem.Allocator) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        for (self.queue.items) |b| try out.append(a, b.path);
+        for (self.queue.items) |b| try out.append(a, try a.dupe(u8, b.path));
     }
 
     pub fn pendingBytes(self: *Writer) u64 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         return self.pending_bytes + self.inflight_bytes;
+    }
+
+    pub fn writeErrorCount(self: *Writer) u64 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.write_errors;
     }
 
     pub fn filesWritten(self: *Writer) u64 {
@@ -223,6 +288,16 @@ pub const Writer = struct {
             var blob = self.queue.orderedRemove(0);
             self.pending_bytes -|= blob.bytes.len;
             self.inflight_bytes = blob.bytes.len;
+            self.inflight_path = blob.path;
+            self.mutex.unlock(self.io);
+
+            // Re-read the epoch UNDER THE LOCK, immediately before the write.
+            // It used to be sampled in the same critical section that popped
+            // the blob, where it could not possibly differ from `blob.epoch` —
+            // the check was dead and the comment calling it load-bearing was
+            // wrong. A fence raised between the pop and the write is exactly
+            // the interleaving the fence exists for. (audit S14)
+            self.mutex.lockUncancelable(self.io);
             const live_epoch = self.epoch;
             self.mutex.unlock(self.io);
 
@@ -245,6 +320,7 @@ pub const Writer = struct {
                 self.bytes_written += blob.bytes.len;
             }
             self.inflight_bytes = 0;
+            self.inflight_path = null;
             self.freeBlob(&blob);
             self.done.broadcast(self.io);
             self.mutex.unlock(self.io);
@@ -268,7 +344,13 @@ fn writeAtomic(path: []const u8, bytes: []const u8) !void {
     var off: usize = 0;
     while (off < bytes.len) {
         const n = std.c.write(fd, bytes.ptr + off, bytes.len - off);
-        if (n <= 0) return error.WriteFailed;
+        if (n < 0) {
+            // A benign signal must not cost the file. (audit N9)
+            const e = std.c._errno().*;
+            if (e == @intFromEnum(std.c.E.INTR) or e == @intFromEnum(std.c.E.AGAIN)) continue;
+            return error.WriteFailed;
+        }
+        if (n == 0) return error.WriteFailed;
         off += @intCast(n);
     }
 

@@ -3215,13 +3215,15 @@ pub fn resolvedContextForLoad(
     return if (ctx_cap > 0) @min(sized, ctx_cap) else sized;
 }
 
-/// The SSD-first call site: reads live memory like `autoContextFor` does, and
-/// passes `cache_reserve = 0` for the reason given above.
-fn ssdFirstSessionTokensNow(config: *const model_mod.ModelConfig, kv_bits: u64, active_mem: u64, chunk: u32) u32 {
+/// The SSD-first call site. Takes the ceiling rather than reading it: the
+/// budget is a property of the MACHINE, not of how busy the box happened to be
+/// at load, and the caller passes the STATIC ceiling for both arms. Passes
+/// `cache_reserve = 0` for the reason given above.
+fn ssdFirstSessionTokensNow(config: *const model_mod.ModelConfig, kv_bits: u64, ceiling: u64, active_mem: u64, chunk: u32) u32 {
     return resolvedContextForLoad(
         server_config.max_context_size,
         config.pinned_context,
-        currentGpuMemoryCeiling(active_mem),
+        ceiling,
         active_mem,
         0,
         prefillTransientReserve(config, kv_bits, chunk),
@@ -3241,6 +3243,7 @@ fn ssdFirstSessionTokensNow(config: *const model_mod.ModelConfig, kv_bits: u64, 
 fn ssdFirstBudgetForLoad(
     config: *model_mod.ModelConfig,
     requested: u64,
+    ceiling: u64,
     active_mem: usize,
     ctx_kv: u64,
     transient_reserve: u64,
@@ -3248,7 +3251,7 @@ fn ssdFirstBudgetForLoad(
     if (!config.ssdFirstCapable() or !prefix_cache_mod.ssdFirstEnabled()) return null;
     const budget = ssdFirstPrefixCacheMem(
         requested,
-        currentGpuMemoryCeiling(active_mem),
+        ceiling,
         active_mem,
         ctx_kv,
         transient_reserve,
@@ -3295,11 +3298,16 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64) u64
     // NOT `getEffectiveContextLength`: on an auto boot it is still unpinned here
     // and re-derives through the cache ask (see `resolvedContextForLoad`).
     const ssd_ctx_kv: u64 = (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config)) *|
-        ssdFirstSessionTokensNow(config, kv_bits, active_mem, @intCast(ssd_chunk));
+        ssdFirstSessionTokensNow(config, kv_bits, staticGpuMemoryCeiling(), active_mem, @intCast(ssd_chunk));
     // SSD-first takes the whole decision or none of it — ONE line here, so a
     // change to how `ctx_kv` / the transient reserve are computed above merges
     // without touching this arm.
-    if (ssdFirstBudgetForLoad(config, requested, active_mem, ssd_ctx_kv, prefillTransientReserve(config, kv_bits, ssd_chunk))) |b| return b;
+    // STATIC ceiling on BOTH arms, for the reason the RAM arm gives below: the
+    // budget is a property of the machine, not of the minute. Reading the live
+    // ceiling here made the SSD budget swing boot-to-boot — and on this arm the
+    // budget IS the one-session RAM floor, so "one session" would have meant a
+    // different number every boot. (audit S1)
+    if (ssdFirstBudgetForLoad(config, requested, staticGpuMemoryCeiling(), active_mem, ssd_ctx_kv, prefillTransientReserve(config, kv_bits, ssd_chunk))) |b| return b;
     // Pin first, then hand the pinned width in as the override: the plan must
     // bill the width `generate.effectivePrefillChunk` will resolve to, and the
     // pin is that width (it already folded in an explicit `--prefill-chunk`).

@@ -1286,6 +1286,9 @@ pub const Scheduler = struct {
     /// pointer to this ever escapes, which is the whole point: the cache
     /// itself is freed on every model switch.
     hot_cache_digests: []prefix_cache_mod.HotPrefixCache.EntryDigest = &.{},
+    /// The residency the digests above describe, published in the SAME
+    /// critical section so a reader cannot mix a stale set with a fresh total.
+    digest_residency: u64 = 0,
     digest_mu: std.Io.Mutex = .init,
 
     max_concurrent: u32,
@@ -1503,10 +1506,6 @@ pub const Scheduler = struct {
     }
 
     pub fn deinit(self: *Scheduler) void {
-        if (self.hot_cache_digests.len > 0) {
-            self.allocator.free(self.hot_cache_digests);
-            self.hot_cache_digests = &.{};
-        }
         self.shutdown.store(true, .release);
         // Wake inference thread if it's waiting on queue_cond.
         self.queue_mu.lockUncancelable(self.io);
@@ -1515,6 +1514,19 @@ pub const Scheduler = struct {
         self.queue_mu.unlock(self.io);
 
         if (self.inference_thread) |t| t.join();
+
+        // Digest snapshot: freed HERE, below the join, for the same reason the
+        // slot drains are. `publishHotCacheDigests` frees the superseded slice
+        // on the inference thread after every finished request, and
+        // `reclaimableHotCacheBytesFor` reads the live one on connection
+        // threads under `digest_mu`. Freeing it above the join raced both: two
+        // frees of one pointer, or a reader holding a slice the deinit had
+        // already released. Below the join the publisher is gone, so this is
+        // the last writer. (audit B0)
+        if (self.hot_cache_digests.len > 0) {
+            self.allocator.free(self.hot_cache_digests);
+            self.hot_cache_digests = &.{};
+        }
 
         // Drain any leftover slots — should be empty if all conn threads
         // called `complete` properly, but defensive. Inference thread has
@@ -3989,9 +4001,15 @@ fn publishHotCacheDigests(sch: *Scheduler) void {
         (hc.digestsAlloc(sch.allocator) catch return)
     else
         &.{};
+    const residency: u64 = if (sch.hot_prefix_cache) |hc| hc.residentBytes() else 0;
     sch.digest_mu.lockUncancelable(sch.io);
     const old = sch.hot_cache_digests;
     sch.hot_cache_digests = fresh;
+    // Published UNDER the same lock as the digests it describes: the reader
+    // subtracts one from the other, and a publish landing between two separate
+    // reads gives a mixed view whose stale-digest/fresh-residency direction
+    // OVER-credits. (audit N6)
+    sch.digest_residency = residency;
     sch.digest_mu.unlock(sch.io);
     if (old.len > 0) sch.allocator.free(old);
 }
@@ -4000,13 +4018,14 @@ fn publishHotCacheDigests(sch: *Scheduler) void {
 /// back for THIS prompt. Copies nothing out — the reduction happens under the
 /// lock and only a scalar leaves.
 pub fn reclaimableHotCacheBytesFor(sch: *Scheduler, prompt_tokens: []const u32) u64 {
-    const residency = sch.resident_hot_cache_bytes.load(.monotonic);
+    // Hash outside the lock (pure, and the prompt is ours), then take BOTH
+    // halves of the subtraction from the same critical section. (audit N6)
     const fp = prefix_cache_mod.HotPrefixCache.prefixFingerprint(prompt_tokens);
     sch.digest_mu.lockUncancelable(sch.io);
     defer sch.digest_mu.unlock(sch.io);
     return prefix_cache_mod.HotPrefixCache.reclaimableFromDigests(
         sch.hot_cache_digests,
-        residency,
+        sch.digest_residency,
         fp,
     );
 }
@@ -4907,6 +4926,11 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
             // most recently used one (= the active session) and so any entry
             // spilled here already has a complete copy to spill INTO.
             hc.spillIdleEntries(s);
+            // The spill moved entries out of RAM; the connection-thread guard
+            // reads a PUBLISHED residency, so without this it keeps crediting
+            // (and the digest snapshot keeps describing) a cache that is
+            // already gone. (audit S10)
+            publishHotCacheResidency(sch);
         }
     }
     // Return this turn's transients to the OS. The per-`CACHE_CLEAR_INTERVAL`
@@ -5662,7 +5686,14 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 .fits = fits_fn,
             };
             if (!Probe.call(&probe)) {
-                const report = if (sch.hot_prefix_cache) |hc|
+                // Per-MODEL, off the slot — same rule as `commitSlotIfApplicable`
+                // ("Phase D: per-model prefix cache"). `sch.hot_prefix_cache`
+                // is whichever model the inference thread loaded last; in a
+                // multi-model registry that is a DIFFERENT cache, so the pass
+                // evicted a stranger's entries, protected the wrong MRU, and
+                // returned none of the memory this request needs — then
+                // refused it by name. (audit S19)
+                const report = if (slot.model.prefix_cache) |hc|
                     // `true` = never evict the entry THIS request restored
                     // from: its buffers are refcount-shared with the slot's
                     // cache, so dropping it frees nothing and only throws
@@ -7517,4 +7548,26 @@ test "SSD-first behaviour is gated on ONE arch predicate at one place per mechan
     const cb = source[cs..ce];
     try testing.expect(std.mem.indexOf(u8, cb, "if (!hc.ssd_first) return;") != null);
     try testing.expect(std.mem.indexOf(u8, cb, "if (d.writer == null) return;") != null);
+}
+
+test "the digest snapshot is freed AFTER the inference thread is joined" {
+    // Audit B0. `publishHotCacheDigests` frees the superseded slice on the
+    // inference thread after every finished request, and connection threads
+    // read the live one under `digest_mu`. Freeing it in `deinit` ABOVE the
+    // join raced both — two frees of one pointer, or a reader holding a slice
+    // deinit had already released. Order is the fix, so order is the test.
+    // Needles split: this scan must not match its own literals.
+    const source = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, source, "pub fn deinit(self: *Scheduler) void {") orelse
+        return error.MissingSchedulerDeinit;
+    const body = source[start..];
+    const join = std.mem.indexOf(u8, body, "if (self.inference_" ++ "thread) |t| t.join();") orelse
+        return error.MissingJoin;
+    const free_at = std.mem.indexOf(u8, body, "self.allocator.free(self.hot_cache" ++ "_digests);") orelse
+        return error.MissingDigestFree;
+    try testing.expect(free_at > join);
+    // And it is the ONLY free of that field in deinit — a second one above the
+    // join would satisfy nothing above but reintroduce the race.
+    const rest = body[free_at + 1 ..];
+    try testing.expect(std.mem.indexOf(u8, rest, "self.allocator.free(self.hot_cache" ++ "_digests);") == null);
 }
