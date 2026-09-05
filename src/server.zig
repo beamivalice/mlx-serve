@@ -23326,3 +23326,56 @@ test "prefillChunkCap: the chunk sizer's two #363 changes are qwen4_exp-only" {
     try t.expect(std.mem.indexOf(u8, rbody, "prefillChunk" ++ "Cap(config, ceiling, active_mem, ctx_kv_bytes, hot_cache_ask)") != null);
     try t.expect(std.mem.indexOf(u8, rbody, "PREFILL_RESERVE_BUDGET_" ++ "SHARE") == null);
 }
+
+test "prefillRequestTerms: the admission bill's new terms are qwen4_exp-only" {
+    // PR #363 item 4, and the clearest policy violation the review found: the
+    // ALLOCATOR side of the reservation is gated (`generate.reservedPrefill-
+    // Tokens`) while the GUARD side was not, so off qwen4_exp the bill charged
+    // headroom the engine would never reserve. A pure over-bill is a 400 on a
+    // prompt a93e2c0 admitted.
+    const t = std.testing;
+    const seq: u64 = 200_000; // well past RESERVE_MIN_TOKENS
+    const chunk: u64 = 4096;
+    const max_tokens: u64 = 8192;
+    const kv_bits: u64 = 8;
+
+    // A 27B-class GatedDeltaNet pack: `linear_num_value_heads` is parsed
+    // generically, so `ssmCheckpointBytes()` is NON-zero here and the
+    // checkpoint term really did bill on this arch.
+    var q35 = qwen4ExpOomConfig();
+    q35.model_type = "qwen3_5_moe";
+    try t.expect(q35.ssmCheckpointBytes() > 0);
+    try t.expect(retainedSsmCheckpointBytes(&q35, seq, chunk) > 0);
+
+    const warm = WarmPrefix{ .matched_tokens = 100_000, .capacity_tokens = 400_000 };
+    for ([_][]const u8{ "qwen3_5", "qwen3_5_moe", "qwen3_next", "bailing_hybrid", "lfm2", "nemotron_h", "llama", "mistral" }) |mt| {
+        var cfg = qwen4ExpOomConfig();
+        cfg.model_type = mt;
+        const terms = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, warm);
+        try t.expectEqual(@as(u64, 0), terms.reserved_kv_bytes);
+        try t.expectEqual(@as(u64, 0), terms.checkpoint_bytes);
+        try t.expectEqual(@as(u64, 0), terms.state_bytes);
+        try t.expectEqual(@as(u64, 0), terms.shared_resident_bytes);
+        // ...which makes the whole bill a93e2c0's 13-argument expression: the
+        // new terms are added into `gross` and the credit is a saturating
+        // subtraction, so `.{}` is the identity.
+        try t.expectEqual(
+            prefillMemoryNeeded(seq, 24, 2, cfg.kvBytesPerToken(), 256, 256, 2560, 9216, kv_bits, chunk, cfg.prefillAttnKeys(seq), prefillStreamBytesPerToken(&cfg), prefillDequantWeightBytes(&cfg), .{}),
+            prefillMemoryNeeded(seq, 24, 2, cfg.kvBytesPerToken(), 256, 256, 2560, 9216, kv_bits, chunk, cfg.prefillAttnKeys(seq), prefillStreamBytesPerToken(&cfg), prefillDequantWeightBytes(&cfg), terms),
+        );
+    }
+
+    // qwen4_exp keeps every term.
+    const q4 = qwen4ExpOomConfig();
+    const gated = prefillRequestTerms(&q4, seq, max_tokens, kv_bits, chunk, warm);
+    try t.expect(gated.reserved_kv_bytes > 0);
+    try t.expect(gated.checkpoint_bytes > 0);
+    try t.expect(gated.state_bytes > 0);
+    try t.expect(gated.shared_resident_bytes > 0);
+
+    // ONE predicate, at the top of the ONE function that builds the struct.
+    const src = @embedFile("server.zig");
+    const at = std.mem.indexOf(u8, src, "pub fn prefillRequest" ++ "Terms(") orelse return error.CallSiteMoved;
+    const body = src[at..@min(src.len, at + 2600)];
+    try t.expect(std.mem.indexOf(u8, body, "if (!config.longCtx" ++ "Gated()) return .{};") != null);
+}
