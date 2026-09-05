@@ -168,6 +168,24 @@ pub fn volumeSpace(path: []const u8) ?VolumeSpace {
     };
 }
 
+/// How a `DiskTier` asks what the volume has left. Injectable because the
+/// live probe reads the REAL volume: `refreshDiskBudget` -> `store_declined`
+/// keys on it, so with the statfs probe hard-wired every SSD-first test
+/// asserted a property of the TESTER'S FREE DISK SPACE. On a box with 14 GiB
+/// free the 64 GiB reserve made `diskBudgetFromFreeSpace` return null, the
+/// store declined, and `kv_len` stayed at the first commit's value while the
+/// test asked for the second — a red suite and a green engine.
+pub const SpaceProbeFn = *const fn (path: []const u8) ?VolumeSpace;
+
+/// Test hook. `testSpaceProbe` returns this regardless of path; a test arms
+/// it through `DiskTier.armTestSpace` so the pairing cannot be half-done.
+var test_space: ?VolumeSpace = null;
+
+fn testSpaceProbe(path: []const u8) ?VolumeSpace {
+    _ = path;
+    return test_space;
+}
+
 pub const IndexEntry = struct {
     /// Directory id — the `e<id>` component.
     id: u64,
@@ -343,6 +361,10 @@ pub const DiskTier = struct {
     /// from it and the volume's free space before every store (mechanism 5);
     /// this keeps the cap itself around across those refreshes.
     operator_cap: u64 = 0,
+    /// The free-space probe `refreshDiskBudget` runs. Defaults to the live
+    /// `statfs`; tests arm a fixed answer with `armTestSpace` so the store
+    /// decision is a property of the CODE, not of the machine running it.
+    space_probe: SpaceProbeFn = volumeSpace,
     /// The volume is under `DISK_STORE_FLOOR`: no new entry persists, but
     /// what is already there stays restorable. Latched so the warning is
     /// logged once per transition.
@@ -391,6 +413,15 @@ pub const DiskTier = struct {
         self.gcToBudget();
         self.base_dir = allocator.dupe(u8, base_dir) catch null;
         return self;
+    }
+
+    /// Test hook: answer every free-space probe with these numbers instead of
+    /// asking the real volume. Every SSD-first test must call this — the
+    /// budget refresh runs on every store in that mode, and without it the
+    /// test's verdict is the tester's free disk space.
+    pub fn armTestSpace(self: *DiskTier, free: u64, total: u64) void {
+        test_space = .{ .free = free, .total = total };
+        self.space_probe = testSpaceProbe;
     }
 
     /// Arm the background writer (SSD-first only). Best effort: a spawn
@@ -484,7 +515,7 @@ pub const DiskTier = struct {
     /// (`store_declined`), because evicting a restorable 1M entry to free a
     /// gigabyte is a bad trade.
     fn refreshDiskBudget(self: *DiskTier) void {
-        const vs = volumeSpace(self.root) orelse return;
+        const vs = self.space_probe(self.root) orelse return;
         // Our own entries are already counted in `used`; the budget is about
         // what the tier may occupy in total, so add what it holds back.
         const budget = diskBudgetFromFreeSpace(self.operator_cap, vs.free +| self.total_bytes, vs.total);
@@ -974,7 +1005,6 @@ pub const DiskTier = struct {
         }
         const kv_target_u: usize = @min(@max(step, max_off), tokens.len);
         if (kv_target_u < MIN_PERSIST_TOKENS) return true;
-        if (self.store_declined) return true;
         const kv_target: u32 = @intCast(kv_target_u);
         switch (config.scheme) {
             .off, .affine => {},
@@ -1000,6 +1030,13 @@ pub const DiskTier = struct {
         // A cache must never fill the user's disk, and free space moves under
         // us (other processes, the model downloads that share this volume).
         if (self.ssd_first) self.refreshDiskBudget();
+        // ...and the refresh gates THIS store, not merely the next one. The
+        // check used to sit above the refresh, so the commit that first
+        // observed a short volume latched `store_declined` and then wrote
+        // anyway; only the following commit declined. On the tester's 14 GiB
+        // box that is exactly the shape the suite saw — the first commit
+        // landed at 640 and the second was refused.
+        if (self.store_declined) return true;
 
         // Superseded check: an existing entry that already covers `tokens`
         // (same key, tokens is a prefix of its tokens, kv already >= ours)
@@ -4030,6 +4067,9 @@ test "DiskTier: SSD-first writes a checkpoint beside the chunk that closes it" {
         var tier = try DiskTier.init(testing.allocator, io, base, "fp-ssdfirst-cp", 0, 128);
         defer tier.deinit();
         tier.ssd_first = true;
+        // SSD-first refreshes the budget from FREE SPACE on every store, so a
+        // test that does not arm this asserts the tester's disk (item 1).
+        tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
         tier.max_flush_bytes = 1; // bound the flush to one chunk
 
         const complete = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
@@ -4084,6 +4124,9 @@ test "DiskTier: SSD-first stages the flush off-thread and indexes LAST" {
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-ssd-writer", 0, 128);
     defer tier.deinit();
     tier.ssd_first = true;
+    // SSD-first refreshes the budget from FREE SPACE on every store, so a
+    // test that does not arm this asserts the tester's disk (item 1).
+    tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
     tier.enableBackgroundWriter();
     try testing.expect(tier.writer != null);
     // The readback bound REPLACES the 512 MB synchronous-stall cap.
@@ -4156,6 +4199,9 @@ test "DiskTier: SSD-first write-through extends without rewriting a persisted ch
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-ssd-wt", 0, 128);
     defer tier.deinit();
     tier.ssd_first = true;
+    // SSD-first refreshes the budget from FREE SPACE on every store, so a
+    // test that does not arm this asserts the tester's disk (item 1).
+    tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
     tier.enableBackgroundWriter();
 
     var cache = try KVCache.init(testing.allocator, 2);
@@ -4239,6 +4285,81 @@ test "volumeSpace: the live probe is plausible or null (statfs ABI guard)" {
     try testing.expect(vs.total > 1024 * 1024 * 1024); // a macOS root volume
 }
 
+test "DiskTier: SSD-first declines to store when the VOLUME is short, and says so" {
+    // The inverse of every other SSD-first test, and the reason the probe had
+    // to become injectable. The store decision is `diskBudgetFromFreeSpace`
+    // over the volume: 10 GiB free against a 512 GiB volume leaves nothing
+    // after the reserve, so the tier stores NOTHING and the caller must not
+    // be told otherwise.
+    //
+    // Before the hook this could not be written at all — the answer came from
+    // whatever volume `std.testing.tmpDir` landed on, which is why the tester's
+    // 14 GiB box turned the suite red while the engine was fine.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-short", 0, 128);
+    defer tier.deinit();
+    tier.ssd_first = true;
+    tier.armTestSpace(10 * 1024 * 1024 * 1024, 512 * 1024 * 1024 * 1024);
+
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 640, 8, 0.0, .float32);
+    var tokens: [640]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    _ = try tier.appendCommit(cache.entries, 640, cache.config, &tokens, false, null, s);
+    tier.drainWriter();
+    try testing.expect(tier.store_declined);
+    try testing.expectEqual(@as(usize, 0), tier.entryCount());
+    try testing.expectEqual(@as(u64, 0), tier.total_bytes);
+
+    // ...and the same tier on a roomy volume stores exactly the same commit.
+    tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
+    _ = try tier.appendCommit(cache.entries, 640, cache.config, &tokens, false, null, s);
+    tier.drainWriter();
+    try testing.expect(!tier.store_declined);
+    try testing.expectEqual(@as(usize, 1), tier.entryCount());
+    try testing.expectEqual(@as(u32, 640), tier.entries.items[0].kv_len);
+}
+
+test "every SSD-first test arms the free-space probe (the suite is not the tester's disk)" {
+    // Class guard for item 1. `refreshDiskBudget` runs on EVERY store in
+    // SSD-first mode, so a test that flips `ssd_first` without arming the
+    // probe silently asserts a property of the machine. Scan the file: each
+    // `ssd_first = true` in the test region must be followed, within a few
+    // lines, by an `armTestSpace` on the same receiver.
+    const whole = @embedFile("kv_disk_cache.zig");
+    const needle = ".ssd_first = " ++ "true;";
+    const arm = "armTest" ++ "Space(";
+    // Only the test region: the engine's own mirror assignment
+    // (`disk.?.ssd_first = ...` in scheduler.zig) is not in this file, and
+    // the doc comments above use a different spelling.
+    var i: usize = 0;
+    var checked: usize = 0;
+    while (std.mem.indexOfPos(u8, whole, i, needle)) |at| {
+        i = at + needle.len;
+        // The receiver is the identifier immediately before the needle.
+        const line_start = std.mem.lastIndexOfScalar(u8, whole[0..at], '\n') orelse 0;
+        const recv = std.mem.trim(u8, whole[line_start..at], " \n\t");
+        // A window big enough for the two comment lines the arming carries.
+        const window = whole[at..@min(whole.len, at + 400)];
+        const found = std.mem.indexOf(u8, window, arm) orelse return error.SsdFirstTestDoesNotArmTheProbe;
+        // ...on the SAME receiver: the call must read `<recv>.armTestSpace(`.
+        const before = window[0..found];
+        if (before.len < recv.len + 1 or
+            before[before.len - 1] != '.' or
+            !std.mem.eql(u8, before[before.len - recv.len - 1 .. before.len - 1], recv)) return error.SsdFirstTestArmsAnotherTier;
+        checked += 1;
+    }
+    try testing.expect(checked >= 6);
+}
+
 test "DiskTier: entries cross the SSD-first boundary in BOTH directions (SSD-first itself bumps no manifest)" {
     // D6. SSD-first changes WHEN chunks are written (write-through) and WHICH
     // checkpoints are present (outside the byte budget) — never the on-disk
@@ -4270,6 +4391,9 @@ test "DiskTier: entries cross the SSD-first boundary in BOTH directions (SSD-fir
         var ssd = try DiskTier.init(testing.allocator, io, base, "fp-x-legacy", 0, 128);
         defer ssd.deinit();
         ssd.ssd_first = true;
+        // SSD-first refreshes the budget from FREE SPACE on every store, so a
+        // test that does not arm this asserts the tester's disk (item 1).
+        ssd.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
         ssd.enableBackgroundWriter();
         try testing.expectEqual(@as(usize, 1), ssd.entryCount());
         var out = try KVCache.init(testing.allocator, 3);
@@ -4285,6 +4409,9 @@ test "DiskTier: entries cross the SSD-first boundary in BOTH directions (SSD-fir
     {
         var ssd = try DiskTier.init(testing.allocator, io, base, "fp-x-ssd", 0, 128);
         ssd.ssd_first = true;
+        // SSD-first refreshes the budget from FREE SPACE on every store, so a
+        // test that does not arm this asserts the tester's disk (item 1).
+        ssd.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
         ssd.enableBackgroundWriter();
         _ = try ssd.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
         ssd.drainWriter();
@@ -4353,6 +4480,9 @@ test "DiskTier: the root-wide sweep drops strays and never touches the live tier
     var live = try DiskTier.init(testing.allocator, io, base, "fp-live", 0, 128);
     defer live.deinit();
     live.ssd_first = true;
+    // SSD-first refreshes the budget from FREE SPACE on every store, so a
+    // test that does not arm this asserts the tester's disk (item 1).
+    live.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
     // The live tier's own root, mid-write-through: chunks, no index yet. Staged
     // AFTER init on purpose — at init the tier's own `scan` drops an
     // index-less entry, and that is right: a startup leftover really is
@@ -4748,6 +4878,9 @@ test "DiskTier chunk share: a prefix-diverging entry hard-links the donor's whol
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-share", 0, 128);
     defer tier.deinit();
     tier.ssd_first = true;
+    // SSD-first refreshes the budget from FREE SPACE on every store, so a
+    // test that does not arm this asserts the tester's disk (item 1).
+    tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
 
     // 600 tokens => chunks 0..3 whole (512 tokens), chunk 4 partial (88).
     var cache = try KVCache.init(testing.allocator, 3);
@@ -4814,6 +4947,9 @@ test "DiskTier chunk share: total_bytes is bytes on disk whichever holder dies f
         var tier = try DiskTier.init(testing.allocator, io, base, "fp-order", 0, 128);
         defer tier.deinit();
         tier.ssd_first = true;
+        // SSD-first refreshes the budget from FREE SPACE on every store, so a
+        // test that does not arm this asserts the tester's disk (item 1).
+        tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
         try testing.expectEqual(@as(u64, 0), tier.total_bytes);
 
         _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.a, false, null, s);
@@ -4897,6 +5033,9 @@ test "DiskTier chunk share: meta v6 carries inherited_chunks; a v5 manifest load
         var tier = try DiskTier.init(testing.allocator, io, base, "fp-v6", 0, 128);
         defer tier.deinit();
         tier.ssd_first = true;
+        // SSD-first refreshes the budget from FREE SPACE on every store, so a
+        // test that does not arm this asserts the tester's disk (item 1).
+        tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
         _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.a, false, null, s);
         _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.b, false, null, s);
         heir_id = tier.entries.items[1].id;
