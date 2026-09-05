@@ -3672,3 +3672,71 @@ value that is zero forever on a linear-layer trunk. The fold now SKIPS an
 uninitialized entry and takes the minimum over those that hold a buffer, 0 when
 none does — which is also the safe direction, since a caching layer with no rows
 yet can only happen while the whole cache is cold.
+
+## The 400/503 mapping existed only where nobody was looking (external review of PR #363, item 2, 2026-09-06)
+
+Two named, actionable errors reach a client from the generation path: a memory
+503 when the MLX working-set latch (#353) abandons a request mid-forward, and a
+400 when the admission estimator refuses a prompt that does not fit even with an
+empty hot cache. Both messages name the levers. Both were written four times —
+once per surface — on the NON-STREAMING arm only.
+
+The streaming arms did something else entirely. `/v1/chat/completions` wrote
+`data: {"error":{"message":"Internal server error: GenerationOutOfMemory",
+"type":"server_error"}}`. `/v1/messages` wrote the same string into an
+Anthropic `error` event. `/v1/completions` logged the error and wrote
+**nothing** — the client got a dropped socket mid-stream. `/v1/responses` had no
+`catch` anywhere on its path, streaming or not, so the error propagated to the
+route dispatcher and the socket died there too.
+
+Agents stream. So the surface that carried the actionable message was the one
+almost nobody reached, and the surface everyone reached carried a Zig error name.
+
+The fix is ONE mapping, `server.mapGenerationError`, asked by both paths:
+
+* `error.GenerationOutOfMemory` / `error.OutOfMemory` → 503, `GEN_OOM_MSG`;
+* `error.PrefillDoesNotFit` → 400, `PREFILL_NOFIT_MSG` (a request refused before
+  its first forward is the client's request being too large, not an engine
+  fault, so `invalid_request_error` on BOTH dialects);
+* `error.GenerationFailed` → 500, "generation failed";
+* anything else → 500 keeping the error NAME in the message — the streaming
+  arms' one virtue over the non-streaming ones, which sent it bare.
+
+`sendGenerationError` is the single arm every surface's `catch` calls, and it
+branches on ONE fact: has the SSE response head gone out?
+
+* **Not yet** — the status line is still ours, so the streaming request gets
+  byte-for-byte the response its non-streaming twin would have got. A client
+  should not have to parse a different error shape because it asked for a
+  stream.
+* **Already** — the status is spent, so the same `type` and `message` ride the
+  surface's terminal `error` event: an OpenAI `data:` frame that also carries
+  `choices[0].finish_reason: "error"` (so a client parsing only chunks
+  terminates instead of waiting out a stream that will never deliver another
+  delta) followed by `[DONE]`; an Anthropic `event: error` (which IS the
+  terminator there — no `[DONE]`); a Responses `event: error` with its
+  `sequence_number`, then `[DONE]` on HTTP and nothing extra over the WS bridge.
+
+That fact needs one owner, so `Conn.sse_headers_sent` is set in exactly one
+place — `sendSseHeaders`, which is now the only site in server.zig that spells
+`Content-Type: text/event-stream`. Three of four surfaces setting a flag is the
+same defect one layer down.
+
+Two structural consequences fell out. `/v1/responses` gained a wrapper
+(`handleResponses` around `handleResponsesInner`) purely to have an error arm at
+all, and it owns the SSE sequence counter so the terminal `error` event can
+carry the number the spec requires on every Responses event; the WS transport
+keeps the error instead, because it has its own terminal frame AND
+borrowed-store cleanup to run at the call site (it now maps through the same
+function). And the four inner `catch |err| switch (err)` blocks around
+`nonStreamingViaScheduler` are GONE: they mapped the same three classes a second
+time, which is exactly how the two paths came to disagree. Every class now
+propagates to the surface's one arm.
+
+Tests: `mapGenerationError` per class including the unknown arm; the three SSE
+body builders carrying the mapped type, code and message plus their surface's
+terminator; absent-form scans for every pre-review spelling of a raw error name
+in a client-visible frame; a count of the surfaces routing through the sender;
+and arm [6] of `tests/test_mlx_error_recovery.sh`, which fires
+`MLX_SERVE_MLX_FAULT_STEP` at a STREAMING request and asserts the 503 message
+and `finish_reason: "error"` on the wire, with the raw name absent.
