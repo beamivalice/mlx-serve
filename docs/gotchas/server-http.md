@@ -2456,6 +2456,35 @@ converge at rest anyway, since RAM holds one session between requests either
 way. The resolved budget is logged once at load, naming the flag, so nobody
 has to infer which reading applied.
 
+**A knock-on: the prefill chunk stops being a guess.** The generic sizer spends
+at most a QUARTER of the post-weights serving budget on the one-off prefill
+transient (`PREFILL_RESERVE_BUDGET_SHARE`), because it cannot know what the hot
+cache will actually need and a quarter is a safe guess for a 16 GB Mac. On this
+137 GB box that quarter is ~7.2 GiB, and rung 4096's reserve is ~15.3 GiB, so a
+no-flag boot prefills at 1024 — measured 25–34% slower at ≤256k — while the real
+headroom is several times the reserve.
+
+Under SSD-first the cache's need is not a guess: it is one session at the
+working context, exactly the quantity mechanism 5 already computes. So the
+arch-gated `ssdFirstChunkForBudget` takes the widest ladder rung whose transient
+fits `serving − one_session − slack`, chunk chosen FIRST and the cache taking
+the residual (never the reverse, which is what made the old clamp
+non-monotone). At an auto-sized ~256k working context that leaves 22,701 MiB
+and the boot lands on 4096; at an explicit `--ctx-size 1048576` one session is
+20,736 MiB, only 7,149 MiB is left, and it lands on 1024 — the same rung the
+heuristic picked, arrived at honestly. Asking for the full million AND a wide
+forward is a real conflict and the session wins it; the reverse is what must
+never happen, so when nothing fits the narrowest rung is taken rather than the
+resident session given up. `--prefill-chunk` still outranks everything.
+
+The slack is deliberately NOT a second session. The resident entry and the live
+KV are the same buffers, so subtracting one session already reserves the cache's
+floor — subtracting it twice is the very double count this mechanism removes,
+and it would bar every wide rung on any box. The 1 GiB covers what genuinely is
+not shared: the previous turn's entry is not superseded until the commit at the
+END of a request, so during a diverged prefill its un-shared tail coexists with
+the new KV.
+
 **Blast radius.** Every one of these is gated on `ModelConfig.ssdFirstCapable()`
 (`model_type == "qwen4_exp"`) AND `MLX_SERVE_PREFIX_SSD_FIRST`, read at exactly
 one place — the scheduler's disk-tier attach — into `HotPrefixCache.ssd_first`
