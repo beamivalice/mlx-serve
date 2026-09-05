@@ -2017,20 +2017,20 @@ context 20.7 GB is subtracted from the cache's headroom for KV that only exists
 once a request is that long. That is being removed arch-gated on the SSD-first
 branch. This fix makes the default sane with that bill still in place.
 
-**That bill is also why the rung is narrow, and removing it is what widens it:**
-with the full-context term gone the cache's headroom on this box goes
-8,173 -> 28,909 MiB and the sizer's `sizerCtxKvBytes` bar goes with it, so
-reserve(4096) at ~15.3 GiB sits inside 28.9 GiB and rung 4096 leaves ~13 GB of
-hot cache with no flags at all.
+**CORRECTED BY MEASUREMENT.** I first wrote here that the wide rung would
+arrive when the SSD-first branch removed this bill. It does not need to, and
+the arithmetic I used to say so was wrong in two ways: I was comparing a full
+admission bill against a transient reserve, and I was assuming the load-time
+`PREFILL_RESERVE_BUDGET_SHARE` still gated the outcome. The per-request chooser
+below does not go through the load-time sizer at all — it prices the REQUEST
+against live free memory — so on this box a 300k or 384k prompt already gets
+chunk 4096 today, with this bill still in the clamp. What the SSD-first change
+buys is a bigger hot cache, not a wider chunk.
 
-One caveat survives that removal, and it is worth stating because it is the
-last gate: `PREFILL_RESERVE_BUDGET_SHARE` still bars any rung claiming more
-than a QUARTER of the serving budget — 7.2 GiB here — so a 15.3 GiB reserve
-clears the residual bar but NOT the share. Neither term is a place to shave:
+`PREFILL_RESERVE_BUDGET_SHARE` and the reserve estimator both stay untouched:
 the judge at chunk 4096 peaked 90.3 GB of a ~93 GiB ceiling at 384k, so the
-reserve estimator is not loose, and the share is what stops one forward from
-trading the whole session for its own speed. Widening the rung on this box is a
-decision about the share, taken deliberately, not a side effect of this fix.
+estimator is not loose, and the share is what stops one forward from trading
+the whole session for its own speed at LOAD time.
 
 **One ordering wrinkle, deliberately left standing.**
 `prefixCacheMemForLoad` calls `getEffectiveContextLength`, which on an
@@ -2116,9 +2116,16 @@ closed by the chooser never returning a width whose bill exceeds `available`.
 Choosing the width at the scheduler left the ADMISSION probe still pricing the
 load-time pin, and that is a refusal, not a slowdown. A prompt that fits at 512
 and nothing wider was refused by name — `error.PrefillDoesNotFit`, a 400 — for
-a width the forward would never have used. **At `--ctx-size 1048576` the case
-this serves is the 1M-token prompt itself**: the context the operator
-configured, refused on the server configured to hold it.
+a width the forward would never have used.
+
+**Measured, and not what I assumed.** I wrote this expecting the 1M-token
+prompt to be the case it serves. It is not: on this box a 1M prompt bills
+30,261 MB even at the ladder floor against 28,909 MB free, so it does not fit
+at ANY width and is refused whatever the ladder does — the advertised context
+is larger than the machine can prefill, which is a ctx-KV problem and not a
+width one. The case this actually serves is the long-but-not-maximal prompt:
+at 384k the floor bills 12,258 MB and the load-time pin's width bills 12,632,
+so a budget between them is admitted at 512 instead of refused at 1024.
 
 So `prefillAdmissionBill` picks its width the same way, through the same
 `chooseRequestPrefillChunk`, which walks the ladder from the widest affordable
@@ -2140,6 +2147,26 @@ An explicit `--prefill-chunk` keeps TODAY's behaviour on purpose: the chooser
 returns it unchanged and the refusal fires at that width. The operator picked
 it; silently downgrading the width they asked for would be a worse answer than
 saying no.
+
+### The measured ladder
+
+From the estimator itself, bills in MB for the deployed shape (8-bit KV,
+`max_tokens` 2048), against the live box's 28,909 MiB of free memory:
+
+| seq | w4096 | w2048 | w1024 | w512 | chooser picks |
+|---|---|---|---|---|---|
+| 4,096 | 3,981 | 2,441 | 1,521 | 1,136 | **4096** |
+| 60,000 | 6,227 | 4,732 | 3,770 | 3,045 | **4096** |
+| 300,000 | 12,743 | 11,249 | 10,351 | 9,978 | **4096** |
+| 384,000 | 15,024 | 13,529 | 12,632 | 12,258 | **4096** |
+| 1,048,576 | 33,027 | 31,532 | 30,635 | 30,261 | floor, refused |
+
+Load-time sizing hands all five of those rows chunk 1024. Note the ladder is
+seq-INDEPENDENT here (rung 8192 and 4096 both forward at 4096, the rest map to
+themselves): that is the hd-256 non-sliding branch of `boundedPrefillChunk`. On
+a sliding-band arch the composed-causal score budget collapses every rung to
+the floor past ~300k, which is a different policy family and one reason the
+gate is an opt-in of one.
 
 ### Scope
 
