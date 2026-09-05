@@ -8,13 +8,13 @@ Native Zig server running MLX-format LMs on Apple Silicon; OpenAI/Anthropic/Olla
 - `docs/gotchas/{tool-calling,server-http,engine-mlx,models-media,app}.md` — full war stories behind every rule in `## Rules`.
 - `tests/CLAUDE.md` — integration-test matrix. `app/CLAUDE.md` — Swift app layout + rules (auto-load in their dirs).
 - Skills: `/release` (pre-release checklist, CalVer, CHANGELOG), `/bench` (llmprobe methodology + comparison traps).
-- `containers/agent-shell-mlxserve/` — Agent Sandbox guest OCI image (`make push`/`make export`), ships dropbear (`SandboxSSHTests`); `containers/guest-kernel/` — kernel 6.6 + fuse owner-read clamp (#150), `build.sh` → `kernel-arm64.gz`, tag pinned by `AgentSandbox.kernelTag` + `scripts/fetch-guest-rootfs.sh` (bump together).
-- `website/` — GitHub Pages site + `llm-tier-list/`. Design: `docs/reference.md`. Guards: `tests/test_website_pages.sh`, `tests/website_tier_list_logic.mjs`.
+- `containers/{agent-shell-mlxserve,guest-kernel}/` — Agent Sandbox guest image + kernel; two pinned artifacts that BUMP TOGETHER. Detail: `docs/reference.md`.
+- `website/` — GitHub Pages site + `llm-tier-list/`. Design + guards: `docs/reference.md`.
 - **Growth policy (ENFORCED)**: this file stays under 100k bytes and EVERY rule bullet is ≤ 3 lines. New gotcha = 1–3-line rule here + full story in `docs/gotchas/*.md`. New subsystem = one Layout row + a `docs/reference.md` section. App content → `app/CLAUDE.md`. Never paste war stories or measurements here.
 
 ## Stack
 
-Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds); mlx + mlx-c PINNED SUBMODULES (`lib/mlx-src` v0.32.2, `lib/mlxc-src` 56b2d39 = PR #127) self-built NAX-enabled by `scripts/build-mlx.sh` into `lib/mlx/` (FFI `src/mlx.zig`); jinja.cpp (wangzhaode, Apache-2.0, NOT llama.cpp's) as `lib/jinja_cpp/libjinja.a`; stb_image + libwebp; safetensors; BPE. Embedded engines: ds4 (`lib/ds4`, DSV4-Flash GGUF) + libllama (`lib/llama`, generic GGUF).
+Zig 0.17 (pinned nightly, `scripts/fetch-zig.sh`; brew 0.16 no longer builds); mlx + mlx-c PINNED SUBMODULES (`lib/mlx-src` v0.32.2, `lib/mlxc-src` 56b2d39 = PR #127), NAX-enabled by `scripts/build-mlx.sh` into `lib/mlx/` (FFI `src/mlx.zig`); jinja.cpp (wangzhaode, Apache-2.0, NOT llama.cpp's) as `lib/jinja_cpp/libjinja.a`; stb_image + libwebp; safetensors; BPE. Embedded engines: ds4 (`lib/ds4`, DSV4-Flash GGUF) + libllama (`lib/llama`, generic GGUF).
 
 ## Layout (`src/`)
 
@@ -162,7 +162,7 @@ With `tools`, tokens buffer for detection (all tag families + raw JSON); thinkin
 
 - Product skills: `~/.mlx-serve/skills/*.md` (frontmatter trigger substring → body into system prompt; `SkillManager` rescans on mtime).
 - `DownloadManager`: streams to `.partial`, Range resume, 3 retries, cancel preserves partial, size-matching files skipped.
-- Server log `~/.mlx-serve/logs/mlx-serve-<port>.log` is THE post-mortem file (`--log-level debug`). Grep: `jinja error:`, `[cache] reusing/invalidated`, `<- N+M tokens`, `tool_msgs=`, `[spec-stats]`, `spec-gate:`, `[loop-stop]`, `[lan] proxy`, `[disk-cache] restored`, `[hot-cache]`. Capture: `MLX_SERVE_RAW_DUMP_FILE=<abs>` → `tests/harvest_tool_traffic.py`. Reproduce tool bugs `stream:false` first; `pkill -f mlx-serve` between KV-poison tests.
+- Post-mortem file: `~/.mlx-serve/logs/mlx-serve-<port>.log` (`--log-level debug`). Grep `jinja error:`, `[cache] reusing/invalidated`, `<- N+M tokens`, `tool_msgs=`, `[spec-stats]`, `spec-gate:`, `[loop-stop]`, `[lan] proxy`, `[disk-cache] restored`, `[hot-cache]`. Capture `MLX_SERVE_RAW_DUMP_FILE=<abs>` → `tests/harvest_tool_traffic.py`; repro tool bugs `stream:false` first; `pkill -f mlx-serve` between KV-poison tests.
 
 ## Rules (distilled gotchas — stories in docs/gotchas/; every bullet ≤ 3 lines)
 
