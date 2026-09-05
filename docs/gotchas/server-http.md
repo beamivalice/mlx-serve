@@ -3393,3 +3393,120 @@ BEFORE `s.deinit()`, which frees the very buffers the entry would otherwise stil
 the address the prefix already occupied" IS "no copy happened". The copy arm cannot fake it —
 its donor is still alive in the entry, so the allocator cannot hand the copy that same address.
 Both arms then assert the SAME BYTES: the arms differ in ownership, never in output.
+
+## A WARM turn was billed for the prefix it was about to SHARE
+
+Live 2026-09-05, qwen4-ladder run on `4d180d1`. The 768k rung's SECOND request
+— 786,707 tokens, 31 more than the entry the turn before it had just committed
+— was refused before its first forward:
+
+```
+[admission] needed=25866 MB available=19032 MB reclaimable=10294 MB width=512 verdict=evict
+  prompt 786707 tokens needs ~25866MB, ~19032MB available + ~10294MB reclaimable
+    hot cache (of ~24826MB resident) — admitting, the prefill will evict
+  [hot-cache] reused 786676/786707 tokens (matched 786695; entry 2/2)
+  [hot-cache] evicted 1 entries (9397 MB live, 10294 MB billed) to admit a 786707-token prefill
+[scheduler] prefill refused: 786707 tokens do not fit even with an empty hot cache
+  prompt 786707 tokens needs ~25866MB at prefill chunk 512 …, ~19320MB available
+    after evicting ~14531MB of hot cache — refused before prefill
+```
+
+It restored its own 786,676-token entry from RAM, destroyed the OTHER session's
+523,887-token entry on the way, and was then refused anyway. The same request
+served on `5c4b4bc`, so it read as a fix-round regression — and it is not. No
+commit in `5c4b4bc..4d180d1` touched the bill: `prefillMemoryNeeded`,
+`prefillRequestTerms`, `reservedCacheTokens`, `statePerTokenBilled` and
+`qsaMaskBytes` are byte-identical across the range. What changed was the
+machine's slack. The blindness is older than the fix round; the fix round only
+took away the room it had been hiding in.
+
+**The term.** `prefillMemoryNeeded` bills `seq * kv_per_tok` and
+`prefillRequestTerms` bills `reserved * statePerTokenBilled` — the whole
+prompt's KV and the whole prompt's QSA indexer history, unconditionally. A RAM
+hot-cache restore rebinds the entry's MLX handles by REFCOUNT: those rows are
+already inside `mlx_get_active_memory`, so the `available` the bill is compared
+against is already net of them. Billing them again is a second copy nobody
+allocates. At 786,707 tokens on qwen4_exp at 8-bit that is 786,676 x (13,056 +
+3,840) = 13.3 GB of the 25.9 GB bill — against 19.0 GB free.
+
+The existing rule ("`active_mem` already holds the resident entry, so the
+prefill guard must never ADD it again") had only ever been read as a
+prohibition on adding a term. The other half — that the terms already there
+describe rows the request will not allocate — was never written down.
+
+**Why it is not a subtraction.** The credit is gated on CAPACITY, not on the
+match. Past the restored buffer's capacity `KVCache.nextCapacityReserved`
+allocates the whole new capacity beside the old one (`growQuantBuf`
+slice_updates the old into the new and both live until the eval) — and the old
+one belongs to the hot entry, which eviction PROTECTS, so it does not go away.
+A chain extension that outgrows its entry therefore really does have to find a
+full fresh buffer, and must be credited nothing. `WarmPrefix.creditedRows` is
+all-or-nothing on `reserved <= capacity_tokens` for exactly that reason:
+
+* 786,707 over a 786,676-row entry: `reserved` 787,419 <= capacity 787,456 —
+  no grow, full credit, bill 26.6 GB -> 10.8 GB, ADMITTED with no eviction.
+* 1,047,556 over the same entry: `reserved` 1,048,268 > 787,456 — a grow, no
+  credit, bill unchanged. That request is refused by MARGIN (33.2 GB billed
+  against 31.7 GB free; the terms sum to ~27.9 GB before the estimator's 5/4),
+  which is a separate question from this one.
+
+**Two threads, one subtraction.** The credit leaves the bill through exactly
+ONE door — `PrefillRequestTerms.shared_resident_bytes`, assigned in one place
+and subtracted in one place, scan-pinned — because the other failure mode of
+this rule is crediting the same prefix twice: once out of `needed` and once as
+reclaimable hot cache. `HotPrefixCache.reclaimableBytesFor` already withholds
+the matched entry (eviction refuses to take it), and that withholding is what
+the connection thread's `pinnedResidentBytes` reads.
+
+The connection thread does not price the credit at all. It has no slot, no
+cache and no capacity reading, and a published `EntryDigest` fingerprints only
+the first `DIGEST_PREFIX_TOKENS` ids — so it cannot know how much of a matching
+entry a prompt actually shares, and guessing is the OVER-credit direction,
+which ends in an uncatchable Metal abort rather than a 400. Instead it defers:
+when `pinnedResidentBytes(bill) > 0` the guard admits and says so, and the
+inference thread — which holds the real cache and `KVCache.residentCapacityTokens()`
+— bills the warm request and still refuses by NAME if it does not fit. A gate
+that runs BEFORE the estimator that knows better IS the estimator (#126); the
+honest form of that rule here is not to decide.
+
+The 1M rung had been naming the defect in its own refusal text: "of which ~0MB
+can be reclaimed (the entry a restore would share is not evictable)" — the
+guard reporting that the bytes it was billing were bytes it had also proved
+nobody was going to hand back.
+
+Tests: the two live-numbered bills (786,707 @ 19,032 MB admits at ~10.8 GB;
+1,047,556 over the same entry is credited nothing until its buffer covers the
+reservation), the exactly-once scan across both files, and `pinnedResidentBytes`
+at the live 24,826/10,294 MB reading.
+
+### Follow-ups the 1M rung is still waiting on
+
+The 1,047,556-token chain extension above is refused by MARGIN, not by this
+defect. The terms sum to ~27.9 GB against 31,717 MB free; the estimator's 5/4
+takes the bill to 33.2 GB (the log's own number, 32,953 MB). Two levers were
+costed and DECLINED for the change that fixed the warm bill, because shaving a
+margin on a path where a real OOM is uncatchable is not a trade a warm-bill fix
+gets to make:
+
+* **(B) one copy of `state_bytes` while the QSA capacity buffer is being
+  reallocated.** `statePerTokenBilled` bills two — the live history plus the
+  copy `attachQsaHistoryToLatest` materializes at the end of the prefill. On a
+  GROW the old history belongs to the protected hot entry and is already in
+  `active_mem`, so the pair that actually coexists may be one new buffer plus
+  the attach, not two new ones. Worth ~4 GB at 1M. Needs the attach's lifetimes
+  checked against the grow's, not assumed.
+* **(C) exempt exactly-known buffer sizes from the 5/4.** The margin exists for
+  transients whose peak is estimated; a reserved KV buffer's size is arithmetic,
+  not an estimate. Worth ~1.5 GB at 1M — probably not enough on its own.
+
+Note also that the QSA-history bill fix landing beside this one takes 2,304 MiB
+off the 1M bill directly (33.2 GB -> ~30.2 GB against 31,717 MB free), so the
+rung may admit without either lever. The re-judge is what decides that, not this
+arithmetic.
+
+One seam between the two changes, since they touch the same terms: the credit
+here is `credited *| (kv_per_tok +| config.qsaHistoryBytesPerToken())` — ONE
+copy of the history, spelled with the per-token helper and deliberately NOT with
+`statePerTokenBilled`. A change to how many copies the bill charges therefore
+does not have to be mirrored in the credit: the credit is what a restore SHARES,
+which is one live history whatever the bill's multiplier is.
