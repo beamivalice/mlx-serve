@@ -3835,6 +3835,12 @@ pub fn warmQsaEnvCaches() void {
     _ = qsaAttnMinS();
     _ = qsaAttnBk();
     _ = qsaAttnBalanced();
+    // The one QSA env cache with two PROVEN readers on two threads: the
+    // inference thread through `qsaSelectBlocks` -> `qsaScoreRowsPerChunk`,
+    // and the HTTP/admission thread through `server.prefillNeededAtChunk` ->
+    // `qsaMaskBytes` -> `qsaPrefillTransientBytes`. Both `?u64` cache and
+    // `bool` log flag are non-atomic, so first touch had to stop being a race.
+    _ = qsaScoreSheetBudget();
 }
 
 /// `qsaSelectKernelEnabled` consults an override first, so warming it through
@@ -39862,7 +39868,7 @@ test "qsa sparse attn: the split-K merge is invariant in the split count (1, 8, 
 }
 
 test "scan: every lazily-cached QSA env read is warmed from main, not raced into" {
-    // L20. These caches are `?bool`/`?c_int` filled on FIRST TOUCH, and first
+    // L20. These caches are optionals filled on FIRST TOUCH, and first
     // touch happens on whichever thread asks first — the HTTP thread parsing a
     // request, or the inference thread inside a forward. A non-atomic optional
     // written from two threads is UB. They are process constants read from the
@@ -39873,16 +39879,26 @@ test "scan: every lazily-cached QSA env read is warmed from main, not raced into
     const body_end = std.mem.indexOfPos(u8, src, fn_start, "\n}\n").?;
     const body = src[fn_start..body_end];
 
-    // Every `var qsa_*: ?bool` / `?c_int` in the file is an env cache (kernel
-    // handles are `?mlx.mlx_fast_metal_kernel`, config caches are structs).
+    // Any `var qsa_*_cached` / `qsa_*_env` optional is an env cache, WHATEVER
+    // its payload. Keying on `?bool`/`?c_int` was the hole: the sheet budget
+    // caches a `?u64` and was the only one with two proven threads reading it,
+    // so the guard could not see the one variable that was genuinely raced.
     var declared: usize = 0;
     var it = std.mem.tokenizeScalar(u8, src, '\n');
     while (it.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " ");
         if (!std.mem.startsWith(u8, trimmed, "var qsa_")) continue;
-        const is_bool = std.mem.indexOf(u8, trimmed, ": ?bool") != null;
-        const is_int = std.mem.indexOf(u8, trimmed, ": ?c_int") != null;
-        if (!is_bool and !is_int) continue;
+        const name_end = std.mem.indexOf(u8, trimmed, ":") orelse continue;
+        const name = trimmed["var ".len..name_end];
+        const is_cache = std.mem.endsWith(u8, name, "_cached") or std.mem.endsWith(u8, name, "_env");
+        if (!is_cache) continue;
+        // Only OPTIONALS are filled on first touch; a plain bool/usize is
+        // either a one-shot flag or a counter, neither of which reads the env.
+        if (std.mem.indexOf(u8, trimmed[name_end..], ": ?") == null) continue;
+        // Compiled kernel handles are cached the same way and named the same
+        // way, but they are built, not read from the environment, and the
+        // inference thread is their only toucher.
+        if (std.mem.indexOf(u8, trimmed[name_end..], "mlx_fast_metal_kernel") != null) continue;
         // Overrides are set by tests, never read from the environment.
         if (std.mem.indexOf(u8, trimmed, "_override") != null) continue;
         declared += 1;
