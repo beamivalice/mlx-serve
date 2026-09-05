@@ -4646,6 +4646,18 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
         // The qwen4_exp in-checkpoint head also commits its QSA half — its KV
         // alone is not a restorable history (`MtpCacheRef.head`).
         const head = mc.head();
+        // Its row count IS its cache's step (`Transformer.qwen4MtpAdvance`;
+        // the head's layer index is not 0, so `KVCache.update` never advances
+        // it and `truncate` early-returns at an untrimmed tail). A snapshot
+        // whose step disagrees carries a key history the restore can only
+        // decline or silently skip — refuse to commit it, and say why.
+        if (head) |t| {
+            const hm = &t.qwen4_mtp.?;
+            if (hm.cache.step != hm.seq_offset) {
+                log.warn("[hot-cache] mtp head step gap (cache.step={d}, history={d} rows) — head history not committed\n", .{ hm.cache.step, hm.seq_offset });
+                break :blk null;
+            }
+        }
         break :blk .{
             .cache = mc.kv() orelse break :blk null,
             .base_pos = gen_ptr.mtp_position_base,

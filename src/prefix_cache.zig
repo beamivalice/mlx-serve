@@ -344,7 +344,13 @@ pub const HotPrefixCache = struct {
         const t = target orelse return null;
         const snap = snap_opt orelse return null;
         const want = switch (specAdoptPlan(snap.base_pos, snap.snapshot.step, matched, t.head != null, snap.head_aux != null)) {
-            .skip => return null,
+            .skip => {
+                // A blind head is never silent: name the two numbers that
+                // failed to line up (a snap that starts past the reuse, or
+                // ends before it).
+                log.info("  [hot-cache] {s} not adopted: want {d} tokens from base {d}, snap holds {d} (matched {d})\n", .{ what, matched -| snap.base_pos, snap.base_pos, snap.snapshot.step, matched });
+                return null;
+            },
             .decline_head_no_history => {
                 log.info("  [qwen4] MTP head restore declined (snapshot carries no QSA history) — head starts blind\n", .{});
                 return null;
@@ -2107,24 +2113,42 @@ test "prefix cache: MTP committed history round-trips, clamped; a history ending
     try testing.expectEqual(@as(usize, 7), base2); // untouched
 }
 
+fn testWriteCacheLayer(cache: *KVCache, s: mlx.mlx_stream, layer: u32, written: u32, step: u32) !void {
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    const count: f64 = @floatFromInt(step * 8);
+    const base: f64 = @floatFromInt(written * 8 + layer * 1_000_000);
+    try mlx.check(mlx.mlx_arange(&flat, base, base + count, 1.0, .float32, s));
+    var k = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(k);
+    const shape = [_]c_int{ 1, 1, @intCast(step), 8 };
+    try mlx.check(mlx.mlx_reshape(&k, flat, &shape, 4, s));
+    var view = try cache.update(layer, k, k, s, 0);
+    view.deinit();
+}
+
 fn testFillCache(cache: *KVCache, s: mlx.mlx_stream, n_layers: u32, tokens: u32) !void {
     var written: u32 = 0;
     while (written < tokens) {
         const step: u32 = @min(64, tokens - written);
         var li: u32 = 0;
-        while (li < n_layers) : (li += 1) {
-            var flat = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(flat);
-            const count: f64 = @floatFromInt(step * 8);
-            const base: f64 = @floatFromInt(written * 8 + li * 1_000_000);
-            try mlx.check(mlx.mlx_arange(&flat, base, base + count, 1.0, .float32, s));
-            var k = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(k);
-            const shape = [_]c_int{ 1, 1, @intCast(step), 8 };
-            try mlx.check(mlx.mlx_reshape(&k, flat, &shape, 4, s));
-            var view = try cache.update(li, k, k, s, 0);
-            view.deinit();
-        }
+        while (li < n_layers) : (li += 1) try testWriteCacheLayer(cache, s, li, written, step);
+        written += step;
+    }
+}
+
+/// Fill a HEAD-shaped cache: ONE layer at `layer` — the qwen4_exp MTP head's
+/// single layer sits at `num_hidden_layers`, never 0 — driven through the
+/// head's own row-count bookkeeping (`Transformer.qwen4MtpAdvance`) exactly
+/// as `qwen4MtpForward` drives it. A head fixture that fills at layer 0 gets
+/// `step` for free from `KVCache.update` (which advances it ONLY there), so
+/// it cannot see a head step bug at all.
+fn testFillHeadCache(cache: *KVCache, s: mlx.mlx_stream, layer: u32, tokens: u32, seq_offset: *usize) !void {
+    var written: u32 = 0;
+    while (written < tokens) {
+        const step: u32 = @min(64, tokens - written);
+        try testWriteCacheLayer(cache, s, layer, written, step);
+        transformer_mod.Transformer.qwen4MtpAdvance(cache, seq_offset, @intCast(step));
         written += step;
     }
 }
@@ -3532,14 +3556,54 @@ test "spec adopt: a qwen4 head target declines a payload with no QSA half; KV-on
     try testing.expectEqual(Tag.skip, Plan.tag(specAdoptPlan(0, 20, 31, true, false)));
 }
 
+test "qwen4 MTP head persist: the head's row count IS its cache step, so a committed history adopts" {
+    // The head forwards its one layer at index `num_hidden_layers`, and
+    // `KVCache.update` advances `step` ONLY at layer 0 — so nothing the head's
+    // forward does moves its cache's step. `qwen4MtpAdvance` is what sets it,
+    // and every downstream decision reads it: the commit snapshots `step`, and
+    // `qwen4MtpAdopt` demands the QSA key history be EXACTLY that long
+    // (`MtpHeadQsaHistoryGap`) after `specAdoptPlan` has already refused any
+    // snap shorter than the reuse (a silent `.skip`).
+    const s = mlx.gpuStream();
+    const head_layer: u32 = 3; // stands in for `num_hidden_layers`
+    var kv = try KVCache.init(testing.allocator, head_layer + 1);
+    defer kv.deinit();
+    var seq_offset: usize = 0;
+    try testFillHeadCache(&kv, s, head_layer, 100, &seq_offset);
+    try testing.expectEqual(@as(usize, 100), seq_offset);
+    try testing.expectEqual(seq_offset, kv.step);
+
+    // What the commit ships: the KV snapshot's step beside a QSA key history
+    // as long as the rows the head actually appended.
+    var snap = DflashSnap{ .snapshot = try kv.snapshot(), .base_pos = 0 };
+    defer snap.deinit();
+    try testing.expectEqual(seq_offset, snap.snapshot.step);
+
+    const Tag = std.meta.Tag(SpecAdopt);
+    const plan = specAdoptPlan(snap.base_pos, snap.snapshot.step, seq_offset, true, true);
+    try testing.expectEqual(Tag.head, std.meta.activeTag(plan));
+    try testing.expectEqual(seq_offset, plan.head);
+    // The equality `qwen4MtpAdopt` enforces (aux rows == kv_snap.step).
+    try testing.expectEqual(@as(usize, 100), snap.snapshot.step);
+
+    // And the shape the bug had: the SAME 100-row history carrying the step
+    // `KVCache.update` left behind at a non-zero layer is not adoptable at any
+    // length — the head starts blind on a full hot-cache hit, silently.
+    try testing.expectEqual(Tag.skip, std.meta.activeTag(specAdoptPlan(0, 0, seq_offset, true, true)));
+}
+
 test "spec snap bytes: the qwen4 head's QSA half is billed into the entry" {
     // A 62.7k-token index-key history is tens of MB of resident state. A
     // budget that counted only the head's KV would evict against a number
     // that is not the entry's size.
     const s = mlx.gpuStream();
-    var kv = try KVCache.init(testing.allocator, 1);
+    // Head-shaped: one layer at the head's own index, never layer 0.
+    const head_layer: u32 = 3;
+    var kv = try KVCache.init(testing.allocator, head_layer + 1);
     defer kv.deinit();
-    try testFillCache(&kv, s, 1, 16);
+    var head_rows: usize = 0;
+    try testFillHeadCache(&kv, s, head_layer, 16, &head_rows);
+    try testing.expectEqual(head_rows, kv.step);
     var snap = DflashSnap{ .snapshot = try kv.snapshot(), .base_pos = 0 };
     defer snap.deinit();
     const kv_only = HotPrefixCache.specSnapBytes(&snap);

@@ -15817,6 +15817,11 @@ pub const Transformer = struct {
         want: usize,
     ) !void {
         const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
+        // The head's own row count IS its cache's step (`qwen4MtpAdvance` —
+        // its layer index is not 0, so `update` never advances it). A live
+        // head that disagrees means the bookkeeping regressed, and adopting
+        // onto it would hide that behind a blind-head log line.
+        if (m.cache.step != m.seq_offset) return error.MtpHeadStepGap;
         // The raw index-key history is the authority every new key is
         // appended against, so a history that is not EXACTLY as long as the
         // KV it came with is not adoptable at any length.
@@ -15835,6 +15840,21 @@ pub const Transformer = struct {
         // from a position the trunk does not have.
         try self.qwen4MtpTruncate(want);
         if (m.seq_offset != want) return error.MtpHeadTrimGap;
+    }
+
+    /// Commit a forward's `seq_len` rows to the head's own bookkeeping.
+    ///
+    /// The head forwards its ONE layer at index `num_hidden_layers`, and
+    /// `KVCache.update` advances `self.step` ONLY at layer 0 — so nothing the
+    /// head's forward does moves its cache's step. The head's row count is the
+    /// authority and the cache is told it HERE. Without this line the head
+    /// ships a committed snapshot whose step is whatever the last `truncate`
+    /// left (0 on a turn that ends with no draft tail to trim) beside a QSA
+    /// key history hundreds of rows long, and every restore either declines
+    /// (`MtpHeadQsaHistoryGap`) or silently skips it (`specAdoptPlan`).
+    pub fn qwen4MtpAdvance(cache: *KVCache, seq_offset: *usize, seq_len: c_int) void {
+        seq_offset.* += @intCast(seq_len);
+        cache.step = seq_offset.*;
     }
 
     /// `mrope_ctx` (image turns): the head's rows sit at ABSOLUTE positions
@@ -15907,7 +15927,7 @@ pub const Transformer = struct {
         };
         defer _ = mlx.mlx_array_free(mlp_out);
         h = try self.hcWrite(h, mlp_out, pre2.inj, batch, seq_len);
-        m.seq_offset += @intCast(seq_len);
+        qwen4MtpAdvance(&m.cache, &m.seq_offset, seq_len);
 
         // History append wants the stream and nothing else: the mixer read and
         // the vocab-wide projection are pure, so skipping them is free.
