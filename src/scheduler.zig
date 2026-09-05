@@ -323,7 +323,19 @@ pub var prefill_chunk_adapt: ?*const fn (
     u32,
     u32,
     *generate_mod.AdaptiveWidthState,
+    u64,
 ) u32 = null;
+
+/// S17's twin: re-price a WIDEN after the interleave tick
+/// (`server.adaptivePrefillWidenStillFits`). Null declines every widen, which
+/// is the safe default for a host with no estimator installed.
+pub var prefill_chunk_widen_ok: ?*const fn (
+    *const model_mod.ModelConfig,
+    u64,
+    usize,
+    u32,
+    u64,
+) bool = null;
 
 /// Twin of the above for the REFUSAL: logs the numbers the estimator
 /// compared, from the module that owns them. A refusal quotes the number it
@@ -5391,7 +5403,27 @@ fn writeThroughArmed(slot: *Slot) bool {
 const ChunkWidthCtx = struct {
     cfg: ?*const model_mod.ModelConfig,
     kv_bits: u64,
+    /// This slot's own prefix cache — per-`LoadedModel`, the same handle the
+    /// write-through uses, never `sch.hot_prefix_cache` (a multi-model
+    /// registry makes those different caches). Only used for
+    /// `stagedHostBytes`, which is documented INFERENCE-THREAD-ONLY and is
+    /// read here from inside the prefill loop, on that thread. (audit S11)
+    hc: ?*prefix_cache_mod.HotPrefixCache,
 };
+
+/// Host bytes the SSD writer is holding for this slot right now. Zero without
+/// a cache, without a disk tier, or without an armed writer.
+fn chunkWidthStagedBytes(wc: *ChunkWidthCtx) u64 {
+    const hc = wc.hc orelse return 0;
+    return hc.stagedHostBytes();
+}
+
+fn chunkWidenConfirmCb(opaque_ctx: *anyopaque, pos: usize, want: u32) bool {
+    const wc: *ChunkWidthCtx = @ptrCast(@alignCast(opaque_ctx));
+    const cfg = wc.cfg orelse return false;
+    const ok = prefill_chunk_widen_ok orelse return false;
+    return ok(cfg, wc.kv_bits, pos, want, chunkWidthStagedBytes(wc));
+}
 
 fn chunkWidthCb(
     opaque_ctx: *anyopaque,
@@ -5403,7 +5435,7 @@ fn chunkWidthCb(
     const wc: *ChunkWidthCtx = @ptrCast(@alignCast(opaque_ctx));
     const cfg = wc.cfg orelse return cur;
     const pick = prefill_chunk_adapt orelse return cur;
-    return pick(cfg, wc.kv_bits, pos, cur, cap, st);
+    return pick(cfg, wc.kv_bits, pos, cur, cap, st, chunkWidthStagedBytes(wc));
 }
 
 fn interleaveDecodeTickCb(opaque_ctx: *anyopaque) void {
@@ -5761,6 +5793,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     var width_ctx = ChunkWidthCtx{
         .cfg = slot.model.config,
         .kv_bits = if (slot.cache.config.scheme == .off) 16 else slot.cache.config.bits,
+        .hc = if (slot.model.prefix_cache) |*p| p else null,
     };
 
     // Ownership of the restored spec caches transfers AT THE CALL:
@@ -5850,7 +5883,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             else
                 null,
             .chunk_width_hook = if (prefill_chunk_adapt != null)
-                .{ .ctx = &width_ctx, .call = chunkWidthCb }
+                .{ .ctx = &width_ctx, .call = chunkWidthCb, .confirm = chunkWidenConfirmCb }
             else
                 null,
             // Init's argmax-only gate must see logprobs BEFORE the split-
