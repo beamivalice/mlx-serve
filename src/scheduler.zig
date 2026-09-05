@@ -5235,6 +5235,56 @@ const InterleaveCtx = struct {
     ticks: u32 = 0,
 };
 
+/// SSD-first mechanism 3: persist each completed prefill chunk as the prefill
+/// produces it. The token record for the chunk-aligned prefix is a genuine
+/// prefix of this turn's prompt, so `appendCommit` recognises the next call as
+/// an EXTEND of the same entry and rewrites nothing: chunks [0, kv_len/chunk)
+/// stay exactly as written. A cancelled or killed prefill therefore leaves a
+/// restorable chunk-aligned prefix, and the end-of-request flush is the tail.
+///
+/// Armed only when the model is SSD-first AND the background writer is up, so
+/// the inference thread pays the readback and never the file write.
+fn prefillWriteThroughCb(opaque_ctx: *anyopaque, abs_kv_pos: usize, cps: []const transformer_mod.SSMCheckpoint) void {
+    const wc: *WriteThroughCtx = @ptrCast(@alignCast(opaque_ctx));
+    const slot = wc.slot;
+    const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return;
+    if (!hc.ssd_first) return;
+    const d = if (hc.disk) |*dd| dd else return;
+    if (d.writer == null) return;
+    // Vision entries never spill (the placeholder rows make a token-only key
+    // ambiguous), and a position past the prompt is not a prompt prefix.
+    if (slot.vision_key != 0) return;
+    if (abs_kv_pos == 0 or abs_kv_pos > slot.full_prompt.len) return;
+    const s = if (slot.model.transformer) |x| x.s else return;
+    wc.chunks += 1;
+    _ = d.appendCommit(
+        slot.cache.entries,
+        abs_kv_pos,
+        slot.cache.config,
+        slot.full_prompt[0..abs_kv_pos],
+        slot.has_tools,
+        if (cps.len > 0) cps else null,
+        s,
+    ) catch |err| {
+        log.warn("  [disk-cache] prefill write-through failed: {s}\n", .{@errorName(err)});
+    };
+}
+
+const WriteThroughCtx = struct {
+    slot: *Slot,
+    chunks: u32 = 0,
+};
+
+/// The ONE gate for mechanism 3: SSD-first arch predicate + a live background
+/// writer (so the chunk write never runs on the inference thread) + a disk
+/// tier to write into. Pure over the slot so it can be unit-tested.
+fn writeThroughArmed(slot: *Slot) bool {
+    const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return false;
+    if (!hc.ssd_first) return false;
+    const d = if (hc.disk) |*dd| dd else return false;
+    return d.writer != null and slot.vision_key == 0;
+}
+
 fn interleaveDecodeTickCb(opaque_ctx: *anyopaque) void {
     const ic: *InterleaveCtx = @ptrCast(@alignCast(opaque_ctx));
     if (ic.ticks == 0) {
@@ -5570,6 +5620,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // streams between this prefill's chunks. Ticks hosted here are billed
     // out of prefill_ns below (the decoding slots got the time).
     var interleave_ctx = InterleaveCtx{ .sch = sch };
+    var write_through_ctx = WriteThroughCtx{ .slot = slot };
 
     // Ownership of the restored spec caches transfers AT THE CALL:
     // initWithOptions adopts them and frees them via its own errdefers on
@@ -5650,6 +5701,11 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .prefill_progress = if (observe) &sch.inflight_prefill_tokens else null,
             .interleave_hook = if (prefillInterleaveEnabled())
                 .{ .ctx = &interleave_ctx, .call = interleaveDecodeTickCb }
+            else
+                null,
+            // Mechanism 3, SSD-first only.
+            .write_through_hook = if (writeThroughArmed(slot))
+                .{ .ctx = &write_through_ctx, .call = prefillWriteThroughCb }
             else
                 null,
             // Init's argmax-only gate must see logprobs BEFORE the split-
@@ -7320,4 +7376,36 @@ test "the qwen4 coarse rerank head is built at LOAD, on both load paths" {
     const boot = std.mem.indexOf(u8, source, "doLoadOnInferenceThread(sch, params)") orelse return error.MissingBootLoad;
     const cold = std.mem.indexOf(u8, source, "doLoadOnInferenceThread(sch, req)") orelse return error.MissingColdLoad;
     try testing.expect(boot != cold);
+}
+
+test "SSD-first behaviour is gated on ONE arch predicate at one place per mechanism" {
+    // Low-blast-radius bar. Every SSD-first mechanism must key on
+    // `HotPrefixCache.ssd_first`, and that field must be set from exactly one
+    // place, from `ModelConfig.ssdFirstCapable()` AND the env switch. If a
+    // second arming site appears, a non-qwen4_exp arch can silently take a new
+    // path.
+    // Scan the CODE, not this test's own literals.
+    const whole = @embedFile("scheduler.zig");
+    const source = whole[0 .. std.mem.indexOf(u8, whole, "test \"SSD-first behaviour is gated") orelse whole.len];
+    try testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, source, "prefix_cache.?.ssd_first = params.config.ssdFirstCapable() and"),
+    );
+    try testing.expect(std.mem.indexOf(u8, source, "prefix_cache_mod.ssdFirstEnabled()") != null);
+
+    // Mechanism 3 is wired only behind `writeThroughArmed`, which itself
+    // demands ssd_first + a live background writer.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, ".write_through_hook = if (writeThroughArmed(slot))"));
+    const gs = std.mem.indexOf(u8, source, "fn writeThroughArmed(slot: *Slot) bool {") orelse
+        return error.MissingWriteThroughGate;
+    const ge = std.mem.indexOfPos(u8, source, gs, "\n}\n") orelse return error.MissingWriteThroughGateEnd;
+    const gate = source[gs..ge];
+    try testing.expect(std.mem.indexOf(u8, gate, "if (!hc.ssd_first) return false;") != null);
+    try testing.expect(std.mem.indexOf(u8, gate, "d.writer != null") != null);
+    // The callback re-checks both (it outlives the arming decision).
+    const cs = std.mem.indexOf(u8, source, "fn prefillWriteThroughCb(") orelse return error.MissingWriteThroughCb;
+    const ce = std.mem.indexOfPos(u8, source, cs, "\n}\n") orelse return error.MissingWriteThroughCbEnd;
+    const cb = source[cs..ce];
+    try testing.expect(std.mem.indexOf(u8, cb, "if (!hc.ssd_first) return;") != null);
+    try testing.expect(std.mem.indexOf(u8, cb, "if (d.writer == null) return;") != null);
 }

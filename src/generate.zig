@@ -1818,11 +1818,25 @@ pub const Generator = struct {
         /// runs atomically (pre-interleave behavior, and the
         /// MLX_SERVE_PREFILL_INTERLEAVE=0 kill switch).
         interleave_hook: ?InterleaveHook = null,
+        /// SSD-first mechanism 3 (qwen4_exp only; see `WriteThroughHook`).
+        write_through_hook: ?WriteThroughHook = null,
     };
 
     pub const InterleaveHook = struct {
         ctx: *anyopaque,
         call: *const fn (ctx: *anyopaque) void,
+    };
+
+    /// SSD-first mechanism 3: called at every completed prefill chunk with the
+    /// ABSOLUTE KV position now forwarded and the SSM checkpoints captured so
+    /// far. The bytes of a chunk are final once it is evaluated, so persisting
+    /// them here — rather than at end of request — means a cancelled or
+    /// killed prefill still leaves a chunk-aligned restorable prefix, and the
+    /// end-of-request flush is only the tail. Null on every arch but the one
+    /// the scheduler arms.
+    pub const WriteThroughHook = struct {
+        ctx: *anyopaque,
+        call: *const fn (ctx: *anyopaque, abs_kv_pos: usize, cps: []const SSMCheckpoint) void,
     };
 
     /// Selects the source slice that `initWithOptions` will dupe into
@@ -2381,6 +2395,14 @@ pub const Generator = struct {
                 // Publish progress once per chunk — same cadence discipline as
                 // `inflight_generated_tokens` (once per decode tick), never per token.
                 if (options.prefill_progress) |p| p.store(@intCast(pos), .monotonic);
+                // Mechanism 3: persist this chunk now. The KV bytes for
+                // [0, pos) are final (the eval above materialized them), so
+                // the SSD tier can index a chunk-aligned prefix that survives
+                // a cancel or a kill. Serialization is bounded (one chunk);
+                // the file write is off-thread.
+                if (options.write_through_hook) |wt| {
+                    wt.call(wt.ctx, pos + ssm_cp_offset, ssm_checkpoints.items);
+                }
                 // Yield to the scheduler between chunks — never after the
                 // last (the post-prefill decode tick covers that boundary).
                 if (pos < loop_end) {

@@ -154,22 +154,33 @@ pub const Writer = struct {
         }
     }
 
-    /// Epoch fence: everything staged before this call is discarded rather
-    /// than written. Drains first so nothing lands in a directory the caller
-    /// is about to remove.
-    pub fn fence(self: *Writer) void {
+    /// Epoch fence: staged bytes for `path_prefix` (null = EVERYTHING) are
+    /// discarded rather than written, and anything already in the writer's
+    /// hands is waited out — so the caller can remove the directory those
+    /// bytes were headed for without the writer re-creating it.
+    ///
+    /// The prefix form is load-bearing: an `appendCommit` that evicts an LRU
+    /// entry must not throw away the bytes it just staged for the entry it is
+    /// writing. Only the doomed directory's blobs go.
+    pub fn fence(self: *Writer, path_prefix: ?[]const u8) void {
         self.mutex.lockUncancelable(self.io);
-        self.epoch += 1;
-        for (self.queue.items) |*b| {
+        if (path_prefix == null) self.epoch += 1;
+        var i: usize = 0;
+        while (i < self.queue.items.len) {
+            const b = &self.queue.items[i];
+            const doomed = if (path_prefix) |pre| std.mem.startsWith(u8, b.path, pre) else true;
+            if (!doomed) {
+                i += 1;
+                continue;
+            }
             self.pending_bytes -|= b.bytes.len;
-            self.freeBlob(b);
+            var owned = self.queue.orderedRemove(i);
+            self.freeBlob(&owned);
             self.files_dropped += 1;
         }
-        self.queue.clearRetainingCapacity();
         self.done.broadcast(self.io);
-        // A blob already in the writer's hands carries the OLD epoch; it is
-        // discarded at the write check. Wait for it so the caller's rmdir is
-        // safe.
+        // A blob already in the writer's hands is waited out (a full fence also
+        // discards it via the epoch check) so the caller's rmdir is safe.
         while (self.running and self.inflight_bytes > 0) self.done.waitUncancelable(self.io, &self.mutex);
         self.mutex.unlock(self.io);
     }
@@ -327,7 +338,7 @@ test "kv_disk_writer: the epoch fence drops staged bytes instead of writing them
 
     try w.start();
     defer w.deinit();
-    w.fence();
+    w.fence(null);
     const after_fence = w.epoch;
     try testing.expect(after_fence > 1);
     try testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "never.bin", .{}));

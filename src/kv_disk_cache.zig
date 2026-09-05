@@ -1684,7 +1684,9 @@ pub const DiskTier = struct {
         // directory about to disappear are discarded, and anything already in
         // the writer's hands is waited out — otherwise a background write
         // re-creates the tree we just deleted.
-        if (self.writer) |w| w.fence();
+        const dir_abs = std.fmt.allocPrint(self.allocator, "{s}/e{d}/", .{ self.root, id }) catch null;
+        defer if (dir_abs) |da| self.allocator.free(da);
+        if (self.writer) |w| w.fence(dir_abs);
         const rel = std.fmt.allocPrint(self.allocator, "e{d}", .{id}) catch return;
         defer self.allocator.free(rel);
         var root_dir = std.Io.Dir.openDirAbsolute(self.io, self.root, .{ .iterate = true }) catch return;
@@ -3459,4 +3461,76 @@ test "DiskTier: SSD-first stages the flush off-thread and indexes LAST" {
             );
         }
     }
+}
+
+test "DiskTier: SSD-first write-through extends without rewriting a persisted chunk" {
+    // Mechanism 3: the prefill hands the tier each completed chunk as a
+    // chunk-aligned PREFIX of this turn's prompt. Two bars:
+    //  * a killed prefill leaves a restorable chunk-aligned prefix — after the
+    //    second write-through the entry is indexed at 256 and restores;
+    //  * a persisted chunk is never rewritten — the third call stages only the
+    //    new chunk (plus the index), so a 1M session writes each chunk once.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-ssd-wt", 0, 128);
+    defer tier.deinit();
+    tier.ssd_first = true;
+    tier.enableBackgroundWriter();
+
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    var tokens: [768]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    // Chunk boundary 1: positions [0, 640) forwarded (5 chunks of 128).
+    try fillCache(&cache, s, 2, 640, 8, 0.0, .float32);
+    var src640 = buildHybridEntries(s, 11.0, 22.0);
+    defer freeHybridEntries(&src640);
+    var cps640 = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src640, 640, s),
+    };
+    defer for (&cps640) |*cp| cp.deinit(testing.allocator);
+    _ = try tier.appendCommit(cache.entries, 640, cache.config, tokens[0..640], false, &cps640, s);
+    tier.drainWriter();
+    try testing.expectEqual(@as(usize, 1), tier.entryCount());
+    try testing.expectEqual(@as(u32, 640), tier.entries.items[0].kv_len);
+    // The prefix is already restorable — this is what survives a kill -9
+    // mid-prefill.
+    {
+        var c2 = try KVCache.init(testing.allocator, 2);
+        defer c2.deinit();
+        var dst: [3]SSMCacheEntry = .{
+            .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+            .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+            .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        };
+        defer freeHybridEntries(&dst);
+        try testing.expectEqual(@as(u32, 640), try tier.restoreIntoHybrid(&c2, &dst, 0, 640, s));
+    }
+    tier.drainWriter(); // the restore re-indexes for LRU
+    const written_after_first = tier.writer.?.filesWritten();
+
+    // Chunk boundary 2: the prefill continues to 768. Only chunk 5 is new.
+    try fillCache(&cache, s, 2, 128, 8, 640.0, .float32);
+    tier.writer.?.setPaused(true);
+    _ = try tier.appendCommit(cache.entries, 768, cache.config, tokens[0..768], false, &cps640, s);
+    var staged = std.ArrayList([]const u8).empty;
+    defer staged.deinit(testing.allocator);
+    try tier.writer.?.stagedPaths(&staged, testing.allocator);
+    for (staged.items) |p| {
+        // c000000..c000004 are already on disk and must NOT be restaged.
+        try testing.expect(std.mem.indexOf(u8, p, "/c000000.") == null);
+        try testing.expect(std.mem.indexOf(u8, p, "/c000004.") == null);
+    }
+    try testing.expect(staged.items.len <= 2); // the new chunk + meta.json
+    tier.writer.?.setPaused(false);
+    tier.drainWriter();
+    try testing.expect(tier.writer.?.filesWritten() - written_after_first <= 2);
+    try testing.expectEqual(@as(usize, 1), tier.entryCount());
+    try testing.expectEqual(@as(u32, 768), tier.entries.items[0].kv_len);
 }
