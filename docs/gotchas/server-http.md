@@ -1894,3 +1894,131 @@ named **400** on all four surfaces, with the compared byte counts logged
 budget)`. At 1M context the clamp reserves the whole context's KV, and an
 entry is billed at the QSA history's two copies — 11.3 GB for 524k tokens. The
 entry lands on the SSD tier instead; that is the cap working, not a defect.
+
+---
+
+## The chunk sizer read the cache ASK, so a smaller ask bought a smaller cache
+
+Two boots of the same 69 GB `qwen4_exp` pack on the same 137 GB Mac, same
+`--ctx-size 1048576 --kv-quant 8`, differing only in one flag:
+
+```
+--prefix-cache-mem 10GB  ->  [hot-cache] budget clamped 10240 -> 3873 MB
+--prefix-cache-mem 24GB  ->  [hot-cache] budget clamped 24576 -> 5703 MB
+```
+
+Asking for **less** got **less than half** the cache. Not noise — arithmetic,
+and reproducible.
+
+### The loop
+
+Both boots imply the same headroom: `ceiling - weights` = 28,909 MiB, and the
+1M context's KV is `(13,056 + 7,680) B/tok x 1,048,576` = 20,736 MiB. So both
+have 8,173 MiB to split between the prefill transient and the hot cache. What
+differed was the split, and the ask decided it:
+
+1. `pinPrefillChunk` passed the RAW requested budget into `resolvePrefillChunk`
+   as `hot_cache_reserve`. The rung bar is
+   `(ceiling - weights - hot_cache_reserve) / 4`.
+2. At a 10 GB ask that bar admitted rung **1024**, whose transient reserve is
+   ~4,300 MiB. At a 24 GB ask the bar dropped below every rung's reserve, so
+   the ladder bottomed out at **512** — reserve ~2,470 MiB.
+3. `prefixCacheMemForLoad` then billed *that* chunk's reserve back against the
+   *same* request: `min(ask, ceiling - weights - ctx_kv - reserve)`.
+   - 28,909 - 20,736 - 4,300 = **3,873**
+   - 28,909 - 20,736 - 2,470 = **5,703**
+
+A bigger ask stepped the chunk DOWN, which shrank the reserve, which left the
+cache MORE bytes. The ask was on both sides of the equation with opposite
+signs, so the composed function was not monotone in it — and the operator's
+lever pointed the wrong way over part of its range.
+
+### The fix is an ORDER, not a formula
+
+The clamp already subtracts the chunk's reserve from the cache's headroom.
+That makes the cache the **residual claimant**: it gets what the chunk leaves.
+Pre-charging the cache in the sizer and then charging the chunk to the cache in
+the clamp is the same bytes billed twice, in a circle. So the dependency runs
+one way now:
+
+- `resolvePrefillChunk` no longer takes the ask at all — the parameter is gone,
+  which is what makes the property structural rather than a comment. Its share
+  bar prices the whole post-weights serving budget.
+- `clampedPrefixCacheMem` then hands the cache the remainder.
+
+Monotonicity is now by construction: nothing before the clamp reads
+`requested`, and the clamp is `@min(requested, headroom)` over a headroom the
+ask cannot move. A fixpoint iteration (chunk -> clamp -> chunk until stable)
+would also have worked and was rejected as more machinery for the same answer.
+
+### Second bite: `requested == 0` used to feed the sizer a zero reserve
+
+The old code was accidentally *right* about one thing — with the ask in the
+bar, a big ask forced a narrow chunk, which left the cache something. Remove
+the ask and a wide rung can eat the whole remainder, and
+`clampedPrefixCacheMem`'s `@max(..., 1)` "never return 0" floor then hands the
+cache **one byte**: an enabled cache that cannot hold a single turn. The clamp
+cannot defend a budget the chunk has already spent, so the defence moved one
+step earlier, into the sizer, as a second ask-independent bar:
+
+```
+cap = min( serving / PREFILL_RESERVE_BUDGET_SHARE,
+           (serving - ctx_kv) - HOT_CACHE_FLOOR_BYTES )
+```
+
+`ctx_kv` here is `sizerCtxKvBytes` — the PINNED context's bill under an
+explicit `--ctx-size`, and **0** while the context is auto. Auto-context is
+derived FROM the chunk (`pinAutoContext` pins the chunk first, deliberately),
+so reading it here would be circular; and it does not need to be read, because
+`computeMemoryContext` subtracts the chunk's reserve itself and shrinks to fit
+whatever rung comes out. Both terms are ask-independent, so neither reopens the
+loop above.
+
+### Third bite: `--prefill-chunk` was honored by the forward and ignored by the bill
+
+`generate.effectivePrefillChunk` lets an explicit `--prefill-chunk` outrank the
+machine-sized pin. `pinPrefillChunk` did not — only its *log line* consulted
+`prefill_chunk_explicit`. So on the deployed flags (`--prefill-chunk 4096`) the
+clamp reserved a 512- or 1024-token transient for a forward that ran 4096: an
+under-reserve of several GB, in the one estimator whose entire job is to stop
+the cache from filling into an uncatchable Metal OOM. `explicitPrefillChunk()`
+mirrors the precedence and `billedPrefillChunk` is where both readers meet; the
+test calls *both* with an explicit chunk set and demands the same number.
+
+### Fourth bite: the clamped value went nowhere
+
+`prefixCacheMemForLoad`'s answer reached `initWithMem` and stopped there. The
+process-global `prefix_cache_mem_bytes` still held the raw ask, and
+`computeMemoryContext` and `aneGateHeadroom` both read it — so the auto-context
+sizer and the ANE admission gate went on reserving 24 GB for a cache that had
+been given 5.7. The clamp now publishes into `hot_cache_mem_resolved` and every
+post-load reserve reads `resolvedPrefixCacheMem()`. It is a SEPARATE global
+rather than an overwrite of the ask: the ask is the launch flag, and
+re-clamping an already-clamped value on the next model load would ratchet the
+budget toward 1 byte across a model swap. A line scan over `server.zig` pins
+that no code path reads the ask directly except the accessor's own fallback.
+
+The log line names what it billed, so the next report is one grep:
+
+```
+[hot-cache] budget clamped 24576 -> 5703 MB (chunk 512 reserve 2470 MB, ctx KV 20736 MB)
+```
+
+### Not fixed here
+
+The `ctx_kv` term itself double-counts: the clamp bills the FULL configured
+context against a budget the hot cache shares with the live KV, so at 1M
+context 20.7 GB is subtracted from the cache's headroom for KV that only exists
+once a request is that long. That is being removed arch-gated on the SSD-first
+branch. This fix makes the default sane with that bill still in place.
+
+### Rules this produced
+
+- A resolver whose output is billed back against its own input is a loop; check
+  monotonicity in the input before believing the output.
+- A knob that is read on both sides of a bill with opposite signs is not a
+  knob. Give the residual claimant the remainder instead of pre-charging it.
+- A precedence rule (`--prefill-chunk` outranks the pin) is a property of the
+  PAIR of readers. Pin it with a test that calls both.
+- A clamp's "never return 0" floor is not a guarantee that anything useful
+  survives; the floor has to be defended by whoever spends first.
