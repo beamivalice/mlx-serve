@@ -6222,6 +6222,68 @@ pub fn ssmRollbackFromCapture(entry: *SSMCacheEntry, accepted: u32, verify_len: 
     }
 }
 
+test "a PLE rollback leaves no freed-but-non-null QSA handle behind" {
+    // Raised by a code read of the PLE arm: `ssmFreeQsaState(entry)` frees
+    // `entry.qsa_pooled` and the arm never assigns it, so a checkpoint whose
+    // PLE layer ALSO carried QSA history would double-free at teardown.
+    //
+    // It cannot: the free and the null live in the same helper, which is why
+    // the arm does not repeat the assignment. Characterization test — it pins
+    // that pairing, because the arm reads as if it were missing one, and the
+    // failure mode if the helper ever stops nulling is a SIGSEGV in a teardown
+    // path far from here.
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    var e: SSMCacheEntry = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = true };
+    defer {
+        ssmFreeSpecCapture(&e);
+        _ = mlx.mlx_array_free(e.conv_state);
+        _ = mlx.mlx_array_free(e.ssm_state);
+        // Frees whatever the rollback left live. A double free here is the
+        // defect this test exists to rule out.
+        ssmFreeQsaState(&e);
+    }
+
+    const state_len: c_int = 2;
+    const verify_len: c_int = 3;
+    const width: c_int = 4;
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    const n: f64 = @floatFromInt((state_len + verify_len) * width);
+    try mlx.check(mlx.mlx_arange(&flat, 0.0, n, 1.0, .float32, s));
+    const shape = [_]c_int{ 1, state_len + verify_len, width };
+    try mlx.check(mlx.mlx_reshape(&e.spec_ple_input, flat, &shape, 3, s));
+    e.spec_ple_len = @intCast(state_len + verify_len);
+
+    // The impossible-today entry: a PLE window AND a QSA pooled bank plus its
+    // key-history accelerator, all live on the same layer.
+    var pflat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(pflat);
+    try mlx.check(mlx.mlx_arange(&pflat, 0.0, 8.0, 1.0, .float32, s));
+    const pshape = [_]c_int{ 1, 2, 4 };
+    try mlx.check(mlx.mlx_reshape(&e.qsa_pooled, pflat, &pshape, 3, s));
+    try mlx.check(mlx.mlx_reshape(&e.qsa_key_buf, pflat, &pshape, 3, s));
+    e.qsa_key_rows = 2;
+    e.qsa_pooled_blocks = 2;
+
+    try ssmRollbackFromCapture(&e, 1, @intCast(verify_len), s);
+
+    // The window is rebound to the accepted prefix ...
+    try t.expect(e.aux_state.ctx != null);
+    const got = mlx.getShape(e.aux_state);
+    try t.expectEqual(state_len, got[1]);
+    try t.expectEqual(width, got[2]);
+    // ... and every QSA handle the arm dropped is NULL, not dangling. The
+    // accelerators' counters go with them: a row count that outlives its
+    // buffer is the other half of this bug class.
+    try t.expect(e.qsa_pooled.ctx == null);
+    try t.expect(e.qsa_key_buf.ctx == null);
+    try t.expect(e.qsa_pooled_buf.ctx == null);
+    try t.expect(e.qsa_score_bank.ctx == null);
+    try t.expectEqual(@as(c_int, 0), e.qsa_key_rows);
+    try t.expectEqual(@as(c_int, 0), e.qsa_pooled_blocks);
+}
+
 /// Keep the pooled-key rows that are still complete blocks of a key history
 /// truncated to `keep_rows` (the block size is implied by the two shapes).
 fn truncatePooled(pooled: *mlx.mlx_array, keep_rows: c_int, ratio: c_int, s: mlx.mlx_stream) !void {
