@@ -5152,6 +5152,71 @@ persisted history of the wrong length is worse than none.
 
 `MLX_SERVE_MTP_HEAD_PERSIST=0` restores the old reset-every-request
 behaviour, for the A/B and for a fast retreat.
+### Follow-up: the persisted head shipped its history with a step of 0 (2026-09-05, qwen4_exp)
+
+The feature above landed correct and then stopped working, without a line of it
+changing. On a hot-cache turn that reused essentially the whole prompt —
+
+```
+[hot-cache] reused 16806/16837 (matched 16837)
+  [qwen4] MTP head restore declined (MtpHeadQsaHistoryGap) — head starts blind
+```
+
+— the head was refused by its OWN adopt-time invariant: the QSA raw-key
+history (`aux_shape[1]`, one row per row `qsaAppendKeys` ever appended, so
+always `== qwen4_mtp.seq_offset`) had to equal the head KV snapshot's `step`,
+and the snapshot's step was 0.
+
+The cause is one line that was never written. The head forwards its single
+layer at index `cfg.num_hidden_layers` (`qwen4MtpForward` → `qwen4AttnWith` →
+`gatedFullAttnWith` → `ctx.cache.update(layer, …)`), and `KVCache.update`
+advances `self.step` only `if (layer == 0)` — on both the affine and the dense
+arm. The head's cache has `num_hidden_layers + 1` entries and only ever writes
+the LAST one, so no forward has ever moved its step. The head kept its own
+count in `seq_offset` (which `MtpCacheRef.step()` returns, which
+`mtpCommittedHistoryLen` reads, which is what the aux history is as long as),
+and the cache's step was only ever written by `KVCache.truncate` or a restore.
+
+At the commit site `mc.truncate(committed)` is what would have repaired it —
+and `qwen4MtpTruncate` early-returns `if (len >= m.seq_offset)`. So the repair
+happened exactly when the turn ended with a speculative draft tail to trim,
+and not otherwise. That is the three-outcome behaviour the bug presented as,
+all from the same code:
+
+| how turn 1 ended | snapshot step | what turn 2 logged |
+|---|---|---|
+| pending draft trimmed at commit | `= rows` | `[qwen4] MTP head restored (N tokens from base B)` |
+| no trim, head previously truncated to some k > 0 | stale `k` | `MTP head restore declined (MtpHeadQsaHistoryGap)` |
+| no trim, step never written at all | `0` | nothing — `specAdoptPlan` saw `want > snap_step` and returned `.skip` |
+
+The `.skip` arm was the worst of the three: `restoreSpecSnap` returned null
+without a word, so a head that drafted blind on a 16.8k-token hit looked
+exactly like a head with nothing to restore. It now logs want-vs-snap.
+
+Why the feature's own tests did not catch it. The live test passed when the
+feature landed and broke without touching it, because the split-K work changed
+WHEN the adaptive serial probe fires: it now fires in turn 1, which ends that
+turn with no draft tail, which removes the accidental trim. And the hermetic
+test could not see it at all — its fixture filled the cache at layer 0, the one
+index where `update` hands out `step` for free. A head-cache fixture that fills
+at layer 0 is testing the trunk's bookkeeping, not the head's; `testFillHeadCache`
+now fills at the head's own index and drives `Transformer.qwen4MtpAdvance`, the
+production seam the fix lives in, so both head tests were red before it.
+
+The fix is `cache.step = seq_offset.*` inside `qwen4MtpAdvance`, and the
+adopt-time equality is deliberately UNTOUCHED — head KV rows and key-history
+rows must be the same rows, and relaxing the check would have converted a loud
+refusal into `QsaHistoryGap` on the first turn past the QSA budget. Two
+companions make the invariant self-reporting rather than emergent:
+`qwen4MtpAdopt` returns `MtpHeadStepGap` for a live head whose step and row
+count disagree instead of adopting onto it, and the commit site refuses to
+commit such a snapshot and names both numbers
+(`[hot-cache] mtp head step gap (cache.step=…, history=… rows)`).
+
+Class: a cache whose step is advanced by ONE privileged index is a trunk API.
+Any single-layer cache borrowed for a sidecar — a head, a drafter, a probe —
+owns its own count, and its fixture must fill where the real one does.
+
 ## Split-K rescued the QSA sparse-attn kernel, and the S=1 lever that was going to test it was inert (2026-09-05, qwen4_exp, M5 Max)
 
 The fused sparse-attention kernel shipped as one threadgroup per (query row,
