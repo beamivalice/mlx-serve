@@ -1285,6 +1285,10 @@ pub fn serve(
     defer scheduler_mod.prefill_admission_fits = null;
     scheduler_mod.prefill_request_chunk = &requestPrefillChunkNow;
     defer scheduler_mod.prefill_request_chunk = null;
+    // The published budget is per MODEL; the global is process-wide. Retire it
+    // whenever the scheduler drops the resident cache (audit S5/S7).
+    scheduler_mod.hot_cache_budget_invalidate = &clearResolvedPrefixCacheMem;
+    defer scheduler_mod.hot_cache_budget_invalidate = null;
     scheduler_mod.prefill_admission_refused_log = &logPrefillRefusal;
     defer scheduler_mod.prefill_admission_refused_log = null;
     // Fourth of the family, and the only one the PREFILL LOOP asks rather
@@ -21686,4 +21690,45 @@ test "the sizer's cache reserve is a constant, not the ask or the resolved budge
     const body = declBody(src, "fn computeMemoryContext(") orelse return error.CallSiteMoved;
     try t.expect(std.mem.indexOf(u8, body, "CTX_SIZING_CACHE_" ++ "RESERVE") != null);
     try t.expect(std.mem.indexOf(u8, body, "resolvedPrefixCache" ++ "Mem()") == null);
-    try t.expect(std.mem.indexOf(u8, body, "prefix_cache_mem_" ++ "bytes") == null);}
+    try t.expect(std.mem.indexOf(u8, body, "prefix_cache_mem_" ++ "bytes") == null);
+}
+
+test "the published hot-cache budget is retired when the cache is dropped" {
+    // Audit S5/S7: the budget is PER MODEL, the global holding it is
+    // process-wide. Without a retire, model B's ANE gate reserves model A's
+    // cache, and a first boot reads a budget no load has published.
+    const t = std.testing;
+    publishResolvedPrefixCacheMem(4096);
+    try t.expectEqual(@as(u64, 4096), resolvedPrefixCacheMem());
+    clearResolvedPrefixCacheMem();
+    // Back to the ASK, which is the honest pre-load answer — and, being the
+    // larger figure, the conservative one for anything that reserves.
+    try t.expectEqual(prefix_cache_mem_bytes, resolvedPrefixCacheMem());
+
+    // A resolved ZERO is a real budget (`--prefix-cache-mem 0` under
+    // SSD-first), not "unresolved" — audit N2. The sentinel is maxInt.
+    publishResolvedPrefixCacheMem(0);
+    try t.expectEqual(@as(u64, 0), resolvedPrefixCacheMem());
+    clearResolvedPrefixCacheMem();
+    try t.expectEqual(prefix_cache_mem_bytes, resolvedPrefixCacheMem());
+
+    // Scan: every site that drops the resident cache retires the budget with
+    // it, and the hook is installed. Needles split.
+    const sched = @embedFile("scheduler.zig");
+    const drop = "hot_prefix_cache = " ++ "null;";
+    const retire = "hot_cache_budget_" ++ "invalidate) |f| f();";
+    var i: usize = 0;
+    var drops: usize = 0;
+    while (std.mem.indexOfPos(u8, sched, i, drop)) |at| {
+        i = at + 1;
+        // The declaration sites (`.hot_prefix_cache = null,` in a struct
+        // literal) are initialisers, not drops.
+        if (at > 0 and sched[at - 1] == '.') continue;
+        drops += 1;
+        const tail = sched[at..@min(sched.len, at + 400)];
+        try t.expect(std.mem.indexOf(u8, tail, retire) != null);
+    }
+    try t.expect(drops >= 4);
+    const src = @embedFile("server.zig");
+    try t.expect(std.mem.indexOf(u8, src, "scheduler_mod.hot_cache_budget_invalidate = &clearResolvedPrefix" ++ "CacheMem;") != null);
+}

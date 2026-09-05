@@ -330,6 +330,13 @@ pub var prefill_chunk_adapt: ?*const fn (
 /// compared, and the scheduler cannot format a bill it has no estimator for.
 pub var prefill_admission_refused_log: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool) void = null;
 
+/// Invalidate the published hot-cache budget (`server.clearResolvedPrefixCacheMem`).
+/// The budget is PER MODEL but the global holding it is process-wide, so an
+/// unload or a switch must retire it — otherwise the next model's ANE gate
+/// reserves the previous model's cache (audit S5/S7). Same fn-pointer shape as
+/// the neighbours: the scheduler deliberately has no server.zig import.
+pub var hot_cache_budget_invalidate: ?*const fn () void = null;
+
 pub const SlotState = enum { pending_prefill, decoding, finished, errored };
 
 /// Result of `Slot.waitNext`. Driven by the inference thread; consumed by
@@ -1614,6 +1621,7 @@ pub const Scheduler = struct {
         self.dflash = null;
         self.hot_prefix_cache = null;
         self.resident_hot_cache_bytes.store(0, .monotonic);
+        if (hot_cache_budget_invalidate) |f| f();
         self.reclaimable_hot_cache_bytes.store(0, .monotonic);
         if (self.load_error_name) |n| self.allocator.free(n);
 
@@ -2628,6 +2636,7 @@ fn doLoadDs4OnInferenceThread(sch: *Scheduler, params: anytype) !void {
     sch.dflash = null;
     sch.hot_prefix_cache = null;
     publishHotCacheResidency(sch);
+    if (hot_cache_budget_invalidate) |f| f();
 }
 
 /// llama.cpp load on the inference thread. Mirrors `doLoadDs4OnInferenceThread`:
@@ -2705,6 +2714,7 @@ fn doLoadLlamaOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     sch.dflash = null;
     sch.hot_prefix_cache = null;
     publishHotCacheResidency(sch);
+    if (hot_cache_budget_invalidate) |f| f();
 }
 
 /// The post-load residency bill the eviction gate reserves, in bytes.
@@ -2843,6 +2853,7 @@ fn doLoadGenOnInferenceThread(sch: *Scheduler, params: anytype, modality: gen_mo
     sch.dflash = null;
     sch.hot_prefix_cache = null;
     publishHotCacheResidency(sch);
+    if (hot_cache_budget_invalidate) |f| f();
 }
 
 /// Sum of `*.safetensors` bytes in `model_dir` — the MLX weight footprint used
@@ -4645,6 +4656,7 @@ fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
         sch.dflash = null;
         sch.hot_prefix_cache = null;
         publishHotCacheResidency(sch);
+        if (hot_cache_budget_invalidate) |f| f();
     }
     sch.registry.mutex.lockUncancelable(sch.io);
     sch.registry.accountEvictedLocked(bytes);
