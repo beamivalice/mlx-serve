@@ -4042,3 +4042,58 @@ test "SSD-first: an idle entry spills to disk and leaves RAM; the active session
         try testing.expectEqual(@as(usize, 2), hc.entryCount());
     }
 }
+
+test "SSD-first: one resident session makes reclaimableBytes truthfully ZERO" {
+    // D2. `reclaimableBytes` is residency minus the largest entry, because a
+    // restore refcount-shares the matched entry with the slot's cache and the
+    // connection thread cannot know WHICH entry a prompt will match — only
+    // that it pins at most one.
+    //
+    // Under SSD-first that formula needs no SSD-specific accounting, and this
+    // pins why: at rest RAM holds exactly the active session, so the largest
+    // entry IS the only entry and the provable discount is 0 — correct,
+    // because evicting it returns nothing (its buffers are the live KV, which
+    // `active_mem` already counts). Crediting it would double-count the very
+    // bytes mechanism 5 stopped double-counting.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+
+    var tokens_a: [600]u32 = undefined;
+    for (&tokens_a, 0..) |*t, i| t.* = @intCast(i + 7);
+    var tokens_b: [600]u32 = undefined;
+    for (&tokens_b, 0..) |*t, i| t.* = @intCast(i + 90_000);
+
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 1, 600);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc.ssd_first = true;
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, buf[0..root_len], "fp-reclaim", 0, 128);
+    defer hc.deinit();
+
+    try hc.commit(&cache, &tokens_a, false);
+    hc.flushPendingDisk(s);
+    try testing.expectEqual(@as(usize, 1), hc.entryCount());
+    try testing.expect(hc.residentBytes() > 0);
+    try testing.expectEqual(@as(u64, 0), hc.reclaimableBytes());
+
+    // Mid-switch, two sessions are briefly resident and the non-active one IS
+    // genuinely reclaimable — its disk copy is complete (mechanisms 1-4), so
+    // the same formula reports a real number rather than a hopeful one.
+    try hc.commit(&cache, &tokens_b, false);
+    hc.flushPendingDisk(s);
+    try testing.expectEqual(@as(usize, 2), hc.entryCount());
+    try testing.expect(hc.reclaimableBytes() > 0);
+
+    // ...and the idle spill returns it to 0 without evicting the session being
+    // served: RAM is back to one entry, so nothing is claimed that a restore
+    // would immediately pin again.
+    hc.spillIdleEntries(s);
+    try testing.expectEqual(@as(usize, 1), hc.entryCount());
+    try testing.expectEqual(@as(u64, 0), hc.reclaimableBytes());
+}
