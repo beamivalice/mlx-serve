@@ -768,7 +768,7 @@ pub const Slot = struct {
     /// its pad-waste cap. Delegates to `batchKvLenOf` — the ONE source, and
     /// never `cache.step` (0 forever on a linear-layer-0 trunk).
     pub fn batchKvLen(self: *const Slot) u32 {
-        return batchKvLenOf(&self.cache);
+        return batchKvLenOf(&self.cache, self.model.config);
     }
 
     /// Free everything the slot owns. Only safe to call when no thread can
@@ -2342,7 +2342,26 @@ pub fn batchedPadWaste(kv_lens_asc: []const u32) f64 {
 /// this cap exists to bound. `KVCache.kvLenForBatching` reads the first
 /// ATTENTION layer's own offset on those trunks and `step` where layer 0 is
 /// attention, so it is right on every arch and needs no arch list here.
-pub fn batchKvLenOf(cache: *const KVCache) u32 {
+pub fn batchKvLenOf(cache: *const KVCache, cfg: ?*const model_mod.ModelConfig) u32 {
+    // ARCH GATE (PR #363 item 2). Waking a cap that was dead is not a free
+    // fix: a group that used to batch now SPLITS, the long slot decodes
+    // serially, and the +12%/+8% two- and four-stream batched wins measured on
+    // the 27B qwen3_5 were measured with the cap dead. `modelBatchable` and
+    // `supportsBatchedGdnDecode` between them mean the archs that actually
+    // reach a batched group on a linear-layer-0 trunk are qwen3_5 dense and
+    // qwen3_next — real packs, real concurrent serving, and nobody has run the
+    // multi-stream A/B on either.
+    //
+    // So the kv-length rule is qwen4_exp's, and every other arch keeps
+    // `cache.step` — the exact field a93e2c0 fed the cap, including the defect
+    // that it is 0 forever on a hybrid and the cap therefore never fires
+    // there. That defect is a KNOWN LIMIT off qwen4_exp, documented in
+    // `docs/gotchas/server-http.md`, pending a multi-stream measurement.
+    //
+    // A null config (unit fixtures, and any future caller with no model in
+    // hand) takes the a93e2c0 arm: an unknown arch is not the gated one.
+    const c = cfg orelse return @intCast(cache.step);
+    if (!c.longCtxGated()) return @intCast(cache.step);
     return @intCast(cache.kvLenForBatching());
 }
 
@@ -7314,10 +7333,23 @@ test "the pad-waste cap reads the arch's TRUE attention KV length, not cache.ste
         try testing.expectEqual(@as(usize, 0), caches[i].step); // the trap
     }
 
+    // The GATED arch (PR #363 item 2). RED before the fix: every entry here
+    // was `cache.step` == 0.
+    var q4 = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
     var kv_lens: [3]u32 = undefined;
-    for (caches[0..], 0..) |*c, i| kv_lens[i] = batchKvLenOf(c);
-    // RED before the fix: every entry here was `cache.step` == 0.
+    for (caches[0..], 0..) |*c, i| kv_lens[i] = batchKvLenOf(c, &q4);
     try testing.expectEqualSlices(u32, &[_]u32{ 1_000, 1_000, 60_000 }, &kv_lens);
+
+    // ...and every OTHER hybrid keeps a93e2c0 exactly: `cache.step`, which is
+    // 0 forever here, so the cap stays dead. That is a KNOWN LIMIT off
+    // qwen4_exp — the batched wins on the 27B were measured with the cap dead
+    // and un-batching those streams is unmeasured (docs/gotchas/server-http.md,
+    // the #363 blast-radius ledger). A null config takes the same arm.
+    for ([_][]const u8{ "qwen3_5", "qwen3_5_moe", "qwen3_next", "lfm2", "nemotron_h", "bailing_hybrid" }) |mt| {
+        var cfg = model_mod.ModelConfig{ .model_type = mt };
+        for (caches[0..]) |*c| try testing.expectEqual(@as(u32, 0), batchKvLenOf(c, &cfg));
+    }
+    for (caches[0..]) |*c| try testing.expectEqual(@as(u32, 0), batchKvLenOf(c, null));
 
     // With the real lengths the cap fires. All three pads to 3 x 60000 = 180k
     // against 62k useful (2.9x); the 60k slot falls out and decodes serially,
@@ -7336,6 +7368,7 @@ test "an attention-first trunk's batching lengths are unchanged by the fix" {
     // entry 0 is initialized, so the length source is still `step` and the cap
     // sees exactly the numbers it saw before.
     const lens = [_]usize{ 1_000, 1_000, 1_000, 100_000 };
+    var llama = model_mod.ModelConfig{ .model_type = "llama" };
     var caches: [4]KVCache = undefined;
     var built: usize = 0;
     defer for (caches[0..built]) |*c| c.deinit();
@@ -7346,9 +7379,14 @@ test "an attention-first trunk's batching lengths are unchanged by the fix" {
         caches[i].step = len;
         caches[i].entries[0].initialized = true;
         caches[i].entries[0].offset = len;
-        kv_lens[i] = batchKvLenOf(&caches[i]);
+        kv_lens[i] = batchKvLenOf(&caches[i], &llama);
     }
     try testing.expectEqualSlices(u32, &[_]u32{ 1_000, 1_000, 1_000, 100_000 }, &kv_lens);
+    // Both arms of the gate agree here — `kvLenForBatching` returns `step`
+    // when entry 0 is initialized, so a dense arch is unchanged whichever
+    // side of the predicate it falls on.
+    var q4b = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
+    for (caches[0..], 0..) |*c, i| try testing.expectEqual(kv_lens[i], batchKvLenOf(c, &q4b));
     // Same keep count as reading `cache.step` directly — the pre-fix answer.
     try testing.expectEqual(@as(usize, 3), batchedKvKeepCount(&kv_lens));
     try testing.expectEqual(
@@ -7374,7 +7412,12 @@ test "the batched group takes its kv length from the ONE accessor, never cache.s
     // ...and the one accessor is the KVCache's, not a re-derivation.
     const src_of = std.mem.indexOf(u8, src, "pub fn batchKvLenOf(") orelse return error.MissingAccessor;
     const of_end = std.mem.indexOfPos(u8, src, src_of, "\n}\n") orelse return error.MissingAccessorEnd;
-    try testing.expect(std.mem.indexOf(u8, src[src_of..of_end], "kvLenForBatching()") != null);
+    const of_body = src[src_of..of_end];
+    try testing.expect(std.mem.indexOf(u8, of_body, "kvLenForBatching()") != null);
+    // ...and the arch gate is the ONE predicate, in this ONE function. A
+    // second site with its own conjunct is how the two drift.
+    try testing.expect(std.mem.indexOf(u8, of_body, "c.longCtx" ++ "Gated()") != null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "longCtx" ++ "Gated()"));
 }
 
 test "modelBatchable permits pure-attention" {
