@@ -3162,6 +3162,41 @@ pub fn ssdFirstPrefixCacheMem(
     return @max(ctx_kv_bytes +| idle, 1);
 }
 
+/// The SSD-first arm of `prefixCacheMemForLoad`, gate and log included, so the
+/// call site is a single line. Returns null when the arch gate is off, and the
+/// caller falls through to `clampedPrefixCacheMem` unchanged.
+///
+/// Deliberately NOT folded into `prefixCacheMemForLoad`: that function's other
+/// inputs (the prefill chunk it pins, the transient reserve it derives) are
+/// under repair elsewhere, and both arms must inherit those fixes without this
+/// one being re-litigated in the merge.
+fn ssdFirstBudgetForLoad(
+    config: *model_mod.ModelConfig,
+    requested: u64,
+    active_mem: usize,
+    ctx_kv: u64,
+    transient_reserve: u64,
+) ?u64 {
+    if (!config.ssdFirstCapable() or !prefix_cache_mod.ssdFirstEnabled()) return null;
+    const budget = ssdFirstPrefixCacheMem(
+        requested,
+        currentGpuMemoryCeiling(active_mem),
+        active_mem,
+        ctx_kv,
+        transient_reserve,
+    );
+    // D1: on this arch `--prefix-cache-mem` is the IDLE allowance, not the
+    // whole cache — 0 means "no idle entries", not "use all the headroom".
+    // Say so once, naming the flag, so the resolved budget is never a mystery.
+    log.info("[hot-cache] SSD-first budget {d} MB = one session at the working context ({d} MB) + {d} MB idle (--prefix-cache-mem {d} MB = the IDLE allowance on this arch; 0 = no idle entries)\n", .{
+        budget >> 20,
+        ctx_kv >> 20,
+        (budget -| ctx_kv) >> 20,
+        requested >> 20,
+    });
+    return budget;
+}
+
 /// Impure wrapper for the model-load site (`Scheduler.doLoadOnInferenceThread`,
 /// reached through the LoadParams/LoadRequest resolver pointer — the scheduler
 /// deliberately has no server.zig import): the weights are resident there, so
@@ -3178,27 +3213,10 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64) u64
     const ssd_chunk: u64 = pinPrefillChunk(config);
     const ssd_ctx_kv: u64 = (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config)) *|
         getEffectiveContextLength(config);
-    if (config.ssdFirstCapable() and prefix_cache_mod.ssdFirstEnabled()) {
-        const budget = ssdFirstPrefixCacheMem(
-            requested,
-            currentGpuMemoryCeiling(active_mem),
-            active_mem,
-            ssd_ctx_kv,
-            prefillTransientReserve(config, kv_bits, ssd_chunk),
-        );
-        hot_cache_mem_resolved = budget;
-        // D1: on this arch `--prefix-cache-mem` means the IDLE allowance, not
-        // the whole cache — 0 is "no idle entries", not "use all headroom".
-        // Say so once, naming the flag, so the resolved budget is never a
-        // mystery in a log.
-        log.info("[hot-cache] SSD-first budget {d} MB = one session at the working context ({d} MB) + {d} MB idle (--prefix-cache-mem {d} MB = the IDLE allowance on this arch; 0 = no idle entries)\n", .{
-            budget >> 20,
-            ssd_ctx_kv >> 20,
-            (budget -| ssd_ctx_kv) >> 20,
-            requested >> 20,
-        });
-        return budget;
-    }
+    // SSD-first takes the whole decision or none of it — ONE line here, so a
+    // change to how `ctx_kv` / the transient reserve are computed above merges
+    // without touching this arm.
+    if (ssdFirstBudgetForLoad(config, requested, active_mem, ssd_ctx_kv, prefillTransientReserve(config, kv_bits, ssd_chunk))) |b| return b;
     // Pin first, then hand the pinned width in as the override: the plan must
     // bill the width `generate.effectivePrefillChunk` will resolve to, and the
     // pin is that width (it already folded in an explicit `--prefill-chunk`).

@@ -2412,11 +2412,25 @@ entry restores from its first flush.
 treats the hot cache as what is left over after the live session's
 full-context KV reserve. But a restore refcount-shares the entry's buffers with
 the slot's cache: the resident entry for the session being served costs nothing
-beyond the reserve already billed. At 1M that clamp cut the budget to ~10 GB —
-less than half an entry — so the entry could not stay resident and every warm
-turn cold-prefilled while the cap "held". `ssdFirstPrefixCacheMem` floors the
-budget at one entry at the working context and gives `--prefix-cache-mem` to
-IDLE entries on top of it; 0 means none idle, which is the mode's whole point.
+beyond the reserve already billed.
+
+The subtraction is not a rounding error. `prefixCacheMemForLoad` bills the FULL
+configured context — at 1M and 8-bit KV that is 13,056 B/token of KV plus
+7,680 B/token of recurrent and indexer state, 20,736 MiB — against the very
+budget the hot cache SHARES with the live KV. Measured on the 137 GB box: a
+10 GB ask resolved to 3,873 MB and a 24 GB ask to 5,703 MB. Neither holds one
+entry, so the entry could not stay resident and every warm turn cold-prefilled
+while the cap "held" — the #330 cliff again, one level down, and this time the
+cap was right about its own arithmetic and wrong about what it was counting.
+
+`ssdFirstPrefixCacheMem` floors the budget at one entry at the working context
+and gives `--prefix-cache-mem` to IDLE entries on top of it; 0 means none idle,
+which is the mode's whole point. It is a SEPARATE function selected by the arch
+gate through a one-line call site rather than a branch woven into
+`prefixCacheMemForLoad`, because that function's other inputs — the prefill
+chunk it pins, the transient reserve it derives — have their own defects under
+repair, and both arms must inherit those fixes without this one being
+re-litigated in the merge.
 
 The disk side gets the reciprocal treatment: the budget is
 `min(operator cap, free - min(64 GiB, 10% of the volume))` with a 1 GiB store
