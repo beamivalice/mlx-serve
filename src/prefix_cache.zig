@@ -4865,6 +4865,10 @@ test "SSD-first: an in-flight write does not stall the tick — the entry is re-
 
     // The writer is held: everything the spill stages stays in flight.
     hc.disk.?.writer.?.setPaused(true);
+    // Never let a failed assertion below hang the SUITE: teardown drains,
+    // and a drain against a paused writer waits forever. (Scan-pinned: every
+    // `setPaused(true)` in a test owes a deferred unpause.)
+    defer hc.disk.?.writer.?.setPaused(false);
     hc.spillIdleEntries(s);
     // It RETURNED (a drain would have deadlocked against the paused writer),
     // the index knows the entry, and RAM still holds it.
