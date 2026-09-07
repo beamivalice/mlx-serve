@@ -6733,6 +6733,7 @@ pub const SSMCacheEntrySnapshot = struct {
     aux_state: mlx.mlx_array = .{ .ctx = null },
     qsa_pooled: mlx.mlx_array = .{ .ctx = null },
     qsa_ratio: c_int = 4,
+    qsa_rows: c_int = 0,
     /// The (ngram_size - 1) tokens preceding this entry.
     ple_prev: [qwen4_mod.MAX_NGRAM_SIZE]u32 = @splat(0),
     ple_prev_valid: bool = false,
@@ -6777,6 +6778,7 @@ pub fn ssmSnapshot(src: *const SSMCacheEntry) SSMCacheEntrySnapshot {
         _ = mlx.mlx_array_set(&out.qsa_pooled, src.qsa_pooled);
     }
     out.qsa_ratio = src.qsa_ratio;
+    out.qsa_rows = qsaHistoryRows(src);
     out.ple_prev = src.ple_prev;
     out.ple_prev_valid = src.ple_prev_valid;
     return out;
@@ -6819,6 +6821,10 @@ pub fn ssmRestore(dst: *SSMCacheEntry, snap: *const SSMCacheEntrySnapshot) !void
     dst.qsa_ratio = snap.qsa_ratio;
     dst.ple_prev = snap.ple_prev;
     dst.ple_prev_valid = snap.ple_prev_valid;
+    if (snap.aux_state.ctx != null) {
+        const sh = mlx.getShape(dst.aux_state);
+        dst.qsa_key_rows = if (sh.len >= 2) sh[1] else 0;
+    }
 }
 
 /// Free the transient PLD spec-decode capture buffers on an SSM entry
@@ -7220,6 +7226,9 @@ pub fn captureSsmCheckpoint(
             out.aux_state = try materializedOwnedCopy(s, src.aux_state);
         }
         out.qsa_ratio = src.qsa_ratio;
+        if (ssmAuxIsQsaHistory(src)) {
+            out.qsa_rows = @intCast(pos);
+        }
         out.ple_prev = src.ple_prev;
         out.ple_prev_valid = src.ple_prev_valid;
         layers[i] = out;
@@ -7300,6 +7309,7 @@ pub fn shareSsmCheckpoint(allocator: std.mem.Allocator, cp: *const SSMCheckpoint
             _ = mlx.mlx_array_set(&out.qsa_pooled, src.qsa_pooled);
         }
         out.qsa_ratio = src.qsa_ratio;
+        out.qsa_rows = src.qsa_rows;
         out.ple_prev = src.ple_prev;
         out.ple_prev_valid = src.ple_prev_valid;
         layers[i] = out;
@@ -7328,6 +7338,18 @@ pub fn ssmCheckpointBytes(cp: *const SSMCheckpoint) u64 {
     for (cp.layers) |l| {
         inline for (.{ l.conv_state, l.ssm_state, l.aux_state, l.qsa_pooled }) |arr| {
             if (arr.ctx != null) total += @as(u64, mlx.mlx_array_size(arr)) * @as(u64, mlx.mlx_array_itemsize(arr));
+        }
+    }
+    return total;
+}
+
+pub fn qsaHistoryBytesHeld(cps: []const SSMCheckpoint) u64 {
+    var total: u64 = 0;
+    for (cps) |cp| {
+        for (cp.layers) |l| {
+            inline for (.{ l.aux_state, l.qsa_pooled }) |arr| {
+                if (arr.ctx != null) total += @as(u64, mlx.mlx_array_size(arr)) * @as(u64, mlx.mlx_array_itemsize(arr));
+            }
         }
     }
     return total;
@@ -7412,6 +7434,14 @@ pub fn ssmAuxIsQsaHistory(e: *const SSMCacheEntry) bool {
     return mlx.mlx_array_size(e.conv_state) == 0;
 }
 
+fn qsaHistoryRows(e: *const SSMCacheEntry) c_int {
+    if (!ssmAuxIsQsaHistory(e)) return 0;
+    if (e.qsa_key_rows > 0) return e.qsa_key_rows;
+    if (e.aux_state.ctx == null) return 0;
+    const sh = mlx.getShape(e.aux_state);
+    return if (sh.len >= 2) sh[1] else 0;
+}
+
 fn snapshotHasQsaHistory(l: *const SSMCacheEntrySnapshot) bool {
     if (l.aux_state.ctx == null) return false;
     if (l.qsa_pooled.ctx != null) return true;
@@ -7424,6 +7454,17 @@ pub fn checkpointHasQsaHistory(cp: *const SSMCheckpoint) bool {
         if (snapshotHasQsaHistory(l)) return true;
     }
     return false;
+}
+
+pub fn checkpointQsaAuxRows(cp: *const SSMCheckpoint) c_int {
+    var r: c_int = 0;
+    for (cp.layers) |*l| {
+        if (!snapshotHasQsaHistory(l)) continue;
+        if (l.aux_state.ctx == null) continue;
+        const sh = mlx.getShape(l.aux_state);
+        if (sh.len >= 2 and sh[1] > r) r = sh[1];
+    }
+    return r;
 }
 
 /// One QSA layer's history onto `dst_aux`/`dst_pooled`, sliced to `take` rows
@@ -7537,6 +7578,7 @@ fn attachQsaHistoryToLatestMode(cps: []SSMCheckpoint, live: []const SSMCacheEntr
         copied += 1;
     }
     if (copied == 0) return;
+    recordQsaRowsOnCheckpoints(cps, live);
     keepOnlyLatestQsaHistory(cps);
     const vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(vec);
@@ -7551,6 +7593,18 @@ fn attachQsaHistoryToLatestMode(cps: []SSMCheckpoint, live: []const SSMCacheEntr
         }
     }
     if (n > 0) _ = mlx.mlx_eval(vec);
+}
+
+fn recordQsaRowsOnCheckpoints(cps: []SSMCheckpoint, live: []const SSMCacheEntry) void {
+    for (cps) |*cp| {
+        if (cp.layers.len != live.len) continue;
+        const pos_rows: c_int = @intCast(cp.pos);
+        for (cp.layers, live) |*dst, src| {
+            if (!ssmAuxIsQsaHistory(&src)) continue;
+            if (dst.qsa_rows == 0) dst.qsa_rows = pos_rows;
+            dst.qsa_ratio = src.qsa_ratio;
+        }
+    }
 }
 
 /// Keep the QSA history on the NEWEST snap that carries it and drop it from
@@ -7600,8 +7654,11 @@ pub fn applyQsaHistoryAt(entries: []SSMCacheEntry, src_cp: *const SSMCheckpoint,
         // A restore replaces the history behind the append accelerator's back. Shared: the
         // first append re-seeds a private buffer from it.
         ssmFreeQsaState(dst);
+        const ks = mlx.getShape(src.aux_state);
+        if (ks.len < 2 or ks[1] < keep) return error.QsaHistoryGap;
         try copyQsaHistorySliced(&dst.aux_state, &dst.qsa_pooled, src.aux_state, src.qsa_pooled, src.qsa_ratio, keep, false, s);
         dst.qsa_ratio = src.qsa_ratio;
+        dst.qsa_key_rows = keep;
     }
 }
 
@@ -7619,6 +7676,7 @@ pub fn sliceQsaHistoryOntoCheckpoint(dst: *SSMCheckpoint, src: *const SSMCheckpo
         // Materialize: the trim drops `src` next, and a view would keep its whole buffer alive.
         try copyQsaHistorySliced(&d.aux_state, &d.qsa_pooled, s_l.aux_state, s_l.qsa_pooled, s_l.qsa_ratio, keep, true, s);
         d.qsa_ratio = s_l.qsa_ratio;
+        d.qsa_rows = keep;
     }
     // Materialize now: an unevaluated copy node keeps `src`'s buffer alive.
     const vec = mlx.mlx_vector_array_new();
@@ -30949,6 +31007,186 @@ test "captureSsmCheckpoint materializes state copies (parent-buffer retention cl
 
     // Null ssm_state stays null (LFM2 gated_conv shape).
     try testing.expect(cp.layers[0].ssm_state.ctx == null);
+}
+
+test "QSA checkpoint aux+pooled bytes are O(rows + checkpoints)" {
+    const s = mlx.gpuStream();
+    const n: c_int = 64;
+    const hd: c_int = 8;
+    const ratio: c_int = 4;
+    const aux_shape = [_]c_int{ 1, n, hd };
+    const pooled_shape = [_]c_int{ 1, @divExact(n, ratio), hd };
+    var aux = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(aux);
+    {
+        var flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(flat);
+        try mlx.check(mlx.mlx_arange(&flat, 0.0, @floatFromInt(n * hd), 1.0, .float32, s));
+        try mlx.check(mlx.mlx_reshape(&aux, flat, &aux_shape, 3, s));
+        try mlx.check(mlx.mlx_array_eval(aux));
+    }
+    var pooled = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(pooled);
+    {
+        var flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(flat);
+        try mlx.check(mlx.mlx_arange(&flat, 1000.0, 1000.0 + @as(f64, @floatFromInt((n / ratio) * hd)), 1.0, .float32, s));
+        try mlx.check(mlx.mlx_reshape(&pooled, flat, &pooled_shape, 3, s));
+        try mlx.check(mlx.mlx_array_eval(pooled));
+    }
+    const live: SSMCacheEntry = .{
+        .conv_state = .{ .ctx = null },
+        .ssm_state = .{ .ctx = null },
+        .initialized = true,
+        .aux_state = aux,
+        .qsa_pooled = pooled,
+        .qsa_ratio = ratio,
+    };
+    aux = mlx.mlx_array_new();
+    pooled = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_array_set(&aux, live.aux_state));
+    try mlx.check(mlx.mlx_array_set(&pooled, live.qsa_pooled));
+    var live_arr = [_]SSMCacheEntry{live};
+    defer {
+        if (live_arr[0].aux_state.ctx != null) _ = mlx.mlx_array_free(live_arr[0].aux_state);
+        if (live_arr[0].qsa_pooled.ctx != null) _ = mlx.mlx_array_free(live_arr[0].qsa_pooled);
+    }
+
+    const positions = [_]usize{ 16, 32, 48, 64 };
+    var cps: [positions.len]SSMCheckpoint = undefined;
+    for (positions, 0..) |p, i| {
+        cps[i] = try captureSsmCheckpoint(testing.allocator, &live_arr, p, s);
+    }
+    defer for (&cps) |*c| c.deinit(testing.allocator);
+    try attachQsaHistoryToLatest(&cps, &live_arr, s);
+
+    const held = qsaHistoryBytesHeld(&cps);
+    const one: u64 = @as(u64, @intCast(n)) * @as(u64, @intCast(hd)) * 4 +
+        @as(u64, @intCast(@divExact(n, ratio))) * @as(u64, @intCast(hd)) * 4;
+    try testing.expect(held <= one + @as(u64, positions.len) * 64);
+    for (positions, 0..) |p, i| {
+        try testing.expectEqual(@as(c_int, @intCast(p)), cps[i].layers[0].qsa_rows);
+        if (i + 1 < positions.len) {
+            try testing.expect(cps[i].layers[0].aux_state.ctx == null);
+        }
+    }
+    try testing.expect(checkpointHasQsaHistory(&cps[positions.len - 1]));
+
+    var dest = [_]SSMCacheEntry{.{
+        .conv_state = .{ .ctx = null },
+        .ssm_state = .{ .ctx = null },
+        .initialized = true,
+    }};
+    defer ssmFreeQsaState(&dest[0]);
+    try applyQsaHistoryAt(&dest, &cps[positions.len - 1], 16, s);
+    try testing.expectEqual(@as(c_int, 16), mlx.getShape(dest[0].aux_state)[1]);
+    {
+        var got = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(got);
+        try mlx.check(mlx.mlx_astype(&got, dest[0].aux_state, .float32, s));
+        try mlx.check(mlx.mlx_array_eval(got));
+        const d = mlx.mlx_array_data_float32(got) orelse return error.TestUnexpectedNullData;
+        try testing.expectEqual(@as(f32, 0), d[0]);
+        try testing.expectEqual(@as(f32, 15.0 * 8.0 + 7.0), d[15 * 8 + 7]);
+    }
+
+    var t: Transformer = undefined;
+    t.s = s;
+    t.allocator = testing.allocator;
+    const extra_shape = [_]c_int{ 1, 1, hd };
+    var extra = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(extra);
+    try mlx.check(mlx.mlx_ones(&extra, &extra_shape, 3, .float32, s));
+    try t.qsaAppendKeys(&dest[0], extra, 16);
+    try mlx.check(mlx.mlx_array_eval(dest[0].aux_state));
+    try testing.expectEqual(@as(c_int, 17), mlx.getShape(dest[0].aux_state)[1]);
+    try testing.expectEqual(@as(c_int, 64), mlx.getShape(cps[positions.len - 1].layers[0].aux_state)[1]);
+    {
+        var got = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(got);
+        try mlx.check(mlx.mlx_astype(&got, cps[positions.len - 1].layers[0].aux_state, .float32, s));
+        try mlx.check(mlx.mlx_array_eval(got));
+        const d = mlx.mlx_array_data_float32(got) orelse return error.TestUnexpectedNullData;
+        try testing.expectEqual(@as(f32, 63.0 * 8.0 + 7.0), d[63 * 8 + 7]);
+    }
+}
+
+test "qsa_rows is the checkpoint position, never current live length" {
+    const s = mlx.gpuStream();
+    const hd: c_int = 8;
+    const ratio: c_int = 4;
+    const aux_shape = [_]c_int{ 1, 16, hd };
+    var aux = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(aux);
+    try mlx.check(mlx.mlx_ones(&aux, &aux_shape, 3, .float32, s));
+    var pooled = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(pooled);
+    const pooled_shape = [_]c_int{ 1, 4, hd };
+    try mlx.check(mlx.mlx_ones(&pooled, &pooled_shape, 3, .float32, s));
+    var live16 = [_]SSMCacheEntry{.{
+        .conv_state = .{ .ctx = null },
+        .ssm_state = .{ .ctx = null },
+        .initialized = true,
+        .aux_state = aux,
+        .qsa_pooled = pooled,
+        .qsa_ratio = ratio,
+    }};
+    aux = mlx.mlx_array_new();
+    pooled = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_array_set(&aux, live16[0].aux_state));
+    try mlx.check(mlx.mlx_array_set(&pooled, live16[0].qsa_pooled));
+    defer ssmFreeQsaState(&live16[0]);
+
+    var cp32 = try captureSsmCheckpoint(testing.allocator, &live16, 32, s);
+    defer cp32.deinit(testing.allocator);
+    try testing.expectEqual(@as(c_int, 32), cp32.layers[0].qsa_rows);
+
+    const aux64_shape = [_]c_int{ 1, 64, hd };
+    var aux64 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(aux64);
+    try mlx.check(mlx.mlx_ones(&aux64, &aux64_shape, 3, .float32, s));
+    var pooled64 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(pooled64);
+    const pooled64_shape = [_]c_int{ 1, 16, hd };
+    try mlx.check(mlx.mlx_ones(&pooled64, &pooled64_shape, 3, .float32, s));
+    var live64 = [_]SSMCacheEntry{.{
+        .conv_state = .{ .ctx = null },
+        .ssm_state = .{ .ctx = null },
+        .initialized = true,
+        .aux_state = aux64,
+        .qsa_pooled = pooled64,
+        .qsa_ratio = ratio,
+    }};
+    aux64 = mlx.mlx_array_new();
+    pooled64 = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_array_set(&aux64, live64[0].aux_state));
+    try mlx.check(mlx.mlx_array_set(&pooled64, live64[0].qsa_pooled));
+    defer ssmFreeQsaState(&live64[0]);
+    var cps = [_]SSMCheckpoint{
+        try captureSsmCheckpoint(testing.allocator, &live64, 16, s),
+        try captureSsmCheckpoint(testing.allocator, &live64, 64, s),
+    };
+    defer for (&cps) |*c| c.deinit(testing.allocator);
+    try testing.expectEqual(@as(c_int, 16), cps[0].layers[0].qsa_rows);
+    try testing.expectEqual(@as(c_int, 64), cps[1].layers[0].qsa_rows);
+
+    const aux8_shape = [_]c_int{ 1, 8, hd };
+    var aux8 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(aux8);
+    try mlx.check(mlx.mlx_ones(&aux8, &aux8_shape, 3, .float32, s));
+    var live8 = [_]SSMCacheEntry{.{
+        .conv_state = .{ .ctx = null },
+        .ssm_state = .{ .ctx = null },
+        .initialized = true,
+        .aux_state = aux8,
+        .qsa_ratio = ratio,
+    }};
+    aux8 = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_array_set(&aux8, live8[0].aux_state));
+    defer ssmFreeQsaState(&live8[0]);
+    try attachQsaHistoryToLatest(&cps, &live8, s);
+    try testing.expectEqual(@as(c_int, 16), cps[0].layers[0].qsa_rows);
+    try testing.expectEqual(@as(c_int, 64), cps[1].layers[0].qsa_rows);
 }
 
 test "captureSsmCheckpoint does not copy QSA aux history" {

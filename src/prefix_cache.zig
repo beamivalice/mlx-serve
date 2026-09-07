@@ -1116,6 +1116,15 @@ pub const HotPrefixCache = struct {
             return .{ .matched = 0, .full_match = false };
         }
         // The stamp before the bump: two arms after the restore still end in `matched = 0`.
+        if (e.ssm_checkpoints) |cps| {
+            if (highestCheckpointAtOrBelow(cps, m.shared)) |cp| {
+                const src_cp = qsaHistorySource(cps, cp) orelse cp;
+                const have = transformer_mod.checkpointQsaAuxRows(src_cp);
+                if (have > 0 and have < @as(c_int, @intCast(cp.pos))) {
+                    return error.QsaHistoryGap;
+                }
+            }
+        }
         const used_before_restore = e.last_used;
         e.last_used = self.bumpCounter();
         // Identity of the entry this request runs on: evicting it frees nothing (shared buffers).
@@ -3760,6 +3769,43 @@ test "HotPrefixCache: a QSA arch restore with no indexer history is a miss, neve
             try testing.expectEqual(@as(usize, 0), moe_off);
             try testing.expect(target[0].aux_state.ctx == null);
         }
+    }
+}
+
+test "HotPrefixCache: a history tensor shorter than the checkpoint is a miss, not a short hit" {
+    const s = mlx.gpuStream();
+    var tokens: [70]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 1);
+    var lookup_latest: [70]u32 = tokens;
+    lookup_latest[64] = 999;
+    var lookup_interior: [70]u32 = tokens;
+    lookup_interior[16] = 999;
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    hc.qsa_history_required = true;
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 3, tokens.len);
+    var live = pcBuildQsaHybrid(s, 8, 100.0);
+    defer pcFreeQsaHybrid(&live);
+    const cps = try testing.allocator.alloc(SSMCheckpoint, 2);
+    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 16, s);
+    cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 64, s);
+    try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
+    try testing.expectEqual(@as(c_int, 8), mlx.getShape(cps[1].layers[0].aux_state)[1]);
+    try testing.expectEqual(@as(c_int, 64), cps[1].layers[0].qsa_rows);
+    try hc.commitWithState(&cache, &tokens, false, 0, cps, null, null);
+
+    for ([_][]const u32{ &lookup_latest, &lookup_interior }) |lookup| {
+        var target_cache = try KVCache.init(testing.allocator, 3);
+        defer target_cache.deinit();
+        var target = pcEmptySsm();
+        defer pcFreeQsaHybrid(&target);
+        var moe_off: usize = 0;
+        try testing.expectError(error.QsaHistoryGap, hc.lookupAndRestore(&target_cache, &moe_off, &target, s, lookup, false, 0, null, null));
+        try testing.expectEqual(@as(usize, 0), target_cache.step);
+        try testing.expect(target[0].aux_state.ctx == null);
     }
 }
 
