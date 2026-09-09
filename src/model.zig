@@ -924,6 +924,14 @@ pub const ModelConfig = struct {
         return self.isQwen4();
     }
 
+    pub fn batchedEffectiveKvLen(self: *const ModelConfig, kv: u32, gather_on: bool, gather_min_kv: u32) u32 {
+        if (!self.isQwen4() or !gather_on) return kv;
+        if (kv <= gather_min_kv) return kv;
+        const cap = self.indexer_budget + self.indexer_compress_ratio;
+        if (cap == 0) return kv;
+        return @min(kv, cap);
+    }
+
     /// SSD-first prefix cache arch predicate; delegates to `longCtxGated`.
     pub fn ssdFirstCapable(self: *const ModelConfig) bool {
         return self.longCtxGated();

@@ -731,10 +731,6 @@ pub const Slot = struct {
     }
 
     /// This slot's attention KV length for the batched group; never `cache.step` (0 forever on a linear-layer-0 trunk).
-    pub fn batchKvLen(self: *const Slot) u32 {
-        return batchKvLenOf(&self.cache, self.model.config);
-    }
-
     /// Free everything the slot owns. Only safe to call when no thread can
     /// observe the slot anymore (i.e. after the inference thread has
     /// finished/errored it AND the connection thread has consumed the final
@@ -2294,11 +2290,32 @@ pub fn batchedPadWaste(kv_lens_asc: []const u32) f64 {
 /// KDA) it is 0 forever and the pad-waste cap never fired. `KVCache.kvLenForBatching` reads
 /// the first attention layer's own offset there.
 pub fn batchKvLenOf(cache: *const KVCache, cfg: ?*const model_mod.ModelConfig) u32 {
+    return batchKvLenOfWith(cache, cfg, 1, false);
+}
+
+pub fn batchKvLenOfWith(cache: *const KVCache, cfg: ?*const model_mod.ModelConfig, seq_len: c_int, any_mrope: bool) u32 {
     // Arch gate: the multi-stream batched wins on the 27B were measured with the cap dead,
     // so every other arch keeps `cache.step` (and the dead cap) pending a measurement.
     const c = cfg orelse return @intCast(cache.step);
     if (!c.longCtxGated()) return @intCast(cache.step);
-    return @intCast(cache.kvLenForBatching());
+    const raw: u32 = @intCast(cache.kvLenForBatching());
+    const gather_on = transformer_mod.qsaBatchedGatherOn(seq_len, any_mrope);
+    const min_kv: u32 = @intCast(transformer_mod.qsaBatchedGatherFloor(seq_len));
+    return c.batchedEffectiveKvLen(raw, gather_on, min_kv);
+}
+
+pub fn fillGroupPadWasteKvLens(
+    caches: []const *const KVCache,
+    cfg: ?*const model_mod.ModelConfig,
+    seq_len: c_int,
+    mrope: []const bool,
+    out: []u32,
+) void {
+    var any_mrope = false;
+    for (mrope) |m| if (m) {
+        any_mrope = true;
+    };
+    for (caches, 0..) |c, i| out[i] = batchKvLenOfWith(c, cfg, seq_len, any_mrope);
 }
 
 /// Pure-config predicate: is this model's architecture compatible with the
@@ -6336,7 +6353,13 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
             // The stable insertion sort is part of the change: `std.sort.pdq` is unstable and
             // off qwen4_exp every key is `cache.step` == 0, so the sort decides the ordering.
             if (gate_batch_kv_len) {
-                for (group, 0..) |g, i| kv_lens[i] = g.batchKvLen();
+                var caches_buf: [MAX_BATCH_GROUP]*const KVCache = undefined;
+                var mrope_buf: [MAX_BATCH_GROUP]bool = undefined;
+                for (group, 0..) |g, i| {
+                    caches_buf[i] = &g.cache;
+                    mrope_buf[i] = g.mrope_pos != null;
+                }
+                fillGroupPadWasteKvLens(caches_buf[0..group.len], group[0].model.config, 1, mrope_buf[0..group.len], kv_lens[0..group.len]);
                 // Stable insertion sort, ascending, slots and lengths moving together.
                 var i: usize = 1;
                 while (i < group.len) : (i += 1) {
@@ -7039,9 +7062,21 @@ fn mtpGroupEnabled() bool {
 /// qwen4_exp verify rows are expert BYTES (S=1/2/4 = 16/22/31 ms) and the batched forward
 /// has no PLE spec capture at S > 1, so its MTP rounds stay solo; two of them interleave
 /// (68 tok/s aggregate vs 65 plain), three lose to the plain batched tick (67 vs 82).
+var mtp_batched_qwen4_env: ?bool = null;
+fn mtpBatchedQwen4Enabled() bool {
+    if (mtp_batched_qwen4_env) |v| return v;
+    const on = if (std.c.getenv("MLX_SERVE_MTP_BATCHED_QWEN4")) |p| !std.mem.eql(u8, std.mem.span(p), "0") else false;
+    mtp_batched_qwen4_env = on;
+    return on;
+}
+
+fn mtpQwen4StaySolo(has_qwen4: bool, env_on: bool) bool {
+    return has_qwen4 and !env_on;
+}
+
 fn mtpRoundsStaySolo(slot: *const Slot) bool {
     const t = slot.model.transformer orelse return true;
-    return t.qwen4 != null;
+    return mtpQwen4StaySolo(t.qwen4 != null, mtpBatchedQwen4Enabled());
 }
 
 fn mtpCrowdThresholdFor(slot: *const Slot) usize {
@@ -7069,7 +7104,13 @@ fn runMtpGroups(sch: *Scheduler, slots: []*Slot) !void {
         }
         if (group.len >= 2) {
             var kv_lens: [MAX_BATCH_GROUP]u32 = undefined;
-            for (group, 0..) |g, i| kv_lens[i] = g.batchKvLen();
+            var caches_buf: [MAX_BATCH_GROUP]*const KVCache = undefined;
+            var mrope_buf: [MAX_BATCH_GROUP]bool = undefined;
+            for (group, 0..) |g, i| {
+                caches_buf[i] = &g.cache;
+                mrope_buf[i] = g.mrope_pos != null;
+            }
+            fillGroupPadWasteKvLens(caches_buf[0..group.len], group[0].model.config, 2, mrope_buf[0..group.len], kv_lens[0..group.len]);
             var i: usize = 1;
             while (i < group.len) : (i += 1) {
                 const slot_i = group[i];
@@ -7649,6 +7690,182 @@ test "an attention-first trunk's batching lengths are unchanged by the fix" {
         batchedKvKeepCount(&[_]u32{ 1_000, 1_000, 1_000, 100_000 }),
         batchedKvKeepCount(&kv_lens),
     );
+}
+
+test "batchKvLenOf bills qwen4 selected length when the gather arm is on" {
+    const prev = transformer_mod.qsa_batched_gather_override;
+    defer transformer_mod.qsa_batched_gather_override = prev;
+    transformer_mod.qsa_batched_gather_override = true;
+    var q4 = model_mod.ModelConfig{
+        .model_type = "qwen4_exp",
+        .indexer_budget = 2048,
+        .indexer_compress_ratio = 4,
+    };
+    var cache = try KVCache.init(testing.allocator, 32);
+    defer cache.deinit();
+    cache.entries[3].initialized = true;
+    cache.entries[3].offset = 162_000;
+    try testing.expectEqual(@as(u32, 2052), batchKvLenOf(&cache, &q4));
+    transformer_mod.qsa_batched_gather_override = false;
+    try testing.expectEqual(@as(u32, 162_000), batchKvLenOf(&cache, &q4));
+    var llama = model_mod.ModelConfig{ .model_type = "llama" };
+    cache.step = 162_000;
+    cache.entries[0].initialized = true;
+    cache.entries[0].offset = 162_000;
+    transformer_mod.qsa_batched_gather_override = true;
+    try testing.expectEqual(@as(u32, 162_000), batchKvLenOf(&cache, &llama));
+}
+
+test "batchKvLenOf bills raw when any gather switch is off or the slot is vision" {
+    const prev_b = transformer_mod.qsa_batched_gather_override;
+    const prev_g = transformer_mod.qsa_gather_override;
+    const prev_d = transformer_mod.qsa_decode_gather_override;
+    const prev_v = transformer_mod.qsa_verify_gather_override;
+    defer {
+        transformer_mod.qsa_batched_gather_override = prev_b;
+        transformer_mod.qsa_gather_override = prev_g;
+        transformer_mod.qsa_decode_gather_override = prev_d;
+        transformer_mod.qsa_verify_gather_override = prev_v;
+    }
+    transformer_mod.qsa_batched_gather_override = true;
+    transformer_mod.qsa_gather_override = true;
+    transformer_mod.qsa_decode_gather_override = true;
+    transformer_mod.qsa_verify_gather_override = true;
+    var q4 = model_mod.ModelConfig{
+        .model_type = "qwen4_exp",
+        .indexer_budget = 2048,
+        .indexer_compress_ratio = 4,
+    };
+    var cache = try KVCache.init(testing.allocator, 32);
+    defer cache.deinit();
+    cache.entries[3].initialized = true;
+    cache.entries[3].offset = 162_000;
+    try testing.expectEqual(@as(u32, 2052), batchKvLenOfWith(&cache, &q4, 1, false));
+    try testing.expectEqual(@as(u32, 2052), batchKvLenOfWith(&cache, &q4, 4, false));
+    try testing.expectEqual(@as(u32, 162_000), batchKvLenOfWith(&cache, &q4, 1, true));
+    try testing.expectEqual(@as(u32, 162_000), batchKvLenOfWith(&cache, &q4, 4, true));
+    transformer_mod.qsa_batched_gather_override = false;
+    try testing.expectEqual(@as(u32, 162_000), batchKvLenOfWith(&cache, &q4, 1, false));
+    transformer_mod.qsa_batched_gather_override = true;
+    transformer_mod.qsa_gather_override = false;
+    try testing.expectEqual(@as(u32, 162_000), batchKvLenOfWith(&cache, &q4, 1, false));
+    transformer_mod.qsa_gather_override = true;
+    transformer_mod.qsa_decode_gather_override = false;
+    try testing.expectEqual(@as(u32, 162_000), batchKvLenOfWith(&cache, &q4, 1, false));
+    try testing.expectEqual(@as(u32, 2052), batchKvLenOfWith(&cache, &q4, 4, false));
+    transformer_mod.qsa_decode_gather_override = true;
+    transformer_mod.qsa_verify_gather_override = false;
+    try testing.expectEqual(@as(u32, 2052), batchKvLenOfWith(&cache, &q4, 1, false));
+    try testing.expectEqual(@as(u32, 162_000), batchKvLenOfWith(&cache, &q4, 4, false));
+}
+
+test "grouping a 300k text slot beside a 1k vision slot is not admitted on the sparse bill" {
+    const prev_b = transformer_mod.qsa_batched_gather_override;
+    const prev_g = transformer_mod.qsa_gather_override;
+    const prev_d = transformer_mod.qsa_decode_gather_override;
+    defer {
+        transformer_mod.qsa_batched_gather_override = prev_b;
+        transformer_mod.qsa_gather_override = prev_g;
+        transformer_mod.qsa_decode_gather_override = prev_d;
+    }
+    transformer_mod.qsa_batched_gather_override = true;
+    transformer_mod.qsa_gather_override = true;
+    transformer_mod.qsa_decode_gather_override = true;
+    var q4 = model_mod.ModelConfig{
+        .model_type = "qwen4_exp",
+        .indexer_budget = 2048,
+        .indexer_compress_ratio = 4,
+    };
+    var caches: [2]KVCache = undefined;
+    var built: usize = 0;
+    defer for (caches[0..built]) |*c| c.deinit();
+    caches[0] = try KVCache.init(testing.allocator, 32);
+    built = 1;
+    caches[0].entries[3].initialized = true;
+    caches[0].entries[3].offset = 300_000;
+    caches[1] = try KVCache.init(testing.allocator, 32);
+    built = 2;
+    caches[1].entries[3].initialized = true;
+    caches[1].entries[3].offset = 1_000;
+    const ptrs = [_]*const KVCache{ &caches[0], &caches[1] };
+    var billed: [2]u32 = undefined;
+    fillGroupPadWasteKvLens(&ptrs, &q4, 1, &.{ false, true }, &billed);
+    try testing.expectEqual(@as(u32, 300_000), billed[0]);
+    try testing.expectEqual(@as(u32, 1_000), billed[1]);
+    var billed_asc = billed;
+    std.mem.sort(u32, &billed_asc, {}, std.sort.asc(u32));
+    try testing.expectEqual(@as(usize, 0), batchedKvKeepCount(&billed_asc));
+    const per_slot = [_]u32{
+        batchKvLenOfWith(&caches[1], &q4, 1, true),
+        batchKvLenOfWith(&caches[0], &q4, 1, false),
+    };
+    try testing.expectEqual(@as(usize, 2), batchedKvKeepCount(&per_slot));
+}
+
+test "S>=2 pad-waste floor is max of gather and verify mins" {
+    const prev_b = transformer_mod.qsa_batched_gather_override;
+    const prev_g = transformer_mod.qsa_gather_override;
+    const prev_v = transformer_mod.qsa_verify_gather_override;
+    const prev_gm = transformer_mod.qsa_gather_min_kv_override;
+    const prev_vm = transformer_mod.qsa_verify_gather_min_kv_override;
+    defer {
+        transformer_mod.qsa_batched_gather_override = prev_b;
+        transformer_mod.qsa_gather_override = prev_g;
+        transformer_mod.qsa_verify_gather_override = prev_v;
+        transformer_mod.qsa_gather_min_kv_override = prev_gm;
+        transformer_mod.qsa_verify_gather_min_kv_override = prev_vm;
+    }
+    transformer_mod.qsa_batched_gather_override = true;
+    transformer_mod.qsa_gather_override = true;
+    transformer_mod.qsa_verify_gather_override = true;
+    transformer_mod.qsa_gather_min_kv_override = 20_000;
+    transformer_mod.qsa_verify_gather_min_kv_override = 16_384;
+    var q4 = model_mod.ModelConfig{
+        .model_type = "qwen4_exp",
+        .indexer_budget = 2048,
+        .indexer_compress_ratio = 4,
+    };
+    var cache = try KVCache.init(testing.allocator, 32);
+    defer cache.deinit();
+    cache.entries[3].initialized = true;
+    cache.entries[3].offset = 18_000;
+    try testing.expectEqual(@as(u32, 18_000), batchKvLenOfWith(&cache, &q4, 4, false));
+    cache.entries[3].offset = 162_000;
+    try testing.expectEqual(@as(u32, 2052), batchKvLenOfWith(&cache, &q4, 4, false));
+}
+
+test "batchedEffectiveKvLen: qwen4 bills selected length, other archs keep raw kv" {
+    var q4 = model_mod.ModelConfig{
+        .model_type = "qwen4_exp",
+        .indexer_budget = 2048,
+        .indexer_compress_ratio = 4,
+    };
+    const min_kv: u32 = 8192;
+    try testing.expectEqual(@as(u32, 2052), q4.batchedEffectiveKvLen(162_000, true, min_kv));
+    try testing.expectEqual(@as(u32, 2052), q4.batchedEffectiveKvLen(64_000, true, min_kv));
+    try testing.expectEqual(@as(u32, 8000), q4.batchedEffectiveKvLen(8000, true, min_kv));
+    try testing.expectEqual(@as(u32, 162_000), q4.batchedEffectiveKvLen(162_000, false, min_kv));
+    var llama = model_mod.ModelConfig{ .model_type = "llama" };
+    try testing.expectEqual(@as(u32, 162_000), llama.batchedEffectiveKvLen(162_000, true, min_kv));
+    var q35 = model_mod.ModelConfig{ .model_type = "qwen3_5" };
+    try testing.expectEqual(@as(u32, 162_000), q35.batchedEffectiveKvLen(162_000, true, min_kv));
+
+    const billed = [_]u32{
+        q4.batchedEffectiveKvLen(16_384, true, min_kv),
+        q4.batchedEffectiveKvLen(162_000, true, min_kv),
+    };
+    try testing.expectEqual(@as(usize, 2), batchedKvKeepCount(&billed));
+    const raw_pair = [_]u32{ 16_384, 162_000 };
+    try testing.expectEqual(@as(usize, 0), batchedKvKeepCount(&raw_pair));
+    const other = [_]u32{ 1_000, 162_000 };
+    try testing.expectEqual(@as(usize, 0), batchedKvKeepCount(&other));
+}
+
+test "mtpQwen4StaySolo is opt-in" {
+    try testing.expect(mtpQwen4StaySolo(true, false));
+    try testing.expect(!mtpQwen4StaySolo(true, true));
+    try testing.expect(!mtpQwen4StaySolo(false, false));
+    try testing.expect(!mtpQwen4StaySolo(false, true));
 }
 
 test "modelBatchable permits pure-attention" {
