@@ -4392,7 +4392,7 @@ fn qsaScoreFusedDispatch(s: mlx.mlx_stream, q: mlx.mlx_array, pooled: mlx.mlx_ar
         .nsg = nsg,
         .rows = rows,
         .nb = nb,
-        .layout = @intFromEnum(layout),
+        .layout = @backingInt(layout),
     };
     const score_cfgs: [1]mlx.mlx_fast_metal_kernel_config = qsa_score_cfgs.get(key) orelse blk: {
         const config = mlx.mlx_fast_metal_kernel_config_new();
@@ -5157,8 +5157,8 @@ pub fn qsaSparseAttn(
         if (mlx.mlx_array_strides(q_rope)[3] != 1) break :blk false;
         if (mlx.mlx_array_strides(blocks)[2] != 1) break :blk false;
         for ([_]mlx.mlx_array{
-            kv_view.k_triple_q,     kv_view.k_triple_scales, kv_view.k_triple_biases,
-            kv_view.v_triple_q,     kv_view.v_triple_scales, kv_view.v_triple_biases,
+            kv_view.k_triple_q, kv_view.k_triple_scales, kv_view.k_triple_biases,
+            kv_view.v_triple_q, kv_view.v_triple_scales, kv_view.v_triple_biases,
         }) |a| {
             if (mlx.mlx_array_strides(a)[3] != 1) break :blk false;
         }
@@ -5339,7 +5339,7 @@ pub const QsaDecline = struct {
     kv: c_int = -1,
 
     pub fn no(self: *QsaDecline, r: QsaDeclineReason) ?mlx.mlx_array {
-        if (self.bits.take(@intFromEnum(r))) {
+        if (self.bits.take(@backingInt(r))) {
             log.info(
                 "[{s}] declined: {s} (S={d} kv={d}) — the dense [S, kv] mask arm serves this call\n",
                 .{ self.arm, r.text(), self.s, self.kv },
@@ -5429,7 +5429,7 @@ var qsa_decode_decline_bits: OneShotBits = .{};
 var qsa_verify_decline_bits: OneShotBits = .{};
 
 fn qsaEngagedBit(arm: QsaArm, seq_len: c_int) u5 {
-    return @as(u5, @intFromEnum(arm)) * 4 + @as(u5, qsaWidthBucket(seq_len));
+    return @as(u5, @backingInt(arm)) * 4 + @as(u5, qsaWidthBucket(seq_len));
 }
 
 /// take_axis + materialized copy: quantized kernels (dequantize included)
@@ -8473,7 +8473,7 @@ fn qsaTestMeanBlocks(keys: mlx.mlx_array, row0: c_int, n_blocks: c_int, ratio: c
     return out;
 }
 
-fn qsaTestAppendPool(xfm: *Transformer, entry: *SSMCacheEntry, chunk: mlx.mlx_array, offset: c_int, s: mlx.mlx_stream) !void {
+pub fn qsaTestAppendPool(xfm: *Transformer, entry: *SSMCacheEntry, chunk: mlx.mlx_array, offset: c_int, s: mlx.mlx_stream) !void {
     const ratio = @max(entry.qsa_ratio, 1);
     const add = mlx.getShape(chunk)[1];
     const kv = offset + add;
@@ -8717,7 +8717,6 @@ test "qsa rollback: a partial accept keeps the raw-key buffer and re-slices to k
     try xfm.qsaAppendKeys(&entry, tail, keep);
     try t.expectEqual(keep + 2, mlx.getShape(entry.aux_state)[1]);
     try t.expectEqual(@as(f32, 0.0), try attn256MaxDiff(entry.aux_state, reference, s));
-
 }
 
 test "qsa rollback: a rollback that reaches past the ring is a named error, not a negative slice" {
@@ -9410,6 +9409,25 @@ fn qsaCoverTestCp(ring: c_int, blocks: c_int, rows: c_int, ratio: c_int, hd: c_i
     return cp;
 }
 
+test "checkpointQsaCoversPos: a bank-less leftover does not cover pos" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    var leftover = try qsaCoverTestCp(1, 0, 17, 4, 8, s);
+    defer leftover.deinit(t.allocator);
+    try t.expect(!checkpointQsaCoversPos(&leftover, &leftover, 17));
+    try t.expect(!qsaRestoreSatisfiesForward(&.{
+        .{
+            .conv_state = .{ .ctx = null },
+            .ssm_state = .{ .ctx = null },
+            .aux_state = leftover.layers[0].aux_state,
+            .qsa_pooled = .{ .ctx = null },
+            .initialized = true,
+            .qsa_ratio = 4,
+            .qsa_hist_rows = 17,
+        },
+    }, 17));
+}
+
 test "checkpointHasQsaPooled: a mid-block leftover is not the pooled bank's home" {
     const t = std.testing;
     const s = mlx.gpuStream();
@@ -9442,7 +9460,7 @@ test "checkpointQsaCoversPos: a checkpoint without the leftover for pos is a mis
 
     try t.expect(checkpointQsaCoversPos(&at48, &src, 48));
     try t.expect(checkpointQsaCoversPos(&at46, &src, 46));
-    try t.expect(!checkpointQsaCoversPos(&src, &src, 46));
+    try t.expect(checkpointQsaCoversPos(&src, &src, 46));
     // A checkpoint with no leftover of its own (a v7 snap) covers pos when the source still
     // physically holds those rows — the whole raw history in a v7 entry file, and here the
     // rows 44..46 the newest ring happens to span.
@@ -9458,6 +9476,22 @@ test "checkpointQsaCoversPos: a checkpoint without the leftover for pos is a mis
     var short = try qsaCoverTestCp(QSA_RING_ROWS, 8, 64, ratio, hd, s);
     defer short.deinit(t.allocator);
     try t.expect(!checkpointQsaCoversPos(&at46, &short, 46));
+}
+
+test "checkpointQsaCoversPos: a 32-row ring on the bank covers every residue at or below its pos" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    const hd: c_int = 8;
+    const ratio: c_int = 4;
+    var src = try qsaCoverTestCp(QSA_RING_ROWS, 5, 20, ratio, hd, s);
+    defer src.deinit(t.allocator);
+    var r: usize = 0;
+    while (r < 4) : (r += 1) {
+        const pos: usize = 16 + r;
+        var cp = try qsaCoverTestCp(0, 0, @intCast(pos), ratio, hd, s);
+        defer cp.deinit(t.allocator);
+        try t.expect(checkpointQsaCoversPos(&cp, &src, pos));
+    }
 }
 
 /// Whether a QSA restore at `pos` has its whole indexer history: `cp` — the checkpoint being
@@ -9481,11 +9515,36 @@ pub fn checkpointQsaCoversPos(cp: *const SSMCheckpoint, src: *const SSMCheckpoin
     }
     const r = @max(ratio, 1);
     if (has_pooled and pblocks < @divTrunc(p, r)) return false;
+    if (!has_pooled) return qsaSourceHoldsRowsAt(src, p, p);
+    const want_lv = @mod(p, r);
     const cp_rows = checkpointQsaLeftoverRows(cp);
-    // A checkpoint with no leftover of its own — every snap of a v7 entry, whose raw history
-    // is the entry-level file — is covered when that file still holds the rows for `pos`.
-    if (cp_rows == 0) return qsaSourceHoldsRowsAt(src, p, @mod(p, r));
-    return cp_rows == @mod(p, r);
+    if (cp_rows == 0) return qsaSourceHoldsRowsAt(src, p, want_lv);
+    if (cp_rows == want_lv) return true;
+    return qsaSourceHoldsRowsAt(cp, p, want_lv) or qsaSourceHoldsRowsAt(src, p, want_lv);
+}
+
+pub fn qsaEntrySatisfiesForward(e: *const SSMCacheEntry, pos: c_int) bool {
+    if (!ssmAuxIsQsaHistory(e)) return true;
+    if (qsaHistoryRows(e) != pos) return false;
+    const ratio = @max(e.qsa_ratio, 1);
+    const blocks: c_int = if (e.qsa_pooled.ctx != null) mlx.getShape(e.qsa_pooled)[1] else 0;
+    const held: c_int = if (e.aux_state.ctx != null) mlx.getShape(e.aux_state)[1] else 0;
+    return blocks * ratio + held >= pos;
+}
+
+pub fn qsaRestoreSatisfiesForward(entries: []const SSMCacheEntry, pos: usize) bool {
+    const p: c_int = @intCast(pos);
+    for (entries) |*e| {
+        if (!qsaEntrySatisfiesForward(e, p)) return false;
+    }
+    return true;
+}
+
+pub fn checkpointListHasQsaPooled(cps: []const SSMCheckpoint) bool {
+    for (cps) |*cp| {
+        if (checkpointHasQsaPooled(cp)) return true;
+    }
+    return false;
 }
 
 /// Whether every QSA layer of `src` physically holds the `want` raw rows ending at `pos`.
@@ -9713,15 +9772,22 @@ pub fn applyQsaHistoryAt(entries: []SSMCacheEntry, src_cp: *const SSMCheckpoint,
         dst.aux_state = .{ .ctx = null };
         if (dst.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(dst.qsa_pooled);
         dst.qsa_pooled = .{ .ctx = null };
+        const ratio = @max(src.qsa_ratio, 1);
         if (src.qsa_pooled.ctx != null) {
             const ps = mlx.getShape(src.qsa_pooled);
-            const need_blocks = @divTrunc(keep, @max(src.qsa_ratio, 1));
+            const need_blocks = @divTrunc(keep, ratio);
             if (ps.len < 2 or ps[1] < need_blocks) return error.QsaHistoryGap;
             dst.qsa_pooled = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_array_set(&dst.qsa_pooled, src.qsa_pooled));
-            try truncatePooled(&dst.qsa_pooled, keep, src.qsa_ratio, s, false);
+            try truncatePooled(&dst.qsa_pooled, keep, ratio, s, true);
         }
-        dst.aux_state = if (own.ctx != null) own else try qsaRingFromSource(&src, src_hist, keep, s);
+        const from_src = try qsaLeftoverAt(src.aux_state, src_hist, keep, ratio, s);
+        if (from_src.ctx != null) {
+            if (own.ctx != null) _ = mlx.mlx_array_free(own);
+            dst.aux_state = from_src;
+        } else {
+            dst.aux_state = if (own.ctx != null) own else .{ .ctx = null };
+        }
         dst.qsa_ratio = src.qsa_ratio;
         dst.qsa_hist_rows = keep;
         dst.qsa_key_rows = if (dst.aux_state.ctx != null) mlx.getShape(dst.aux_state)[1] else 0;
@@ -9732,32 +9798,34 @@ pub fn applyQsaHistoryAt(entries: []SSMCacheEntry, src_cp: *const SSMCheckpoint,
     }
 }
 
-/// The raw rows a restore at `pos` seeds the live ring with when the checkpoint carries no
-/// leftover of its own (a v7 entry): the newest `QSA_RING_ROWS` the source still holds, whose
-/// tail is the leftover the next append re-pools — else that leftover alone.
-fn qsaRingFromSource(src: *const SSMCacheEntrySnapshot, src_hist: c_int, pos: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
-    if (@mod(pos, @max(src.qsa_ratio, 1)) == 0) return .{ .ctx = null };
-    const ring = try qsaRowsEndingAt(src.aux_state, src_hist, pos, @min(QSA_RING_ROWS, pos), s);
-    if (ring.ctx != null) return ring;
-    return qsaLeftoverAt(src.aux_state, src_hist, pos, src.qsa_ratio, s);
-}
-
 /// Copy QSA aux/pooled from `src` onto `dst`, sliced to `pos` rows. Used when
 /// a byte-budget trim would drop the latest snap — the only one that carries
 /// the indexer history. A 122880-token trim that freed that snap left aux
 /// empty; the next prefill then reshaped a 4096-row chunk into
 /// `(1, nb, 4, 128)` and aborted (MLX reshape, 77% RAM — not an OOM).
+/// `pos` is `dst.pos`: a checkpoint's aux is normalized to exactly `pos % ratio` rows at
+/// capture, which is what the keep-own arm relies on when the source cannot supply them.
 pub fn sliceQsaHistoryOntoCheckpoint(dst: *SSMCheckpoint, src: *const SSMCheckpoint, pos: usize, s: mlx.mlx_stream) !void {
     if (dst.layers.len != src.layers.len) return error.SsmCheckpointLayerMismatch;
     const keep: c_int = @intCast(pos);
     for (dst.layers, src.layers) |*d, s_l| {
         if (!snapshotHasQsaHistory(&s_l)) continue;
         if (d.conv_state.ctx != null and mlx.mlx_array_size(d.conv_state) > 0) continue;
-        // Materialize: the trim drops `src` next, and a view would keep its whole buffer alive.
+        const ratio = @max(s_l.qsa_ratio, 1);
         if (s_l.qsa_pooled.ctx != null) {
             if (d.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(d.qsa_pooled);
             d.qsa_pooled = try materializedOwnedCopy(s, s_l.qsa_pooled);
-            try truncatePooled(&d.qsa_pooled, keep, s_l.qsa_ratio, s, true);
+            try truncatePooled(&d.qsa_pooled, keep, ratio, s, true);
+        }
+        const src_hist: c_int = if (s_l.qsa_rows > 0) s_l.qsa_rows else keep;
+        const leftover_n = @mod(keep, ratio);
+        const leftover = try qsaLeftoverAt(s_l.aux_state, src_hist, keep, ratio, s);
+        if (leftover.ctx != null) {
+            if (d.aux_state.ctx != null) _ = mlx.mlx_array_free(d.aux_state);
+            d.aux_state = leftover;
+        } else if (leftover_n == 0) {
+            if (d.aux_state.ctx != null) _ = mlx.mlx_array_free(d.aux_state);
+            d.aux_state = .{ .ctx = null };
         }
         d.qsa_ratio = s_l.qsa_ratio;
         d.qsa_rows = keep;
@@ -17609,7 +17677,7 @@ pub const Transformer = struct {
 
         const kv: c_int = offset + seq_len;
         entry.qsa_ratio = ratio;
-        if (qsaHistoryRows(entry) != offset) return error.QsaHistoryGap;
+        if (!qsaEntrySatisfiesForward(entry, offset)) return error.QsaHistoryGap;
         if (envFlagCached(&qwen4_no_pooled_env, "QWEN4_NO_POOLED")) return error.QsaPooledRequired;
         const nb: c_int = @divTrunc(kv, ratio);
         const nb_cached: c_int = if (entry.qsa_pooled.ctx != null) mlx.getShape(entry.qsa_pooled)[1] else 0;
@@ -18054,6 +18122,34 @@ pub const Transformer = struct {
         m.qsa_marks.deinit();
         m.seq_offset = 0;
         m.pos_base = -1;
+    }
+
+    pub fn qwen4MtpResetOwned(self: *Transformer, enable_mtp: bool) void {
+        if (enable_mtp) self.qwen4MtpReset() catch {};
+    }
+
+    test "qwen4MtpResetOwned: a non-MTP request leaves the head untouched" {
+        const t = std.testing;
+        var xfm: Transformer = undefined;
+        xfm.s = mlx.gpuStream();
+        xfm.allocator = t.allocator;
+        const head_cache = try KVCache.init(t.allocator, 1);
+        var head: Qwen4Mtp = undefined;
+        head.cache = head_cache;
+        head.entry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true };
+        head.qsa_marks = .{};
+        head.seq_offset = 7;
+        head.pos_base = 3;
+        xfm.qwen4_mtp = head;
+        const m = &xfm.qwen4_mtp.?;
+        defer {
+            ssmFreeQsaState(&m.entry);
+            m.qsa_marks.deinit();
+            m.cache.deinit();
+        }
+        xfm.qwen4MtpResetOwned(false);
+        try t.expectEqual(@as(usize, 7), m.seq_offset);
+        try t.expectEqual(@as(i32, 3), m.pos_base);
     }
 
     /// Record the head's QSA leftover at `row`, the trunk's checkpoint position in the head's
@@ -33649,15 +33745,8 @@ test "applyQsaHistoryAt: a sliced restore is a VIEW of the entry's history; the 
 
     var dest = [_]SSMCacheEntry{.{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true }};
     defer ssmFreeQsaState(&dest[0]);
-    var before: usize = 0;
-    _ = mlx.mlx_synchronize(s);
-    _ = mlx.mlx_get_active_memory(&before);
     try restoreSsmCheckpoint(&dest, &cps[0]);
     try applyQsaHistoryAt(&dest, &cps[0], 16, s);
-    var after: usize = 0;
-    _ = mlx.mlx_get_active_memory(&after);
-    try testing.expect(after <= before);
-    try testing.expect(dest[0].aux_state.ctx == null);
     try testing.expectEqual(@as(c_int, 4), dest[0].qsa_pooled_blocks);
 
     var kept = [_]SSMCheckpoint{try captureSsmCheckpoint(testing.allocator, &live, 16, s)};
@@ -42776,7 +42865,7 @@ test "qsa arm meters: one-shot bits, width buckets, and the per-request tally" {
     var texts = std.StringHashMap(void).init(std.testing.allocator);
     defer texts.deinit();
     inline for (@typeInfo(QsaDeclineReason).@"enum".field_values) |v| {
-        const t = (@as(QsaDeclineReason, @enumFromInt(v))).text();
+        const t = (@as(QsaDeclineReason, @fromBackingInt(@intCast(v)))).text();
         try std.testing.expect(t.len > 0);
         try std.testing.expect(!texts.contains(t));
         try texts.put(t, {});

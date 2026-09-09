@@ -45,6 +45,7 @@ const model_mod = @import("model.zig");
 const vision_mod = @import("vision.zig");
 const chat_mod = @import("chat.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
+const restore_dump = @import("restore_dump.zig");
 const metrics_mod = @import("metrics.zig");
 const kv_disk_cache = @import("kv_disk_cache.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
@@ -425,6 +426,7 @@ pub const Slot = struct {
     vision_embeddings: ?mlx.mlx_array,
     vision_key: u64,
     cache_key: u64 = 0,
+    skip_prefix_cache: bool = false,
     /// First dynamic image/audio/video placeholder in `full_prompt`. Cache
     /// state before this position is safe to share across media hashes.
     media_start: ?usize,
@@ -4348,19 +4350,40 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                     continue;
                 }
                 var prefill_sw = io_util.Stopwatch.init(sch.io);
-                runPrefill(sch, slot) catch |err| {
-                    if (err == error.Cancelled) {
-                        // Client vanished mid-prefill (conn thread noticed on
-                        // an idle keepalive probe and set slot.cancelled);
-                        // the chunk loop aborted. A clean finish, not an error.
-                        log.info("[scheduler] prefill aborted: client disconnected\n", .{});
-                        finishSlot(sch, slot, "cancelled");
-                        continue;
-                    }
-                    log.err("[scheduler] prefill failed for slot: {s}\n", .{@errorName(err)});
-                    slot.markError(@errorName(err));
-                    continue;
-                };
+                var qsa_gap_retried = false;
+                prefill: while (true) {
+                    runPrefill(sch, slot) catch |err| {
+                        if (err == error.Cancelled) {
+                            log.info("[scheduler] prefill aborted: client disconnected\n", .{});
+                            finishSlot(sch, slot, "cancelled");
+                            break :prefill;
+                        }
+                        if (err == error.QsaHistoryGap and !qsa_gap_retried) {
+                            if (sch.hot_prefix_cache) |hc| _ = hc.dropLastRestored();
+                            if (slot.ssm_entries) |ents| prefix_cache_mod.HotPrefixCache.resetSsmEntries(ents);
+                            if (slot.model.transformer) |xf| {
+                                slot.cache.truncate(0, xf.s) catch {};
+                                xf.resetQsaPooledRope();
+                                xf.qwen4MtpResetOwned(slot.enable_mtp);
+                            }
+                            if (slot.legacy_gen) |*g| {
+                                g.deinit(slot.allocator);
+                                slot.legacy_gen = null;
+                            }
+                            slot.moe_seq_offset = 0;
+                            slot.cached_tokens = 0;
+                            slot.skip_prefix_cache = true;
+                            log.warn("[hot-cache] restored entry failed the QSA history check — dropped, cold prefill\n", .{});
+                            qsa_gap_retried = true;
+                            continue :prefill;
+                        }
+                        log.err("[scheduler] prefill failed for slot: {s}\n", .{@errorName(err)});
+                        slot.markError(@errorName(err));
+                        break :prefill;
+                    };
+                    break :prefill;
+                }
+                if (slot.state == .errored or slot.cancelled.load(.acquire)) continue;
                 slot.prefill_ns = prefill_sw.read() -| slot.prefill_interleaved_ns;
                 // Exact time-to-first-token: elapsed from request arrival
                 // (Slot.init, pre-queue-wait) to prefill completion. Captured
@@ -4899,7 +4922,7 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
             .head_marks = if (head) |t| t.qwen4MtpMarks() else &.{},
         };
     };
-    const finish_st = hc.commitWithMediaState(&slot.cache, total_tokens, slot.has_tools, slot.vision_key, slot.cache_key, slot.media_start, ssm_cps_opt, dflash_commit, mtp_commit) catch |err| {
+    const finish_st = hc.commitWithMediaState(&slot.cache, total_tokens, slot.has_tools, slot.vision_key, slot.cache_key, slot.media_start, ssm_cps_opt, dflash_commit, mtp_commit, slot.full_prompt.len) catch |err| {
         // Ownership of the checkpoints transferred to the cache regardless of
         // the outcome — its error paths free them (#330 adjacent: freeing
         // here too was a double free, with a different allocator).
@@ -4964,7 +4987,7 @@ fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache)
     // its error paths free them (#330 adjacent) — so detach from the slot
     // BEFORE the call or Slot.deinit frees them a second time.
     slot.cancelled_prefill = .{};
-    const st = hc.commitWithMediaState(&slot.cache, slot.full_prompt[0..len], slot.has_tools, slot.vision_key, slot.cache_key, media_start, cps, null, null) catch |err| {
+    const st = hc.commitWithMediaState(&slot.cache, slot.full_prompt[0..len], slot.has_tools, slot.vision_key, slot.cache_key, media_start, cps, null, null, len) catch |err| {
         log.warn("[hot-cache] cancelled-prefill commit failed: {s}\n", .{@errorName(err)});
         return;
     };
@@ -5861,6 +5884,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // because the conn thread holds a refcount on slot.model.
     const xfm_ptr: *Transformer = slot.model.transformer.?;
     if (slot.model.prefix_cache) |*hc| {
+        if (slot.skip_prefix_cache) hc.skip_prefix_cache = true;
         {
             // Only build a restore target when this request will actually
             // draft — a non-dflash turn leaves the payload in the entry for
@@ -6156,6 +6180,14 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     slot.cached_tokens = hot_matched;
     slot.prompt_tokens = gen.prompt_tokens + slot.cached_tokens;
     slot.state = .decoding;
+    if (hot_matched == 0) {
+        const cold_pos = if (slot.moe_seq_offset > 0) slot.moe_seq_offset else slot.cache.step;
+        _ = restore_dump.dumpRestoreIfEnabled(&slot.cache, slot.ssm_entries, xfm_ptr.s, .{
+            .kind = "cold",
+            .pos = cold_pos,
+            .source = "cold",
+        });
+    }
 }
 
 /// Sum the in-flight generated tokens over the active slots for the live-tok/s

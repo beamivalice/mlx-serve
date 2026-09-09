@@ -836,7 +836,7 @@ fn mixExeBytes(h: *std.hash.Fnv1a_64) void {
         const got = std.c.read(fd, &buf, buf.len);
         if (got < 0) {
             const e = std.c._errno().*;
-            if (e == @intFromEnum(std.c.E.INTR)) continue;
+            if (e == @backingInt(std.c.E.INTR)) continue;
             break;
         }
         if (got == 0) break;
@@ -924,7 +924,7 @@ pub fn fileFingerprint(path: []const u8) ?u64 {
         while (done < buf.len) {
             const got = std.c.pread(fd, buf[done..].ptr, buf.len - done, @intCast(off + done));
             if (got < 0) {
-                if (std.c._errno().* == @intFromEnum(std.c.E.INTR)) continue;
+                if (std.c._errno().* == @backingInt(std.c.E.INTR)) continue;
                 return null;
             }
             if (got == 0) break;
@@ -1670,9 +1670,9 @@ test "round_cost: persist write is a no-op when a diagnostic that adds barriers 
     try testing.expect(!storeShouldWrite(true, true, 8));
     try testing.expect(!storeShouldWrite(false, false, 8));
     try testing.expect(!storeShouldWrite(true, false, 0));
-    try testing.expect(persistDiagArmedFrom(&.{"1", null, null}));
-    try testing.expect(persistDiagArmedFrom(&.{null, null, null}) == false);
-    try testing.expect(persistDiagArmedFrom(&.{"0", "0", "0"}) == false);
-    try testing.expect(persistDiagArmedFrom(&.{null, "1", null}));
-    try testing.expect(persistDiagArmedFrom(&.{null, null, "5"}));
+    try testing.expect(persistDiagArmedFrom(&.{ "1", null, null }));
+    try testing.expect(persistDiagArmedFrom(&.{ null, null, null }) == false);
+    try testing.expect(persistDiagArmedFrom(&.{ "0", "0", "0" }) == false);
+    try testing.expect(persistDiagArmedFrom(&.{ null, "1", null }));
+    try testing.expect(persistDiagArmedFrom(&.{ null, null, "5" }));
 }

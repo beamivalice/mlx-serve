@@ -489,6 +489,15 @@ pub const DiskTier = struct {
         return std.fmt.parseInt(u64, rest[0..slash], 10) catch null;
     }
 
+    pub fn poisonId(self: *DiskTier, id: u64, err_name: []const u8) bool {
+        for (self.entries.items) |*e| {
+            if (e.id != id) continue;
+            if (!e.poisoned) self.poisonEntry(e, err_name);
+            return true;
+        }
+        return false;
+    }
+
     /// Mark one entry dead; `chunk_bytes` is zeroed so every "is this whole?" reader answers no.
     fn poisonEntry(self: *DiskTier, e: *IndexEntry, err_name: []const u8) void {
         _ = self;
@@ -1407,9 +1416,8 @@ pub const DiskTier = struct {
         const wrote_mb = @as(f64, @floatFromInt(written_bytes)) / (1024.0 * 1024.0);
         const ms: u64 = sw.read() / std.time.ns_per_ms;
         log.info("  [disk-cache] persisted {d}/{d} tokens (+{d} chunks, {d} ssm-cp, {d:.1} MB, {d}ms); resident={d:.1} MB ({d} entries)\n", .{
-            kv_len,               kv_target,          chunks_done - keep, new_entry.ssm_positions.len, wrote_mb, ms,
-            @as(f64, @floatFromInt(self.total_bytes)) / (1024.0 * 1024.0),
-            self.entries.items.len,
+            kv_len,                                                        kv_target,              chunks_done - keep, new_entry.ssm_positions.len, wrote_mb, ms,
+            @as(f64, @floatFromInt(self.total_bytes)) / (1024.0 * 1024.0), self.entries.items.len,
         });
         // The one completion marker: every chunk and every wanted checkpoint is staged. A
         // bounded flush leaves it out and `disk_dirty` set. A write that already failed for this
@@ -6705,12 +6713,12 @@ test "DiskTier: a v7 full-aux QSA file serves a mid-block leftover inside a RING
     try testing.expectEqual(@as(c_int, 46), dst[2].qsa_hist_rows);
     try testing.expectEqual(@as(c_int, 11), mlx.getShape(dst[2].qsa_pooled)[1]);
     try testing.expectEqual(@as(f32, 800.0), ssmArrVal(dst[2].qsa_pooled, 0, s));
-    // The live ring is RING_ROWS rows ending at 46, so its last two rows are the checkpoint's
+    // A restore at 46 (ratio 4) seeds exactly the 2 leftover rows 44 and 45, which are the checkpoint's
     // own leftover — source rows 44 and 45.
-    const ring = mlx.getShape(dst[2].aux_state)[1];
-    try testing.expectEqual(transformer_mod.QSA_RING_ROWS, ring);
-    try testing.expectEqual(@as(f32, 1052.0), ssmArrVal(dst[2].aux_state, @intCast((ring - 2) * hd), s));
-    try testing.expectEqual(@as(f32, 1060.0), ssmArrVal(dst[2].aux_state, @intCast((ring - 1) * hd), s));
+    const leftover = mlx.getShape(dst[2].aux_state)[1];
+    try testing.expectEqual(@as(c_int, 2), leftover);
+    try testing.expectEqual(@as(f32, 1052.0), ssmArrVal(dst[2].aux_state, 0, s));
+    try testing.expectEqual(@as(f32, 1060.0), ssmArrVal(dst[2].aux_state, hd, s));
 
     try tmp.dir.createDirPath(io, "fp-qsa-v8/e9");
     try tmp.dir.writeFile(io, .{
