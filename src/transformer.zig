@@ -2744,6 +2744,8 @@ pub fn qsaBatchedGatherEnabled() bool {
 
 pub fn qsaBatchedGatherOn(seq_len: c_int, any_mrope: bool) bool {
     if (any_mrope) return false;
+    const st = qwen4Standin();
+    if (st.attn_qsa or st.attn_sdpa) return false;
     if (!qsaBatchedGatherEnabled()) return false;
     if (!qsaGatherEnabled()) return false;
     if (seq_len <= 1) return qsaDecodeGatherEnabled();
@@ -2751,7 +2753,7 @@ pub fn qsaBatchedGatherOn(seq_len: c_int, any_mrope: bool) bool {
 }
 
 pub fn qsaBatchedGatherFloor(seq_len: c_int) c_int {
-    if (seq_len >= 2) return qsaVerifyGatherMinKv();
+    if (seq_len >= 2) return @max(qsaGatherMinKv(), qsaVerifyGatherMinKv());
     return qsaGatherMinKv();
 }
 
@@ -4473,6 +4475,7 @@ pub fn qsaBatchedGatherAttn(
     masks: []const mlx.mlx_array,
     ratio: c_int,
     attn_scale: f32,
+    out_arms: []QsaArm,
 ) !mlx.mlx_array {
     const qs = mlx.getShape(q_rope);
     const n: usize = @intCast(qs[0]);
@@ -4481,6 +4484,7 @@ pub fn qsaBatchedGatherAttn(
     const hd: c_int = qs[3];
     if (views.len != n or blocks.len != n) return error.QsaBatchedGatherLen;
     if (masks.len != 0 and masks.len != n) return error.QsaBatchedGatherLen;
+    if (out_arms.len != 0 and out_arms.len != n) return error.QsaBatchedGatherLen;
     const fused_min_s = qsaAttnMinS();
     const standin_sdpa = qwen4Standin().attn_sdpa;
     var outs = try allocator.alloc(mlx.mlx_array, n);
@@ -4520,6 +4524,11 @@ pub fn qsaBatchedGatherAttn(
         if (gathered) |g| {
             outs[i] = g;
             built = i + 1;
+            if (out_arms.len == n) out_arms[i] = switch (qsaWidthBucket(seq_len)) {
+                0 => .decode_gather,
+                1 => .verify_gather,
+                else => .prefill_gather,
+            };
             continue;
         }
         var mask_tmp: mlx.mlx_array = .{ .ctx = null };
@@ -4532,6 +4541,7 @@ pub fn qsaBatchedGatherAttn(
         } else .{ .ctx = null };
         outs[i] = mlx.mlx_array_new();
         built = i + 1;
+        if (out_arms.len == n) out_arms[i] = .mask;
         if (mask.ctx != null) {
             if (try fusedSdpa256Masked(s, q_slot, kv_view.k, kv_view.v, attn_scale, mask)) |fused| {
                 _ = mlx.mlx_array_free(outs[i]);
@@ -16191,11 +16201,6 @@ pub const Transformer = struct {
         entry.ple_prev_valid = true;
     }
 
-    pub fn pleDeferApplies(ple_defer: bool, batched: bool) bool {
-        _ = batched;
-        return ple_defer;
-    }
-
     /// Host-side n-gram gather: `[B, S, ple_embed_dim]` bf16 for this chunk's
     /// token ids, advancing the token history. Serial: `entry`'s history over
     /// `[1, S]`. Batched (`ctx.batch_slots`): `[N, 1]`, each row hashed
@@ -16224,8 +16229,8 @@ pub const Transformer = struct {
             }
             break :blk self.pleClaimSpecCapture(entry, n);
         };
-        if (pleDeferApplies(ctx.ple_defer, ctx.batch_slots != null)) {
-            std.debug.assert(ctx.ple_pending == null);
+        if (ctx.ple_defer) {
+            if (ctx.ple_pending != null) return error.PlePendingAlreadySet;
             @memset(pk, 0);
             const emb = mlx.mlx_array_new_data(pk.ptr, &shape, 3, .bfloat16);
             errdefer _ = mlx.mlx_array_free(emb);
@@ -16259,14 +16264,12 @@ pub const Transformer = struct {
     /// n-gram history advanced. No-op without a pending leaf.
     pub fn flushDeferredPle(self: *Transformer, ctx: *ForwardCtx) !void {
         const p = ctx.ple_pending orelse return;
-        ctx.ple_pending = null;
-        defer {
-            _ = mlx.mlx_array_free(p.emb);
-            _ = mlx.mlx_array_free(p.token_ids);
-        }
         const dst = mlx.mlx_array_data_bfloat16(p.emb) orelse return error.PleLeafUnreadable;
         const out: [*]u16 = @constCast(dst);
         try self.pleGatherBf16(ctx, p.token_ids, p.entry, p.layer, p.seq_len, out[0..mlx.mlx_array_size(p.emb)], p.capture);
+        ctx.ple_pending = null;
+        _ = mlx.mlx_array_free(p.emb);
+        _ = mlx.mlx_array_free(p.token_ids);
     }
 
     /// Drop a pending leaf without filling it (the forward that built on it
@@ -17056,9 +17059,9 @@ pub const Transformer = struct {
         // the selection too: `qsaVerifyGatherAttn` reads the UNION of the
         // rows' selections instead of the whole cache. Its own kv floor is
         // higher than the prefill/decode one — the union is fixed-size.
-        const want_blocks = batch == 1 and kv > qsaGatherMinKv() and qsaGatherEnabled() and
+        const want_blocks = batch == 1 and kv > (if (seq_len >= 2) @max(qsaGatherMinKv(), qsaVerifyGatherMinKv()) else qsaGatherMinKv()) and qsaGatherEnabled() and
             (seq_len >= FUSED256_MIN_Q_LEN or (seq_len == 1 and qsaDecodeGatherEnabled()) or
-                (seq_len >= 2 and seq_len < FUSED256_MIN_Q_LEN and qsaVerifyGatherEnabled() and kv > qsaVerifyGatherMinKv()));
+                (seq_len >= 2 and seq_len < FUSED256_MIN_Q_LEN and qsaVerifyGatherEnabled()));
         if (want_blocks) {
             // Prefill: sorted per-row block indices for the gather kernel;
             // the dense [S, kv] mask is never built. Decode (S==1): the same
@@ -19731,7 +19734,7 @@ pub const Transformer = struct {
     ) !?mlx.mlx_array {
         if (!qsaBatchedGatherEnabled()) return null;
         if (self.qwen4 == null) return null;
-        std.debug.assert(ctx.qsa_mask.ctx == null);
+        if (ctx.qsa_mask.ctx != null) return null;
         for (slots) |sc| if (sc.mrope_pos != null) return null;
         var any_blocks = false;
         for (slots) |sc| if (sc.qsa_blocks.ctx != null) {
@@ -19748,17 +19751,20 @@ pub const Transformer = struct {
         defer self.allocator.free(blks);
         var slot_masks = try self.allocator.alloc(mlx.mlx_array, slots.len);
         defer self.allocator.free(slot_masks);
+        const arms = try self.allocator.alloc(QsaArm, slots.len);
+        defer self.allocator.free(arms);
         for (slots, 0..) |slot_ctx, i| {
             views[i] = try slot_ctx.cache.denseView(layer, self.s);
             blks[i] = slot_ctx.qsa_blocks;
             slot_masks[i] = slot_ctx.qsa_mask;
-            if (slot_ctx.qsa_blocks.ctx != null) slot_ctx.qsa_arms.noteGather(seq_len) else slot_ctx.qsa_arms.note(.mask);
         }
         if (!qsa_batched_gather_logged) {
             qsa_batched_gather_logged = true;
             log.info("[qsa-batched-gather] engaged (slots={d} S={d}) — MLX_SERVE_QSA_BATCHED_GATHER=0 restores the dense padded mask\n", .{ slots.len, seq_len });
         }
-        return try qsaBatchedGatherAttn(self.allocator, self.s, q_rope, views, blks, slot_masks, ratio, attn_scale);
+        const stacked = try qsaBatchedGatherAttn(self.allocator, self.s, q_rope, views, blks, slot_masks, ratio, attn_scale, arms);
+        for (slots, arms) |slot_ctx, arm| slot_ctx.qsa_arms.note(arm);
+        return stacked;
     }
 
     fn gatedFullAttnWith(
@@ -26747,7 +26753,9 @@ var decode_prof_enabled: ?bool = null;
 /// in-situ fwd-ubench reports what that block costs. Diagnostic only.
 pub const Standin = packed struct(u16) { gdn: bool = false, attn: bool = false, mlp: bool = false, gdn_recur: bool = false, gdn_proj: bool = false, attn_qsa: bool = false, attn_sdpa: bool = false, hc: bool = false, moe_shared: bool = false, moe_router: bool = false, moe_gateup: bool = false, moe_down: bool = false, _pad: u4 = 0 };
 var standin_cached: ?Standin = null;
+pub var qwen4_standin_override: ?Standin = null;
 pub fn qwen4Standin() Standin {
+    if (qwen4_standin_override) |v| return v;
     if (standin_cached) |v| return v;
     var v = Standin{};
     if (std.c.getenv("QWEN4_STANDIN")) |raw| {
@@ -41506,7 +41514,7 @@ test "qsa batched gather S=1: N=1 is byte-identical to solo, N=2 matches per-slo
 
     const solo0 = (try qsaDecodeGatherAttn(s, q0, &view0, fx0.blocks, ratio, scale)) orelse return error.GatherDeclined;
     defer _ = mlx.mlx_array_free(solo0);
-    const bat1 = try qsaBatchedGatherAttn(ta, s, q0, &.{view0}, &.{fx0.blocks}, &.{}, ratio, scale);
+    const bat1 = try qsaBatchedGatherAttn(ta, s, q0, &.{view0}, &.{fx0.blocks}, &.{}, ratio, scale, &.{});
     defer _ = mlx.mlx_array_free(bat1);
     try std.testing.expectEqual(@as(f32, 0), try attn256MaxDiff(bat1, solo0, s));
 
@@ -41518,7 +41526,7 @@ test "qsa batched gather S=1: N=1 is byte-identical to solo, N=2 matches per-slo
     try mlx.check(mlx.mlx_concatenate_axis(&q_n2, qvec, 0, s));
     const views = [_]DenseKVView{ view0, view1 };
     const blks = [_]mlx.mlx_array{ fx0.blocks, fx1.blocks };
-    const bat2 = try qsaBatchedGatherAttn(ta, s, q_n2, &views, &blks, &.{}, ratio, scale);
+    const bat2 = try qsaBatchedGatherAttn(ta, s, q_n2, &views, &blks, &.{}, ratio, scale, &.{});
     defer _ = mlx.mlx_array_free(bat2);
     const solo1 = (try qsaDecodeGatherAttn(s, q1, &view1, fx1.blocks, ratio, scale)) orelse return error.GatherDeclined;
     defer _ = mlx.mlx_array_free(solo1);
@@ -41580,7 +41588,7 @@ test "qsa batched gather mixed group: a mask-only slot matches its solo masked S
     const views = [_]DenseKVView{ view0, view1 };
     const blks = [_]mlx.mlx_array{ fx0.blocks, .{ .ctx = null } };
     const masks = [_]mlx.mlx_array{ .{ .ctx = null }, fx1.mask };
-    const bat = try qsaBatchedGatherAttn(ta, s, q_n2, &views, &blks, &masks, ratio, scale);
+    const bat = try qsaBatchedGatherAttn(ta, s, q_n2, &views, &blks, &masks, ratio, scale, &.{});
     defer _ = mlx.mlx_array_free(bat);
     var want = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(want);
@@ -41632,7 +41640,7 @@ test "qsa batched gather S=2 and S=4: N=1 is byte-identical to solo verify, N=2 
         const view1 = DenseKVView{ .k = k1, .v = v1, .owned = false };
         const solo0 = (try qsaVerifyGatherAttn(s, q0, &view0, fx0.blocks, ratio, scale)) orelse return error.GatherDeclined;
         defer _ = mlx.mlx_array_free(solo0);
-        const bat1 = try qsaBatchedGatherAttn(ta, s, q0, &.{view0}, &.{fx0.blocks}, &.{}, ratio, scale);
+        const bat1 = try qsaBatchedGatherAttn(ta, s, q0, &.{view0}, &.{fx0.blocks}, &.{}, ratio, scale, &.{});
         defer _ = mlx.mlx_array_free(bat1);
         try std.testing.expectEqual(@as(f32, 0), try attn256MaxDiff(bat1, solo0, s));
 
@@ -41644,7 +41652,7 @@ test "qsa batched gather S=2 and S=4: N=1 is byte-identical to solo verify, N=2 
         try mlx.check(mlx.mlx_concatenate_axis(&q_n2, qvec, 0, s));
         const views = [_]DenseKVView{ view0, view1 };
         const blks = [_]mlx.mlx_array{ fx0.blocks, fx1.blocks };
-        const bat2 = try qsaBatchedGatherAttn(ta, s, q_n2, &views, &blks, &.{}, ratio, scale);
+        const bat2 = try qsaBatchedGatherAttn(ta, s, q_n2, &views, &blks, &.{}, ratio, scale, &.{});
         defer _ = mlx.mlx_array_free(bat2);
         const solo1 = (try qsaVerifyGatherAttn(s, q1, &view1, fx1.blocks, ratio, scale)) orelse return error.GatherDeclined;
         defer _ = mlx.mlx_array_free(solo1);
@@ -41660,13 +41668,16 @@ test "qsa batched gather S=2 and S=4: N=1 is byte-identical to solo verify, N=2 
 
 test "qsaBatchedAttn: kill switch and mrope refuse the gather arm" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
-    var xfm: Transformer = undefined;
+    var xfm_bytes: [@sizeOf(Transformer)]u8 align(@alignOf(Transformer)) = @splat(0);
+    const xfm: *Transformer = @ptrCast(&xfm_bytes);
     xfm.allocator = std.testing.allocator;
-    xfm.qwen4 = @ptrFromInt(@alignOf(qwen4_mod.Qwen4State));
-    var cache: KVCache = undefined;
+    var q4_bytes: [@sizeOf(qwen4_mod.Qwen4State)]u8 align(@alignOf(qwen4_mod.Qwen4State)) = @splat(0);
+    xfm.qwen4 = @ptrCast(&q4_bytes);
+    var cache_bytes: [@sizeOf(KVCache)]u8 align(@alignOf(KVCache)) = @splat(0);
+    const cache: *KVCache = @ptrCast(&cache_bytes);
     var off: usize = 0;
-    var ctx: ForwardCtx = .{ .cache = &cache, .moe_seq_offset = &off, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
-    var slot: ForwardCtx = .{ .cache = &cache, .moe_seq_offset = &off, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
+    var ctx: ForwardCtx = .{ .cache = cache, .moe_seq_offset = &off, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
+    var slot: ForwardCtx = .{ .cache = cache, .moe_seq_offset = &off, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
     const slots = [_]*ForwardCtx{&slot};
     const dummy = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(dummy);
@@ -41714,6 +41725,15 @@ test "qsaBatchedGatherOn matches the arm's switches and vision refusal" {
     qsa_verify_gather_override = false;
     try std.testing.expect(qsaBatchedGatherOn(1, false));
     try std.testing.expect(!qsaBatchedGatherOn(4, false));
+    qsa_verify_gather_override = true;
+    const prev_st = qwen4_standin_override;
+    defer qwen4_standin_override = prev_st;
+    qwen4_standin_override = .{ .attn_qsa = true };
+    try std.testing.expect(!qsaBatchedGatherOn(1, false));
+    qwen4_standin_override = .{ .attn_sdpa = true };
+    try std.testing.expect(!qsaBatchedGatherOn(1, false));
+    qwen4_standin_override = .{};
+    try std.testing.expect(qsaBatchedGatherOn(1, false));
 }
 
 // ── Verify-width QSA gather (S = 2 .. FUSED256_MIN_Q_LEN-1) ──
@@ -46388,13 +46408,6 @@ fn qwen4BatchedPleForward(
     }
     for (slots) |sl| sl.off += @intCast(seq_len);
     return .{ .logits = logits, .pending = pending };
-}
-
-test "ple_defer applies on the batched arm" {
-    try std.testing.expect(Transformer.pleDeferApplies(true, false));
-    try std.testing.expect(Transformer.pleDeferApplies(true, true));
-    try std.testing.expect(!Transformer.pleDeferApplies(false, false));
-    try std.testing.expect(!Transformer.pleDeferApplies(false, true));
 }
 
 test "batched PLE defer engages at N=2 and matches eager at S=1 and S=4" {
