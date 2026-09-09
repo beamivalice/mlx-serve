@@ -169,7 +169,7 @@ jobs:
         run: bash scripts/fetch-llama.sh
 
       - name: Build mlx-serve (Zig)
-        run: zig build -Doptimize=ReleaseFast -Dversion=${{ steps.version.outputs.version }}
+        run: zig build -Doptimize=ReleaseFast -Dversion=${{ steps.version.outputs.version }} -Dgit-sha=${{ github.sha }}
 
       # The Agent Sandbox's guest-side binary (static aarch64-linux ELF). It
       # rides inside the .app at Resources/guest/vz-agent — without it the

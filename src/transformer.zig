@@ -3033,6 +3033,7 @@ pub fn qsaNaxEligible(
 
 var qsa_nax_probe_state: std.atomic.Value(u8) = .init(0);
 pub var qsa_nax_probe_fail_override: bool = false;
+pub var qsa_nax_probe_flip_override: bool = false;
 var qsa_nax_kernel_builds: usize = 0;
 pub var qsa_gather_used_nax: bool = false;
 pub var qsa_gather_engaged_stock: u32 = 0;
@@ -3068,49 +3069,192 @@ pub fn qsaNaxArm() void {
     qsa_nax_probe_state.store(if (ok) 2 else 1, .release);
 }
 
-fn qsaNaxRunProbe() bool {
-    if (mlx.noGpuBackend()) return false;
-    const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return false;
-    const kernel = getQsaNaxKernel() catch return false;
-    var q = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(q);
-    if (mlx.mlx_zeros(&q, &[_]c_int{ 1, 24, 16, 256 }, 4, .bfloat16, s) != 0) return false;
-    var k = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(k);
-    if (mlx.mlx_zeros(&k, &[_]c_int{ 1, 2, 16, 256 }, 4, .bfloat16, s) != 0) return false;
-    var v = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(v);
-    if (mlx.mlx_zeros(&v, &[_]c_int{ 1, 2, 16, 256 }, 4, .bfloat16, s) != 0) return false;
-    var blk_zeros: [16]i32 = @splat(0);
-    const bshape = [_]c_int{ 1, 16, 1 };
-    const blocks = mlx.mlx_array_new_data(&blk_zeros, &bshape, 3, .int32);
-    defer _ = mlx.mlx_array_free(blocks);
+const QSA_NAX_PROBE_FLOOR: f32 = 4.9e-4;
+
+fn qsaProbeLcgBf16(s: mlx.mlx_stream, shape: []const c_int, seed: u32) ?mlx.mlx_array {
+    var n: usize = 1;
+    for (shape) |d| n *= @intCast(d);
+    const buf = std.heap.page_allocator.alloc(f32, n) catch return null;
+    defer std.heap.page_allocator.free(buf);
+    var state = seed;
+    for (buf) |*x| {
+        state = state *% 1664525 +% 1013904223;
+        x.* = @as(f32, @floatFromInt(state >> 8)) * (1.0 / 16777216.0) - 0.5;
+    }
+    const host = mlx.mlx_array_new_data(buf.ptr, shape.ptr, @intCast(shape.len), .float32);
+    defer _ = mlx.mlx_array_free(host);
+    var out = mlx.mlx_array_new();
+    if (mlx.mlx_astype(&out, host, .bfloat16, s) != 0) {
+        _ = mlx.mlx_array_free(out);
+        return null;
+    }
+    if (mlx.mlx_array_eval(out) != 0) {
+        _ = mlx.mlx_array_free(out);
+        return null;
+    }
+    return out;
+}
+
+fn qsaProbeCorruptFirst(s: mlx.mlx_stream, arr: mlx.mlx_array) ?mlx.mlx_array {
+    var contig = mlx.mlx_array_new();
+    if (mlx.mlx_contiguous(&contig, arr, false, s) != 0) {
+        _ = mlx.mlx_array_free(contig);
+        return null;
+    }
+    defer _ = mlx.mlx_array_free(contig);
+    var f32a = mlx.mlx_array_new();
+    if (mlx.mlx_astype(&f32a, contig, .float32, s) != 0) {
+        _ = mlx.mlx_array_free(f32a);
+        return null;
+    }
+    defer _ = mlx.mlx_array_free(f32a);
+    if (mlx.mlx_array_eval(f32a) != 0) return null;
+    const n = mlx.mlx_array_size(f32a);
+    if (n == 0) return null;
+    const src = mlx.mlx_array_data_float32(f32a) orelse return null;
+    const buf = std.heap.page_allocator.alloc(f32, n) catch return null;
+    defer std.heap.page_allocator.free(buf);
+    @memcpy(buf, src[0..n]);
+    buf[0] += 1.0;
+    const shape = mlx.getShape(arr);
+    const host = mlx.mlx_array_new_data(buf.ptr, shape.ptr, @intCast(shape.len), .float32);
+    defer _ = mlx.mlx_array_free(host);
+    var out = mlx.mlx_array_new();
+    if (mlx.mlx_astype(&out, host, mlx.mlx_array_dtype(arr), s) != 0) {
+        _ = mlx.mlx_array_free(out);
+        return null;
+    }
+    return out;
+}
+
+fn qsaProbeBitEqual(s: mlx.mlx_stream, a: mlx.mlx_array, b: mlx.mlx_array) bool {
+    var eq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eq);
+    if (mlx.mlx_array_equal(&eq, a, b, false, s) != 0) return false;
+    if (mlx.mlx_array_eval(eq) != 0) return false;
+    var ok: bool = false;
+    if (mlx.mlx_array_item_bool(&ok, eq) != 0) return false;
+    return ok;
+}
+
+fn qsaProbeAllFinite(s: mlx.mlx_stream, a: mlx.mlx_array) bool {
+    var fin = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(fin);
+    if (mlx.mlx_isfinite(&fin, a, s) != 0) return false;
+    var all = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(all);
+    if (mlx.mlx_all(&all, fin, false, s) != 0) return false;
+    if (mlx.mlx_array_eval(all) != 0) return false;
+    var ok: bool = false;
+    if (mlx.mlx_array_item_bool(&ok, all) != 0) return false;
+    return ok;
+}
+
+fn qsaProbeMaxAbsDiff(s: mlx.mlx_stream, a: mlx.mlx_array, b: mlx.mlx_array) ?f32 {
+    var sub = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sub);
+    if (mlx.mlx_subtract(&sub, a, b, s) != 0) return null;
+    var ab = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ab);
+    if (mlx.mlx_abs(&ab, sub, s) != 0) return null;
+    var mx = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mx);
+    if (mlx.mlx_max(&mx, ab, false, s) != 0) return null;
+    if (mlx.mlx_array_eval(mx) != 0) return null;
+    var v: f32 = 0;
+    if (mlx.mlx_array_item_float32(&v, mx) != 0) return null;
+    return v;
+}
+
+fn qsaGatherProbeDispatch(
+    s: mlx.mlx_stream,
+    q: mlx.mlx_array,
+    k: mlx.mlx_array,
+    v: mlx.mlx_array,
+    scale: f32,
+    blocks: mlx.mlx_array,
+    ratio: c_int,
+    nax: bool,
+) ?mlx.mlx_array {
+    const kernel = (if (nax) getQsaNaxKernel() else getAttnQsa256Kernel()) catch return null;
+    const qs = mlx.getShape(q);
+    const ks = mlx.getShape(k);
+    const gqa: c_int = @divTrunc(qs[1], ks[1]);
+    const nsg: c_int = @divTrunc(gqa + 7, 8);
+    const bk: c_int = if (nax) 32 else qsaGatherBk();
     const one = [_]c_int{1};
-    const scl_data = [_]f32{1.0 / 16.0};
+    const scl_data = [_]f32{scale};
     const scl = mlx.mlx_array_new_data(&scl_data, &one, 1, .float32);
     defer _ = mlx.mlx_array_free(scl);
     const config = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
-    const o_shape = [_]c_int{ 1, 24, 16, 256 };
-    if (mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &o_shape, 4, .bfloat16) != 0) return false;
-    if (mlx.mlx_fast_metal_kernel_config_set_grid(config, 16 * 32, 2 * 2, 1) != 0) return false;
-    if (mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 2, 1) != 0) return false;
-    if (mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", .bfloat16) != 0) return false;
-    if (mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "NSG", 2) != 0) return false;
-    if (mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BK", 32) != 0) return false;
-    if (mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "RATIO", 4) != 0) return false;
+    const o_shape = [_]c_int{ qs[0], qs[1], qs[2], 256 };
+    if (mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &o_shape, 4, .bfloat16) != 0) return null;
+    if (mlx.mlx_fast_metal_kernel_config_set_grid(config, qs[2] * 32, ks[1] * nsg, qs[0]) != 0) return null;
+    if (mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, nsg, 1) != 0) return null;
+    if (mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", .bfloat16) != 0) return null;
+    if (mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "NSG", nsg) != 0) return null;
+    if (mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BK", bk) != 0) return null;
+    if (mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "RATIO", ratio) != 0) return null;
     const inputs_arr = [_]mlx.mlx_array{ q, k, v, scl, blocks };
     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
     var outputs_vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outputs_vec);
-    if (mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, config, s) != 0) return false;
-    if (mlx.mlx_vector_array_size(outputs_vec) != 1) return false;
+    if (mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, config, s) != 0) return null;
+    if (mlx.mlx_vector_array_size(outputs_vec) != 1) return null;
     var out = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(out);
-    if (mlx.mlx_vector_array_get(&out, outputs_vec, 0) != 0) return false;
-    if (mlx.mlx_array_eval(out) != 0) return false;
+    if (mlx.mlx_vector_array_get(&out, outputs_vec, 0) != 0) {
+        _ = mlx.mlx_array_free(out);
+        return null;
+    }
+    if (mlx.mlx_array_eval(out) != 0) {
+        _ = mlx.mlx_array_free(out);
+        return null;
+    }
+    return out;
+}
+
+fn qsaNaxRunProbe() bool {
+    if (mlx.noGpuBackend()) return false;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return false;
+    const q = qsaProbeLcgBf16(s, &[_]c_int{ 1, 24, 16, 256 }, 0x9A7E016) orelse return false;
+    defer _ = mlx.mlx_array_free(q);
+    const k = qsaProbeLcgBf16(s, &[_]c_int{ 1, 2, 16, 256 }, 0x51A2002) orelse return false;
+    defer _ = mlx.mlx_array_free(k);
+    const v = qsaProbeLcgBf16(s, &[_]c_int{ 1, 2, 16, 256 }, 0xC0FFEE3) orelse return false;
+    defer _ = mlx.mlx_array_free(v);
+    var blk: [16 * 4]i32 = undefined;
+    for (0..16) |r| {
+        for (0..4) |b| blk[r * 4 + b] = @intCast(b);
+    }
+    const bshape = [_]c_int{ 1, 16, 4 };
+    const blocks = mlx.mlx_array_new_data(&blk, &bshape, 3, .int32);
+    defer _ = mlx.mlx_array_free(blocks);
+    const scale: f32 = 1.0 / 16.0;
+    const ratio: c_int = 4;
+    const stock = qsaGatherProbeDispatch(s, q, k, v, scale, blocks, ratio, false) orelse return false;
+    defer _ = mlx.mlx_array_free(stock);
+    var nax = qsaGatherProbeDispatch(s, q, k, v, scale, blocks, ratio, true) orelse return false;
+    defer _ = mlx.mlx_array_free(nax);
+    if (qsa_nax_probe_flip_override) {
+        const flipped = qsaProbeCorruptFirst(s, nax) orelse return false;
+        _ = mlx.mlx_array_free(nax);
+        nax = flipped;
+    }
+    const ref = qsaGatherF32Reference(q, k, v, scale, blocks, ratio, s) catch return false;
+    defer _ = mlx.mlx_array_free(ref);
+    if (!qsaProbeAllFinite(s, nax) or !qsaProbeAllFinite(s, stock) or !qsaProbeAllFinite(s, ref)) {
+        log.info("[qsa-gather] disabled: probe mismatch (non-finite)\n", .{});
+        return false;
+    }
+    const max_stock = qsaProbeMaxAbsDiff(s, stock, ref) orelse return false;
+    const max_nax = qsaProbeMaxAbsDiff(s, nax, ref) orelse return false;
+    if (!(max_nax <= @max(1.5 * max_stock, QSA_NAX_PROBE_FLOOR))) {
+        log.info("[qsa-gather] disabled: probe mismatch (nax vs stock)\n", .{});
+        return false;
+    }
     return true;
 }
 
@@ -3865,6 +4009,7 @@ fn qsaSelectTopBlocksSplit(
 pub const QsaScoreLayout = enum(u8) { base = 0, h4 = 1 };
 
 pub var qsa_score_fused_override: ?bool = null;
+pub var qsa_score_probe_flip_override: bool = false;
 var qsa_score_fused_env: ?bool = null;
 pub var qsa_score_layout_override: ?QsaScoreLayout = null;
 pub var qsa_score_tf32_override: ?bool = null;
@@ -3905,6 +4050,14 @@ var qsa_score_probe_state: std.atomic.Value(u8) = .init(0);
 
 fn qsaScoreFusedProbeOk() bool {
     return qsa_score_probe_state.load(.acquire) == 2;
+}
+
+pub fn qsaScoreFusedProbeFailed() bool {
+    return qsa_score_probe_state.load(.acquire) == 1;
+}
+
+pub fn qsaScoreFusedProbeReset() void {
+    qsa_score_probe_state.store(0, .release);
 }
 
 pub fn qsaScoreFusedArm() void {
@@ -4239,7 +4392,7 @@ fn qsaScoreFusedDispatch(s: mlx.mlx_stream, q: mlx.mlx_array, pooled: mlx.mlx_ar
         .nsg = nsg,
         .rows = rows,
         .nb = nb,
-        .layout = @intFromEnum(layout),
+        .layout = @backingInt(layout),
     };
     const score_cfgs: [1]mlx.mlx_fast_metal_kernel_config = qsa_score_cfgs.get(key) orelse blk: {
         const config = mlx.mlx_fast_metal_kernel_config_new();
@@ -4266,6 +4419,30 @@ fn qsaScoreFusedDispatch(s: mlx.mlx_stream, q: mlx.mlx_array, pooled: mlx.mlx_ar
     return out;
 }
 
+fn qsaScoreFusedProbeLayout(s: mlx.mlx_stream, rows: c_int, nb: c_int) bool {
+    const q = qsaProbeLcgBf16(s, &[_]c_int{ 1, 4, rows, 128 }, 0x51C04E11) orelse return false;
+    defer _ = mlx.mlx_array_free(q);
+    const pooled = qsaProbeLcgBf16(s, &[_]c_int{ 1, nb, 128 }, 0xA5A55A5A) orelse return false;
+    defer _ = mlx.mlx_array_free(pooled);
+    const k32t = qsaScoreK32tFromPooled(s, pooled) catch return false;
+    defer _ = mlx.mlx_array_free(k32t);
+    const want = qsaScoreSheetComposed(s, q, k32t) catch return false;
+    defer _ = mlx.mlx_array_free(want);
+    var got = qsaScoreFusedDispatch(s, q, pooled) catch return false;
+    defer _ = mlx.mlx_array_free(got);
+    if (qsa_score_probe_flip_override) {
+        const flipped = qsaProbeCorruptFirst(s, got) orelse return false;
+        _ = mlx.mlx_array_free(got);
+        got = flipped;
+    }
+    if (mlx.mlx_array_eval(got) != 0 or mlx.mlx_array_eval(want) != 0) return false;
+    if (!qsaProbeBitEqual(s, got, want)) {
+        log.info("[qsa-score] disabled: probe mismatch ({s})\n", .{if (rows >= 128) "h4" else "base"});
+        return false;
+    }
+    return true;
+}
+
 fn qsaScoreFusedRunProbe() bool {
     if (mlx.noGpuBackend()) {
         log.info("[qsa-score] disabled: no gpu\n", .{});
@@ -4276,59 +4453,12 @@ fn qsaScoreFusedRunProbe() bool {
         log.info("[qsa-score] disabled: not gpu stream\n", .{});
         return false;
     }
-    const kernel = getQsaScoreKernel() catch |e| {
+    _ = getQsaScoreKernel() catch |e| {
         log.info("[qsa-score] disabled: {s}\n", .{@errorName(e)});
         return false;
     };
-    var q = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(q);
-    if (mlx.mlx_zeros(&q, &[_]c_int{ 1, 4, 1, 128 }, 4, .bfloat16, s) != 0) {
-        log.info("[qsa-score] disabled: probe alloc\n", .{});
-        return false;
-    }
-    var pooled = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(pooled);
-    if (mlx.mlx_zeros(&pooled, &[_]c_int{ 1, 32, 128 }, 3, .bfloat16, s) != 0) {
-        log.info("[qsa-score] disabled: probe alloc\n", .{});
-        return false;
-    }
-    const rows: c_int = 1;
-    const nb: c_int = 32;
-    const layout = qsaScoreLayoutFor(rows);
-    const nsg = qsaScoreNsg(layout);
-    const r_tg = qsaScoreRowsPerTg(layout, nsg);
-    const ngrp: c_int = @divTrunc(rows + r_tg - 1, r_tg);
-    const nslab: u32 = @intCast(@divTrunc(nb + 31, 32));
-    const nsh: c_int = @intCast(qsaScoreNsh(nslab, @intCast(ngrp), layout));
-    const config = mlx.mlx_fast_metal_kernel_config_new();
-    defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
-    qsaScoreFusedFillConfig(config, rows, nb, nsg, ngrp, nsh, layout) catch |e| {
-        log.info("[qsa-score] disabled: {s}\n", .{@errorName(e)});
-        return false;
-    };
-    const inputs_arr = [_]mlx.mlx_array{ q, pooled };
-    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
-    defer _ = mlx.mlx_vector_array_free(inputs_vec);
-    var outputs_vec = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(outputs_vec);
-    if (mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, config, s) != 0) {
-        log.info("[qsa-score] disabled: probe apply\n", .{});
-        return false;
-    }
-    if (mlx.mlx_vector_array_size(outputs_vec) != 1) {
-        log.info("[qsa-score] disabled: MetalKernelBadOutputCount\n", .{});
-        return false;
-    }
-    var out = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(out);
-    if (mlx.mlx_vector_array_get(&out, outputs_vec, 0) != 0) {
-        log.info("[qsa-score] disabled: probe alloc\n", .{});
-        return false;
-    }
-    if (mlx.mlx_array_eval(out) != 0) {
-        log.info("[qsa-score] disabled: probe eval\n", .{});
-        return false;
-    }
+    if (!qsaScoreFusedProbeLayout(s, 16, 700)) return false;
+    if (!qsaScoreFusedProbeLayout(s, 128, 700)) return false;
     return true;
 }
 
@@ -5027,8 +5157,8 @@ pub fn qsaSparseAttn(
         if (mlx.mlx_array_strides(q_rope)[3] != 1) break :blk false;
         if (mlx.mlx_array_strides(blocks)[2] != 1) break :blk false;
         for ([_]mlx.mlx_array{
-            kv_view.k_triple_q,     kv_view.k_triple_scales, kv_view.k_triple_biases,
-            kv_view.v_triple_q,     kv_view.v_triple_scales, kv_view.v_triple_biases,
+            kv_view.k_triple_q, kv_view.k_triple_scales, kv_view.k_triple_biases,
+            kv_view.v_triple_q, kv_view.v_triple_scales, kv_view.v_triple_biases,
         }) |a| {
             if (mlx.mlx_array_strides(a)[3] != 1) break :blk false;
         }
@@ -5209,7 +5339,7 @@ pub const QsaDecline = struct {
     kv: c_int = -1,
 
     pub fn no(self: *QsaDecline, r: QsaDeclineReason) ?mlx.mlx_array {
-        if (self.bits.take(@intFromEnum(r))) {
+        if (self.bits.take(@backingInt(r))) {
             log.info(
                 "[{s}] declined: {s} (S={d} kv={d}) — the dense [S, kv] mask arm serves this call\n",
                 .{ self.arm, r.text(), self.s, self.kv },
@@ -5299,7 +5429,7 @@ var qsa_decode_decline_bits: OneShotBits = .{};
 var qsa_verify_decline_bits: OneShotBits = .{};
 
 fn qsaEngagedBit(arm: QsaArm, seq_len: c_int) u5 {
-    return @as(u5, @intFromEnum(arm)) * 4 + @as(u5, qsaWidthBucket(seq_len));
+    return @as(u5, @backingInt(arm)) * 4 + @as(u5, qsaWidthBucket(seq_len));
 }
 
 /// take_axis + materialized copy: quantized kernels (dequantize included)
@@ -8343,7 +8473,7 @@ fn qsaTestMeanBlocks(keys: mlx.mlx_array, row0: c_int, n_blocks: c_int, ratio: c
     return out;
 }
 
-fn qsaTestAppendPool(xfm: *Transformer, entry: *SSMCacheEntry, chunk: mlx.mlx_array, offset: c_int, s: mlx.mlx_stream) !void {
+pub fn qsaTestAppendPool(xfm: *Transformer, entry: *SSMCacheEntry, chunk: mlx.mlx_array, offset: c_int, s: mlx.mlx_stream) !void {
     const ratio = @max(entry.qsa_ratio, 1);
     const add = mlx.getShape(chunk)[1];
     const kv = offset + add;
@@ -8587,7 +8717,6 @@ test "qsa rollback: a partial accept keeps the raw-key buffer and re-slices to k
     try xfm.qsaAppendKeys(&entry, tail, keep);
     try t.expectEqual(keep + 2, mlx.getShape(entry.aux_state)[1]);
     try t.expectEqual(@as(f32, 0.0), try attn256MaxDiff(entry.aux_state, reference, s));
-
 }
 
 test "qsa rollback: a rollback that reaches past the ring is a named error, not a negative slice" {
@@ -9280,6 +9409,25 @@ fn qsaCoverTestCp(ring: c_int, blocks: c_int, rows: c_int, ratio: c_int, hd: c_i
     return cp;
 }
 
+test "checkpointQsaCoversPos: a bank-less leftover does not cover pos" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    var leftover = try qsaCoverTestCp(1, 0, 17, 4, 8, s);
+    defer leftover.deinit(t.allocator);
+    try t.expect(!checkpointQsaCoversPos(&leftover, &leftover, 17));
+    try t.expect(!qsaRestoreSatisfiesForward(&.{
+        .{
+            .conv_state = .{ .ctx = null },
+            .ssm_state = .{ .ctx = null },
+            .aux_state = leftover.layers[0].aux_state,
+            .qsa_pooled = .{ .ctx = null },
+            .initialized = true,
+            .qsa_ratio = 4,
+            .qsa_hist_rows = 17,
+        },
+    }, 17));
+}
+
 test "checkpointHasQsaPooled: a mid-block leftover is not the pooled bank's home" {
     const t = std.testing;
     const s = mlx.gpuStream();
@@ -9312,7 +9460,7 @@ test "checkpointQsaCoversPos: a checkpoint without the leftover for pos is a mis
 
     try t.expect(checkpointQsaCoversPos(&at48, &src, 48));
     try t.expect(checkpointQsaCoversPos(&at46, &src, 46));
-    try t.expect(!checkpointQsaCoversPos(&src, &src, 46));
+    try t.expect(checkpointQsaCoversPos(&src, &src, 46));
     // A checkpoint with no leftover of its own (a v7 snap) covers pos when the source still
     // physically holds those rows — the whole raw history in a v7 entry file, and here the
     // rows 44..46 the newest ring happens to span.
@@ -9328,6 +9476,22 @@ test "checkpointQsaCoversPos: a checkpoint without the leftover for pos is a mis
     var short = try qsaCoverTestCp(QSA_RING_ROWS, 8, 64, ratio, hd, s);
     defer short.deinit(t.allocator);
     try t.expect(!checkpointQsaCoversPos(&at46, &short, 46));
+}
+
+test "checkpointQsaCoversPos: a 32-row ring on the bank covers every residue at or below its pos" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    const hd: c_int = 8;
+    const ratio: c_int = 4;
+    var src = try qsaCoverTestCp(QSA_RING_ROWS, 5, 20, ratio, hd, s);
+    defer src.deinit(t.allocator);
+    var r: usize = 0;
+    while (r < 4) : (r += 1) {
+        const pos: usize = 16 + r;
+        var cp = try qsaCoverTestCp(0, 0, @intCast(pos), ratio, hd, s);
+        defer cp.deinit(t.allocator);
+        try t.expect(checkpointQsaCoversPos(&cp, &src, pos));
+    }
 }
 
 /// Whether a QSA restore at `pos` has its whole indexer history: `cp` — the checkpoint being
@@ -9351,11 +9515,36 @@ pub fn checkpointQsaCoversPos(cp: *const SSMCheckpoint, src: *const SSMCheckpoin
     }
     const r = @max(ratio, 1);
     if (has_pooled and pblocks < @divTrunc(p, r)) return false;
+    if (!has_pooled) return qsaSourceHoldsRowsAt(src, p, p);
+    const want_lv = @mod(p, r);
     const cp_rows = checkpointQsaLeftoverRows(cp);
-    // A checkpoint with no leftover of its own — every snap of a v7 entry, whose raw history
-    // is the entry-level file — is covered when that file still holds the rows for `pos`.
-    if (cp_rows == 0) return qsaSourceHoldsRowsAt(src, p, @mod(p, r));
-    return cp_rows == @mod(p, r);
+    if (cp_rows == 0) return qsaSourceHoldsRowsAt(src, p, want_lv);
+    if (cp_rows == want_lv) return true;
+    return qsaSourceHoldsRowsAt(cp, p, want_lv) or qsaSourceHoldsRowsAt(src, p, want_lv);
+}
+
+pub fn qsaEntrySatisfiesForward(e: *const SSMCacheEntry, pos: c_int) bool {
+    if (!ssmAuxIsQsaHistory(e)) return true;
+    if (qsaHistoryRows(e) != pos) return false;
+    const ratio = @max(e.qsa_ratio, 1);
+    const blocks: c_int = if (e.qsa_pooled.ctx != null) mlx.getShape(e.qsa_pooled)[1] else 0;
+    const held: c_int = if (e.aux_state.ctx != null) mlx.getShape(e.aux_state)[1] else 0;
+    return blocks * ratio + held >= pos;
+}
+
+pub fn qsaRestoreSatisfiesForward(entries: []const SSMCacheEntry, pos: usize) bool {
+    const p: c_int = @intCast(pos);
+    for (entries) |*e| {
+        if (!qsaEntrySatisfiesForward(e, p)) return false;
+    }
+    return true;
+}
+
+pub fn checkpointListHasQsaPooled(cps: []const SSMCheckpoint) bool {
+    for (cps) |*cp| {
+        if (checkpointHasQsaPooled(cp)) return true;
+    }
+    return false;
 }
 
 /// Whether every QSA layer of `src` physically holds the `want` raw rows ending at `pos`.
@@ -9583,15 +9772,22 @@ pub fn applyQsaHistoryAt(entries: []SSMCacheEntry, src_cp: *const SSMCheckpoint,
         dst.aux_state = .{ .ctx = null };
         if (dst.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(dst.qsa_pooled);
         dst.qsa_pooled = .{ .ctx = null };
+        const ratio = @max(src.qsa_ratio, 1);
         if (src.qsa_pooled.ctx != null) {
             const ps = mlx.getShape(src.qsa_pooled);
-            const need_blocks = @divTrunc(keep, @max(src.qsa_ratio, 1));
+            const need_blocks = @divTrunc(keep, ratio);
             if (ps.len < 2 or ps[1] < need_blocks) return error.QsaHistoryGap;
             dst.qsa_pooled = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_array_set(&dst.qsa_pooled, src.qsa_pooled));
-            try truncatePooled(&dst.qsa_pooled, keep, src.qsa_ratio, s, false);
+            try truncatePooled(&dst.qsa_pooled, keep, ratio, s, true);
         }
-        dst.aux_state = if (own.ctx != null) own else try qsaRingFromSource(&src, src_hist, keep, s);
+        const from_src = try qsaLeftoverAt(src.aux_state, src_hist, keep, ratio, s);
+        if (from_src.ctx != null) {
+            if (own.ctx != null) _ = mlx.mlx_array_free(own);
+            dst.aux_state = from_src;
+        } else {
+            dst.aux_state = if (own.ctx != null) own else .{ .ctx = null };
+        }
         dst.qsa_ratio = src.qsa_ratio;
         dst.qsa_hist_rows = keep;
         dst.qsa_key_rows = if (dst.aux_state.ctx != null) mlx.getShape(dst.aux_state)[1] else 0;
@@ -9602,32 +9798,34 @@ pub fn applyQsaHistoryAt(entries: []SSMCacheEntry, src_cp: *const SSMCheckpoint,
     }
 }
 
-/// The raw rows a restore at `pos` seeds the live ring with when the checkpoint carries no
-/// leftover of its own (a v7 entry): the newest `QSA_RING_ROWS` the source still holds, whose
-/// tail is the leftover the next append re-pools — else that leftover alone.
-fn qsaRingFromSource(src: *const SSMCacheEntrySnapshot, src_hist: c_int, pos: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
-    if (@mod(pos, @max(src.qsa_ratio, 1)) == 0) return .{ .ctx = null };
-    const ring = try qsaRowsEndingAt(src.aux_state, src_hist, pos, @min(QSA_RING_ROWS, pos), s);
-    if (ring.ctx != null) return ring;
-    return qsaLeftoverAt(src.aux_state, src_hist, pos, src.qsa_ratio, s);
-}
-
 /// Copy QSA aux/pooled from `src` onto `dst`, sliced to `pos` rows. Used when
 /// a byte-budget trim would drop the latest snap — the only one that carries
 /// the indexer history. A 122880-token trim that freed that snap left aux
 /// empty; the next prefill then reshaped a 4096-row chunk into
 /// `(1, nb, 4, 128)` and aborted (MLX reshape, 77% RAM — not an OOM).
+/// `pos` is `dst.pos`: a checkpoint's aux is normalized to exactly `pos % ratio` rows at
+/// capture, which is what the keep-own arm relies on when the source cannot supply them.
 pub fn sliceQsaHistoryOntoCheckpoint(dst: *SSMCheckpoint, src: *const SSMCheckpoint, pos: usize, s: mlx.mlx_stream) !void {
     if (dst.layers.len != src.layers.len) return error.SsmCheckpointLayerMismatch;
     const keep: c_int = @intCast(pos);
     for (dst.layers, src.layers) |*d, s_l| {
         if (!snapshotHasQsaHistory(&s_l)) continue;
         if (d.conv_state.ctx != null and mlx.mlx_array_size(d.conv_state) > 0) continue;
-        // Materialize: the trim drops `src` next, and a view would keep its whole buffer alive.
+        const ratio = @max(s_l.qsa_ratio, 1);
         if (s_l.qsa_pooled.ctx != null) {
             if (d.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(d.qsa_pooled);
             d.qsa_pooled = try materializedOwnedCopy(s, s_l.qsa_pooled);
-            try truncatePooled(&d.qsa_pooled, keep, s_l.qsa_ratio, s, true);
+            try truncatePooled(&d.qsa_pooled, keep, ratio, s, true);
+        }
+        const src_hist: c_int = if (s_l.qsa_rows > 0) s_l.qsa_rows else keep;
+        const leftover_n = @mod(keep, ratio);
+        const leftover = try qsaLeftoverAt(s_l.aux_state, src_hist, keep, ratio, s);
+        if (leftover.ctx != null) {
+            if (d.aux_state.ctx != null) _ = mlx.mlx_array_free(d.aux_state);
+            d.aux_state = leftover;
+        } else if (leftover_n == 0) {
+            if (d.aux_state.ctx != null) _ = mlx.mlx_array_free(d.aux_state);
+            d.aux_state = .{ .ctx = null };
         }
         d.qsa_ratio = s_l.qsa_ratio;
         d.qsa_rows = keep;
@@ -17479,7 +17677,7 @@ pub const Transformer = struct {
 
         const kv: c_int = offset + seq_len;
         entry.qsa_ratio = ratio;
-        if (qsaHistoryRows(entry) != offset) return error.QsaHistoryGap;
+        if (!qsaEntrySatisfiesForward(entry, offset)) return error.QsaHistoryGap;
         if (envFlagCached(&qwen4_no_pooled_env, "QWEN4_NO_POOLED")) return error.QsaPooledRequired;
         const nb: c_int = @divTrunc(kv, ratio);
         const nb_cached: c_int = if (entry.qsa_pooled.ctx != null) mlx.getShape(entry.qsa_pooled)[1] else 0;
@@ -17924,6 +18122,34 @@ pub const Transformer = struct {
         m.qsa_marks.deinit();
         m.seq_offset = 0;
         m.pos_base = -1;
+    }
+
+    pub fn qwen4MtpResetOwned(self: *Transformer, enable_mtp: bool) void {
+        if (enable_mtp) self.qwen4MtpReset() catch {};
+    }
+
+    test "qwen4MtpResetOwned: a non-MTP request leaves the head untouched" {
+        const t = std.testing;
+        var xfm: Transformer = undefined;
+        xfm.s = mlx.gpuStream();
+        xfm.allocator = t.allocator;
+        const head_cache = try KVCache.init(t.allocator, 1);
+        var head: Qwen4Mtp = undefined;
+        head.cache = head_cache;
+        head.entry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true };
+        head.qsa_marks = .{};
+        head.seq_offset = 7;
+        head.pos_base = 3;
+        xfm.qwen4_mtp = head;
+        const m = &xfm.qwen4_mtp.?;
+        defer {
+            ssmFreeQsaState(&m.entry);
+            m.qsa_marks.deinit();
+            m.cache.deinit();
+        }
+        xfm.qwen4MtpResetOwned(false);
+        try t.expectEqual(@as(usize, 7), m.seq_offset);
+        try t.expectEqual(@as(i32, 3), m.pos_base);
     }
 
     /// Record the head's QSA leftover at `row`, the trunk's checkpoint position in the head's
@@ -33519,15 +33745,8 @@ test "applyQsaHistoryAt: a sliced restore is a VIEW of the entry's history; the 
 
     var dest = [_]SSMCacheEntry{.{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true }};
     defer ssmFreeQsaState(&dest[0]);
-    var before: usize = 0;
-    _ = mlx.mlx_synchronize(s);
-    _ = mlx.mlx_get_active_memory(&before);
     try restoreSsmCheckpoint(&dest, &cps[0]);
     try applyQsaHistoryAt(&dest, &cps[0], 16, s);
-    var after: usize = 0;
-    _ = mlx.mlx_get_active_memory(&after);
-    try testing.expect(after <= before);
-    try testing.expect(dest[0].aux_state.ctx == null);
     try testing.expectEqual(@as(c_int, 4), dest[0].qsa_pooled_blocks);
 
     var kept = [_]SSMCheckpoint{try captureSsmCheckpoint(testing.allocator, &live, 16, s)};
@@ -41727,7 +41946,7 @@ fn qsaGatherF32Reference(
         lmax = @max(lmax, qsaGatherRowL(p, kb, ratio));
     }
     const nl: usize = @intCast(lmax);
-    const ta = std.testing.allocator;
+    const ta = std.heap.page_allocator;
     const idx = try ta.alloc(u32, nq * nl);
     defer ta.free(idx);
     const vis = try ta.alloc(bool, nq * nl);
@@ -42085,6 +42304,75 @@ test "gatherQsa256 NAX: probe failure latches stock gather bit-identical to the 
     defer _ = mlx.mlx_array_free(fallback);
     try std.testing.expect(!qsa_gather_used_nax);
     try std.testing.expectEqual(@as(f32, 0), try attn256MaxDiff(stock, fallback, s));
+}
+
+test "gatherQsa256 NAX: a probe mismatch latches the stock gather" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
+    if (!qsaNaxOsOk()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    qsa_gather_override = true;
+    defer qsa_gather_override = null;
+    const saved_nax = qsa_nax_override;
+    const saved_fail = qsa_nax_probe_fail_override;
+    const saved_flip = qsa_nax_probe_flip_override;
+    defer {
+        qsa_nax_override = saved_nax;
+        qsa_nax_probe_fail_override = saved_fail;
+        qsa_nax_probe_flip_override = saved_flip;
+        qsaNaxProbeReset();
+    }
+    var prng = std.Random.DefaultPrng.init(0xa11);
+    const rnd = prng.random();
+    const qL: c_int = 16;
+    const kL: c_int = 16;
+    const kb: c_int = 4;
+    const q_shape = [_]c_int{ 1, 24, qL, 256 };
+    const kv_shape = [_]c_int{ 1, 2, kL, 256 };
+    const q = try attn256RandBf16(rnd, &q_shape, s);
+    defer _ = mlx.mlx_array_free(q);
+    const k = try attn256RandBf16(rnd, &kv_shape, s);
+    defer _ = mlx.mlx_array_free(k);
+    const v = try attn256RandBf16(rnd, &kv_shape, s);
+    defer _ = mlx.mlx_array_free(v);
+    var fx = try QsaBlockFixture.build(rnd, qL, kL, kb, 4);
+    defer fx.deinit();
+    const scale: f32 = 1.0 / 16.0;
+    qsa_nax_override = false;
+    const stock = (try gatherQsa256(s, q, k, v, scale, fx.blocks, 4)) orelse return error.GatherDeclined;
+    defer _ = mlx.mlx_array_free(stock);
+    qsa_nax_probe_fail_override = false;
+    qsa_nax_probe_flip_override = true;
+    qsaNaxProbeReset();
+    qsa_nax_override = true;
+    const fallback = (try gatherQsa256(s, q, k, v, scale, fx.blocks, 4)) orelse return error.GatherDeclined;
+    defer _ = mlx.mlx_array_free(fallback);
+    try std.testing.expect(qsaNaxProbeFailed());
+    try std.testing.expect(!qsa_gather_used_nax);
+    try std.testing.expectEqual(@as(f32, 0), try attn256MaxDiff(stock, fallback, s));
+}
+
+test "gatherQsa256 NAX: probe passes on this machine" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
+    if (!qsaNaxOsOk()) return error.SkipZigTest;
+    const saved_nax = qsa_nax_override;
+    const saved_fail = qsa_nax_probe_fail_override;
+    const saved_flip = qsa_nax_probe_flip_override;
+    defer {
+        qsa_nax_override = saved_nax;
+        qsa_nax_probe_fail_override = saved_fail;
+        qsa_nax_probe_flip_override = saved_flip;
+        qsaNaxProbeReset();
+    }
+    qsa_nax_probe_fail_override = false;
+    qsa_nax_probe_flip_override = false;
+    qsa_nax_override = true;
+    qsaNaxProbeReset();
+    qsaNaxArm();
+    try std.testing.expect(!qsaNaxProbeFailed());
+    try std.testing.expect(qsaNaxEnabled());
 }
 
 test "gatherQsa256 NAX: latch is consulted before NAX kernel construction" {
@@ -42577,7 +42865,7 @@ test "qsa arm meters: one-shot bits, width buckets, and the per-request tally" {
     var texts = std.StringHashMap(void).init(std.testing.allocator);
     defer texts.deinit();
     inline for (@typeInfo(QsaDeclineReason).@"enum".field_values) |v| {
-        const t = (@as(QsaDeclineReason, @enumFromInt(v))).text();
+        const t = (@as(QsaDeclineReason, @fromBackingInt(@intCast(v)))).text();
         try std.testing.expect(t.len > 0);
         try std.testing.expect(!texts.contains(t));
         try texts.put(t, {});
@@ -48796,9 +49084,8 @@ test "qsa visibility skip: bit-identical selection where it is an identity, and 
 
 test "qsa score sheet budget: the env parser, and the row chunk it buys at nb 95k" {
     const t = std.testing;
-    const saved_fused = qsa_score_fused_override;
-    defer qsa_score_fused_override = saved_fused;
     qsa_score_fused_override = false;
+    defer qsa_score_fused_override = null;
     try t.expectEqual(QSA_SCORE_SHEET_BUDGET_MB_DEFAULT, qsaScoreSheetMbFrom(null));
     try t.expectEqual(QSA_SCORE_SHEET_BUDGET_MB_DEFAULT, qsaScoreSheetMbFrom(""));
     try t.expectEqual(QSA_SCORE_SHEET_BUDGET_MB_DEFAULT, qsaScoreSheetMbFrom("wide"));
@@ -49897,6 +50184,62 @@ test "qsa score kernel: never built without NAX" {
     try testing.expectError(error.NaxUnavailable, getQsaScoreKernel());
     try testing.expectEqual(builds, qsaScoreKernelBuilds());
     try testing.expect(!qsaScoreKernelBuilt());
+}
+
+test "qsa score fused: a probe mismatch latches the composed arm" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
+    if (!qsaScoreTf32Enabled()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    const saved_override = qsa_score_fused_override;
+    const saved_flip = qsa_score_probe_flip_override;
+    const saved_env = qsa_score_fused_env;
+    defer {
+        qsa_score_fused_override = saved_override;
+        qsa_score_probe_flip_override = saved_flip;
+        qsa_score_fused_env = saved_env;
+        qsaScoreFusedProbeReset();
+    }
+    qsa_score_fused_override = true;
+    qsa_score_probe_flip_override = true;
+    qsaScoreFusedProbeReset();
+    qsaScoreFusedArm();
+    try testing.expect(qsaScoreFusedProbeFailed());
+    try testing.expect(!qsaScoreFusedActive());
+    var prng = std.Random.DefaultPrng.init(0xF11);
+    const q = try attn256RandBf16(prng.random(), &[_]c_int{ 1, 4, 2, 128 }, s);
+    defer _ = mlx.mlx_array_free(q);
+    const pooled = try attn256RandBf16(prng.random(), &[_]c_int{ 1, 64, 128 }, s);
+    defer _ = mlx.mlx_array_free(pooled);
+    try mlx.check(mlx.mlx_array_eval(pooled));
+    try testing.expect((try qsaScoreFused(s, q, pooled)) == null);
+    const k32t = try qsaScoreK32tFromPooled(s, pooled);
+    defer _ = mlx.mlx_array_free(k32t);
+    const composed = try qsaScoreSheetComposed(s, q, k32t);
+    defer _ = mlx.mlx_array_free(composed);
+    try testing.expect(composed.ctx != null);
+}
+
+test "qsa score fused: probe passes on this machine" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
+    if (!qsaScoreTf32Enabled()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    const saved_override = qsa_score_fused_override;
+    const saved_flip = qsa_score_probe_flip_override;
+    defer {
+        qsa_score_fused_override = saved_override;
+        qsa_score_probe_flip_override = saved_flip;
+        qsaScoreFusedProbeReset();
+    }
+    qsa_score_fused_override = true;
+    qsa_score_probe_flip_override = false;
+    qsaScoreFusedProbeReset();
+    qsaScoreFusedArm();
+    try testing.expect(!qsaScoreFusedProbeFailed());
+    try testing.expect(qsaScoreFusedActive());
 }
 
 test "qsa score fused: default on engages, =0 declines" {
