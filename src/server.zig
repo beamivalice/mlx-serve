@@ -3771,8 +3771,16 @@ test "an explicit --prefill-chunk is the chunk that gets BILLED" {
 
 /// The deployed long-context shape at the live per-token widths: 12 caching layers, hd 256,
 /// 2 KV heads (13,056 B/tok at 8-bit); a 128-wide QSA indexer at ratio 4.
-fn qwen4RequestTestConfig() model_mod.ModelConfig {
+fn qsaScoreFusedOffGuard() struct {
+    pub fn deinit(_: @This()) void {
+        transformer_mod.qsa_score_fused_override = null;
+    }
+} {
     transformer_mod.qsa_score_fused_override = false;
+    return .{};
+}
+
+fn qwen4RequestTestConfig() model_mod.ModelConfig {
     var cfg = model_mod.ModelConfig{};
     cfg.model_type = "qwen4_exp"; // arch-scan-exempt: test fixture, not a gate
     cfg.num_hidden_layers = 48;
@@ -3796,6 +3804,14 @@ fn qwen4RequestTestConfig() model_mod.ModelConfig {
     return cfg;
 }
 
+test "qwen4RequestTestConfig does not leak qsa_score_fused_override" {
+    const saved = transformer_mod.qsa_score_fused_override;
+    defer transformer_mod.qsa_score_fused_override = saved;
+    transformer_mod.qsa_score_fused_override = null;
+    _ = qwen4RequestTestConfig();
+    try std.testing.expectEqual(@as(?bool, null), transformer_mod.qsa_score_fused_override);
+}
+
 /// The width a ladder rung actually forwards at for this prompt.
 fn widthForRung(cfg: *const model_mod.ModelConfig, seq: u64, rung: u32) u32 {
     return @intCast(generate_mod.effectivePrefillChunk(
@@ -3809,6 +3825,8 @@ fn widthForRung(cfg: *const model_mod.ModelConfig, seq: u64, rung: u32) u32 {
 }
 
 test "the load-time budget is reproducible: free RAM at load does not move it" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
     // Two boots 11 minutes apart resolved the same 10 GB ask to 1076 and 9757 MB off the live ceiling.
     const t = std.testing;
     const cfg = qwen4RequestTestConfig();
@@ -3844,6 +3862,8 @@ test "the load-time budget is reproducible: free RAM at load does not move it" {
 }
 
 test "an auto boot sizes the SAME context whatever the cache ask (live check #6)" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
     // `--prefix-cache-mem 60GB` collapsed the advertised context to 870 tokens (ctx KV billed at 26 MB).
     const t = std.testing;
     const cfg = qwen4RequestTestConfig();
@@ -3898,6 +3918,8 @@ test "the clamp bills the context that will be SERVED, not the placeholder" {
 }
 
 test "the SSD-first budget bills the FLOOR reserve, at the deployed pack's live numbers" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
     // `ssdFirstBudgetForLoad` short-circuits above `planHotCache`, so the floor-width reserve never ran on qwen4_exp.
     const t = std.testing;
     var cfg = qwen4RequestTestConfig();
@@ -3957,6 +3979,8 @@ test "the SSD-first budget bills the FLOOR reserve, at the deployed pack's live 
 }
 
 test "SSD-first is gated on a DISK TIER: with --prefix-cache-disk off, qwen4_exp takes the RAM arm" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
     // `ssdFirstEnabled()` never checked that a tier exists, and `--prefix-cache-disk` is off by default.
     const t = std.testing;
     var cfg = qwen4RequestTestConfig();
@@ -4005,6 +4029,8 @@ test "SSD-first is gated on a DISK TIER: with --prefix-cache-disk off, qwen4_exp
 }
 
 test "an auto boot advertises the session the SSD-first budget floor was billed for" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
     // The load-time bill and the pinned context must be one session: the SSD arm billed with
     // `cache_reserve = 0` while `pinAutoContext` sized against `CTX_SIZING_CACHE_RESERVE`, so
     // the floor held RAM for a larger session than the one advertised.
@@ -4104,6 +4130,8 @@ test "the load-time session bill is billed at the boot's --kv-quant, not bf16" {
 }
 
 test "an explicit --ctx-size boot never consults the session reserve" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
     // `--ctx-size` wins in the resolver's first branch; asserted as invariance in the reserve.
     const t = std.testing;
     var cfg = qwen4RequestTestConfig();
@@ -4144,6 +4172,8 @@ test "an explicit --ctx-size keeps the load-time context byte-identical" {
 }
 
 test "clampReserveWidth: the load-time reserve is a promise to the FIRST request" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
     // The ceiling inversion: same ask, `iogpu.wired_limit_mb 120000` got a 3.6x smaller cache
     // because the wider rung's reserve grew faster than the headroom. Billing the ladder floor
     // makes the budget monotone in the ceiling.
@@ -4247,6 +4277,8 @@ test "chooseRequestPrefillChunk: an ordinary prompt buys the wide chunk a 1M ses
 }
 
 test "chooseRequestPrefillChunk: WIDEST that fits, at the boundary" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
     // "Widest that fits": priced at the exact bill of a width that width comes out; one byte
     // under, a strictly narrower one (except at the floor). Walks the config's own ladder.
     const t = std.testing;
@@ -4279,6 +4311,8 @@ test "chooseRequestPrefillChunk: WIDEST that fits, at the boundary" {
 }
 
 test "chooseRequestPrefillChunk: the explicit flag and the gate both outrank it" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
     const t = std.testing;
     const cfg = qwen4RequestTestConfig();
     const kv_bits: u64 = 8;
@@ -4304,6 +4338,8 @@ test "chooseRequestPrefillChunk: the explicit flag and the gate both outrank it"
 }
 
 test "admission tries the ladder DOWN before refusing: a prompt that fits only at 512" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
     // The probe used to price the load-time pin while the scheduler chose a per-request width,
     // so a prompt that fit only at the floor was refused for a forward that never ran.
     const t = std.testing;
@@ -4345,6 +4381,8 @@ test "admission tries the ladder DOWN before refusing: a prompt that fits only a
 }
 
 test "the post-eviction re-ask never exceeds what live memory affords, and never runs on an arch that has no per-request width" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
     // The composition the scheduler runs: the chooser is asked before and after the eviction
     // pass, and the second reading (live memory) runs.
     const t = std.testing;
@@ -21726,7 +21764,6 @@ test "admitMtpForCtx: the --max-mtp-ctx ceiling outranks the request's own flag"
 
 /// The qwen4_exp shape of the live #353 report: Qwen3.8-Flash-Next mixed-4-8bit, `--ctx-size 1048576 --kv-quant 8`.
 fn qwen4ExpOomConfig() model_mod.ModelConfig {
-    transformer_mod.qsa_score_fused_override = false;
     var cfg = model_mod.ModelConfig{};
     cfg.model_type = "qwen4_exp"; // arch-scan-exempt: test fixture, not a gate
     cfg.num_hidden_layers = 48;
@@ -21753,7 +21790,17 @@ fn qwen4ExpOomConfig() model_mod.ModelConfig {
     return cfg;
 }
 
+test "qwen4ExpOomConfig does not leak qsa_score_fused_override" {
+    const saved = transformer_mod.qsa_score_fused_override;
+    defer transformer_mod.qsa_score_fused_override = saved;
+    transformer_mod.qsa_score_fused_override = null;
+    _ = qwen4ExpOomConfig();
+    try std.testing.expectEqual(@as(?bool, null), transformer_mod.qsa_score_fused_override);
+}
+
 test "the 458k prefill's two unbilled terms are billed: retained checkpoints and reserved capacity" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
     const t = std.testing;
     // A 458,832-token cold prefill was admitted against 26.6 GB of headroom and died mid-prefill.
     const cfg = qwen4ExpOomConfig();
@@ -21806,6 +21853,8 @@ test "the 458k prefill's two unbilled terms are billed: retained checkpoints and
 }
 
 test "the reservation is bounded by the CONTEXT: an omitted max_tokens cannot bill 26 TB" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
     const t = std.testing;
     // An omitted `max_tokens` is maxInt(u32)/4; the memory guard used to run before
     // `clampMaxTokens`, so the reservation billed ~26 TB of KV and refused every long prompt.
@@ -21897,6 +21946,8 @@ test "the guard credits only PROVABLY reclaimable cache bytes, never the entry a
 }
 
 test "the admission probe bills the request's OWN kv-quant and chunking, not the process defaults" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
     // The probe used to hardcode `kv_override = null`, pricing a `kv_quant: 4` request at fp16 on the inference thread.
     const t = std.testing;
     const cfg = qwen4ExpOomConfig();
@@ -21964,6 +22015,8 @@ fn adaptCapFor(cfg: *const model_mod.ModelConfig, seq: u64) u32 {
 }
 
 test "adaptivePrefillWidth: a step-down is immediate, by as many rungs as it takes, and never 0" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
     // The down direction does not wait for a trend or a margin.
     const t = std.testing;
     const cfg = qwen4RequestTestConfig();
@@ -22000,6 +22053,8 @@ test "adaptivePrefillWidth: a step-down is immediate, by as many rungs as it tak
 }
 
 test "adaptivePrefillWidth: HOLD is margin 1.0 — the admitted width is not second-guessed" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
     // `prefillMemoryNeeded` already carries its own 5/4; a second 1.25 on the hold stepped the
     // 768k prompt down from the width admission admitted.
     const t = std.testing;
@@ -22020,6 +22075,8 @@ test "adaptivePrefillWidth: HOLD is margin 1.0 — the admitted width is not sec
 }
 
 test "adaptivePrefillWidth: a widen costs 1.25x AND two consecutive supporting probes" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
     // Holding is free, growing is a bet: two consecutive probes.
     const t = std.testing;
     const cfg = qwen4RequestTestConfig();
@@ -22052,6 +22109,8 @@ test "adaptivePrefillWidth: a widen costs 1.25x AND two consecutive supporting p
 }
 
 test "the tail-merge gate reads the ARCH, not the installed hook (serve installs it for everyone)" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
     // `serve` installs `prefill_chunk_adapt` unconditionally, so `chunk_width_hook != null` is
     // true on every arch and reading it as the gate put the scaled bound back everywhere. This
     // builds the slot state the way `serve` does and asserts the two answers differ.
@@ -22095,6 +22154,8 @@ test "the tail-merge gate reads the ARCH, not the installed hook (serve installs
 }
 
 test "the tail-merge bound scales ONLY where the per-chunk adaptive width is live" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
     // Every arch but an adaptive-width qwen4_exp keeps the flat `TAIL_MERGE_MAX` at every chunk width.
     const t = std.testing;
 
@@ -22124,6 +22185,8 @@ test "the tail-merge bound scales ONLY where the per-chunk adaptive width is liv
 }
 
 test "adaptivePrefillWidth: the ratchet is one-way, and the cap is a ceiling" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
     const t = std.testing;
     const cfg = qwen4RequestTestConfig();
     const kv_bits: u64 = 8;
@@ -22152,6 +22215,8 @@ test "adaptivePrefillWidth: the ratchet is one-way, and the cap is a ceiling" {
 }
 
 test "adaptivePrefillWidth: a 1M prompt walks DOWN as the box fills, and a small one never moves" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
     // Sweep: the width is the widest rung that fits, only narrows within one prefill, and is always forwardable.
     const t = std.testing;
     const cfg = qwen4RequestTestConfig();
@@ -22202,6 +22267,8 @@ test "prefillHeadroomNow subtracts the SSD writer's staged HOST bytes" {
 }
 
 test "adaptivePrefillWidth: the widen prices the QSA sheet at the LIVE KV, not at one chunk" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
     // `prefillTransientReserve` bills the QSA sheet at `kv = chunk`; past the indexer budget the
     // sheet costs its whole budget, so a widen decided on that number is unguarded.
     const t = std.testing;
@@ -22245,6 +22312,8 @@ test "adaptivePrefillWidth: the widen prices the QSA sheet at the LIVE KV, not a
 }
 
 test "adaptivePrefillChunkEnabled: the arch, both kill switches, and any pinned width" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
     const t = std.testing;
     const cfg = qwen4RequestTestConfig();
     var other = qwen4RequestTestConfig();
@@ -22313,6 +22382,8 @@ test "resolvedContextForLoad: an auto boot bills the session it will serve, not 
 }
 
 test "the advertised context does not move with the cache ask" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
     // Sizing the context against the ask collapsed it (60GB ask -> 870 tokens); sizing against the
     // resolved budget was a one-step loop. A constant reserve closes both.
     const t = std.testing;
@@ -22417,6 +22488,8 @@ test "a WARM turn is not billed for the prefix it is about to SHARE (786,707 @ 1
 }
 
 test "a chain extension that OUTGROWS the resident entry is credited the rows it holds" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
     const t = std.testing;
     // Past the restored capacity the cache grows per layer: the resident rows stay credited and
     // the grow bills the new capacity beyond the old plus one eval window of old buffers.
@@ -22602,6 +22675,8 @@ test "prefillChunkCap: the chunk sizer's two long-context changes are qwen4_exp-
 }
 
 test "prefillRequestTerms: the admission bill's new terms are qwen4_exp-only" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
     // The allocator side of the reservation is gated (`generate.reservedPrefillTokens`); the
     // guard side was not, so off qwen4_exp the bill charged headroom never reserved.
     const t = std.testing;
@@ -22700,6 +22775,8 @@ test "prefillAdmissionBill: the evict-to-admit credits are qwen4_exp-only" {
 }
 
 test "memoryRefusalMessage: the 400 names the hot cache only where the bill carries it" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
     // A non-qwen4 refusal read "the hot prefix cache holds ~0MB ..." on a box with a multi-GB resident cache.
     const t = std.testing;
     const MB: u64 = 1024 * 1024;
