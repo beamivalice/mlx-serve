@@ -254,6 +254,20 @@ cp "$SWIFT_BIN" "$CONTENTS/MacOS/MLXCore"
 # App resources (tray icon etc.)
 cp -R "$SCRIPT_DIR/Sources/MLXServe/Resources/"* "$CONTENTS/Resources/" 2>/dev/null || true
 
+PLUGIN_SRC="$PROJECT_ROOT/lib/opencode2-mlx-serve"
+PLUGIN_DST="$CONTENTS/Resources/opencode2-mlx-serve"
+if [ -d "$PLUGIN_SRC" ]; then
+    mkdir -p "$PLUGIN_DST"
+    for f in LICENSE package.json tui.tsx; do
+        [ -f "$PLUGIN_SRC/$f" ] && cp "$PLUGIN_SRC/$f" "$PLUGIN_DST/"
+    done
+    for f in "$PLUGIN_SRC"/*.ts; do
+        [ -f "$f" ] || continue
+        case "$(basename "$f")" in *.test.ts) continue ;; esac
+        cp "$f" "$PLUGIN_DST/"
+    done
+fi
+
 # SwiftPM does not embed resource bundles when we assemble the .app by hand.
 # SwaTex loads its KaTeX fonts from this bundle at runtime.
 cp -R "$SWATEX_RESOURCE_BUNDLE" "$CONTENTS/Resources/"
