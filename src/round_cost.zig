@@ -20,7 +20,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
-const log = @import("log.zig");
 const transformer_mod = @import("transformer.zig");
 
 /// Drafts per round the table covers (MTP depth <= 8, a DFlash block up to 16); index 0 is serial.
@@ -170,10 +169,6 @@ pub const Table = struct {
     restored_serial: u32 = 0,
     /// Persisted width cells dropped at load for failing the step bound.
     restored_dropped: u32 = 0,
-    serial_baseline: [N_BUCKETS]f32 = @splat(0),
-    serial_new_folds: [N_BUCKETS]u32 = @splat(0),
-    serial_drop_done: [N_BUCKETS]bool = @splat(false),
-    width_drops: u32 = 0,
 
     /// Folded width cells; never counts the serial row.
     pub fn foldedCells(self: *const Table) u32 {
@@ -289,37 +284,7 @@ pub const Table = struct {
             return .implausible;
         }
         self.serial_folded += 1;
-        const v = foldInto(&self.serial[bucket], ms, 1.0, self.serial_seq);
-        if (self.serial_baseline[bucket] > 0 and !self.serial_drop_done[bucket]) {
-            self.serial_new_folds[bucket] += 1;
-            if (self.serial_new_folds[bucket] >= MIN_SAMPLES and
-                serialMoved(self.serial_baseline[bucket], self.serial[bucket].ms))
-            {
-                self.dropStaleWidthCells(bucket);
-            }
-        }
-        return v;
-    }
-
-    fn dropStaleWidthCells(self: *Table, moved: usize) void {
-        const old_ms = self.serial_baseline[moved];
-        const new_ms = self.serial[moved].ms;
-        var dropped_any = false;
-        for (0..N_BUCKETS) |b| {
-            if (b != moved and self.serial_new_folds[b] >= MIN_SAMPLES) continue;
-            var w: u32 = 0;
-            while (w <= MAX_WIDTH) : (w += 1) {
-                if (self.cells[w][b].n == 0) continue;
-                self.cells[w][b] = .{};
-                dropped_any = true;
-            }
-            self.serial_drop_done[b] = true;
-            if (self.serial[b].n >= MIN_SAMPLES) self.serial_baseline[b] = self.serial[b].ms;
-            self.serial_new_folds[b] = MIN_SAMPLES;
-        }
-        if (!dropped_any) return;
-        self.width_drops += 1;
-        log.info("[spec-cost] bucket {d} width cells dropped: serial moved {d:.1} -> {d:.1}\n", .{ moved, old_ms, new_ms });
+        return foldInto(&self.serial[bucket], ms, 1.0, self.serial_seq);
     }
 
     fn selfSpike(cell: Cell, ms: f32, clock: u32) bool {
@@ -797,9 +762,14 @@ pub fn totalFolded(t: *const Table) u32 {
     return t.folded +% t.serial_folded;
 }
 
+pub fn persistEnabledFrom(raw: ?[]const u8) bool {
+    const v = raw orelse return false;
+    return std.mem.eql(u8, v, "1");
+}
+
 pub fn persistEnabled() bool {
-    const raw = std.c.getenv("MLX_SERVE_ROUND_COST_PERSIST") orelse return true;
-    return !std.mem.eql(u8, std.mem.span(raw), "0");
+    const raw = std.c.getenv("MLX_SERVE_ROUND_COST_PERSIST");
+    return persistEnabledFrom(if (raw) |r| std.mem.span(r) else null);
 }
 
 pub fn persistDiagArmedFrom(raws: []const ?[*:0]const u8) bool {
@@ -830,11 +800,6 @@ pub fn persistDiagArmed() bool {
 
 pub fn storeShouldWrite(persist_on: bool, diag_armed: bool, key_len: usize) bool {
     return persist_on and !diag_armed and key_len != 0;
-}
-
-fn serialMoved(old: f32, new: f32) bool {
-    if (!(old > 0)) return false;
-    return @abs(new - old) > old * SWITCH_MARGIN;
 }
 
 var build_id_buf: [64]u8 = undefined;
@@ -1037,9 +1002,6 @@ pub fn parse(text: []const u8, layout: Layout) ?Table {
     t.serial_seq = RESEED_GAP + 1;
     t.restored = t.foldedCells();
     t.restored_serial = t.foldedSerialCells();
-    for (t.serial, 0..) |c, b| {
-        if (c.n >= MIN_SAMPLES) t.serial_baseline[b] = c.ms;
-    }
     return t;
 }
 
@@ -1119,17 +1081,6 @@ const testing = std.testing;
 fn feed(t: *Table, width: u32, kv: u32, ms: f32, tok: f32) void {
     var i: u32 = 0;
     while (i < MIN_SAMPLES) : (i += 1) _ = t.observe(width, kv, ms, tok, true, false);
-}
-
-fn feedSerial(t: *Table, kv: u32, ms: f32) void {
-    var i: u32 = 0;
-    while (i < MIN_SAMPLES) : (i += 1) _ = t.observeSerial(kv, ms, true, false);
-}
-
-fn persistRoundTrip(t: Table) Table {
-    var buf: [2048]u8 = undefined;
-    const text = serialize(&buf, &t) catch unreachable;
-    return parse(text, t.layout) orelse unreachable;
 }
 
 test "round_cost: kv buckets" {
@@ -1709,71 +1660,12 @@ test "round_cost: cacheKey differs for two build ids and matches for the same id
     try testing.expectEqualStrings(k1, k3);
 }
 
-test "round_cost: serial-move drop waits for MIN_SAMPLES new folds against the persisted baseline" {
-    var live = Table{ .layout = .long };
-    feed(&live, 1, 1000, 23.2, 1.89);
-    feed(&live, 2, 1000, 30.3, 1.10);
-    feedSerial(&live, 1000, 19.0);
-    var t = persistRoundTrip(live);
-    try testing.expect(t.measuredMs(1, 0) != null);
-    try testing.expect(t.measuredMs(2, 0) != null);
-
-    try testing.expectEqual(Verdict.reseeded, t.observeSerial(1000, 15.2, true, false));
-    try testing.expectEqual(@as(u32, 2), t.measuredCount(0));
-    try testing.expectEqual(@as(u32, 0), t.width_drops);
-
-    feedSerial(&t, 1000, 15.2);
-    try testing.expectEqual(@as(u32, 0), t.measuredCount(0));
-    try testing.expectEqual(@as(u32, 1), t.width_drops);
-    try testing.expect(!t.active(0));
-
-    feed(&t, 1, 1000, 20.0, 1.8);
-    try testing.expect(t.measuredMs(1, 0) != null);
-    feedSerial(&t, 1000, 17.0);
-    try testing.expect(t.measuredMs(1, 0) != null);
-    try testing.expectEqual(@as(u32, 1), t.width_drops);
-
-    var keep_live = Table{ .layout = .long };
-    feed(&keep_live, 1, 1000, 23.2, 1.89);
-    feed(&keep_live, 2, 1000, 30.3, 1.10);
-    feedSerial(&keep_live, 1000, 19.0);
-    var u = persistRoundTrip(keep_live);
-    feedSerial(&u, 1000, 18.5);
-    try testing.expect(u.measuredMs(1, 0) != null);
-    try testing.expect(u.measuredMs(2, 0) != null);
-    try testing.expectEqual(@as(u32, 2), u.measuredCount(0));
-    try testing.expectEqual(@as(u32, 0), u.width_drops);
-}
-
-test "round_cost: a serial-move drop covers buckets whose serial is not re-confirmed" {
-    var live = Table{ .layout = .long };
-    feed(&live, 1, 1000, 23.2, 1.89);
-    feed(&live, 2, 3000, 30.3, 1.10);
-    feedSerial(&live, 1000, 19.0);
-    feedSerial(&live, 3000, 19.0);
-    var t = persistRoundTrip(live);
-    try testing.expect(t.active(0));
-    try testing.expect(t.active(1));
-
-    feedSerial(&t, 1000, 15.2);
-    try testing.expectEqual(@as(u32, 0), t.measuredCount(0));
-    try testing.expectEqual(@as(u32, 0), t.measuredCount(1));
-    try testing.expectEqual(@as(u32, 1), t.width_drops);
-
-    var u_live = Table{ .layout = .long };
-    feed(&u_live, 1, 1000, 23.2, 1.89);
-    feed(&u_live, 2, 3000, 30.3, 1.10);
-    feedSerial(&u_live, 1000, 19.0);
-    feedSerial(&u_live, 3000, 19.0);
-    var u = persistRoundTrip(u_live);
-    feedSerial(&u, 3000, 19.0);
-    feedSerial(&u, 1000, 15.2);
-    try testing.expectEqual(@as(u32, 0), u.measuredCount(0));
-    try testing.expect(u.measuredMs(2, 1) != null);
-    try testing.expectEqual(@as(u32, 1), u.width_drops);
-}
-
 test "round_cost: persist write is a no-op when a diagnostic that adds barriers is armed" {
+    try testing.expect(!persistEnabledFrom(null));
+    try testing.expect(!persistEnabledFrom(""));
+    try testing.expect(!persistEnabledFrom("0"));
+    try testing.expect(persistEnabledFrom("1"));
+    try testing.expect(!persistEnabledFrom("true"));
     try testing.expect(storeShouldWrite(true, false, 8));
     try testing.expect(!storeShouldWrite(true, true, 8));
     try testing.expect(!storeShouldWrite(false, false, 8));
