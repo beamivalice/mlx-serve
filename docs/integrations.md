@@ -126,6 +126,8 @@ opencode --model mlx/MODEL_ID
 
 `opencode2` (npm `@opencode/cli`) reuses the same `OPENCODE_CONFIG_CONTENT` provider JSON. The launcher also writes a dedicated config dir and registers the mlx-serve monitor plugin (sidebar stats + footer turn meter, reading `GET /metrics.json`).
 
+**Start the server with `--metrics`** (`mlx-serve serve --metrics`). The CLI server has metrics off by default and answers `/metrics.json` with 503; the plugin then shows `feed --metrics off` and an otherwise empty panel, while the footer turn meter still works from the streamed response. The MLX Core app enables metrics by default. `mlx-serve launch opencode2` probes the endpoint and prints a warning when it is off.
+
 ```bash
 export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2"
 export OPENCODE_CONFIG_CONTENT='{"$schema": "https://opencode.ai/config.json", "provider": {"mlx": {"npm": "@ai-sdk/openai-compatible", "name": "MLX Serve (local)", "options": {"baseURL": "http://127.0.0.1:11234/v1"}, "models": {"MODEL_ID": {"name": "MODEL_ID (mlx-serve)", "limit": {"context": CTX, "output": 8192}}}}}}'

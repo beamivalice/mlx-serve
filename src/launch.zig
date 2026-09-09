@@ -192,6 +192,18 @@ pub fn isLoopbackBaseUrl(url: []const u8) bool {
     return std.mem.startsWith(u8, host, "127.");
 }
 
+/// What to tell the user about the monitor plugin's feed, from the status
+/// `GET /metrics.json` returned. The CLI server defaults to metrics OFF and
+/// answers 503; the plugin then shows `feed --metrics off` with an empty panel.
+pub fn metricsFeedNote(status: u16) ?[]const u8 {
+    return switch (status) {
+        200 => null,
+        503 => "this server was started without --metrics: the OpenCode 2 sidebar panel will read '--metrics off' (the footer turn meter still works). Restart with `mlx-serve serve --metrics` for the full panel.",
+        401, 403 => "GET /metrics.json is refused (api key): the OpenCode 2 sidebar panel will read '401 unauthorized'.",
+        else => "GET /metrics.json did not answer 200: the OpenCode 2 sidebar panel will read 'unreachable'.",
+    };
+}
+
 fn isMlxServePlugin(v: std.json.Value) bool {
     if (v != .object) return false;
     const pkg = v.object.get("package") orelse return false;
@@ -480,6 +492,20 @@ fn serverUp(allocator: std.mem.Allocator, io: std.Io, base_url: []const u8) bool
 
 /// `open -g -a "MLX Core"` — nonzero exit = the app isn't installed, which is
 /// the detection: no probing of /Applications by hand.
+/// HTTP status of `GET <base_url>/metrics.json`, or null when curl could not
+/// reach the server at all.
+fn metricsStatus(allocator: std.mem.Allocator, io: std.Io, base_url: []const u8) ?u16 {
+    const url = std.fmt.allocPrint(allocator, "{s}/metrics.json", .{base_url}) catch return null;
+    defer allocator.free(url);
+    const result = std.process.run(allocator, io, .{
+        .argv = &.{ "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "-m", "5", url },
+        .stdout_limit = .limited(64),
+    }) catch return null;
+    defer allocator.free(result.stderr);
+    defer allocator.free(result.stdout);
+    return std.fmt.parseInt(u16, std.mem.trim(u8, result.stdout, " \r\n"), 10) catch null;
+}
+
 fn tryStartApp(allocator: std.mem.Allocator, io: std.Io) bool {
     const result = std.process.run(allocator, io, .{
         .argv = &.{ "open", "-g", "-a", "MLX Core" },
@@ -795,6 +821,14 @@ pub fn cmdLaunch(allocator: std.mem.Allocator, io: std.Io, args: []const []const
     const script = try scriptFor(allocator, parsed.kind, base_url, chosen.id, chosen.budget, oc_config, parsed.extras);
     defer allocator.free(script);
 
+    if (parsed.kind == .opencode2) {
+        // The plugin's whole data source is /metrics.json; say so now rather
+        // than leave an empty panel to explain itself.
+        if (metricsStatus(allocator, io, base_url)) |status| {
+            if (metricsFeedNote(status)) |note| log.warn("{s}\n", .{note});
+        }
+    }
+
     if (parsed.print_only) {
         var stdout_buf: [8192]u8 = undefined;
         var stdout_w = std.Io.File.stdout().writer(io, &stdout_buf);
@@ -1000,6 +1034,14 @@ test "opencode2 cli.json merge omits metricsToken on loopback and writes it othe
     defer known_p.deinit();
     const known_opts = known_p.value.object.get("plugins").?.array.items[0].object.get("options").?.object;
     try t.expectEqualStrings("secret-key", known_opts.get("metricsToken").?.string);
+}
+
+test "opencode2 feed note: 200 is silent, 503 names --metrics, 401 names the key" {
+    try t.expect(metricsFeedNote(200) == null);
+    try t.expect(std.mem.indexOf(u8, metricsFeedNote(503).?, "--metrics") != null);
+    try t.expect(std.mem.indexOf(u8, metricsFeedNote(503).?, "footer turn meter still works") != null);
+    try t.expect(std.mem.indexOf(u8, metricsFeedNote(401).?, "401 unauthorized") != null);
+    try t.expect(std.mem.indexOf(u8, metricsFeedNote(500).?, "unreachable") != null);
 }
 
 test "opencode2 script exports XDG_CONFIG_HOME, OPENCODE_CONFIG_CONTENT, and invokes opencode2" {
