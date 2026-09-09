@@ -2742,6 +2742,19 @@ pub fn qsaBatchedGatherEnabled() bool {
     return v;
 }
 
+pub fn qsaBatchedGatherOn(seq_len: c_int, any_mrope: bool) bool {
+    if (any_mrope) return false;
+    if (!qsaBatchedGatherEnabled()) return false;
+    if (!qsaGatherEnabled()) return false;
+    if (seq_len <= 1) return qsaDecodeGatherEnabled();
+    return qsaVerifyGatherEnabled();
+}
+
+pub fn qsaBatchedGatherFloor(seq_len: c_int) c_int {
+    if (seq_len >= 2) return qsaVerifyGatherMinKv();
+    return qsaGatherMinKv();
+}
+
 var qsa_history_share_env_cached: ?bool = null;
 pub var qsa_history_share_override: ?bool = null;
 
@@ -4457,6 +4470,7 @@ pub fn qsaBatchedGatherAttn(
     q_rope: mlx.mlx_array,
     views: []const DenseKVView,
     blocks: []const mlx.mlx_array,
+    masks: []const mlx.mlx_array,
     ratio: c_int,
     attn_scale: f32,
 ) !mlx.mlx_array {
@@ -4466,7 +4480,9 @@ pub fn qsaBatchedGatherAttn(
     const h_count: c_int = qs[1];
     const hd: c_int = qs[3];
     if (views.len != n or blocks.len != n) return error.QsaBatchedGatherLen;
+    if (masks.len != 0 and masks.len != n) return error.QsaBatchedGatherLen;
     const fused_min_s = qsaAttnMinS();
+    const standin_sdpa = qwen4Standin().attn_sdpa;
     var outs = try allocator.alloc(mlx.mlx_array, n);
     defer allocator.free(outs);
     var built: usize = 0;
@@ -4475,6 +4491,7 @@ pub fn qsaBatchedGatherAttn(
         while (fi < built) : (fi += 1) _ = mlx.mlx_array_free(outs[fi]);
     }
     for (views, blocks, 0..) |*kv_view, blk, i| {
+        const slot_mask: mlx.mlx_array = if (i < masks.len) masks[i] else .{ .ctx = null };
         const i_c: c_int = @intCast(i);
         var q_slot = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(q_slot);
@@ -4490,21 +4507,32 @@ pub fn qsaBatchedGatherAttn(
             s,
         ));
         var gathered: ?mlx.mlx_array = null;
-        if (blk.ctx != null and seq_len >= fused_min_s and seq_len < FUSED256_MIN_Q_LEN) {
+        const qsa_ok = blk.ctx != null and slot_mask.ctx == null and !standin_sdpa;
+        if (qsa_ok and seq_len >= fused_min_s and seq_len < FUSED256_MIN_Q_LEN) {
             gathered = try qsaSparseAttn(s, q_slot, kv_view, blk, ratio, attn_scale);
         }
-        if (gathered == null and blk.ctx != null and seq_len == 1) {
+        if (gathered == null and qsa_ok and seq_len == 1) {
             gathered = try qsaDecodeGatherAttn(s, q_slot, kv_view, blk, ratio, attn_scale);
         }
-        if (gathered == null and blk.ctx != null and seq_len >= 2 and seq_len < FUSED256_MIN_Q_LEN) {
+        if (gathered == null and qsa_ok and seq_len >= 2 and seq_len < FUSED256_MIN_Q_LEN) {
             gathered = try qsaVerifyGatherAttn(s, q_slot, kv_view, blk, ratio, attn_scale);
         }
         if (gathered) |g| {
             outs[i] = g;
-        } else if (blk.ctx != null) {
-            const mask = try qsaMaskFromBlocks(s, blk, mlx.getShape(kv_view.k)[2], ratio);
-            defer _ = mlx.mlx_array_free(mask);
-            outs[i] = mlx.mlx_array_new();
+            built = i + 1;
+            continue;
+        }
+        var mask_tmp: mlx.mlx_array = .{ .ctx = null };
+        defer if (mask_tmp.ctx != null) {
+            _ = mlx.mlx_array_free(mask_tmp);
+        };
+        const mask: mlx.mlx_array = if (slot_mask.ctx != null) slot_mask else if (blk.ctx != null) blk: {
+            mask_tmp = try qsaMaskFromBlocks(s, blk, mlx.getShape(kv_view.k)[2], ratio);
+            break :blk mask_tmp;
+        } else .{ .ctx = null };
+        outs[i] = mlx.mlx_array_new();
+        built = i + 1;
+        if (mask.ctx != null) {
             if (try fusedSdpa256Masked(s, q_slot, kv_view.k, kv_view.v, attn_scale, mask)) |fused| {
                 _ = mlx.mlx_array_free(outs[i]);
                 outs[i] = fused;
@@ -4515,12 +4543,10 @@ pub fn qsaBatchedGatherAttn(
                 try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&outs[i], q_slot, kv_view.k, kv_view.v, attn_scale, "array", mask, .{ .ctx = null }, false, s));
             }
         } else {
-            outs[i] = mlx.mlx_array_new();
             const none = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(none);
             try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&outs[i], q_slot, kv_view.k, kv_view.v, attn_scale, "causal", none, .{ .ctx = null }, false, s));
         }
-        built = i + 1;
     }
     const vec = mlx.mlx_vector_array_new_data(outs.ptr, n);
     defer _ = mlx.mlx_vector_array_free(vec);
@@ -4560,7 +4586,7 @@ pub const QSA_VERIFY_GATHER_MIN_KV_DEFAULT: c_int = 16384;
 var qsa_verify_gather_min_kv_cached: ?c_int = null;
 pub var qsa_verify_gather_min_kv_override: ?c_int = null;
 
-fn qsaVerifyGatherMinKv() c_int {
+pub fn qsaVerifyGatherMinKv() c_int {
     if (qsa_verify_gather_min_kv_override) |v| return v;
     if (qsa_verify_gather_min_kv_cached) |v| return v;
     var v: c_int = QSA_VERIFY_GATHER_MIN_KV_DEFAULT;
@@ -16835,7 +16861,15 @@ pub const Transformer = struct {
             if (sc.qsa_blocks.ctx != null) any_blocks = true;
         }
         const keep_blocks = qsaBatchedGatherEnabled() and self.qwen4 != null and !any_mrope and any_blocks;
-        if (keep_blocks) return mlx.mlx_array_new();
+        if (keep_blocks) {
+            for (slots, 0..) |sc, i| {
+                if (sc.qsa_blocks.ctx == null and masks[i].ctx != null) {
+                    sc.qsa_mask = masks[i];
+                    masks[i] = .{ .ctx = null };
+                }
+            }
+            return mlx.mlx_array_new();
+        }
         for (slots, 0..) |sc, i| {
             if (sc.qsa_blocks.ctx != null) {
                 // Decode-width selection is per-slot unusable in the stacked
@@ -19688,6 +19722,7 @@ pub const Transformer = struct {
 
     fn qsaBatchedAttn(
         self: *Transformer,
+        ctx: *ForwardCtx,
         slots: []const *ForwardCtx,
         q_rope: mlx.mlx_array,
         layer: u32,
@@ -19696,6 +19731,7 @@ pub const Transformer = struct {
     ) !?mlx.mlx_array {
         if (!qsaBatchedGatherEnabled()) return null;
         if (self.qwen4 == null) return null;
+        std.debug.assert(ctx.qsa_mask.ctx == null);
         for (slots) |sc| if (sc.mrope_pos != null) return null;
         var any_blocks = false;
         for (slots) |sc| if (sc.qsa_blocks.ctx != null) {
@@ -19710,16 +19746,19 @@ pub const Transformer = struct {
         }
         var blks = try self.allocator.alloc(mlx.mlx_array, slots.len);
         defer self.allocator.free(blks);
+        var slot_masks = try self.allocator.alloc(mlx.mlx_array, slots.len);
+        defer self.allocator.free(slot_masks);
         for (slots, 0..) |slot_ctx, i| {
             views[i] = try slot_ctx.cache.denseView(layer, self.s);
             blks[i] = slot_ctx.qsa_blocks;
+            slot_masks[i] = slot_ctx.qsa_mask;
             if (slot_ctx.qsa_blocks.ctx != null) slot_ctx.qsa_arms.noteGather(seq_len) else slot_ctx.qsa_arms.note(.mask);
         }
         if (!qsa_batched_gather_logged) {
             qsa_batched_gather_logged = true;
             log.info("[qsa-batched-gather] engaged (slots={d} S={d}) — MLX_SERVE_QSA_BATCHED_GATHER=0 restores the dense padded mask\n", .{ slots.len, seq_len });
         }
-        return try qsaBatchedGatherAttn(self.allocator, self.s, q_rope, views, blks, ratio, attn_scale);
+        return try qsaBatchedGatherAttn(self.allocator, self.s, q_rope, views, blks, slot_masks, ratio, attn_scale);
     }
 
     fn gatedFullAttnWith(
@@ -19940,47 +19979,47 @@ pub const Transformer = struct {
                     slot_view.deinit();
                 }
 
-                if (try self.qsaBatchedAttn(slots, q_rope, layer, seq_len, attn_scale)) |gathered| {
+                if (try self.qsaBatchedAttn(ctx, slots, q_rope, layer, seq_len, attn_scale)) |gathered| {
                     _ = mlx.mlx_array_free(attn_out_b);
                     attn_out_b = gathered;
                 } else {
-                const dense_views = try self.allocator.alloc(DenseKVView, slots.len);
-                defer {
-                    for (dense_views) |*dv| dv.deinit();
-                    self.allocator.free(dense_views);
-                }
-                for (dense_views) |*dv| dv.* = .{ .k = .{ .ctx = null }, .v = .{ .ctx = null }, .owned = false };
-                const kv_len_buf = try self.allocator.alloc(i32, slots.len);
-                defer self.allocator.free(kv_len_buf);
-                var kv_max: c_int = 0;
-                for (slots, 0..) |slot_ctx, i| {
-                    dense_views[i] = try slot_ctx.cache.denseView(layer, self.s);
-                    const klen: c_int = mlx.getShape(dense_views[i].k)[2];
-                    kv_len_buf[i] = klen;
-                    if (klen > kv_max) kv_max = klen;
-                }
+                    const dense_views = try self.allocator.alloc(DenseKVView, slots.len);
+                    defer {
+                        for (dense_views) |*dv| dv.deinit();
+                        self.allocator.free(dense_views);
+                    }
+                    for (dense_views) |*dv| dv.* = .{ .k = .{ .ctx = null }, .v = .{ .ctx = null }, .owned = false };
+                    const kv_len_buf = try self.allocator.alloc(i32, slots.len);
+                    defer self.allocator.free(kv_len_buf);
+                    var kv_max: c_int = 0;
+                    for (slots, 0..) |slot_ctx, i| {
+                        dense_views[i] = try slot_ctx.cache.denseView(layer, self.s);
+                        const klen: c_int = mlx.getShape(dense_views[i].k)[2];
+                        kv_len_buf[i] = klen;
+                        if (klen > kv_max) kv_max = klen;
+                    }
 
-                const stacked_k = try self.padAndStackBatchedKV(dense_views, true, kv_max);
-                defer _ = mlx.mlx_array_free(stacked_k);
-                const stacked_v = try self.padAndStackBatchedKV(dense_views, false, kv_max);
-                defer _ = mlx.mlx_array_free(stacked_v);
-                var stacked_mask = try self.buildBatchedDecodeMask(kv_len_buf, kv_max, seq_len);
-                defer _ = mlx.mlx_array_free(stacked_mask);
-                if (ctx.qsa_mask.ctx != null) {
-                    // qwen4 QSA: the per-slot block selection (bool, false-
-                    // padded to kv_max) narrows the additive pad mask. One
-                    // dense-mask call serves the whole group, so it is billed
-                    // to every slot in it — the tally is per REQUEST.
-                    noteQsaArmForSlots(slots, .mask);
-                    const neg_inf = bf16Scalar(-std.math.inf(f32), self.s);
-                    defer _ = mlx.mlx_array_free(neg_inf);
-                    var narrowed = mlx.mlx_array_new();
-                    try mlx.check(mlx.mlx_where(&narrowed, ctx.qsa_mask, stacked_mask, neg_inf, self.s));
-                    _ = mlx.mlx_array_free(stacked_mask);
-                    stacked_mask = narrowed;
-                }
+                    const stacked_k = try self.padAndStackBatchedKV(dense_views, true, kv_max);
+                    defer _ = mlx.mlx_array_free(stacked_k);
+                    const stacked_v = try self.padAndStackBatchedKV(dense_views, false, kv_max);
+                    defer _ = mlx.mlx_array_free(stacked_v);
+                    var stacked_mask = try self.buildBatchedDecodeMask(kv_len_buf, kv_max, seq_len);
+                    defer _ = mlx.mlx_array_free(stacked_mask);
+                    if (ctx.qsa_mask.ctx != null) {
+                        // qwen4 QSA: the per-slot block selection (bool, false-
+                        // padded to kv_max) narrows the additive pad mask. One
+                        // dense-mask call serves the whole group, so it is billed
+                        // to every slot in it — the tally is per REQUEST.
+                        noteQsaArmForSlots(slots, .mask);
+                        const neg_inf = bf16Scalar(-std.math.inf(f32), self.s);
+                        defer _ = mlx.mlx_array_free(neg_inf);
+                        var narrowed = mlx.mlx_array_new();
+                        try mlx.check(mlx.mlx_where(&narrowed, ctx.qsa_mask, stacked_mask, neg_inf, self.s));
+                        _ = mlx.mlx_array_free(stacked_mask);
+                        stacked_mask = narrowed;
+                    }
 
-                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out_b, q_rope, stacked_k, stacked_v, attn_scale, "array", stacked_mask, .{ .ctx = null }, false, self.s));
+                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out_b, q_rope, stacked_k, stacked_v, attn_scale, "array", stacked_mask, .{ .ctx = null }, false, self.s));
                 }
             }
             return self.gatedAttnTail(attn_out_b, gate, fa, flat_shape, batch, is_prefill, layer);
@@ -41467,7 +41506,7 @@ test "qsa batched gather S=1: N=1 is byte-identical to solo, N=2 matches per-slo
 
     const solo0 = (try qsaDecodeGatherAttn(s, q0, &view0, fx0.blocks, ratio, scale)) orelse return error.GatherDeclined;
     defer _ = mlx.mlx_array_free(solo0);
-    const bat1 = try qsaBatchedGatherAttn(ta, s, q0, &.{view0}, &.{fx0.blocks}, ratio, scale);
+    const bat1 = try qsaBatchedGatherAttn(ta, s, q0, &.{view0}, &.{fx0.blocks}, &.{}, ratio, scale);
     defer _ = mlx.mlx_array_free(bat1);
     try std.testing.expectEqual(@as(f32, 0), try attn256MaxDiff(bat1, solo0, s));
 
@@ -41479,7 +41518,7 @@ test "qsa batched gather S=1: N=1 is byte-identical to solo, N=2 matches per-slo
     try mlx.check(mlx.mlx_concatenate_axis(&q_n2, qvec, 0, s));
     const views = [_]DenseKVView{ view0, view1 };
     const blks = [_]mlx.mlx_array{ fx0.blocks, fx1.blocks };
-    const bat2 = try qsaBatchedGatherAttn(ta, s, q_n2, &views, &blks, ratio, scale);
+    const bat2 = try qsaBatchedGatherAttn(ta, s, q_n2, &views, &blks, &.{}, ratio, scale);
     defer _ = mlx.mlx_array_free(bat2);
     const solo1 = (try qsaDecodeGatherAttn(s, q1, &view1, fx1.blocks, ratio, scale)) orelse return error.GatherDeclined;
     defer _ = mlx.mlx_array_free(solo1);
@@ -41490,6 +41529,191 @@ test "qsa batched gather S=1: N=1 is byte-identical to solo, N=2 matches per-slo
     defer _ = mlx.mlx_vector_array_free(wvec);
     try mlx.check(mlx.mlx_concatenate_axis(&want, wvec, 0, s));
     try std.testing.expectEqual(@as(f32, 0), try attn256MaxDiff(bat2, want, s));
+}
+
+test "qsa batched gather mixed group: a mask-only slot matches its solo masked SDPA" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const ta = std.testing.allocator;
+    qsa_decode_gather_override = true;
+    defer qsa_decode_gather_override = null;
+    qsa_batched_gather_override = true;
+    defer qsa_batched_gather_override = null;
+    var prng = std.Random.DefaultPrng.init(0x51a0);
+    const rnd = prng.random();
+    const ratio: c_int = 4;
+    const kb: c_int = 3;
+    const hq: c_int = 4;
+    const hkv: c_int = 2;
+    const hd: c_int = 64;
+    const scale: f32 = 1.0 / 8.0;
+    const kL0: c_int = 50;
+    const kL1: c_int = 36;
+    const q0 = try attn256RandBf16(rnd, &[_]c_int{ 1, hq, 1, hd }, s);
+    defer _ = mlx.mlx_array_free(q0);
+    const q1 = try attn256RandBf16(rnd, &[_]c_int{ 1, hq, 1, hd }, s);
+    defer _ = mlx.mlx_array_free(q1);
+    const k0 = try attn256RandBf16(rnd, &[_]c_int{ 1, hkv, kL0, hd }, s);
+    defer _ = mlx.mlx_array_free(k0);
+    const v0 = try attn256RandBf16(rnd, &[_]c_int{ 1, hkv, kL0, hd }, s);
+    defer _ = mlx.mlx_array_free(v0);
+    const k1 = try attn256RandBf16(rnd, &[_]c_int{ 1, hkv, kL1, hd }, s);
+    defer _ = mlx.mlx_array_free(k1);
+    const v1 = try attn256RandBf16(rnd, &[_]c_int{ 1, hkv, kL1, hd }, s);
+    defer _ = mlx.mlx_array_free(v1);
+    var fx0 = try QsaBlockFixture.build(rnd, 1, kL0, kb, ratio);
+    defer fx0.deinit();
+    var fx1 = try QsaBlockFixture.build(rnd, 1, kL1, kb, ratio);
+    defer fx1.deinit();
+    const view0 = DenseKVView{ .k = k0, .v = v0, .owned = false };
+    const view1 = DenseKVView{ .k = k1, .v = v1, .owned = false };
+    const solo0 = (try qsaDecodeGatherAttn(s, q0, &view0, fx0.blocks, ratio, scale)) orelse return error.GatherDeclined;
+    defer _ = mlx.mlx_array_free(solo0);
+    const solo1 = try attn256Reference(q1, k1, v1, scale, "array", fx1.mask, s);
+    defer _ = mlx.mlx_array_free(solo1);
+    var q_n2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q_n2);
+    const qparts = [_]mlx.mlx_array{ q0, q1 };
+    const qvec = mlx.mlx_vector_array_new_data(&qparts, 2);
+    defer _ = mlx.mlx_vector_array_free(qvec);
+    try mlx.check(mlx.mlx_concatenate_axis(&q_n2, qvec, 0, s));
+    const views = [_]DenseKVView{ view0, view1 };
+    const blks = [_]mlx.mlx_array{ fx0.blocks, .{ .ctx = null } };
+    const masks = [_]mlx.mlx_array{ .{ .ctx = null }, fx1.mask };
+    const bat = try qsaBatchedGatherAttn(ta, s, q_n2, &views, &blks, &masks, ratio, scale);
+    defer _ = mlx.mlx_array_free(bat);
+    var want = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(want);
+    const wparts = [_]mlx.mlx_array{ solo0, solo1 };
+    const wvec = mlx.mlx_vector_array_new_data(&wparts, 2);
+    defer _ = mlx.mlx_vector_array_free(wvec);
+    try mlx.check(mlx.mlx_concatenate_axis(&want, wvec, 0, s));
+    try std.testing.expectEqual(@as(f32, 0), try attn256MaxDiff(bat, want, s));
+}
+
+test "qsa batched gather S=2 and S=4: N=1 is byte-identical to solo verify, N=2 matches per-slot solos" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const ta = std.testing.allocator;
+    qsa_verify_gather_override = true;
+    defer qsa_verify_gather_override = null;
+    qsa_verify_gather_min_kv_override = 16;
+    defer qsa_verify_gather_min_kv_override = null;
+    qsa_batched_gather_override = true;
+    defer qsa_batched_gather_override = null;
+    var prng = std.Random.DefaultPrng.init(0xc0de);
+    const rnd = prng.random();
+    const ratio: c_int = 4;
+    const kb: c_int = 3;
+    const hq: c_int = 4;
+    const hkv: c_int = 2;
+    const hd: c_int = 256;
+    const scale: f32 = 1.0 / 16.0;
+    const kL0: c_int = 96;
+    const kL1: c_int = 80;
+    for ([_]c_int{ 2, 4 }) |seq| {
+        const q0 = try attn256RandBf16(rnd, &[_]c_int{ 1, hq, seq, hd }, s);
+        defer _ = mlx.mlx_array_free(q0);
+        const q1 = try attn256RandBf16(rnd, &[_]c_int{ 1, hq, seq, hd }, s);
+        defer _ = mlx.mlx_array_free(q1);
+        const k0 = try attn256RandBf16(rnd, &[_]c_int{ 1, hkv, kL0, hd }, s);
+        defer _ = mlx.mlx_array_free(k0);
+        const v0 = try attn256RandBf16(rnd, &[_]c_int{ 1, hkv, kL0, hd }, s);
+        defer _ = mlx.mlx_array_free(v0);
+        const k1 = try attn256RandBf16(rnd, &[_]c_int{ 1, hkv, kL1, hd }, s);
+        defer _ = mlx.mlx_array_free(k1);
+        const v1 = try attn256RandBf16(rnd, &[_]c_int{ 1, hkv, kL1, hd }, s);
+        defer _ = mlx.mlx_array_free(v1);
+        var fx0 = try QsaBlockFixture.build(rnd, seq, kL0, kb, ratio);
+        defer fx0.deinit();
+        var fx1 = try QsaBlockFixture.build(rnd, seq, kL1, kb, ratio);
+        defer fx1.deinit();
+        const view0 = DenseKVView{ .k = k0, .v = v0, .owned = false };
+        const view1 = DenseKVView{ .k = k1, .v = v1, .owned = false };
+        const solo0 = (try qsaVerifyGatherAttn(s, q0, &view0, fx0.blocks, ratio, scale)) orelse return error.GatherDeclined;
+        defer _ = mlx.mlx_array_free(solo0);
+        const bat1 = try qsaBatchedGatherAttn(ta, s, q0, &.{view0}, &.{fx0.blocks}, &.{}, ratio, scale);
+        defer _ = mlx.mlx_array_free(bat1);
+        try std.testing.expectEqual(@as(f32, 0), try attn256MaxDiff(bat1, solo0, s));
+
+        var q_n2 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(q_n2);
+        const qparts = [_]mlx.mlx_array{ q0, q1 };
+        const qvec = mlx.mlx_vector_array_new_data(&qparts, 2);
+        defer _ = mlx.mlx_vector_array_free(qvec);
+        try mlx.check(mlx.mlx_concatenate_axis(&q_n2, qvec, 0, s));
+        const views = [_]DenseKVView{ view0, view1 };
+        const blks = [_]mlx.mlx_array{ fx0.blocks, fx1.blocks };
+        const bat2 = try qsaBatchedGatherAttn(ta, s, q_n2, &views, &blks, &.{}, ratio, scale);
+        defer _ = mlx.mlx_array_free(bat2);
+        const solo1 = (try qsaVerifyGatherAttn(s, q1, &view1, fx1.blocks, ratio, scale)) orelse return error.GatherDeclined;
+        defer _ = mlx.mlx_array_free(solo1);
+        var want = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(want);
+        const wparts = [_]mlx.mlx_array{ solo0, solo1 };
+        const wvec = mlx.mlx_vector_array_new_data(&wparts, 2);
+        defer _ = mlx.mlx_vector_array_free(wvec);
+        try mlx.check(mlx.mlx_concatenate_axis(&want, wvec, 0, s));
+        try std.testing.expectEqual(@as(f32, 0), try attn256MaxDiff(bat2, want, s));
+    }
+}
+
+test "qsaBatchedAttn: kill switch and mrope refuse the gather arm" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    var xfm: Transformer = undefined;
+    xfm.allocator = std.testing.allocator;
+    xfm.qwen4 = @ptrFromInt(@alignOf(qwen4_mod.Qwen4State));
+    var cache: KVCache = undefined;
+    var off: usize = 0;
+    var ctx: ForwardCtx = .{ .cache = &cache, .moe_seq_offset = &off, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
+    var slot: ForwardCtx = .{ .cache = &cache, .moe_seq_offset = &off, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
+    const slots = [_]*ForwardCtx{&slot};
+    const dummy = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(dummy);
+
+    const prev_g = qsa_batched_gather_override;
+    defer qsa_batched_gather_override = prev_g;
+    qsa_batched_gather_override = false;
+    try std.testing.expect((try xfm.qsaBatchedAttn(&ctx, &slots, dummy, 0, 4, 1.0)) == null);
+
+    qsa_batched_gather_override = true;
+    const pos = [_]i32{ 0, 1, 2 };
+    slot.mrope_pos = &pos;
+    try std.testing.expect((try xfm.qsaBatchedAttn(&ctx, &slots, dummy, 0, 4, 1.0)) == null);
+}
+
+test "qsaBatchedGatherOn matches the arm's switches and vision refusal" {
+    const prev_b = qsa_batched_gather_override;
+    const prev_g = qsa_gather_override;
+    const prev_d = qsa_decode_gather_override;
+    const prev_v = qsa_verify_gather_override;
+    defer {
+        qsa_batched_gather_override = prev_b;
+        qsa_gather_override = prev_g;
+        qsa_decode_gather_override = prev_d;
+        qsa_verify_gather_override = prev_v;
+    }
+    qsa_batched_gather_override = true;
+    qsa_gather_override = true;
+    qsa_decode_gather_override = true;
+    qsa_verify_gather_override = true;
+    try std.testing.expect(qsaBatchedGatherOn(1, false));
+    try std.testing.expect(qsaBatchedGatherOn(4, false));
+    try std.testing.expect(!qsaBatchedGatherOn(1, true));
+    try std.testing.expect(!qsaBatchedGatherOn(4, true));
+    qsa_batched_gather_override = false;
+    try std.testing.expect(!qsaBatchedGatherOn(1, false));
+    qsa_batched_gather_override = true;
+    qsa_gather_override = false;
+    try std.testing.expect(!qsaBatchedGatherOn(1, false));
+    qsa_gather_override = true;
+    qsa_decode_gather_override = false;
+    try std.testing.expect(!qsaBatchedGatherOn(1, false));
+    try std.testing.expect(qsaBatchedGatherOn(4, false));
+    qsa_decode_gather_override = true;
+    qsa_verify_gather_override = false;
+    try std.testing.expect(qsaBatchedGatherOn(1, false));
+    try std.testing.expect(!qsaBatchedGatherOn(4, false));
 }
 
 // ── Verify-width QSA gather (S = 2 .. FUSED256_MIN_Q_LEN-1) ──
