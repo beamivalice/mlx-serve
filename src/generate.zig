@@ -255,7 +255,8 @@ pub const MtpHeadRef = union(enum) {
     pub fn moduleOwned(self: MtpHeadRef) bool {
         return switch (self) {
             .qwen => false,
-            .qwen4 => true,
+            // Per-request state swaps onto the module (`Qwen4MtpState`); nothing is shared.
+            .qwen4 => false,
         };
     }
 
@@ -263,8 +264,11 @@ pub const MtpHeadRef = union(enum) {
         return switch (self) {
             .qwen => |h| .{ .qwen = try h.makeCache(allocator) },
             .qwen4 => |t| blk: {
-                try t.qwen4MtpReset();
-                break :blk .{ .qwen4 = t };
+                const st = try allocator.create(transformer_mod.Transformer.Qwen4MtpState);
+                errdefer allocator.destroy(st);
+                st.* = try t.qwen4MtpStateNew();
+                t.qwen4MtpActivate(st);
+                break :blk .{ .qwen4 = .{ .t = t, .st = st, .allocator = allocator } };
             },
         };
     }
@@ -303,7 +307,10 @@ pub const MtpHeadRef = union(enum) {
     ) !mtp_mod.StepOut {
         return switch (self) {
             .qwen => |h| mtp_mod.forwardWithMrope(h, target, &cache.qwen, id_arr, hidden, rope_offset, want == .logits, mrope_ctx),
-            .qwen4 => |t| qwen4Step(t, id_arr, hidden, rope_offset, want, mrope_ctx),
+            .qwen4 => |t| blk: {
+                cache.activate();
+                break :blk qwen4Step(t, id_arr, hidden, rope_offset, want, mrope_ctx);
+            },
         };
     }
 
@@ -327,6 +334,7 @@ pub const MtpHeadRef = union(enum) {
                 const shape = [_]c_int{@intCast(token_ids.len)};
                 const id_arr = mlx.mlx_array_new_data(ids_i32.ptr, &shape, 1, .int32);
                 defer _ = mlx.mlx_array_free(id_arr);
+                cache.activate();
                 const out = try qwen4Step(t, id_arr, hidden, rope_offset, .none, mrope_ctx);
                 _ = mlx.mlx_array_free(out.hidden_next);
             },
@@ -425,12 +433,26 @@ pub fn mtpHeadPersistEnabled() bool {
 /// The head's committed-history cache.
 pub const MtpCacheRef = union(enum) {
     qwen: KVCache,
-    qwen4: *Transformer,
+    qwen4: Qwen4Ref,
+
+    /// The in-checkpoint head plus this request's own half of it.
+    pub const Qwen4Ref = struct { t: *Transformer, st: *transformer_mod.Transformer.Qwen4MtpState, allocator: std.mem.Allocator };
+
+    /// Install this request's state on the qwen4 head; no-op on the sidecar arm.
+    pub fn activate(self: *const MtpCacheRef) void {
+        switch (self.*) {
+            .qwen => {},
+            .qwen4 => |r| r.t.qwen4MtpActivate(r.st),
+        }
+    }
 
     pub fn step(self: *const MtpCacheRef) usize {
         return switch (self.*) {
             .qwen => |*c| c.step,
-            .qwen4 => |t| t.qwen4_mtp.?.seq_offset,
+            .qwen4 => |r| blk: {
+                r.t.qwen4MtpActivate(r.st);
+                break :blk r.t.qwen4_mtp.?.seq_offset;
+            },
         };
     }
 
@@ -440,7 +462,10 @@ pub const MtpCacheRef = union(enum) {
     pub fn kv(self: *MtpCacheRef) ?*KVCache {
         return switch (self.*) {
             .qwen => |*c| c,
-            .qwen4 => |t| if (mtpHeadPersistEnabled()) &t.qwen4_mtp.?.cache else null,
+            .qwen4 => |r| blk: {
+                r.t.qwen4MtpActivate(r.st);
+                break :blk if (mtpHeadPersistEnabled()) &r.t.qwen4_mtp.?.cache else null;
+            },
         };
     }
 
@@ -448,21 +473,31 @@ pub const MtpCacheRef = union(enum) {
     pub fn head(self: *MtpCacheRef) ?*Transformer {
         return switch (self.*) {
             .qwen => null,
-            .qwen4 => |t| if (mtpHeadPersistEnabled()) t else null,
+            .qwen4 => |r| blk: {
+                r.t.qwen4MtpActivate(r.st);
+                break :blk if (mtpHeadPersistEnabled()) r.t else null;
+            },
         };
     }
 
     pub fn truncate(self: *MtpCacheRef, len: usize, s: mlx.mlx_stream) !void {
         switch (self.*) {
             .qwen => |*c| try c.truncate(len, s),
-            .qwen4 => |t| try t.qwen4MtpTruncate(len),
+            .qwen4 => |r| {
+                r.t.qwen4MtpActivate(r.st);
+                try r.t.qwen4MtpTruncate(len);
+            },
         }
     }
 
     pub fn deinit(self: *MtpCacheRef) void {
         switch (self.*) {
             .qwen => |*c| c.deinit(),
-            .qwen4 => {},
+            .qwen4 => |r| {
+                r.t.qwen4MtpRelease(r.st);
+                r.st.deinit();
+                r.allocator.destroy(r.st);
+            },
         }
     }
 
@@ -476,10 +511,13 @@ pub const MtpCacheRef = union(enum) {
                 _ = mlx.mlx_vector_array_append_value(vec, entry.keys);
                 _ = mlx.mlx_vector_array_append_value(vec, entry.values);
             },
-            .qwen4 => |t| for (t.qwen4_mtp.?.cache.entries) |*entry| {
-                if (!entry.initialized) continue;
-                _ = mlx.mlx_vector_array_append_value(vec, entry.keys);
-                _ = mlx.mlx_vector_array_append_value(vec, entry.values);
+            .qwen4 => |r| {
+                r.t.qwen4MtpActivate(r.st);
+                for (r.t.qwen4_mtp.?.cache.entries) |*entry| {
+                    if (!entry.initialized) continue;
+                    _ = mlx.mlx_vector_array_append_value(vec, entry.keys);
+                    _ = mlx.mlx_vector_array_append_value(vec, entry.values);
+                }
             },
         }
     }
@@ -1087,7 +1125,7 @@ test "every speculative decoder caps accepted drafts before commit" {
         "nextPld",
         "nextDrafter",
         "nextDflash",
-        "nextMtp",
+        "mtpRoundFinish",
     };
     for (names) |name| {
         const signature = try std.fmt.allocPrint(testing.allocator, "    pub fn {s}", .{name});
@@ -1356,6 +1394,9 @@ pub const Generator = struct {
     /// stops feeding the kv-term learner rather than teaching it a lie.
     /// Set per tick by the scheduler.
     spec_cost_solo: bool = true,
+    /// Draft-depth cap while this slot verifies inside a batched group (0 = none):
+    /// the group's rows must stay on the split-K verify lane (`scheduler.mtpGroupRowCap`).
+    mtp_group_cap: u32 = 0,
     /// Per-phase wall-time trace (MLX_SERVE_MTP_TRACE=1; else untouched).
     mtp_trace: MtpTrace = .{},
     /// Trace-only: stopwatch running across the scheduler gap (round return
@@ -2343,6 +2384,7 @@ pub const Generator = struct {
             );
             ctx.cache.reserve(@intCast(reserved_tokens));
             // The arch's own per-request buffers reserve at the same length.
+            if (mtp_cache) |*mc| mc.activate();
             transformer_mod.reserveQsaHistoryWithHead(
                 ctx.ssm_entries,
                 if (xfm.qwen4_mtp) |*m| &m.entry else null,
@@ -2545,6 +2587,9 @@ pub const Generator = struct {
                     };
                     // The head's own QSA leftover at this position: its ring is 32 rows and
                     // the clamp back to this checkpoint comes a whole generated tail later.
+                    if (mtp_active) {
+                        mtp_cache.?.activate();
+                    }
                     if (mtp_active) xfm.qwen4MtpMarkQsaLeftover(abs_end_for_cp2 -| mtp_position_base) catch |e| {
                         log.debug("[qwen4] MTP head leftover mark failed: {s}\n", .{@errorName(e)});
                     };
@@ -2661,6 +2706,9 @@ pub const Generator = struct {
                     };
                     // The head's own QSA leftover at this position: its ring is 32 rows and
                     // the clamp back to this checkpoint comes a whole generated tail later.
+                    if (mtp_active) {
+                        mtp_cache.?.activate();
+                    }
                     if (mtp_active) xfm.qwen4MtpMarkQsaLeftover(final_abs -| mtp_position_base) catch |e| {
                         log.debug("[qwen4] MTP head leftover mark failed: {s}\n", .{@errorName(e)});
                     };
@@ -5538,7 +5586,7 @@ pub const Generator = struct {
 
     /// Leave the head cleanly for a serial block; `apply_stash` applies the deferred history
     /// stash so the head history is complete up to the block. Idempotent.
-    fn mtpDetachHead(self: *Generator, allocator: std.mem.Allocator, apply_stash: bool) !void {
+    pub fn mtpDetachHead(self: *Generator, allocator: std.mem.Allocator, apply_stash: bool) !void {
         if (self.mtp_pre_draft) |*pd| {
             pd.deinit(allocator);
             self.mtp_pre_draft = null;
@@ -5725,8 +5773,52 @@ pub const Generator = struct {
         return try mtpSerialOneToken(allocator, token);
     }
 
+
+    /// A speculative round between its draft chain and its verdict. `mtpRoundBegin`
+    /// builds it, `mtpRoundVerify` (solo) or the scheduler's group verify fills the
+    /// three verify outputs, `mtpRoundFinish` consumes them.
+    pub const MtpRoundState = struct {
+        chain: MtpPreDraft,
+        tracing: bool,
+        ph: io_util.Stopwatch,
+        livecost: bool,
+        round_watch: io_util.Stopwatch,
+        kv_step_snap: usize,
+        kv_snap: ?transformer_mod.KVCacheSnapshot,
+        moe_seq_offset_snap: usize,
+        /// `[1, 1+m]` int32.
+        verify_input: mlx.mlx_array,
+        /// Positions the verify forward ran; `1 + m` solo, the group's widest row batched.
+        verify_len: u32,
+        verify_logits: mlx.mlx_array = .{ .ctx = null },
+        new_hidden: mlx.mlx_array = .{ .ctx = null },
+        verify_hidden_all: mlx.mlx_array = .{ .ctx = null },
+
+        pub fn deinit(self: *MtpRoundState, allocator: std.mem.Allocator) void {
+            self.chain.deinit(allocator);
+            if (self.kv_snap) |*snap| snap.deinit();
+            _ = mlx.mlx_array_free(self.verify_input);
+            if (self.verify_logits.ctx != null) _ = mlx.mlx_array_free(self.verify_logits);
+            if (self.new_hidden.ctx != null) _ = mlx.mlx_array_free(self.new_hidden);
+            if (self.verify_hidden_all.ctx != null) _ = mlx.mlx_array_free(self.verify_hidden_all);
+        }
+    };
+
+    pub const MtpRoundBegin = union(enum) { done: ?DrafterStepResult, verify: MtpRoundState };
+
     pub fn nextMtp(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
-        if (self.done) return null;
+        var st = switch (try self.mtpRoundBegin(allocator)) {
+            .done => |r| return r,
+            .verify => |v| v,
+        };
+        defer st.deinit(allocator);
+        try self.mtpRoundVerify(&st);
+        return self.mtpRoundFinish(allocator, &st);
+    }
+
+    /// Phases 0–2: serial-block dispatch, the draft chain, rollback anchors, the verify input.
+    pub fn mtpRoundBegin(self: *Generator, allocator: std.mem.Allocator) !MtpRoundBegin {
+        if (self.done) return .{ .done = null };
         std.debug.assert(self.mtp != null);
         std.debug.assert(self.mtp_cache != null);
         std.debug.assert(self.has_last_hidden);
@@ -5787,10 +5879,10 @@ pub const Generator = struct {
         if (self.spec_disabled_runtime or self.mtp_serial_left > 0 or self.mtp_serial_exit != .none) {
             try self.mtpDetachHead(allocator, self.mtpSerialMayResume());
             self.mtpMaybeReleaseModuleHead();
-            return try self.mtpSerialTick(allocator);
+            return .{ .done = try self.mtpSerialTick(allocator) };
         }
 
-        if (try self.checkStop()) return null; // t1 is this block's first emit: stop before drafting
+        if (try self.checkStop()) return .{ .done = null }; // t1 is this block's first emit: stop before drafting
 
         const xfm = self.xfm;
         const s = xfm.s;
@@ -5823,7 +5915,7 @@ pub const Generator = struct {
         // Always-on round wall-clock for the live-cost round EMA (the
         // denominator of the sync fraction). Read at both commit exits.
         const livecost = mtpLiveCostEnabled();
-        var round_watch = io_util.Stopwatch.init(self.timer.io);
+        const round_watch = io_util.Stopwatch.init(self.timer.io);
 
         // ── Phase 0/1: acquire this round's draft chain ──
         // Round plan: fixed mode (and EV warmup) is a single chunk at the
@@ -5858,12 +5950,15 @@ pub const Generator = struct {
             if (mtpEarlyDispatchEnabled()) try mtpChainDispatch(&c, 0, plan_now.m_lo);
             break :blk c;
         };
-        defer chain.deinit(allocator);
+        errdefer chain.deinit(allocator);
         const plan = chain.plan;
-        const m_lo: u32 = plan.m_lo;
-        const m_max: u32 = plan.m_hi;
-        const t1: u32 = chain.t1;
-        const mtp_off0: usize = chain.off0;
+        // A chain pre-drafted before this slot joined a group may be wider than the
+        // cap: use its first `cap` drafts (the head's tail past them is truncated at
+        // the next consume, like any rejected draft).
+        const cap: u32 = if (self.mtp_group_cap > 0) self.mtp_group_cap else mtp_mod.MAX_DEPTH;
+        const m_lo: u32 = @min(plan.m_lo, cap);
+        const m_max: u32 = @min(plan.m_hi, cap);
+        chain.m = @min(chain.m, cap);
         if (tracing) {
             self.mtp_trace.add(.draft, ph.read());
             ph.reset();
@@ -5905,9 +6000,7 @@ pub const Generator = struct {
             _ = mlx.mlx_array_free(h);
             chain.h_chain = null;
         }
-        const drafts = chain.drafts;
         const draft_arrs = chain.draft_arrs;
-        const q_probs = chain.q_probs;
 
         // ── Phase 2: record rollback anchors (NO snapshot on the GDN path) ──
         // A KVCache.snapshot() refcount-shares the KV buffers, which forces
@@ -5920,9 +6013,8 @@ pub const Generator = struct {
         // snapshot is taken at all. A hypothetical pure-attention target
         // (ssm_entries == null) keeps the proven snapshot + re-forward path.
         const kv_step_snap = self.ctx.cache.step;
-        const gdn_trunk = self.ctx.ssm_entries != null;
-        var kv_snap: ?transformer_mod.KVCacheSnapshot = if (gdn_trunk) null else try self.ctx.cache.snapshot();
-        defer if (kv_snap) |*snap| snap.deinit();
+        var kv_snap: ?transformer_mod.KVCacheSnapshot = if (self.ctx.ssm_entries != null) null else try self.ctx.cache.snapshot();
+        errdefer if (kv_snap) |*snap| snap.deinit();
         const moe_seq_offset_snap = self.ctx.moe_seq_offset.*;
 
         // ── Phase 3: verify input [t1, drafts...] as one [1, 1+m] tensor ──
@@ -5932,7 +6024,7 @@ pub const Generator = struct {
         try mlx.check(mlx.mlx_reshape(&t1_2d, chain.t1_arr, &reshape_2d, 2, s));
 
         var verify_input = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(verify_input);
+        errdefer _ = mlx.mlx_array_free(verify_input);
         {
             const drafts_2d = try allocator.alloc(mlx.mlx_array, m);
             var drafts_2d_n: usize = 0;
@@ -5952,10 +6044,29 @@ pub const Generator = struct {
             try mlx.check(mlx.mlx_concatenate_axis(&verify_input, vec, 1, s));
         }
 
+        return .{ .verify = .{
+            .chain = chain,
+            .tracing = tracing,
+            .ph = ph,
+            .livecost = livecost,
+            .round_watch = round_watch,
+            .kv_step_snap = kv_step_snap,
+            .kv_snap = kv_snap,
+            .moe_seq_offset_snap = moe_seq_offset_snap,
+            .verify_input = verify_input,
+            .verify_len = 1 + m,
+        } };
+    }
+
+    /// Phase 3 of a solo round: the trunk verify forward over `[t1, drafts…]`.
+    /// A batched group replaces this with one forward for every slot (`mtpGroupVerify`).
+    pub fn mtpRoundVerify(self: *Generator, st: *MtpRoundState) !void {
+        const xfm = self.xfm;
+        const tracing = st.tracing;
         var new_hidden = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(new_hidden);
         var verify_hidden_all = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(verify_hidden_all);
+        errdefer _ = mlx.mlx_array_free(verify_hidden_all);
         // Enable per-position SSM capture for the verify pass on a GDN trunk
         // so partial accept can roll back without re-forwarding the accepted
         // prefix (mirrors nextPld — the re-forward re-runs the 48-layer
@@ -5967,9 +6078,9 @@ pub const Generator = struct {
         // chain, rollback, commit) and `verify` the forward alone.
         if (tracing and std.c.getenv("MLX_SERVE_MTP_TRACE_SYNC") != null) {
             var sync_watch = io_util.Stopwatch.init(self.timer.io);
-            try mlx.check(mlx.mlx_array_eval(verify_input));
+            try mlx.check(mlx.mlx_array_eval(st.verify_input));
             self.mtp_trace.add(.sync, sync_watch.read());
-            ph.reset();
+            st.ph.reset();
         }
         // Captures the post-final-norm hidden at the LAST position (next
         // round's h_prev) AND all 1+m positions (history re-append).
@@ -5981,7 +6092,7 @@ pub const Generator = struct {
         // chain runs, then sync ONCE (`flushDeferredPle`, below) before Phase
         // 4 evaluates anything. Other arches never set `ple_pending`.
         self.ctx.ple_defer = true;
-        var verify_logits = xfm.forwardWithCaptureAll(&self.ctx, verify_input, &new_hidden, &verify_hidden_all) catch |e| {
+        const verify_logits = xfm.forwardWithCaptureAll(&self.ctx, st.verify_input, &new_hidden, &verify_hidden_all) catch |e| {
             self.ctx.ple_defer = false;
             self.ctx.capture_ssm_seq = false;
             xfm.discardDeferredPle(&self.ctx);
@@ -5990,6 +6101,49 @@ pub const Generator = struct {
         errdefer _ = mlx.mlx_array_free(verify_logits);
         self.ctx.ple_defer = false;
         self.ctx.capture_ssm_seq = false;
+        if (tracing) {
+            self.mtp_trace.add(.verify, st.ph.read());
+            st.ph.reset();
+        }
+        // Fill the deferred PLE leaf: the one host read of the verify ids, and
+        // the point at which the entry's n-gram history + `spec_ple_tokens`
+        // advance. Must precede BOTH the first eval of anything downstream of
+        // the leaf (Phase 4) and `ssmRollbackFromCapture` (Phase 5).
+        try xfm.flushDeferredPle(&self.ctx);
+        st.verify_logits = verify_logits;
+        st.new_hidden = new_hidden;
+        st.verify_hidden_all = verify_hidden_all;
+    }
+
+    /// Phases 4–5 of a round: accept, stash the history, commit or roll back.
+    /// `st.verify_len` may exceed `1 + m` when a batched group padded the row;
+    /// then even a full accept takes the rollback arm (KV + SSM clamp to `1 + m`).
+    pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRoundState) !?DrafterStepResult {
+        const xfm = self.xfm;
+        const s = xfm.s;
+        const tracing = st.tracing;
+        const livecost = st.livecost;
+        var ph = st.ph;
+        var round_watch = st.round_watch;
+        const chain = &st.chain;
+        const plan = chain.plan;
+        const m_lo: u32 = plan.m_lo;
+        const m_max: u32 = plan.m_hi;
+        const m: u32 = chain.m;
+        const t1: u32 = chain.t1;
+        const mtp_off0: usize = chain.off0;
+        const drafts = chain.drafts;
+        const draft_arrs = chain.draft_arrs;
+        const q_probs = chain.q_probs;
+        const kv_step_snap = st.kv_step_snap;
+        const moe_seq_offset_snap = st.moe_seq_offset_snap;
+        var verify_logits = st.verify_logits;
+        st.verify_logits = .{ .ctx = null };
+        errdefer _ = mlx.mlx_array_free(verify_logits);
+        var new_hidden = st.new_hidden;
+        st.new_hidden = .{ .ctx = null };
+        errdefer _ = mlx.mlx_array_free(new_hidden);
+        const verify_hidden_all = st.verify_hidden_all;
         // Always free the transient capture buffers before returning, however
         // we exit this round (full accept, partial accept, or error).
         defer if (self.ctx.ssm_entries) |entries| {
@@ -5997,15 +6151,6 @@ pub const Generator = struct {
         };
         self.mtp_attempted += 1;
         self.mtp_drafted_tokens += m;
-        if (tracing) {
-            self.mtp_trace.add(.verify, ph.read());
-            ph.reset();
-        }
-        // Fill the deferred PLE leaf: the one host read of the verify ids, and
-        // the point at which the entry's n-gram history + `spec_ple_tokens`
-        // advance. Must precede BOTH the first eval of anything downstream of
-        // the leaf (Phase 4) and `ssmRollbackFromCapture` (Phase 5).
-        try xfm.flushDeferredPle(&self.ctx);
 
         // ── Phase 4: decide longest accepted prefix ──
         // Stochastic path is fully BATCHED: accept probabilities for every
@@ -6342,7 +6487,7 @@ pub const Generator = struct {
         }
 
         // ── Phase 5b: commit / rollback the trunk ──
-        if (accepted == m) {
+        if (accepted == m and st.verify_len == 1 + m) {
             const tokens = try allocator.alloc(u32, 1 + m);
             tokens[0] = t1;
             for (drafts[0..m], 0..) |d, idx| tokens[1 + idx] = d;
@@ -6406,7 +6551,7 @@ pub const Generator = struct {
             // the restore-based fallback (same rule as nextPld).
             try self.ctx.cache.truncate(moe_seq_offset_snap + accepted_len, s);
             self.ctx.cache.step = kv_step_snap;
-            try self.rollbackSsmFromCapture(self.ctx.ssm_entries.?, accepted, 1 + m, s);
+            try self.rollbackSsmFromCapture(self.ctx.ssm_entries.?, accepted, st.verify_len, s);
             self.ctx.moe_seq_offset.* = moe_seq_offset_snap + accepted_len;
 
             const vh_shape = mlx.getShape(verify_hidden_all);
@@ -6414,7 +6559,7 @@ pub const Generator = struct {
             const stop = [_]c_int{ 1, @as(c_int, @intCast(accepted)) + 1, vh_shape[2] };
             const strides = [_]c_int{ 1, 1, 1 };
             try mlx.check(mlx.mlx_slice(&re_new_hidden, verify_hidden_all, &start, 3, &stop, 3, &strides, 3, s));
-        } else if (kv_snap) |*snap| {
+        } else if (st.kv_snap) |*snap| {
             try self.ctx.cache.restore(snap);
             self.ctx.moe_seq_offset.* = moe_seq_offset_snap;
 
@@ -6473,6 +6618,7 @@ pub const Generator = struct {
             .accepted_tokens = accepted,
         };
     }
+
 
     // ── MTP adaptive depth ──
     // Unlike the drafter's binary gate, the MTP head has a useful fallback
@@ -8283,8 +8429,9 @@ pub const Generator = struct {
         const mc = &self.mtp_cache.?;
         return switch (mc.*) {
             .qwen => 0,
-            .qwen4 => |t| blk: {
-                const m = &(t.qwen4_mtp orelse break :blk 0);
+            .qwen4 => |r| blk: {
+                r.t.qwen4MtpActivate(r.st);
+                const m = &(r.t.qwen4_mtp orelse break :blk 0);
                 const off0 = mtpRoundOff0(self.mtp_hist_stash, mc.step());
                 break :blk mtpHeadPositionDrift(@intCast(m.pos_base), m.seq_offset, @intCast(off0 + 1));
             },
@@ -8384,6 +8531,15 @@ pub const Generator = struct {
 
     /// One debug line per planned round with every input the planner read.
     fn mtpRoundPlan(self: *Generator) MtpRoundPlan {
+        var plan = self.mtpRoundPlanTraced();
+        if (self.mtp_group_cap > 0) {
+            plan.m_lo = @min(plan.m_lo, self.mtp_group_cap);
+            plan.m_hi = @min(plan.m_hi, self.mtp_group_cap);
+        }
+        return plan;
+    }
+
+    fn mtpRoundPlanTraced(self: *Generator) MtpRoundPlan {
         if (!log.isDebug()) return self.mtpRoundPlanInner();
         const disabled_before = self.spec_disabled_runtime;
         const serial_left_before = self.mtp_serial_left;
@@ -14466,7 +14622,7 @@ test "MTP verify forward defers the PLE gather" {
     // it (the round's one host sync) before Phase 4 evaluates anything or
     // Phase 5 rolls the n-gram history back.
     const src = @embedFile("generate.zig");
-    const build = "xfm.forwardWithCaptureAll(&self.ctx, verify" ++ "_input, &new_hidden, &verify_hidden_all)";
+    const build = "xfm.forwardWithCaptureAll(&self.ctx, st.verify" ++ "_input, &new_hidden, &verify_hidden_all)";
     const at = std.mem.indexOf(u8, src, build) orelse return error.VerifyBuildMissing;
 
     // Armed immediately before the build, disarmed right after it.
@@ -14899,9 +15055,11 @@ test "mtpSerialProbeArm: bounded RETRIES per bucket, and none once the cell is t
     try testing.expectEqual(@as(u8, 0), w.serial_probes[b]);
 }
 
-test "S21: a to_serial on a MODULE-OWNED head is sticky, and the release is a one-shot" {
+test "S21: a to_serial on a per-request head is not sticky; the release stays a one-shot" {
     const G = Generator;
-    try testing.expect(G.stickyOnSerialSwitch(MtpHeadRef{ .qwen4 = undefined }));
+    // The qwen4 head keeps per-request state now (`Qwen4MtpState`), so a serial switch
+    // no longer has to give the module back.
+    try testing.expect(!G.stickyOnSerialSwitch(MtpHeadRef{ .qwen4 = undefined }));
 
     var a = G.MtpAdaptive{};
     try testing.expectEqual(G.MtpAdaptiveAction.to_serial, a.round(0, 3, .serial, 1));
