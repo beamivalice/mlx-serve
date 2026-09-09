@@ -4813,3 +4813,68 @@ tables reach 1.08x (M4 Max rc3 w4/w5 and w1/w2), poisoned width-1 cells
 see every narrower sample refused against a stale wider cell. Uniform
 contamination across a bucket is invisible to any ratio; that table wants
 deleting. Guard: the #382 parse test in `round_cost.zig`.
+
+## The exact block select was one threadgroup per row, and decode has one row (2026-09-09)
+
+`msv_qsa_select` ran one threadgroup per query row: right for a 4096-row prefill chunk, wrong for
+decode, verify and every MTP draft step, where a single threadgroup walked 215k block scores four
+times (three radix digits plus the compaction) at ~20x under the bandwidth floor. Measured with
+the real kernel: 0.73 ms per layer at 860k, 5.8 of the 8.8 ms that separate a long-context tick
+from a short one, and a depth-6 round pays it seven times. Vectorized loads, unrolling and split
+histogram banks inside one threadgroup did nothing (best 0.77 ms): occupancy, not ILP, was the
+bound. Fix: at rows <= 15 and nb >= 24576 each row splits over 16 slices, each slice runs the
+SAME exact radix select (one shared body), and a second dispatch selects over the 16*K
+candidates. Exact because the order is total (ordinal, then lowest original index), so every
+global top-K element sits in its slice's top-K; candidates arrive ascending by original index
+with sentinel slots skipped, which is what resolves a cross-slice tie at the K-th ordinal to the
+lowest index. 0.72 → 0.26 ms per layer at S=1, 0.68 → 0.33 at S=7, ids bit-equal on 1550/1550
+probe cases. The floor is where the live win clears boot-to-boot noise (an A/A boot pair measured
++4% serial / +5% MTP on identical code): +4% MTP net at 40k blocks, +18% serial at 200k; the
+design cannot engage below 16k blocks (2*G*K <= nb at G=16). A second pass measured the
+remaining cost as per-level fixed work, not the walk (each radix level ~10 us regardless of
+element count; the compaction a 32-iteration loop every thread ran): a simd prefix-scan
+compaction and four 8-bit digits at decode widths (shape-gated: 8-bit digits LOSE 3-9% at
+prefill widths) took the split pair 0.120 -> 0.077 ms per layer at S=1 measured as marginal
+in-graph cost, and the floor to 24576. Guards: `qsa select split: ids are identical ...` over random, mostly-zero,
+tied-at-K, NaN/-0.0, bounds<K, ragged nb; the predicate test; the single kernel's exactness test
+pinned to the single arm; the kill-switch seam test.
+
+## The indexer score sheet was four memory-bound ops per row chunk (2026-09-09)
+
+qwen4_exp scored QSA blocks with `astype(q,f32) → mlx_matmul → maximum → sum_axis` over a
+`[4, rows, nb]` f32 sheet re-chunked to a 256 MB budget: at kv 1M, 64 passes of ~3.9 ms per
+4096-token chunk per QSA layer, ~3 s of every prefill chunk, all bandwidth. Two probes settled
+the design: every operand entering the matmul is already bf16-valued (a bf16-in, f32-accumulate
+`matmul2d` computes the same products; only the accumulation order can differ), and MLX's f32
+GEMM runs in tf32 mode on NAX by default with a k-loop of 8 ascending 16-deep steps. A hand
+kernel reproducing that order is bit-identical on 100% of elements at every width, ragged nb,
+and the strided capacity-buffer bank; `mlx_sum_axis` over the 4 heads is sequential ascending
+(brute-forced over every order), so the epilogue sums the same way. `msv_qsa_score` writes the
+f32 sheet straight from bf16 `q_rope` and the bf16 pooled bank (`h4` per-head accumulator at
+rows >= 128, head-interleaved `base` below); the f32 score bank (1,536 B/token, rebuilt on every
+restore) is never built under it, and the sheet budget buys 4x the rows. In situ at 162k the
+score+select chain is 2.0x and the whole prefill -2..5% (the chain is 8% of a chunk there,
+linear in kv); the gather attention (`gatherQsa256`, 66 ms per call, flat in kv) is the larger
+prefill term at every context. Guards: the `qsa score kernel` bit-equality grid (both layouts,
+sliced-Q parent, prefix-view bank), ids through `qsaSelectTopBlocks`, the geometry-fallback and
+bill-follows-predicate tests, `tests/test_qwen4_exp.sh` with the kernel engaged, and the
+`QWEN4_DUMP_QSA_BLOCKS` dump for real-prompt block-id identity.
+
+## The QSA gather attention rides NAX cooperative tensors at prefill (2026-09-09)
+
+`gatherQsa256` (the block-gathered sparse attention of qwen4_exp prefill) was the largest
+flat prefill term at every context: ~65 ms per 4096-row call, ~26% of a chunk, ~3 TFLOP/s
+on a 60 TFLOP/s part. PR #385 (Nikolai V.) ported the split-head-dimension attention of
+MLX's steel NAX kernels to per-query sparse block selection (`msv_qsa_nax_precise`). The
+cooperative input-tensor API needs macOS 26.3 on a G17 GPU, one release past ordinary NAX
+availability, so the gate is its own predicate (`qsaNaxEligible`: G17 + 26.3 + bf16 + hd 256
++ gqa 12 + q_len >= 16) and the kernel is never compiled where it fails. The bf16 MMA rounds
+the softmax weights: the PR split each weight into three bf16 terms; two terms match stock's
+bf16 store to the same max error and beat three on the chained graph (33.5 vs 36.2 ms), one
+term is worse than stock, so two ship. Not bit-identical to the stock gather, so the bar is
+per-element error against float64 of the bf16-rounded inputs, no worse than stock
+(`tests/qsa_nax_precision.py`), and greedy answers are expected to fork on long prompts.
+Measured: gather 2.06x at kv 4k, 1.93x at 65k, 1.64x at 262k (it is not flat in kv: scattered
+K/V reads from a larger buffer); live 162k prefill 1480 -> 1667 tok/s (+12.6%). Default on
+where eligible, `MLX_SERVE_QSA_NAX=0` restores the stock gather. Guards: the `gatherQsa256 NAX`
+tests, the eligibility-predicate test, the precision probe, `tests/test_qsa_nax_prefill.py`.
