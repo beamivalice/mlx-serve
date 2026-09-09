@@ -786,7 +786,7 @@ pub const DiskTier = struct {
             }
         }
         if (qsa_overlay) |*qsa_cp| {
-            try transformer_mod.applyQsaHistoryAt(ssm_entries, qsa_cp, cp_pos, s);
+            try transformer_mod.applyQsaHistoryAt(ssm_entries, qsa_cp, cp_pos, s, true);
         }
         e.last_used = self.bump();
         self.writeMeta(e.*) catch {};
