@@ -15679,6 +15679,7 @@ pub const Transformer = struct {
             .vision_embeddings = null,
             .batch_slots = ctxs,
             .batch_rope_offsets = rope_offset_arr,
+            .ple_defer = self.qwen4 != null,
         };
         // A verify's captures live on the merged entries until split below.
         defer if (capture_ssm) {
@@ -15687,8 +15688,15 @@ pub const Transformer = struct {
 
         // qwen4_exp rides the same driver: GDN + PLE window merged here, QSA
         // key histories reached per slot through `batch_slots` (kv differs).
-        const logits = if (self.qwen4 != null) try self.forwardQwen4With(&bctx, token_arr) else try self.forwardMoeWith(&bctx, token_arr);
-        errdefer _ = mlx.mlx_array_free(logits);
+        const logits = (if (self.qwen4 != null) self.forwardQwen4With(&bctx, token_arr) else self.forwardMoeWith(&bctx, token_arr)) catch |e| {
+            self.discardDeferredPle(&bctx);
+            return e;
+        };
+        errdefer {
+            self.discardDeferredPle(&bctx);
+            _ = mlx.mlx_array_free(logits);
+        }
+        try self.flushDeferredPle(&bctx);
 
         // Hand the advanced state back to the slots it came from, as views,
         // and record the handles so next tick can prove nothing moved.
@@ -16157,6 +16165,11 @@ pub const Transformer = struct {
         entry.ple_prev_valid = true;
     }
 
+    pub fn pleDeferApplies(ple_defer: bool, batched: bool) bool {
+        _ = batched;
+        return ple_defer;
+    }
+
     /// Host-side n-gram gather: `[B, S, ple_embed_dim]` bf16 for this chunk's
     /// token ids, advancing the token history. Serial: `entry`'s history over
     /// `[1, S]`. Batched (`ctx.batch_slots`): `[N, 1]`, each row hashed
@@ -16185,7 +16198,7 @@ pub const Transformer = struct {
             }
             break :blk self.pleClaimSpecCapture(entry, n);
         };
-        if (ctx.ple_defer and ctx.batch_slots == null) {
+        if (pleDeferApplies(ctx.ple_defer, ctx.batch_slots != null)) {
             std.debug.assert(ctx.ple_pending == null);
             @memset(pk, 0);
             const emb = mlx.mlx_array_new_data(pk.ptr, &shape, 3, .bfloat16);
@@ -16237,6 +16250,9 @@ pub const Transformer = struct {
         const p = ctx.ple_pending orelse return;
         ctx.ple_pending = null;
         p.entry.spec_ple_len = 0;
+        if (ctx.batch_slots) |slots| {
+            for (slots) |sc| sc.ssm_entries.?[p.layer].spec_ple_len = 0;
+        }
         _ = mlx.mlx_array_free(p.emb);
         _ = mlx.mlx_array_free(p.token_ids);
     }
@@ -46080,6 +46096,170 @@ test "qwen4 deferred PLE: pipelined decode AND MTP verify widths match the direc
         defer allocator.free(b);
         xfm.discardDeferredPle(&lctx);
         try testing.expect(!std.mem.eql(f32, a, b));
+    }
+}
+
+const Qwen4BatchedPleRun = struct {
+    logits: mlx.mlx_array,
+    pending: bool,
+};
+
+fn qwen4BatchedPleForward(
+    xfm: *Transformer,
+    slots: []const *Qwen4TestSlot,
+    ids: []const i32,
+    seq_len: c_int,
+    capture: bool,
+    defer_ple: bool,
+    do_flush: bool,
+) !Qwen4BatchedPleRun {
+    const N = slots.len;
+    const ctxs = try xfm.allocator.alloc(*ForwardCtx, N);
+    defer xfm.allocator.free(ctxs);
+    var off_buf = try xfm.allocator.alloc(i32, N);
+    defer xfm.allocator.free(off_buf);
+    for (slots, 0..) |sl, i| {
+        ctxs[i] = &sl.ctx;
+        off_buf[i] = @intCast(sl.off);
+    }
+    const ml = xfm.moe_layers.?;
+    const merged = try xfm.allocator.alloc(SSMCacheEntry, ml.len);
+    defer xfm.allocator.free(merged);
+    for (merged) |*m| m.* = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false };
+    defer for (merged) |*m| {
+        if (m.conv_state.ctx != null) _ = mlx.mlx_array_free(m.conv_state);
+        if (m.ssm_state.ctx != null) _ = mlx.mlx_array_free(m.ssm_state);
+        if (m.aux_state.ctx != null) _ = mlx.mlx_array_free(m.aux_state);
+        ssmFreeSpecCapture(m);
+    };
+    for (ml, 0..) |*lw, l| {
+        if (!lw.is_linear and lw.ple == null) continue;
+        merged[l] = try xfm.mergeSsmAcrossSlots(ctxs, l);
+    }
+    const off_shape = [_]c_int{@intCast(N)};
+    const rope_offset_arr = mlx.mlx_array_new_data(off_buf.ptr, &off_shape, 1, .int32);
+    defer _ = mlx.mlx_array_free(rope_offset_arr);
+    var scratch_offset: usize = @intCast(off_buf[0]);
+    var bctx: ForwardCtx = .{
+        .cache = ctxs[0].cache,
+        .moe_seq_offset = &scratch_offset,
+        .ssm_entries = merged,
+        .capture_hidden = null,
+        .capture_ssm_seq = capture,
+        .vision_embeddings = null,
+        .batch_slots = ctxs,
+        .batch_rope_offsets = rope_offset_arr,
+        .ple_defer = defer_ple,
+    };
+    const tshape = [_]c_int{ @intCast(N), seq_len };
+    const tarr = mlx.mlx_array_new_data(@ptrCast(ids.ptr), &tshape, 2, .int32);
+    defer _ = mlx.mlx_array_free(tarr);
+    const logits = try xfm.forwardQwen4With(&bctx, tarr);
+    errdefer _ = mlx.mlx_array_free(logits);
+    const pending = bctx.ple_pending != null;
+    if (do_flush) try xfm.flushDeferredPle(&bctx) else if (bctx.ple_pending != null) xfm.discardDeferredPle(&bctx);
+    for (merged, 0..) |*m, li| {
+        if (!ml[li].is_linear and ml[li].ple == null) continue;
+        try xfm.splitSsmToSlots(m, ctxs, li);
+    }
+    for (slots) |sl| sl.off += @intCast(seq_len);
+    return .{ .logits = logits, .pending = pending };
+}
+
+test "ple_defer applies on the batched arm" {
+    try std.testing.expect(Transformer.pleDeferApplies(true, false));
+    try std.testing.expect(Transformer.pleDeferApplies(true, true));
+    try std.testing.expect(!Transformer.pleDeferApplies(false, false));
+    try std.testing.expect(!Transformer.pleDeferApplies(false, true));
+}
+
+test "batched PLE defer engages at N=2 and matches eager at S=1 and S=4" {
+    const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
+    defer if (config.ngram_table_path) |p| allocator.free(p);
+    var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer xfm.deinit();
+    try testing.expect(xfm.qwen4 != null);
+    xfm.qwen4_stream_f32 = true;
+    xfm.compileQwen4Hc();
+    xfm.compileGdnGate();
+    xfm.compileMoeRouting();
+
+    const n_layers = config.num_hidden_layers;
+    const prompt_a = [_]i32{ 5, 17, 42, 9, 23, 8, 31, 2 };
+    const prompt_b = [_]i32{ 11, 4, 19, 7, 28, 3 };
+    const a_e = try Qwen4TestSlot.init(allocator, n_layers);
+    defer a_e.deinit(allocator);
+    const b_e = try Qwen4TestSlot.init(allocator, n_layers);
+    defer b_e.deinit(allocator);
+    const a_d = try Qwen4TestSlot.init(allocator, n_layers);
+    defer a_d.deinit(allocator);
+    const b_d = try Qwen4TestSlot.init(allocator, n_layers);
+    defer b_d.deinit(allocator);
+    _ = mlx.mlx_array_free(try a_e.forward(&xfm, &prompt_a));
+    _ = mlx.mlx_array_free(try b_e.forward(&xfm, &prompt_b));
+    _ = mlx.mlx_array_free(try a_d.forward(&xfm, &prompt_a));
+    _ = mlx.mlx_array_free(try b_d.forward(&xfm, &prompt_b));
+
+    const widths = [_]c_int{ 1, 4 };
+    const decode_ids = [_]i32{ 13, 6 };
+    const verify_ids = [_]i32{ 13, 6, 27, 3, 19, 40, 12, 8 };
+    for (widths) |w| {
+        const ids: []const i32 = if (w == 1) &decode_ids else &verify_ids;
+        const capture = w > 1;
+        const eager_slots = [_]*Qwen4TestSlot{ a_e, b_e };
+        const defer_slots = [_]*Qwen4TestSlot{ a_d, b_d };
+        const eager = try qwen4BatchedPleForward(&xfm, &eager_slots, ids, w, capture, false, true);
+        defer _ = mlx.mlx_array_free(eager.logits);
+        try testing.expect(!eager.pending);
+        const deferred = try qwen4BatchedPleForward(&xfm, &defer_slots, ids, w, capture, true, true);
+        defer _ = mlx.mlx_array_free(deferred.logits);
+        try testing.expect(deferred.pending);
+        const ea = try qwen4ReadF32(allocator, eager.logits, s);
+        defer allocator.free(ea);
+        const da = try qwen4ReadF32(allocator, deferred.logits, s);
+        defer allocator.free(da);
+        try testing.expectEqualSlices(f32, ea, da);
+        for (a_e.entries, a_d.entries) |*ee, *de| {
+            try testing.expectEqual(ee.ple_prev_valid, de.ple_prev_valid);
+            try testing.expectEqualSlices(u32, &ee.ple_prev, &de.ple_prev);
+            try testing.expectEqual(ee.spec_ple_len, de.spec_ple_len);
+            const n: usize = ee.spec_ple_len;
+            try testing.expectEqualSlices(u32, ee.spec_ple_tokens[0..n], de.spec_ple_tokens[0..n]);
+        }
+        for (b_e.entries, b_d.entries) |*ee, *de| {
+            try testing.expectEqual(ee.ple_prev_valid, de.ple_prev_valid);
+            try testing.expectEqualSlices(u32, &ee.ple_prev, &de.ple_prev);
+            try testing.expectEqual(ee.spec_ple_len, de.spec_ple_len);
+            const n: usize = ee.spec_ple_len;
+            try testing.expectEqualSlices(u32, ee.spec_ple_tokens[0..n], de.spec_ple_tokens[0..n]);
+        }
+        if (capture) {
+            const acc: u32 = 1;
+            const vl: u32 = @intCast(w);
+            for (a_e.entries, a_d.entries) |*ee, *de| {
+                try ssmRollbackFromCapture(ee, acc, vl, s);
+                try ssmRollbackFromCapture(de, acc, vl, s);
+                try testing.expectEqualSlices(u32, &ee.ple_prev, &de.ple_prev);
+            }
+            for (b_e.entries, b_d.entries) |*ee, *de| {
+                try ssmRollbackFromCapture(ee, acc, vl, s);
+                try ssmRollbackFromCapture(de, acc, vl, s);
+                try testing.expectEqualSlices(u32, &ee.ple_prev, &de.ple_prev);
+            }
+            for (a_e.entries) |*e| ssmFreeSpecCapture(e);
+            for (b_e.entries) |*e| ssmFreeSpecCapture(e);
+            for (a_d.entries) |*e| ssmFreeSpecCapture(e);
+            for (b_d.entries) |*e| ssmFreeSpecCapture(e);
+        }
     }
 }
 
