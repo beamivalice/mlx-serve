@@ -17059,9 +17059,9 @@ pub const Transformer = struct {
         // the selection too: `qsaVerifyGatherAttn` reads the UNION of the
         // rows' selections instead of the whole cache. Its own kv floor is
         // higher than the prefill/decode one — the union is fixed-size.
-        const want_blocks = batch == 1 and kv > (if (seq_len >= 2) @max(qsaGatherMinKv(), qsaVerifyGatherMinKv()) else qsaGatherMinKv()) and qsaGatherEnabled() and
+        const want_blocks = batch == 1 and kv > qsaGatherMinKv() and qsaGatherEnabled() and
             (seq_len >= FUSED256_MIN_Q_LEN or (seq_len == 1 and qsaDecodeGatherEnabled()) or
-                (seq_len >= 2 and seq_len < FUSED256_MIN_Q_LEN and qsaVerifyGatherEnabled()));
+                (seq_len >= 2 and seq_len < FUSED256_MIN_Q_LEN and qsaVerifyGatherEnabled() and kv > qsaVerifyGatherMinKv()));
         if (want_blocks) {
             // Prefill: sorted per-row block indices for the gather kernel;
             // the dense [S, kv] mask is never built. Decode (S==1): the same

@@ -6109,6 +6109,7 @@ pub const Generator = struct {
         // the point at which the entry's n-gram history + `spec_ple_tokens`
         // advance. Must precede BOTH the first eval of anything downstream of
         // the leaf (Phase 4) and `ssmRollbackFromCapture` (Phase 5).
+        errdefer xfm.discardDeferredPle(&self.ctx);
         try xfm.flushDeferredPle(&self.ctx);
         st.verify_logits = verify_logits;
         st.new_hidden = new_hidden;
@@ -9256,6 +9257,7 @@ fn lazyForward(xfm: *Transformer, ctx: *ForwardCtx, lazy_token: mlx.mlx_array) !
         return e;
     };
     xfm.flushDeferredPle(ctx) catch |e| {
+        xfm.discardDeferredPle(ctx);
         _ = mlx.mlx_array_free(logits);
         return e;
     };

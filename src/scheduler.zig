@@ -731,14 +731,6 @@ pub const Slot = struct {
     }
 
     /// This slot's attention KV length for the batched group; never `cache.step` (0 forever on a linear-layer-0 trunk).
-    pub fn batchKvLen(self: *const Slot) u32 {
-        return self.batchKvLenAt(1);
-    }
-
-    pub fn batchKvLenAt(self: *const Slot, seq_len: c_int) u32 {
-        return batchKvLenOfWith(&self.cache, self.model.config, seq_len, self.mrope_pos != null);
-    }
-
     /// Free everything the slot owns. Only safe to call when no thread can
     /// observe the slot anymore (i.e. after the inference thread has
     /// finished/errored it AND the connection thread has consumed the final
