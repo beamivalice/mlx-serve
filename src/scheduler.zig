@@ -1375,6 +1375,9 @@ pub const Scheduler = struct {
     /// prompt-token counters and prefill-time histograms only advance when the
     /// request finishes. Written per prefill CHUNK, read by the gauge sampler.
     inflight_prefill_tokens: std.atomic.Value(u64),
+    /// Post-cache tail the in-flight prefill will forward, same scale as
+    /// `inflight_prefill_tokens`; 0 when none is running.
+    inflight_prefill_expected: std.atomic.Value(u64),
     /// Number of slots currently inside `runPrefill`. Set on entry, cleared on
     /// every exit — so the panel can say "prefilling" IMMEDIATELY, rather than
     /// waiting for the first 8192-token chunk to land (~40 s on a 27B). Also
@@ -1491,6 +1494,7 @@ pub const Scheduler = struct {
             .metrics = params.metrics,
             .inflight_generated_tokens = std.atomic.Value(u64).init(0),
             .inflight_prefill_tokens = std.atomic.Value(u64).init(0),
+            .inflight_prefill_expected = std.atomic.Value(u64).init(0),
             .requests_prefilling = std.atomic.Value(u64).init(0),
             .in_flight = 0,
             .queue_cap = cap + 32,
@@ -5777,6 +5781,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     defer if (observe) {
         _ = sch.requests_prefilling.fetchSub(1, .monotonic);
         sch.inflight_prefill_tokens.store(0, .monotonic);
+        sch.inflight_prefill_expected.store(0, .monotonic);
     };
 
     // ds4-backed model: bypass the MLX prefill path entirely. The ds4
@@ -6141,6 +6146,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             // restore hybrids too.
             .cancelled_checkpoint_sink = &slot.cancelled_prefill,
             .prefill_progress = if (observe) &sch.inflight_prefill_tokens else null,
+            .prefill_expected = if (observe) &sch.inflight_prefill_expected else null,
             .interleave_hook = if (prefillInterleaveEnabled())
                 .{ .ctx = &interleave_ctx, .call = interleaveDecodeTickCb }
             else
