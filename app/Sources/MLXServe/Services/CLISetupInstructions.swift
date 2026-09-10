@@ -82,9 +82,9 @@ enum CLISetupInstructions {
                 \(AgentConfigs.opencode2CliJSON(existing: "{}", baseURL: baseURL))
                 EOF
                 export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2"
-                export OPENCODE_CONFIG_CONTENT='\(AgentConfigs.opencodeJSON(baseURL: baseURL, model: servedModelId, budget: budget))'
+                export OPENCODE_CONFIG_CONTENT='\(AgentConfigs.opencodeJSON(baseURL: baseURL, defaultModel: servedModelId, entries: [AgentModelEntry(id: servedModelId, budget: budget, vision: false)], pinModel: true))'
                 if ! command -v opencode2 >/dev/null 2>&1; then echo "opencode2 is not installed: npm install -g @opencode/cli"; exit 127; fi
-                opencode2 --model mlx/\(servedModelId)
+                opencode2 --standalone
                 """),
             // codex honors CODEX_HOME for its whole config tree; the dir must
             // exist before codex runs. Responses wire API — our /v1/responses.

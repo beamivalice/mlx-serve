@@ -138,7 +138,8 @@ OUT=$("$BIN" launch opencode2 --print --url "$BASE" 2>&1)
 OK=1
 echo "$OUT" | grep -q 'export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2"' || OK=0
 echo "$OUT" | grep -q 'export OPENCODE_CONFIG_CONTENT=' || OK=0
-echo "$OUT" | grep -q "opencode2 --model mlx/$MODEL_ID" || OK=0
+echo "$OUT" | grep -q '^opencode2 --standalone$' || OK=0
+echo "$OUT" | grep -q "\"model\": \"mlx/$MODEL_ID\"" || OK=0
 CLI_JSON="$HOME/.mlx-serve/opencode2/opencode/cli.json"
 if [ ! -f "$CLI_JSON" ]; then
     OK=0
@@ -149,7 +150,8 @@ with open(sys.argv[1]) as f:
     d = json.load(f)
 want = sys.argv[2] + '/metrics.json'
 plugins = d.get('plugins') or []
-mlx = [p for p in plugins if (p.get('package') or '').endswith('mlx-serve')]
+# a user's own plugins ride through the merge as plain strings
+mlx = [p for p in plugins if isinstance(p, dict) and (p.get('package') or '').endswith('mlx-serve')]
 assert len(mlx) == 1, mlx
 assert mlx[0].get('options', {}).get('metricsUrl') == want, mlx[0]
 assert 'metricsToken' not in (mlx[0].get('options') or {})

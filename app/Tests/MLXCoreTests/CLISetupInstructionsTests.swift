@@ -86,13 +86,17 @@ final class CLISetupInstructionsTests: XCTestCase {
     func testOpencode2TabUsesDedicatedXdgConfigAndRegistersThePlugin() throws {
         let tab = try XCTUnwrap(tabs.first { $0.id == "opencode2" })
         XCTAssertTrue(tab.command.contains(#"export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2""#))
-        XCTAssertTrue(tab.command.contains("opencode2 --model mlx/gemma-4-e4b-it-4bit"))
+        XCTAssertTrue(tab.command.contains("opencode2 --standalone"))
+        XCTAssertFalse(tab.command.contains("opencode2 --model"))
+        XCTAssertTrue(tab.command.contains(#""model": "mlx/gemma-4-e4b-it-4bit""#))
         XCTAssertTrue(tab.command.contains("npm install -g @opencode/cli"))
         XCTAssertTrue(tab.command.contains("./plugins/mlx-serve"))
         XCTAssertTrue(tab.command.contains("http://localhost:11234/metrics.json"))
         XCTAssertFalse(tab.command.contains("~/.config/opencode"), "must never write the user's real opencode config")
         let json = AgentConfigs.opencodeJSON(
-            baseURL: "http://localhost:11234", model: "gemma-4-e4b-it-4bit", budget: budget)
+            baseURL: "http://localhost:11234", defaultModel: "gemma-4-e4b-it-4bit",
+            entries: [AgentModelEntry(id: "gemma-4-e4b-it-4bit", budget: budget, vision: false)],
+            pinModel: true)
         XCTAssertTrue(tab.command.contains("export OPENCODE_CONFIG_CONTENT='\(json)'"))
     }
 
@@ -101,7 +105,9 @@ final class CLISetupInstructionsTests: XCTestCase {
         let script = LauncherCLI.opencode2.scriptBody("http://localhost:11234",
                                                      "gemma-4-e4b-it-4bit", "cd '/tmp'", budget, [])
         XCTAssertTrue(script.contains(#"export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2""#), script)
-        XCTAssertTrue(script.contains("opencode2 --model mlx/gemma-4-e4b-it-4bit"), script)
+        XCTAssertTrue(script.contains("opencode2 --standalone"), script)
+        XCTAssertFalse(script.contains("opencode2 --model"), script)
+        XCTAssertTrue(script.contains(#""model": "mlx/gemma-4-e4b-it-4bit""#), script)
         XCTAssertTrue(script.contains("npm install -g @opencode/cli"), script)
         XCTAssertTrue(script.contains("exit 127"), script)
     }

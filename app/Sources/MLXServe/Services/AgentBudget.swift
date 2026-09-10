@@ -248,8 +248,10 @@ enum AgentConfigs {
     /// custom providers, so the FULL chat-capable list is baked here — its
     /// in-session /models picker shows exactly these entries, each with its
     /// own limits (never the loaded model's budget stamped on everything).
+    /// `pinModel` writes a top-level `"model"` — opencode 2's TUI has no
+    /// `--model` flag, so the config is the only place to select one.
     static func opencodeJSON(baseURL: String, defaultModel: String,
-                             entries: [AgentModelEntry]) -> String {
+                             entries: [AgentModelEntry], pinModel: Bool = false) -> String {
         var list = entries
         if !list.contains(where: { $0.id == defaultModel }) {
             list.insert(AgentModelEntry(id: defaultModel, budget: AgentBudget.fallback,
@@ -260,9 +262,10 @@ enum AgentConfigs {
             return "\"\(e.id)\": { \"name\": \"\(e.id) (mlx-serve)\",\(attachment) "
                 + "\"limit\": { \"context\": \(e.budget.context), \"output\": \(e.budget.output) } }"
         }.joined(separator: ",\n        ")
+        let pinned = pinModel ? "\n  \"model\": \"mlx/\(defaultModel)\"," : ""
         return """
         {
-          "$schema": "https://opencode.ai/config.json",
+          "$schema": "https://opencode.ai/config.json",\(pinned)
           "provider": {
             "mlx": {
               "npm": "@ai-sdk/openai-compatible",

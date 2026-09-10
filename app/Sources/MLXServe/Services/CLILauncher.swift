@@ -405,11 +405,11 @@ extension LauncherCLI {
                 list.insert(AgentModelEntry(id: model, budget: budget, vision: false), at: 0)
             }
             return """
-            export OPENCODE_CONFIG_CONTENT='\(AgentConfigs.opencodeJSON(baseURL: baseURL, defaultModel: model, entries: list))'
+            export OPENCODE_CONFIG_CONTENT='\(AgentConfigs.opencodeJSON(baseURL: baseURL, defaultModel: model, entries: list, pinModel: true))'
             export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2"
             \(cdLine)
             if ! command -v opencode2 >/dev/null 2>&1; then echo "opencode2 is not installed: npm install -g @opencode/cli"; exit 127; fi
-            opencode2 --model mlx/\(model)
+            opencode2 --standalone
             """
         }
     )

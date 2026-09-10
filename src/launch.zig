@@ -153,11 +153,15 @@ pub fn ompModelsYml(allocator: std.mem.Allocator, base_url: []const u8, entries:
 /// opencode config — carried inline via OPENCODE_CONFIG_CONTENT (merges over
 /// the user's own config, no file writes). Single-quoted in the script, so
 /// the JSON must stay single-quote-free.
-pub fn opencodeJson(allocator: std.mem.Allocator, base_url: []const u8, entries: []const Entry) ![]u8 {
+/// `pin_model` writes a top-level `"model"` — opencode 2's TUI has no
+/// `--model` flag, so the config is the only place to select one.
+pub fn opencodeJson(allocator: std.mem.Allocator, base_url: []const u8, entries: []const Entry, pin_model: ?[]const u8) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "{\"$schema\": \"https://opencode.ai/config.json\", ");
+    if (pin_model) |m| try out.print(allocator, "\"model\": \"mlx/{s}\", ", .{m});
     try out.print(allocator,
-        \\{{"$schema": "https://opencode.ai/config.json", "provider": {{"mlx": {{"npm": "@ai-sdk/openai-compatible", "name": "MLX Serve (local)", "options": {{"baseURL": "{s}/v1"}}, "models": {{
+        \\"provider": {{"mlx": {{"npm": "@ai-sdk/openai-compatible", "name": "MLX Serve (local)", "options": {{"baseURL": "{s}/v1"}}, "models": {{
     , .{base_url});
     for (entries, 0..) |e, i| {
         try out.print(allocator, "{s}\"{s}\": {{\"name\": \"{s} (mlx-serve)\",{s} \"limit\": {{\"context\": {d}, \"output\": {d}}}}}", .{
@@ -421,8 +425,8 @@ pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []cons
                 \\export OPENCODE_CONFIG_CONTENT='{s}'
                 \\export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2"
                 \\if ! command -v opencode2 >/dev/null 2>&1; then echo "opencode2 is not installed: npm install -g @opencode/cli"; exit 127; fi
-                \\opencode2 --model mlx/{s}
-            , .{ opencode_config.?, model });
+                \\opencode2 --standalone
+            , .{opencode_config.?});
         },
         .codex => {
             // PATH first, then the CLI the desktop app bundles (codex's
@@ -813,7 +817,7 @@ pub fn cmdLaunch(allocator: std.mem.Allocator, io: std.Io, args: []const []const
     };
 
     const oc_config: ?[]u8 = if (parsed.kind == .opencode or parsed.kind == .opencode2)
-        try opencodeJson(allocator, base_url, models.entries)
+        try opencodeJson(allocator, base_url, models.entries, if (parsed.kind == .opencode2) chosen.id else null)
     else
         null;
     defer if (oc_config) |c| allocator.free(c);
@@ -897,9 +901,11 @@ test "pi models.json and opencode config parse as JSON and stay single-quote-fre
         .{ .id = "m1", .budget = .{ .context = 4096, .output = 1024 }, .vision = true, .loaded = true },
         .{ .id = "m2", .budget = .{ .context = 8192, .output = 2048 }, .vision = false, .loaded = false },
     };
-    inline for (.{ piModelsJson, opencodeJson }) |builder| {
-        const json = try builder(t.allocator, "http://127.0.0.1:11234", &entries);
-        defer t.allocator.free(json);
+    const pi_json = try piModelsJson(t.allocator, "http://127.0.0.1:11234", &entries);
+    defer t.allocator.free(pi_json);
+    const oc_json = try opencodeJson(t.allocator, "http://127.0.0.1:11234", &entries, "m1");
+    defer t.allocator.free(oc_json);
+    for ([_][]const u8{ pi_json, oc_json }) |json| {
         const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, json, .{});
         defer parsed.deinit();
         // opencode's config rides single-quoted inside the launch script.
@@ -1050,10 +1056,24 @@ test "opencode2 script exports XDG_CONFIG_HOME, OPENCODE_CONFIG_CONTENT, and inv
     defer t.allocator.free(script);
     try t.expect(std.mem.indexOf(u8, script, "export XDG_CONFIG_HOME=\"$HOME/.mlx-serve/opencode2\"") != null);
     try t.expect(std.mem.indexOf(u8, script, "export OPENCODE_CONFIG_CONTENT='{\"provider\":{}}'") != null);
-    try t.expect(std.mem.indexOf(u8, script, "opencode2 --model mlx/m1") != null);
+    // v2 has no root --model flag and resolves models in a SHARED background
+    // service that never sees our env: --standalone, model pinned in the config.
+    try t.expect(std.mem.indexOf(u8, script, "opencode2 --standalone") != null);
+    try t.expect(std.mem.indexOf(u8, script, "--model") == null);
     try t.expect(std.mem.indexOf(u8, script, "npm install -g @opencode/cli") != null);
     try t.expect(std.mem.indexOf(u8, script, "exit 127") != null);
     try t.expect(std.mem.indexOf(u8, script, "'resume' 'it'\\''s'") != null);
+}
+
+test "opencodeJson pins the default model only when asked" {
+    const entries = [_]Entry{.{ .id = "m1", .budget = .{ .context = 4096, .output = 1024 }, .vision = false, .loaded = false }};
+    const plain = try opencodeJson(t.allocator, "http://127.0.0.1:11234", &entries, null);
+    defer t.allocator.free(plain);
+    try t.expect(std.mem.indexOf(u8, plain, "\"model\"") == null);
+
+    const pinned = try opencodeJson(t.allocator, "http://127.0.0.1:11234", &entries, "m1");
+    defer t.allocator.free(pinned);
+    try t.expect(std.mem.indexOf(u8, pinned, "\"model\": \"mlx/m1\"") != null);
 }
 
 test "claude script declares the advertised context window (CLAUDE_CODE_MAX_CONTEXT_TOKENS)" {
