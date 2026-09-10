@@ -471,16 +471,8 @@ pub const MtpCacheRef = union(enum) {
     /// across the whole prompt.
     pub fn appendEvalArrays(self: *const MtpCacheRef, vec: mlx.mlx_vector_array) void {
         switch (self.*) {
-            .qwen => |*c| for (c.entries) |*entry| {
-                if (!entry.initialized) continue;
-                _ = mlx.mlx_vector_array_append_value(vec, entry.keys);
-                _ = mlx.mlx_vector_array_append_value(vec, entry.values);
-            },
-            .qwen4 => |t| for (t.qwen4_mtp.?.cache.entries) |*entry| {
-                if (!entry.initialized) continue;
-                _ = mlx.mlx_vector_array_append_value(vec, entry.keys);
-                _ = mlx.mlx_vector_array_append_value(vec, entry.values);
-            },
+            .qwen => |*c| c.appendEvalArrays(vec),
+            .qwen4 => |t| t.qwen4_mtp.?.cache.appendEvalArrays(vec),
         }
     }
 };
