@@ -719,6 +719,7 @@ pub const Slot = struct {
             .cache = &slot.cache,
             .moe_seq_offset = &slot.moe_seq_offset,
             .ssm_entries = slot.ssm_entries,
+            .ssm_member_gen = transformer_mod.nextSsmMemberGen(),
             .vision_embeddings = slot.vision_embeddings,
             .mrope_pos = slot.mrope_pos,
             .mrope_total = slot.mrope_total,
@@ -757,6 +758,7 @@ pub const Slot = struct {
         self.cancelled_prefill.deinit();
         self.cache.deinit();
         if (self.ssm_entries) |entries| {
+            if (self.model.transformer) |xfm| xfm.ssmGroupDrop(entries);
             for (entries) |*e| {
                 _ = mlx.mlx_array_free(e.conv_state);
                 _ = mlx.mlx_array_free(e.ssm_state);
@@ -5842,6 +5844,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     slot.ctx.mrope_delta = slot.mrope_delta;
     slot.ctx.capture_hidden = null;
     slot.ctx.kv_attn_fused = slot.kv_attn_fused;
+    if (slot.model.transformer) |xfm| try xfm.ssmGroupRelease(&slot.ctx);
 
     // deepseek_v4: PLD/drafter/qwen-MTP verify passes through forwardWith
     // would APPEND draft tokens to module-owned state and corrupt every later
@@ -6647,6 +6650,7 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
     };
 
     if (try loopGuardTick(sch, slot, gen)) return;
+    if (slot.model.transformer) |xfm| try xfm.ssmGroupRelease(&slot.ctx);
 
     // NOTE: no `!gen.spec_disabled_runtime` short-circuit here — the
     // generators handle the disabled fallback internally, and `nextPld`'s
@@ -7455,22 +7459,29 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     // the right place (qwen4's QSA reads it for kv length + tail rule).
     for (batch) |slot| slot.moe_seq_offset += 1;
 
+    // `gen.sampling`, not `slot.sampling`: the Generator's copy passed
+    // the initWithOptions chokepoint and carries the model's
+    // reserved-token suppression mask; the slot's copy is the raw
+    // request params.
+    var sample_params: [MAX_BATCH_GROUP]generate_mod.SamplingParams = undefined;
+    var sample_rows: [MAX_BATCH_GROUP]mlx.mlx_array = undefined;
+    var sample_ids: [MAX_BATCH_GROUP]i32 = undefined;
+    std.debug.assert(live_n == logits_arr.len);
+    std.debug.assert(live_n <= sample_params.len);
+    for (batch, 0..) |slot, i| {
+        sample_params[i] = slot.legacy_gen.?.sampling;
+        sample_rows[i] = logits_arr[i];
+    }
+    if (live_n > 0) {
+        try generate_mod.sampleRows(sample_ids[0..live_n], sample_rows[0..live_n], sample_params[0..live_n], xfm_ptr.s);
+        for (batch, 0..) |slot, i| slot.legacy_gen.?.sampling.draw = sample_params[i].draw;
+    }
+
     // Sample per slot, emit prev id, set new next_token_id.
     for (batch, 0..) |slot, i| {
         const gen = &slot.legacy_gen.?;
         const act = batchedTickAction(slot.cancelled.load(.acquire));
-        // `gen.sampling`, not `slot.sampling`: the Generator's copy passed
-        // the initWithOptions chokepoint and carries the model's
-        // reserved-token suppression mask; the slot's copy is the raw
-        // request params.
-        const sampled: ?i32 = if (act.publish) blk: {
-            const lazy = gen.sampleLazy(logits_arr[i]);
-            try mlx.check(mlx.mlx_array_eval(lazy));
-            var val: i32 = 0;
-            try mlx.check(mlx.mlx_array_item_int32(&val, lazy));
-            _ = mlx.mlx_array_free(lazy);
-            break :blk val;
-        } else null;
+        const sampled: ?i32 = if (act.publish) sample_ids[i] else null;
 
         const emit = gen.next_token_id;
         gen.generated_ids.append(slot.allocator, emit) catch |err| {
