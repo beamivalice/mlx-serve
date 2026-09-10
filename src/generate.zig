@@ -14,6 +14,7 @@ const drafter_mod = @import("drafter.zig");
 const mtp_mod = @import("mtp.zig");
 const round_cost = @import("round_cost.zig");
 const ane_mod = @import("ane.zig");
+const scheduler_mod = @import("scheduler.zig");
 
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -9705,6 +9706,201 @@ pub fn sampleTokenLazy(logits_in: mlx.mlx_array, sampling: SamplingParams, s: ml
     return sampled; // Shape [1], lazy
 }
 
+pub var sample_rows_evals: u64 = 0;
+
+/// One sampling eval for every row of a batched tick. Homogeneous unseeded rows
+/// draw over one stacked `[N, V]` graph (one argmax or one categorical draw);
+/// a seed, mixed filters or a lone row take the per-row arm, whose parts are
+/// reshaped to `[1]` before the concat because a greedy draw is `[1, 1]` and a
+/// categorical draw is `[1]`. Every row advances its `draw` before the eval, so
+/// a failed eval never replays a key.
+pub fn sampleRows(out: []i32, row_logits: []const mlx.mlx_array, params: []SamplingParams, s: mlx.mlx_stream) !void {
+    std.debug.assert(out.len == row_logits.len and out.len == params.len);
+    const n = row_logits.len;
+    if (n == 0) return;
+    const lazy = try sampleRowsLazy(row_logits, params, s);
+    defer _ = mlx.mlx_array_free(lazy);
+    for (params) |*p| p.draw +%= 1;
+    sample_rows_evals += 1;
+    try mlx.check(mlx.mlx_array_eval(lazy));
+    if (n == 1) {
+        try mlx.check(mlx.mlx_array_item_int32(&out[0], lazy));
+        return;
+    }
+    const data = mlx.mlx_array_data_uint32(lazy) orelse return error.MlxError;
+    for (out, data[0..n]) |*dst, v| dst.* = @intCast(v);
+}
+
+/// Rows may share one stacked graph only when every filter matches; a seed
+/// always takes the per-row arm so its key stays per row.
+fn sampleRowsHomogeneous(params: []const SamplingParams) bool {
+    const p0 = params[0];
+    for (params[1..]) |p| {
+        if (p.temperature != p0.temperature or p.top_k != p0.top_k or p.top_p != p0.top_p) return false;
+        const m0 = p0.suppress_mask;
+        const m1 = p.suppress_mask;
+        if (m0 == null and m1 == null) continue;
+        if (m0 == null or m1 == null) return false;
+        if (m0.?.ctx != m1.?.ctx) return false;
+    }
+    return true;
+}
+
+fn sampleRowsAllGreedy(params: []const SamplingParams) bool {
+    for (params) |p| {
+        if (p.temperature >= 0.01) return false;
+    }
+    return true;
+}
+
+fn concatLogitRows(rows: []const mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    if (rows.len == 1) {
+        var out = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_array_set(&out, rows[0]));
+        return out;
+    }
+    const vec = mlx.mlx_vector_array_new_data(rows.ptr, rows.len);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 0, s));
+    return out;
+}
+
+fn logitsAsNV(logits: mlx.mlx_array, n: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    const sh = mlx.getShape(logits);
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    if (sh.len == 2) {
+        try mlx.check(mlx.mlx_array_set(&out, logits));
+        return out;
+    }
+    if (sh.len != 3 or sh[0] != n) return error.BadShape;
+    if (sh[1] == 1) {
+        const sq = [_]c_int{ n, sh[2] };
+        try mlx.check(mlx.mlx_reshape(&out, logits, &sq, 2, s));
+        return out;
+    }
+    const start = [_]c_int{ 0, sh[1] - 1, 0 };
+    const stop = [_]c_int{ n, sh[1], sh[2] };
+    const strides = [_]c_int{ 1, 1, 1 };
+    var sliced = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sliced);
+    try mlx.check(mlx.mlx_slice(&sliced, logits, &start, 3, &stop, 3, &strides, 3, s));
+    const sq = [_]c_int{ n, sh[2] };
+    try mlx.check(mlx.mlx_reshape(&out, sliced, &sq, 2, s));
+    return out;
+}
+
+fn sampleRowsLazyConcat(row_logits: []const mlx.mlx_array, params: []const SamplingParams, s: mlx.mlx_stream) !mlx.mlx_array {
+    var parts: [scheduler_mod.MAX_BATCH_GROUP]mlx.mlx_array = undefined;
+    const n = row_logits.len;
+    if (n > parts.len) return error.BatchTooWide;
+    var n_parts: usize = 0;
+    // One release on every exit: the concat output holds its own references.
+    defer {
+        for (parts[0..n_parts]) |a| _ = mlx.mlx_array_free(a);
+    }
+    const one = [_]c_int{1};
+    for (row_logits, params) |logits, p| {
+        const raw = sampleTokenLazy(logits, p, s);
+        defer _ = mlx.mlx_array_free(raw);
+        parts[n_parts] = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&parts[n_parts], raw, &one, 1, s));
+        n_parts += 1;
+    }
+    return concatLogitRows(parts[0..n_parts], s);
+}
+
+fn sampleRowsAnySeed(params: []const SamplingParams) bool {
+    for (params) |p| {
+        if (p.seed != null) return true;
+    }
+    return false;
+}
+
+fn sampleRowsLazy(row_logits: []const mlx.mlx_array, params: []const SamplingParams, s: mlx.mlx_stream) !mlx.mlx_array {
+    const n: c_int = @intCast(row_logits.len);
+    if (row_logits.len == 1 or !sampleRowsHomogeneous(params) or sampleRowsAnySeed(params)) {
+        return sampleRowsLazyConcat(row_logits, params, s);
+    }
+    const stacked = try concatLogitRows(row_logits, s);
+    defer _ = mlx.mlx_array_free(stacked);
+    var current = try logitsAsNV(stacked, n, s);
+    var owned = true;
+    errdefer if (owned) {
+        _ = mlx.mlx_array_free(current);
+    };
+    const p0 = params[0];
+
+    var suppressed: mlx.mlx_array = .{ .ctx = null };
+    defer if (suppressed.ctx != null) {
+        _ = mlx.mlx_array_free(suppressed);
+    };
+    if (p0.suppress_mask) |m| {
+        suppressed = mlx.mlx_array_new();
+        applySuppressMask(&suppressed, current, m, s) catch {
+            _ = mlx.mlx_array_free(suppressed);
+            suppressed = .{ .ctx = null };
+        };
+        if (suppressed.ctx != null) {
+            _ = mlx.mlx_array_free(current);
+            current = suppressed;
+            suppressed = .{ .ctx = null };
+        }
+    }
+
+    if (sampleRowsAllGreedy(params)) {
+        var result = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(result);
+        try mlx.check(mlx.mlx_argmax_axis(&result, current, -1, false, s));
+        _ = mlx.mlx_array_free(current);
+        owned = false;
+        return result;
+    }
+
+    if (p0.temperature != 1.0) {
+        const temp_arr = mlx.mlx_array_new_float(p0.temperature);
+        defer _ = mlx.mlx_array_free(temp_arr);
+        var next = mlx.mlx_array_new();
+        mlx.check(mlx.mlx_divide(&next, current, temp_arr, s)) catch |err| {
+            _ = mlx.mlx_array_free(next);
+            return err;
+        };
+        _ = mlx.mlx_array_free(current);
+        current = next;
+    }
+    if (p0.top_k > 0) {
+        var next = mlx.mlx_array_new();
+        applyTopK(&next, current, p0.top_k, s) catch {
+            _ = mlx.mlx_array_free(next);
+            next = current;
+            current = mlx.mlx_array_new();
+        };
+        if (current.ctx != null) _ = mlx.mlx_array_free(current);
+        current = next;
+    }
+    if (p0.top_p < 1.0) {
+        var next = mlx.mlx_array_new();
+        applyTopP(&next, current, p0.top_p, s) catch {
+            _ = mlx.mlx_array_free(next);
+            next = current;
+            current = mlx.mlx_array_new();
+        };
+        if (current.ctx != null) _ = mlx.mlx_array_free(current);
+        current = next;
+    }
+
+    const key = seedKey(p0);
+    defer _ = mlx.mlx_array_free(key);
+    var sampled = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(sampled);
+    try mlx.check(mlx.mlx_random_categorical(&sampled, current, -1, key, s));
+    _ = mlx.mlx_array_free(current);
+    owned = false;
+    return sampled;
+}
+
 /// PRNG key for one draw: `seed` mixed with the draw index, so a seeded
 /// request replays byte-for-byte and consecutive draws never share a key.
 /// Null-ctx (MLX global RNG) when the request set no seed.
@@ -11557,6 +11753,143 @@ test "seeded lazy sampling replays the same draws and advances per draw" {
     var all_same = true;
     for (runs[0][1..]) |v| all_same = all_same and v == runs[0][0];
     try testing.expect(!all_same);
+}
+
+test "batched greedy ids equal two solo ids and one sampling eval" {
+    const s = mlx.gpuStream();
+    const data = [_]f32{
+        0.1, 5.0, 0.2, 0.3,
+        0.4, 0.5, 0.6, 9.0,
+    };
+    const row_shape = [_]c_int{ 1, 1, 4 };
+    const r0 = mlx.mlx_array_new_data(&data[0], &row_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(r0);
+    const r1 = mlx.mlx_array_new_data(&data[4], &row_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(r1);
+
+    const greedy = SamplingParams{ .temperature = 0.0 };
+    const solo0 = try evalLazyToken(sampleTokenLazy(r0, greedy, s));
+    const solo1 = try evalLazyToken(sampleTokenLazy(r1, greedy, s));
+
+    sample_rows_evals = 0;
+    var ids: [2]i32 = undefined;
+    var params = [_]SamplingParams{ greedy, greedy };
+    const rows = [_]mlx.mlx_array{ r0, r1 };
+    try sampleRows(&ids, &rows, &params, s);
+    try testing.expectEqual(@as(u64, 1), sample_rows_evals);
+    try testing.expectEqual(@as(i32, @intCast(solo0)), ids[0]);
+    try testing.expectEqual(@as(i32, @intCast(solo1)), ids[1]);
+}
+
+test "batched mixed greedy and sampled rows produce two ids" {
+    const s = mlx.gpuStream();
+    const data = [_]f32{
+        0.1, 5.0, 0.2, 0.3,
+        0.4, 0.5, 0.6, 9.0,
+    };
+    const row_shape = [_]c_int{ 1, 1, 4 };
+    const r0 = mlx.mlx_array_new_data(&data[0], &row_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(r0);
+    const r1 = mlx.mlx_array_new_data(&data[4], &row_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(r1);
+
+    const greedy = SamplingParams{ .temperature = 0.0 };
+    const sampled = SamplingParams{ .temperature = 0.7 };
+    const solo_g = try evalLazyToken(sampleTokenLazy(r0, greedy, s));
+
+    sample_rows_evals = 0;
+    var ids: [2]i32 = undefined;
+    var params = [_]SamplingParams{ greedy, sampled };
+    const rows = [_]mlx.mlx_array{ r0, r1 };
+    try sampleRows(&ids, &rows, &params, s);
+    try testing.expectEqual(@as(u64, 1), sample_rows_evals);
+    try testing.expectEqual(@as(i32, @intCast(solo_g)), ids[0]);
+    try testing.expect(ids[1] >= 0 and ids[1] < 4);
+}
+
+test "batched stacked seedless top_k top_p rows equal solo draws" {
+    const s = mlx.gpuStream();
+    const data = [_]f32{
+        0.1, 5.0, 0.2, 0.3,
+        0.4, 0.5, 0.6, 9.0,
+    };
+    const row_shape = [_]c_int{ 1, 1, 4 };
+    const r0 = mlx.mlx_array_new_data(&data[0], &row_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(r0);
+    const r1 = mlx.mlx_array_new_data(&data[4], &row_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(r1);
+
+    const p = SamplingParams{ .temperature = 0.7, .top_k = 1, .top_p = 0.9 };
+    const solo0 = try evalLazyToken(sampleTokenLazy(r0, p, s));
+    const solo1 = try evalLazyToken(sampleTokenLazy(r1, p, s));
+
+    sample_rows_evals = 0;
+    var ids: [2]i32 = undefined;
+    var params = [_]SamplingParams{ p, p };
+    const rows = [_]mlx.mlx_array{ r0, r1 };
+    try sampleRows(&ids, &rows, &params, s);
+    try testing.expectEqual(@as(u64, 1), sample_rows_evals);
+    try testing.expectEqual(@as(i32, @intCast(solo0)), ids[0]);
+    try testing.expectEqual(@as(i32, @intCast(solo1)), ids[1]);
+}
+
+test "batched stacked seedless rows honour a suppress mask" {
+    const s = mlx.gpuStream();
+    const mask = try buildSuppressMask(&[_]u32{1}, 0, 4, s);
+    defer _ = mlx.mlx_array_free(mask);
+    const data = [_]f32{
+        0.1, 5.0, 0.2, 0.3,
+        0.4, 9.0, 0.5, 0.6,
+    };
+    const row_shape = [_]c_int{ 1, 1, 4 };
+    const r0 = mlx.mlx_array_new_data(&data[0], &row_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(r0);
+    const r1 = mlx.mlx_array_new_data(&data[4], &row_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(r1);
+
+    const p = SamplingParams{ .temperature = 0.7, .top_k = 1, .top_p = 0.9, .suppress_mask = mask };
+    const solo0 = try evalLazyToken(sampleTokenLazy(r0, p, s));
+    const solo1 = try evalLazyToken(sampleTokenLazy(r1, p, s));
+
+    sample_rows_evals = 0;
+    var ids: [2]i32 = undefined;
+    var params = [_]SamplingParams{ p, p };
+    const rows = [_]mlx.mlx_array{ r0, r1 };
+    try sampleRows(&ids, &rows, &params, s);
+    try testing.expectEqual(@as(u64, 1), sample_rows_evals);
+    try testing.expectEqual(@as(i32, @intCast(solo0)), ids[0]);
+    try testing.expectEqual(@as(i32, @intCast(solo1)), ids[1]);
+    try testing.expect(ids[0] != 1);
+    try testing.expect(ids[1] != 1);
+}
+
+test "batched seeded draws keep per-row keys" {
+    const s = mlx.gpuStream();
+    const data = [_]f32{
+        0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0,
+    };
+    const row_shape = [_]c_int{ 1, 1, 4 };
+    const r0 = mlx.mlx_array_new_data(&data[0], &row_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(r0);
+    const r1 = mlx.mlx_array_new_data(&data[4], &row_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(r1);
+
+    const p0 = SamplingParams{ .temperature = 1.0, .seed = 7, .draw = 2 };
+    const p1 = SamplingParams{ .temperature = 1.0, .seed = 99, .draw = 5 };
+    const solo0 = try evalLazyToken(sampleTokenLazy(r0, p0, s));
+    const solo1 = try evalLazyToken(sampleTokenLazy(r1, p1, s));
+
+    sample_rows_evals = 0;
+    var ids: [2]i32 = undefined;
+    var params = [_]SamplingParams{ p0, p1 };
+    const rows = [_]mlx.mlx_array{ r0, r1 };
+    try sampleRows(&ids, &rows, &params, s);
+    try testing.expectEqual(@as(u64, 1), sample_rows_evals);
+    try testing.expectEqual(@as(i32, @intCast(solo0)), ids[0]);
+    try testing.expectEqual(@as(i32, @intCast(solo1)), ids[1]);
+    try testing.expectEqual(p0.draw +% 1, params[0].draw);
+    try testing.expectEqual(p1.draw +% 1, params[1].draw);
 }
 
 test "sampleToken from prefill logits (seq_len > 1)" {
