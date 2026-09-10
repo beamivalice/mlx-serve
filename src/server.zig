@@ -10787,6 +10787,7 @@ fn sampleGauges(ctx: GaugeSamplerCtx) void {
     // pinned, decode reading 0, prefill reading "—". This gauge moves per
     // prefill chunk and returns to 0 the moment the prefill ends.
     ctx.metrics.prefill_tokens_live.set(ctx.scheduler.inflight_prefill_tokens.load(.monotonic));
+    ctx.metrics.prefill_tokens_expected.set(ctx.scheduler.inflight_prefill_expected.load(.monotonic));
     ctx.metrics.requests_prefilling.set(ctx.scheduler.requests_prefilling.load(.monotonic));
 }
 

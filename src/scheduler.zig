@@ -1375,6 +1375,9 @@ pub const Scheduler = struct {
     /// prompt-token counters and prefill-time histograms only advance when the
     /// request finishes. Written per prefill CHUNK, read by the gauge sampler.
     inflight_prefill_tokens: std.atomic.Value(u64),
+    /// Post-cache tail the in-flight prefill will forward, same scale as
+    /// `inflight_prefill_tokens`; 0 when none is running.
+    inflight_prefill_expected: std.atomic.Value(u64),
     /// Number of slots currently inside `runPrefill`. Set on entry, cleared on
     /// every exit — so the panel can say "prefilling" IMMEDIATELY, rather than
     /// waiting for the first 8192-token chunk to land (~40 s on a 27B). Also
@@ -1491,6 +1494,7 @@ pub const Scheduler = struct {
             .metrics = params.metrics,
             .inflight_generated_tokens = std.atomic.Value(u64).init(0),
             .inflight_prefill_tokens = std.atomic.Value(u64).init(0),
+            .inflight_prefill_expected = std.atomic.Value(u64).init(0),
             .requests_prefilling = std.atomic.Value(u64).init(0),
             .in_flight = 0,
             .queue_cap = cap + 32,
@@ -4359,7 +4363,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                             break :prefill;
                         }
                         if (err == error.QsaHistoryGap and !qsa_gap_retried) {
-                            if (sch.hot_prefix_cache) |hc| _ = hc.dropLastRestored();
+                            if (slot.model.prefix_cache) |*hc| _ = prefix_cache_mod.HotPrefixCache.dropQsaGapEntry(hc);
                             if (slot.ssm_entries) |ents| prefix_cache_mod.HotPrefixCache.resetSsmEntries(ents);
                             if (slot.model.transformer) |xf| {
                                 slot.cache.truncate(0, xf.s) catch {};
@@ -5777,6 +5781,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     defer if (observe) {
         _ = sch.requests_prefilling.fetchSub(1, .monotonic);
         sch.inflight_prefill_tokens.store(0, .monotonic);
+        sch.inflight_prefill_expected.store(0, .monotonic);
     };
 
     // ds4-backed model: bypass the MLX prefill path entirely. The ds4
@@ -5884,7 +5889,6 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // because the conn thread holds a refcount on slot.model.
     const xfm_ptr: *Transformer = slot.model.transformer.?;
     if (slot.model.prefix_cache) |*hc| {
-        if (slot.skip_prefix_cache) hc.skip_prefix_cache = true;
         {
             // Only build a restore target when this request will actually
             // draft — a non-dflash turn leaves the payload in the entry for
@@ -5906,7 +5910,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             const mtp_head: ?*Transformer = if (mtp_target) |*mc| mc.head() else null;
             // Restore by move: the slot names itself, opting into the checkout; `finishSlot`
             // releases it on every path that ends the slot.
-            const lookup = hc.lookupAndRestoreForSlot(
+            const lookup = hc.lookupAndRestoreWithMedia(
                 &slot.cache,
                 &slot.moe_seq_offset,
                 slot.ssm_entries,
@@ -5918,6 +5922,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 if (dfl_target) |*dc| .{ .cache = &dc.cache, .base_pos = &dfl_base } else null,
                 if (mtp_kv) |k| .{ .cache = k, .base_pos = &mtp_base, .head = mtp_head } else null,
                 @intFromPtr(slot),
+                slot.skip_prefix_cache,
             ) catch |err| blk: {
                 log.warn("[hot-cache] lookup failed: {s} — proceeding with cold prefill\n", .{@errorName(err)});
                 break :blk prefix_cache_mod.LookupResult{ .matched = 0, .full_match = false };
@@ -6141,6 +6146,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             // restore hybrids too.
             .cancelled_checkpoint_sink = &slot.cancelled_prefill,
             .prefill_progress = if (observe) &sch.inflight_prefill_tokens else null,
+            .prefill_expected = if (observe) &sch.inflight_prefill_expected else null,
             .interleave_hook = if (prefillInterleaveEnabled())
                 .{ .ctx = &interleave_ctx, .call = interleaveDecodeTickCb }
             else

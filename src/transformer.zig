@@ -8561,7 +8561,7 @@ test "qsa leftover: restore at L-30 then append/rollback re-pools bit-identicall
     var dest_arr = [_]SSMCacheEntry{.{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true }};
     defer ssmFreeQsaState(&dest_arr[0]);
     try restoreSsmCheckpoint(&dest_arr, &cps[0]);
-    try applyQsaHistoryAt(&dest_arr, &cps[1], @intCast(pos), s);
+    try applyQsaHistoryAt(&dest_arr, &cps[1], @intCast(pos), s, false);
 
     // The restore carries the raw rows of the block `pos` reopened, and nothing else.
     const tail: c_int = @mod(pos, ratio);
@@ -9677,7 +9677,7 @@ fn attachQsaHistoryToLatestMode(cps: []SSMCheckpoint, live: []const SSMCacheEntr
         if (!ssmAuxIsQsaHistory(&src)) continue;
         const materialize = switch (mode) {
             .copy => true,
-            .share => qsaHandoffMustMaterialize(&src, keep),
+            .share => qsaHandoffMustMaterialize(&src, keep) or src.qsa_pooled_buf.ctx == null,
         };
         if (src.qsa_pooled.ctx != null) {
             if (dst.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(dst.qsa_pooled);
@@ -9756,7 +9756,10 @@ pub fn entriesHaveQsaHistory(entries: []const SSMCacheEntry) bool {
 /// onto `entries` already restored to `pos`. Slices aux to `pos` rows and
 /// pooled to `pos/ratio` blocks. No-op on PLE/GDN layers (they already
 /// hold the per-position window from `restoreSsmCheckpoint`).
-pub fn applyQsaHistoryAt(entries: []SSMCacheEntry, src_cp: *const SSMCheckpoint, pos: usize, s: mlx.mlx_stream) !void {
+/// `materialize` false = the destination holds a slice of `src_cp`'s bank (safe when the
+/// checkpoint outlives the slot's first append); true = an owned copy, required when the
+/// source is a transient such as the SSD tier's overlay.
+pub fn applyQsaHistoryAt(entries: []SSMCacheEntry, src_cp: *const SSMCheckpoint, pos: usize, s: mlx.mlx_stream, materialize: bool) !void {
     if (entries.len != src_cp.layers.len) return error.SsmCheckpointLayerMismatch;
     const keep: c_int = @intCast(pos);
     for (entries, src_cp.layers) |*dst, src| {
@@ -9777,9 +9780,13 @@ pub fn applyQsaHistoryAt(entries: []SSMCacheEntry, src_cp: *const SSMCheckpoint,
             const ps = mlx.getShape(src.qsa_pooled);
             const need_blocks = @divTrunc(keep, ratio);
             if (ps.len < 2 or ps[1] < need_blocks) return error.QsaHistoryGap;
-            dst.qsa_pooled = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_array_set(&dst.qsa_pooled, src.qsa_pooled));
-            try truncatePooled(&dst.qsa_pooled, keep, ratio, s, true);
+            if (materialize) {
+                dst.qsa_pooled = try materializedOwnedCopy(s, src.qsa_pooled);
+            } else {
+                dst.qsa_pooled = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_array_set(&dst.qsa_pooled, src.qsa_pooled));
+            }
+            try truncatePooled(&dst.qsa_pooled, keep, ratio, s, materialize);
         }
         const from_src = try qsaLeftoverAt(src.aux_state, src_hist, keep, ratio, s);
         if (from_src.ctx != null) {
@@ -33517,7 +33524,7 @@ test "QSA checkpoint aux+pooled bytes are O(rows + checkpoints)" {
     }};
     defer ssmFreeQsaState(&dest[0]);
     try restoreSsmCheckpoint(&dest, &cps[2]);
-    try applyQsaHistoryAt(&dest, &cps[positions.len - 1], 46, s);
+    try applyQsaHistoryAt(&dest, &cps[positions.len - 1], 46, s, false);
     // The leftover is the checkpoint's own raw rows 44 and 45, not the newest ring's overlap.
     try testing.expectEqual(@as(c_int, 2), mlx.getShape(dest[0].aux_state)[1]);
     {
@@ -33717,7 +33724,7 @@ test "attachQsaHistoryToLatest is one copy; applyQsaHistoryAt slices to pos" {
     }};
     defer ssmFreeQsaState(&dest_arr[0]);
     try restoreSsmCheckpoint(&dest_arr, &cps[0]);
-    try applyQsaHistoryAt(&dest_arr, &cps[1], 16, s);
+    try applyQsaHistoryAt(&dest_arr, &cps[1], 16, s, false);
     try testing.expect(dest_arr[0].aux_state.ctx == null);
     try testing.expectEqual(@as(c_int, 4), dest_arr[0].qsa_pooled_blocks);
 
@@ -33821,8 +33828,8 @@ test "handoffQsaHistoryToLatest materializes when the buffer's slack past the sn
 }
 
 test "applyQsaHistoryAt: a sliced restore is a VIEW of the entry's history; the trim's slice is a real copy" {
-    // Restore: the first append re-seeds a private buffer, so a materialized slice was a second
-    // transient copy. Trim: it drops the source next, so its slice must own its bytes.
+    // Restore: the slot appends into qsa_pooled_buf via seedCapBuf, so a view of the entry is not written through.
+    // Trim: the inherit slice must own its rows; a view would pin the donor's full bank.
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const n: c_int = 32;
@@ -33846,14 +33853,36 @@ test "applyQsaHistoryAt: a sliced restore is a VIEW of the entry's history; the 
     var dest = [_]SSMCacheEntry{.{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true }};
     defer ssmFreeQsaState(&dest[0]);
     try restoreSsmCheckpoint(&dest, &cps[0]);
-    try applyQsaHistoryAt(&dest, &cps[0], 16, s);
+    try applyQsaHistoryAt(&dest, &cps[0], 16, s, false);
     try testing.expectEqual(@as(c_int, 4), dest[0].qsa_pooled_blocks);
+    try mlx.check(mlx.mlx_array_eval(dest[0].qsa_pooled));
+    try mlx.check(mlx.mlx_array_eval(cps[0].layers[0].qsa_pooled));
+    const dest_ptr = mlx.mlx_array_data_float32(dest[0].qsa_pooled) orelse return error.TestUnexpectedResult;
+    const src_ptr = mlx.mlx_array_data_float32(cps[0].layers[0].qsa_pooled) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(src_ptr, dest_ptr);
+
+    var t: Transformer = undefined;
+    t.s = s;
+    t.allocator = testing.allocator;
+    var extra = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(extra);
+    try mlx.check(mlx.mlx_ones(&extra, &[_]c_int{ 1, 1, 8 }, 3, .float32, s));
+    try t.qsaAppendPooled(&dest[0], extra, dest[0].qsa_pooled_blocks);
+    try mlx.check(mlx.mlx_array_eval(dest[0].qsa_pooled));
+    try mlx.check(mlx.mlx_array_eval(cps[0].layers[0].qsa_pooled));
+    const after_ptr = mlx.mlx_array_data_float32(dest[0].qsa_pooled) orelse return error.TestUnexpectedResult;
+    const src_after = mlx.mlx_array_data_float32(cps[0].layers[0].qsa_pooled) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(src_ptr, src_after);
+    try testing.expect(after_ptr != src_ptr);
 
     var kept = [_]SSMCheckpoint{try captureSsmCheckpoint(testing.allocator, &live, 16, s)};
     defer kept[0].deinit(testing.allocator);
     try sliceQsaHistoryOntoCheckpoint(&kept[0], &cps[0], 16, s);
     try testing.expect(kept[0].layers[0].aux_state.ctx == null);
     try testing.expect(kept[0].layers[0].qsa_pooled.ctx != null);
+    try mlx.check(mlx.mlx_array_eval(kept[0].layers[0].qsa_pooled));
+    const trim_ptr = mlx.mlx_array_data_float32(kept[0].layers[0].qsa_pooled) orelse return error.TestUnexpectedResult;
+    try testing.expect(trim_ptr != src_ptr);
 }
 
 test "affineParamsFromGeometry: exact per-weight solve for off-config sidecar quants" {
@@ -48500,7 +48529,7 @@ test "ssm checkpoint carries the qwen4_exp aux state (key history, pooled keys, 
         ssmFreeQsaState(e);
     };
     try restoreSsmCheckpoint(&dst, cp);
-    try applyQsaHistoryAt(&dst, cp, 37, s);
+    try applyQsaHistoryAt(&dst, cp, 37, s, false);
     try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(dst[0].aux_state, cp.layers[0].aux_state, s));
     try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(dst[0].qsa_pooled, src_e[0].qsa_pooled, s));
     try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(dst[1].aux_state, src_e[1].aux_state, s));
