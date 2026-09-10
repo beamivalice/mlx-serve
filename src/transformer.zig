@@ -12122,6 +12122,8 @@ pub const Transformer = struct {
             "embed"
         else if (std.mem.eql(u8, config.model_type, "bailing_hybrid"))
             "word_embeddings"
+        else if (std.mem.eql(u8, config.model_type, "spark2_5"))
+            "embedding"
         else
             "embed_tokens";
         const emb_w = getNamedWeight(weights, &name_buf, prefix, emb_base, "weight") orelse {
@@ -14492,6 +14494,38 @@ pub const Transformer = struct {
         return self.spliceVisionEmbeddings(h, token_ids, ve, cfg.image_token_id, cfg.audio_token_id, cfg.video_token_id, ctx.vision_splice_offset);
     }
 
+    /// Sigmoid attention output gate read off the same post-input-norm hidden
+    /// the QKV projections read. muse: one gate per channel; spark2_5
+    /// (`attn_gate_headwise`): one gate per head, broadcast over head_dim.
+    /// Returns a new array.
+    fn attnOutGate(self: *const Transformer, normed: mlx.mlx_array, attn_flat: mlx.mlx_array, lw: *const LayerWeights) !mlx.mlx_array {
+        const g_raw = try self.qmatmul(normed, lw.ag_w.?, lw.ag_s, lw.ag_b);
+        defer _ = mlx.mlx_array_free(g_raw);
+        var g_sig = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(g_sig);
+        try mlx.check(mlx.mlx_sigmoid(&g_sig, g_raw, self.s));
+        var gated = mlx.mlx_array_new();
+        if (!self.config.attn_gate_headwise) {
+            try mlx.check(mlx.mlx_multiply(&gated, attn_flat, g_sig, self.s));
+            return gated;
+        }
+        const shape = mlx.getShape(attn_flat);
+        const heads: c_int = @intCast(self.config.num_attention_heads);
+        const per_head = [_]c_int{ shape[0], shape[1], heads, @divExact(shape[2], heads) };
+        const g_shape = [_]c_int{ shape[0], shape[1], heads, 1 };
+        var a4 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(a4);
+        try mlx.check(mlx.mlx_reshape(&a4, attn_flat, &per_head, 4, self.s));
+        var g4 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(g4);
+        try mlx.check(mlx.mlx_reshape(&g4, g_sig, &g_shape, 4, self.s));
+        var gated4 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(gated4);
+        try mlx.check(mlx.mlx_multiply(&gated4, a4, g4, self.s));
+        try mlx.check(mlx.mlx_reshape(&gated, gated4, shape.ptr, 3, self.s));
+        return gated;
+    }
+
     // ── Activation functions ──
 
     /// GELU approximate: dispatches to compiled (fused kernel) when available.
@@ -14550,9 +14584,31 @@ pub const Transformer = struct {
     inline fn mlpActivation(self: *const Transformer, x: mlx.mlx_array) !mlx.mlx_array {
         return switch (self.config.hidden_act) {
             .gelu_approx => self.gelu(x),
+            .gelu => self.geluErf(x),
             .silu => self.silu(x),
             .relu_sq => self.reluSquared(x),
         };
+    }
+
+    /// Exact GELU: 0.5 * x * (1 + erf(x / sqrt(2))), in the activation dtype.
+    fn geluErf(self: *const Transformer, x: mlx.mlx_array) !mlx.mlx_array {
+        const inv_sqrt2 = try scalarOf(0.70710678118654752, mlx.mlx_array_dtype(x), self.s);
+        defer _ = mlx.mlx_array_free(inv_sqrt2);
+        var scaled = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(scaled);
+        try mlx.check(mlx.mlx_multiply(&scaled, x, inv_sqrt2, self.s));
+        var erf = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(erf);
+        try mlx.check(mlx.mlx_erf(&erf, scaled, self.s));
+        var one_plus = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(one_plus);
+        try mlx.check(mlx.mlx_add(&one_plus, self.one, erf, self.s));
+        var x_times = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x_times);
+        try mlx.check(mlx.mlx_multiply(&x_times, x, one_plus, self.s));
+        var result = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_multiply(&result, x_times, self.half, self.s));
+        return result;
     }
 
     fn reluSquared(self: *const Transformer, x: mlx.mlx_array) !mlx.mlx_array {
@@ -15892,19 +15948,10 @@ pub const Transformer = struct {
             defer _ = mlx.mlx_array_free(attn_flat);
             try mlx.check(mlx.mlx_reshape(&attn_flat, attn_t, cur_out_shape, 3, self.s));
 
-            // MuseGlimmer: elementwise sigmoid output gate from the SAME
-            // post-input-norm hidden the QKV projections read.
-            var attn_gated = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(attn_gated);
-            const o_in = if (lw.ag_w) |agw| blk: {
-                const g_raw = try self.qmatmul(normed, agw, lw.ag_s, lw.ag_b);
-                defer _ = mlx.mlx_array_free(g_raw);
-                var g_sig = mlx.mlx_array_new();
-                defer _ = mlx.mlx_array_free(g_sig);
-                try mlx.check(mlx.mlx_sigmoid(&g_sig, g_raw, self.s));
-                try mlx.check(mlx.mlx_multiply(&attn_gated, attn_flat, g_sig, self.s));
-                break :blk attn_gated;
-            } else attn_flat;
+            const o_in = if (lw.ag_w != null) try self.attnOutGate(normed, attn_flat, lw) else attn_flat;
+            defer if (lw.ag_w != null) {
+                _ = mlx.mlx_array_free(o_in);
+            };
 
             const o_out = try self.qmatmul(o_in, lw.o_w, lw.o_s, lw.o_b);
             defer _ = mlx.mlx_array_free(o_out);
@@ -16295,18 +16342,10 @@ pub const Transformer = struct {
             defer _ = mlx.mlx_array_free(attn_flat);
             try mlx.check(mlx.mlx_reshape(&attn_flat, attn_t, &cur_out_shape, 3, self.s));
 
-            // MuseGlimmer sigmoid output gate — mirrors forwardStandard.
-            var attn_gated = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(attn_gated);
-            const o_in = if (lw.ag_w) |agw| blk: {
-                const g_raw = try self.qmatmul(normed, agw, lw.ag_s, lw.ag_b);
-                defer _ = mlx.mlx_array_free(g_raw);
-                var g_sig = mlx.mlx_array_new();
-                defer _ = mlx.mlx_array_free(g_sig);
-                try mlx.check(mlx.mlx_sigmoid(&g_sig, g_raw, self.s));
-                try mlx.check(mlx.mlx_multiply(&attn_gated, attn_flat, g_sig, self.s));
-                break :blk attn_gated;
-            } else attn_flat;
+            const o_in = if (lw.ag_w != null) try self.attnOutGate(normed, attn_flat, lw) else attn_flat;
+            defer if (lw.ag_w != null) {
+                _ = mlx.mlx_array_free(o_in);
+            };
 
             const o_out = try self.qmatmul(o_in, lw.o_w, lw.o_s, lw.o_b);
             defer _ = mlx.mlx_array_free(o_out);
@@ -24368,12 +24407,37 @@ fn initStandardLayers(allocator: std.mem.Allocator, config: ModelConfig, weights
             lw.k_norm = null;
         }
 
-        lw.q_w = try getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.weight");
-        lw.q_s = try getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.q_proj.scales", config.quant_bits);
-        lw.q_b = try getLayerBias(weights, name_buf, prefix, li, "self_attn.q_proj.biases", &config);
         // Additive q-proj bias (Qwen2). Optional — empty for archs without it.
         lw.q_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.q_proj.bias") orelse mlx.mlx_array_new();
-        if (kv_shared) {
+        if (config.attn_fused_qkv) {
+            // Spark-X2.5 ships one [q | k | v] projection; slice it into the
+            // three dense fields the forward reads (row slices, materialized).
+            const q_rows = config.num_attention_heads * config.head_dim;
+            const kv_rows = config.num_key_value_heads * config.head_dim;
+            const fw = try getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_k_v_proj.weight");
+            const fs = try getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.q_k_v_proj.scales", config.quant_bits);
+            const fb = try getLayerBias(weights, name_buf, prefix, li, "self_attn.q_k_v_proj.biases", &config);
+            const w3 = try splitFusedQkvRows(fw, q_rows, kv_rows, fs.ctx == null, &owned_bf16, allocator, s);
+            const s3 = try splitFusedQkvRows(fs, q_rows, kv_rows, false, &owned_bf16, allocator, s);
+            const b3 = try splitFusedQkvRows(fb, q_rows, kv_rows, false, &owned_bf16, allocator, s);
+            lw.q_w = w3[0];
+            lw.q_s = s3[0];
+            lw.q_b = b3[0];
+            lw.k_eq_v = false;
+            lw.k_w = w3[1];
+            lw.k_s = s3[1];
+            lw.k_b = b3[1];
+            lw.k_bias = mlx.mlx_array_new();
+            lw.v_w = w3[2];
+            lw.v_s = s3[2];
+            lw.v_b = b3[2];
+            lw.v_bias = mlx.mlx_array_new();
+        } else {
+            lw.q_w = try getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.weight");
+            lw.q_s = try getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.q_proj.scales", config.quant_bits);
+            lw.q_b = try getLayerBias(weights, name_buf, prefix, li, "self_attn.q_proj.biases", &config);
+        }
+        if (config.attn_fused_qkv) {} else if (kv_shared) {
             // No own K/V — the forward reads kv_source's cache. Leave empty.
             lw.k_eq_v = false;
             lw.k_w = mlx.mlx_array_new();
@@ -24404,16 +24468,20 @@ fn initStandardLayers(allocator: std.mem.Allocator, config: ModelConfig, weights
                 lw.v_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.v_proj.bias") orelse mlx.mlx_array_new();
             }
         }
-        lw.o_w = try getLayerWeight(weights, name_buf, prefix, li, "self_attn.o_proj.weight");
-        lw.o_s = try getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.o_proj.scales", config.quant_bits);
-        lw.o_b = try getLayerBias(weights, name_buf, prefix, li, "self_attn.o_proj.biases", &config);
+        var sfx: [64]u8 = undefined;
+        const o_name = if (config.attn_fused_qkv) "self_attn.out_proj" else "self_attn.o_proj";
+        lw.o_w = try getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&sfx, o_name, "weight"));
+        lw.o_s = try getLayerScaleOrEmpty(weights, name_buf, prefix, li, moeExpertSuffix(&sfx, o_name, "scales"), config.quant_bits);
+        lw.o_b = try getLayerBias(weights, name_buf, prefix, li, moeExpertSuffix(&sfx, o_name, "biases"), &config);
 
-        // MuseGlimmer sigmoid attention output gate. `layers` comes from a raw
-        // alloc, so the struct-default nulls never apply — set every field.
+        // Sigmoid attention output gate (muse: elementwise `gate_proj`;
+        // spark2_5: per-head `g_proj`). `layers` comes from a raw alloc, so
+        // the struct-default nulls never apply — set every field.
         if (config.attn_sigmoid_gate) {
-            lw.ag_w = try getLayerWeight(weights, name_buf, prefix, li, "self_attn.gate_proj.weight");
-            lw.ag_s = try getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.gate_proj.scales", config.quant_bits);
-            lw.ag_b = try getLayerBias(weights, name_buf, prefix, li, "self_attn.gate_proj.biases", &config);
+            const g_name = if (config.attn_gate_headwise) "self_attn.g_proj" else "self_attn.gate_proj";
+            lw.ag_w = try getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&sfx, g_name, "weight"));
+            lw.ag_s = try getLayerScaleOrEmpty(weights, name_buf, prefix, li, moeExpertSuffix(&sfx, g_name, "scales"), config.quant_bits);
+            lw.ag_b = try getLayerBias(weights, name_buf, prefix, li, moeExpertSuffix(&sfx, g_name, "biases"), &config);
         } else {
             lw.ag_w = null;
             lw.ag_s = mlx.mlx_array_new();
@@ -24432,12 +24500,14 @@ fn initStandardLayers(allocator: std.mem.Allocator, config: ModelConfig, weights
 
         // Dense bf16: pre-transpose [out,in]→[in,out] so qmatmulBits dispatches to
         // a plain matmul. No-ops on quantized weights (scales non-null).
-        try maybeTransposeForBf16(&lw.q_w, lw.q_s, &owned_bf16, allocator, s);
-        try maybeTransposeForBf16(&lw.k_w, lw.k_s, &owned_bf16, allocator, s);
-        if (lw.k_eq_v) {
-            lw.v_w = lw.k_w; // re-alias V to the transposed K (no second copy)
-        } else {
-            try maybeTransposeForBf16(&lw.v_w, lw.v_s, &owned_bf16, allocator, s);
+        if (!config.attn_fused_qkv) {
+            try maybeTransposeForBf16(&lw.q_w, lw.q_s, &owned_bf16, allocator, s);
+            try maybeTransposeForBf16(&lw.k_w, lw.k_s, &owned_bf16, allocator, s);
+            if (lw.k_eq_v) {
+                lw.v_w = lw.k_w; // re-alias V to the transposed K (no second copy)
+            } else {
+                try maybeTransposeForBf16(&lw.v_w, lw.v_s, &owned_bf16, allocator, s);
+            }
         }
         try maybeTransposeForBf16(&lw.o_w, lw.o_s, &owned_bf16, allocator, s);
         if (lw.ag_w != null) {
@@ -31480,6 +31550,36 @@ fn getLayerScaleOrEmpty(weights: *const Weights, buf: *[256]u8, prefix: []const 
 ///   tensors ship no biases, but mixed QAT checkpoints override some layers
 ///   to affine (e.g. shared MLP at 8-bit/gs64) and those overrides DO carry
 ///   biases that the affine matmul needs.
+/// Row-slice a fused [q | k | v] tensor (weight, scales or biases — all are
+/// [rows, ...]) into three materialized arrays owned by `owned`. A dense
+/// weight (`transpose`) is stored pre-transposed like every other bf16
+/// projection, so the caller must not run maybeTransposeForBf16 on it. An
+/// empty (null-ctx) input yields three empty arrays.
+fn splitFusedQkvRows(arr: mlx.mlx_array, q_rows: u32, kv_rows: u32, transpose: bool, owned: *std.ArrayList(mlx.mlx_array), allocator: std.mem.Allocator, s: mlx.mlx_stream) ![3]mlx.mlx_array {
+    if (arr.ctx == null) return .{ mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new() };
+    const shape = mlx.getShape(arr);
+    if (shape.len != 2 or shape[0] != @as(c_int, @intCast(q_rows + 2 * kv_rows))) return error.BadFusedQkvShape;
+    const bounds = [_]c_int{ 0, @intCast(q_rows), @intCast(q_rows + kv_rows), shape[0] };
+    var out: [3]mlx.mlx_array = undefined;
+    for (0..3) |i| {
+        const start = [_]c_int{ bounds[i], 0 };
+        const stop = [_]c_int{ bounds[i + 1], shape[1] };
+        const strides = [_]c_int{ 1, 1 };
+        var view = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(view);
+        try mlx.check(mlx.mlx_slice(&view, arr, &start, 2, &stop, 2, &strides, 2, s));
+        var part = mlx.mlx_array_new();
+        if (transpose) {
+            part = try transposeBf16Weight(view, s);
+        } else {
+            try mlx.check(mlx.mlx_contiguous(&part, view, false, s));
+        }
+        try owned.append(allocator, part);
+        out[i] = part;
+    }
+    return out;
+}
+
 fn getLayerBias(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, suffix: []const u8, config: *const ModelConfig) error{MissingWeight}!mlx.mlx_array {
     if (config.quant_bits == 0) return mlx.mlx_array_new();
     if (config.quant_mode.hasBiases()) return try getLayerWeight(weights, buf, prefix, layer, suffix);

@@ -3,6 +3,7 @@
 ## v26.9.3 — dev unreleased
 
 ## Highlights
+- **Spark-X2.5 (XHToken, 1.7B and 4B) is served natively.** `mlx-serve pull spark` fetches the 4B MLX pack; thinking, tool calls and 1M-token context all ride the model's own template.
 - **Flash Next decodes faster at long context: picking the sparse-attention blocks no longer walks the whole row on one GPU threadgroup.** The exact top-k block select now splits each row across 16 threadgroups and merges their candidates, identical ids, 0.72 → 0.26 ms per layer at 860k tokens of context, paid on every decode tick and every speculative draft step. `MLX_SERVE_QSA_SELECT_SPLIT=0` restores the single-threadgroup kernel.
 - **Flash Next sparse-attention prefill runs on the M5 neural accelerators.** The block-gathered attention now uses a NAX cooperative-tensor kernel on M5-class GPUs with macOS 26.3+, contributed by Nikolai V., with a two-term bf16 softmax that matches the stock kernel's precision; long-prompt prefill is about 12% faster at 160k tokens. `MLX_SERVE_QSA_NAX=0` restores the previous gather.
 - **Flash Next prefill scores its sparse-attention blocks in one kernel.** The indexer's score sheet is now produced by a single NAX kernel that reads the bf16 key bank directly, bit-identical to the old four-op chain, and the 1.5 KB-per-token f32 score bank it kept resident (1.6 GB at 1M tokens, rebuilt on every cache restore) is gone. The block-scoring chain runs about 2x faster per prefill chunk, a saving that grows with context length. `MLX_SERVE_QSA_SCORE_FUSED=0` restores the old chain.

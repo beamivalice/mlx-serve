@@ -1712,3 +1712,28 @@ NAME at load (`InvalidQwen4NgramSize/Heads/Vocab/Indexer/PleLayer/ConfigField`,
 reaching the client as `Model load failed: <name>`), `NgramTable.parse`
 checks every header field and proves every region sits inside the mapping,
 and a PLE the layer loop never installed is a load error.
+
+## Spark-X2.5 (`spark2_5`) port (2026-09-09)
+
+XHToken's 1.7B/4B dense models load from the community MLX packs
+(`abenzerps/Spark-X2.5-4B-MLX-{4,8}bit`, mlx-lm layout, same weight names as
+the HF checkpoint) on the standard dense forward. What the arch adds over
+gemma3/muse: exact-erf GELU (`HiddenAct.gelu`, not the tanh approximation the
+compiled GeGLU runs), a fused `q_k_v_proj` row-sliced into q/k/v at load
+(`splitFusedQkvRows`, materialized; dense packs are transposed inside the
+split so the generic transpose pass skips them), an `out_proj` spelling, and
+a PER-HEAD sigmoid output gate (`g_proj` is `[heads, hidden]`, broadcast over
+head_dim in `attnOutGate` — muse's gate is per channel and the same helper
+serves both). Per-type RoPE (sliding: full rotary at 1e4; full: 25% rotary at
+5e6) and the 3:1 sliding(512)/full ladder were already generic
+(`layer_types` + `rope_parameters.{full,sliding}_attention`).
+
+Tokenizer trap: the pre_tokenizer is DeepSeek's (`\p{N}{1,3}` first) but a
+later `Digits(individual_digits)` rule re-splits every group, so the
+checkpoint is per-digit. `digitGroupFromPreTokenizer` used to stop at the
+first `{1,3}` and would have served 3-digit groups. Cross-checked against
+HF `tokenizers` on code, numbers, CJK and contractions: byte-identical ids.
+
+Bar: greedy 8-bit answers (thinking split, GLM `<arg_key>` tool calls,
+tool-response turn, 2.8k-token needle past the 512 window) and the HF
+reference oracle on the bf16 checkpoint (`~/claude-tmp/sparkx/oracle.py`).
