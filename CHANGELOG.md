@@ -27,6 +27,10 @@
 
 - An MLX error while writing the KV cache now fails only the request that hit it, instead of crashing the server when that cache is next reset or freed.
 
+### Fixes
+
+- Qwen3-Embedding no longer returns wrong vectors, or crashes the server on its next embeddings request, when a large embeddings request is split into batches. The later batches were embedded against the earlier ones' cached keys.
+
 ## v26.9.2 — Per-model settings, chat providers, faster Flash Next
 
 ### Highlights
