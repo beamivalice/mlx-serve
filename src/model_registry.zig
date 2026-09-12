@@ -26,6 +26,7 @@ const drafter_mod = @import("drafter.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
 const token_mask_mod = @import("token_mask.zig");
+const rp_mod = @import("reasoning_protocol.zig");
 const model_discovery = @import("model_discovery.zig");
 const io_util = @import("io_util.zig");
 const arch_ds4 = if (@import("build_options").ios) @import("arch/ds4_stub.zig") else @import("arch/ds4.zig");
@@ -87,6 +88,58 @@ pub const LoadState = enum {
 /// (weights/transformer/vision_encoder/drafter) are optional so a stub
 /// entry can exist for `unloaded`/`error_state`/`loading` without faking
 /// half-built mlx state.
+/// Immutable tokenizer-dependent data, owned by the loaded model. A marker
+/// has one lifetime even when different rendered prompts select it.
+pub const ReasoningMarker = struct {
+    arena: std.heap.ArenaAllocator,
+    text: []const u8,
+    atomic: ?u32,
+    open_candidates: []const u32,
+    close_candidates: []const u32,
+    suffix: []const rp_mod.SuffixRun,
+    tokens: []const u32,
+
+    fn init(gpa: std.mem.Allocator, tok: *const Tokenizer, tb: *const token_mask_mod.TokenBytes, marker: []const u8) !ReasoningMarker {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        var open: std.ArrayList(u32) = .empty;
+        var close: std.ArrayList(u32) = .empty;
+        for (tb.bytes, 0..) |maybe, id| {
+            const bytes = maybe orelse continue;
+            if (tb.eos_id != null and id == tb.eos_id.?) continue;
+            if (rp_mod.openerCandidateBytesMatch(marker, bytes)) try open.append(a, @intCast(id));
+            if (std.mem.indexOf(u8, bytes, marker) != null) try close.append(a, @intCast(id));
+        }
+        const suffixes = try a.alloc(rp_mod.SuffixRun, marker.len);
+        @memset(suffixes, .{ .offset = 0, .len = 0 });
+        var tokens: std.ArrayList(u32) = .empty;
+        for (0..marker.len) |k| {
+            const ids = try tok.encode(gpa, marker[k..]);
+            defer gpa.free(ids);
+            if (ids.len == 0 or ids.len > rp_mod.MAX_FORCED_TOKENS) continue;
+            const decoded = try tok.decode(gpa, ids, false);
+            defer gpa.free(decoded);
+            if (!std.mem.eql(u8, decoded, marker[k..])) continue;
+            suffixes[k] = .{ .offset = @intCast(tokens.items.len), .len = @intCast(ids.len) };
+            try tokens.appendSlice(a, ids);
+        }
+        const owned_text = try a.dupe(u8, marker);
+        const open_ids = try open.toOwnedSlice(a);
+        const close_ids = try close.toOwnedSlice(a);
+        const owned_tokens = try tokens.toOwnedSlice(a);
+        return .{
+            .arena = arena,
+            .text = owned_text,
+            .atomic = tok.specialTokenId(marker),
+            .open_candidates = open_ids,
+            .close_candidates = close_ids,
+            .suffix = suffixes,
+            .tokens = owned_tokens,
+        };
+    }
+};
+
 pub const LoadedModel = struct {
     allocator: std.mem.Allocator,
 
@@ -166,6 +219,10 @@ pub const LoadedModel = struct {
     /// lock that serializes its lazy build. See `grammarTokenBytes`.
     token_bytes: ?token_mask_mod.TokenBytes = null,
     token_bytes_mutex: std.Io.Mutex = .init,
+
+    /// Stable marker indexes and exact recovery encodings, built lazily under
+    /// the token-byte lock and retained until model teardown.
+    reasoning_markers: std.ArrayList(*ReasoningMarker) = .empty,
 
     /// Embedded ds4 engine (DeepSeek-V4-Flash via GGUF). When non-null,
     /// `transformer` / `weights` / `tokenizer` / `chat_config` stay null and
@@ -271,11 +328,34 @@ pub const LoadedModel = struct {
     ) !*const token_mask_mod.TokenBytes {
         self.token_bytes_mutex.lockUncancelable(io);
         defer self.token_bytes_mutex.unlock(io);
+        return self.tokenBytesLocked(gpa);
+    }
+
+    fn tokenBytesLocked(self: *LoadedModel, gpa: std.mem.Allocator) !*const token_mask_mod.TokenBytes {
         if (self.token_bytes) |*tb| return tb;
         const tok = self.tokenizer orelse return error.NoTokenizer;
         log.info("[grammar] building token-byte table for {s} (one-time, ~50ms)\n", .{self.id});
         self.token_bytes = try token_mask_mod.build(gpa, tok);
         return &self.token_bytes.?;
+    }
+
+    /// Intern tokenizer-dependent marker data without invalidating references
+    /// held by other requests. All entries share the loaded model's lifetime.
+    pub fn reasoningMarker(self: *LoadedModel, gpa: std.mem.Allocator, io: std.Io, text: []const u8) !*const ReasoningMarker {
+        if (text.len == 0 or text.len > rp_mod.MAX_MARKER_BYTES) return error.UnsupportedReasoningMarker;
+        self.token_bytes_mutex.lockUncancelable(io);
+        defer self.token_bytes_mutex.unlock(io);
+        for (self.reasoning_markers.items) |marker| {
+            if (std.mem.eql(u8, marker.text, text)) return marker;
+        }
+        const tok = self.tokenizer orelse return error.NoTokenizer;
+        const tb = try self.tokenBytesLocked(gpa);
+        const marker = try self.allocator.create(ReasoningMarker);
+        errdefer self.allocator.destroy(marker);
+        marker.* = try ReasoningMarker.init(self.allocator, tok, tb, text);
+        errdefer marker.arena.deinit();
+        try self.reasoning_markers.append(self.allocator, marker);
+        return marker;
     }
 
     /// Free all owned state. Safe to call regardless of `state` — null
@@ -358,6 +438,11 @@ pub const LoadedModel = struct {
             tb.deinit();
             self.token_bytes = null;
         }
+        for (self.reasoning_markers.items) |marker| {
+            marker.arena.deinit();
+            self.allocator.destroy(marker);
+        }
+        self.reasoning_markers.deinit(self.allocator);
         if (self.tokenizer) |tok| {
             tok.deinit();
             self.allocator.destroy(tok);

@@ -36,6 +36,7 @@ const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
+const rp_mod = @import("reasoning_protocol.zig");
 const gen_mod = @import("gen.zig");
 const drafter_mod = @import("drafter.zig");
 const mtp_mod = @import("mtp.zig");
@@ -523,6 +524,12 @@ pub const Slot = struct {
     /// here so the client cannot round-trip the loop into the next prompt.
     loop_trim_start: ?usize,
     cancelled: std.atomic.Value(bool),
+    /// Reasoning-protocol payload boundary, published by the inference thread
+    /// BEFORE the token that carries it is pushed (single-writer atomics, so
+    /// the conn thread reading token i already sees its span). `token_index`
+    /// is the index into the generated stream; `maxInt(u32)` = not started.
+    constraint_payload_at: std.atomic.Value(u32),
+    constraint_payload_offset: std.atomic.Value(u32),
 
     // ── Stats (filled by inference thread, safe to read after finish). ──
     prompt_tokens: u32,
@@ -701,6 +708,8 @@ pub const Slot = struct {
             .finish_details = null,
             .loop_trim_start = null,
             .cancelled = std.atomic.Value(bool).init(false),
+            .constraint_payload_at = std.atomic.Value(u32).init(std.math.maxInt(u32)),
+            .constraint_payload_offset = std.atomic.Value(u32).init(0),
             .prompt_tokens = 0,
             .completion_tokens = 0,
             .prefill_tps = 0.0,
@@ -782,6 +791,23 @@ pub const Slot = struct {
         self.logprobs_buf.deinit(self.allocator);
         self.out_buf.deinit(self.allocator);
         self.allocator.destroy(self);
+    }
+
+    /// Inference thread: record the reasoning→payload boundary so it is
+    /// visible to the conn thread no later than the token that carries it.
+    fn publishConstraintSpan(self: *Slot, token_index: u32, byte_offset: u32) void {
+        self.constraint_payload_offset.store(byte_offset, .release);
+        self.constraint_payload_at.store(token_index, .release);
+    }
+
+    /// Connection thread: where the constrained payload begins relative to
+    /// the generated stream, or null while it has not begun. `token_index`
+    /// matches the reader's own token count (token i carries the payload
+    /// start when the returned index equals i).
+    pub fn constraintPayloadStart(self: *const Slot) ?rp_mod.ConstraintSpan {
+        const at = self.constraint_payload_at.load(.acquire);
+        if (at == std.math.maxInt(u32)) return null;
+        return .{ .token_index = at, .byte_offset = self.constraint_payload_offset.load(.acquire) };
     }
 
     /// Inference thread: enqueue a generated token for the consumer.
@@ -6651,19 +6677,21 @@ fn loopGuardTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
     // covers the regular, PLD, and drafter paths uniformly.
     const loop_guard_start = gen.loopGuardStart();
     if (loopStopDecision(gen.generated_ids.items[loop_guard_start..])) |relative_stop| {
-        if (gen.canForceDeferredConstraintBoundary()) {
-            const boundary = try gen.forceDeferredConstraintBoundary(slot.allocator) orelse {
-                // The hard completion cap won the race with recovery. Preserve
-                // ordinary truncation rather than treating this as an error.
-                finishSlot(sch, slot, "length");
-                return true;
-            };
-            slot.pushToken(boundary);
-            slot.completion_tokens += 1;
-            std.debug.assert(slot.completion_tokens == gen.completion_tokens);
-            if (boundary != 0) slot.was_pad_only = false;
-            log.warn("[grammar] reasoning boundary forced after repetition loop at {d} generated tokens\n", .{gen.generated_ids.items.len - 1});
-            return true;
+        if (gen.hasPrePayloadConstraint()) {
+            switch (try gen.forceConstraintTransition(slot.allocator)) {
+                .committed => |boundary| {
+                    slot.pushToken(boundary);
+                    slot.completion_tokens += 1;
+                    std.debug.assert(slot.completion_tokens == gen.completion_tokens);
+                    if (boundary != 0) slot.was_pad_only = false;
+                    log.warn("[grammar] reasoning boundary forced after repetition loop at {d} generated tokens\n", .{gen.generated_ids.items.len - 1});
+                    return true;
+                },
+                .activated => return true,
+                // The completion cap won the race with recovery: fall through
+                // to the ordinary loop-stop cut.
+                .refused => {},
+            }
         }
         var stop = relative_stop;
         stop.trim_start += loop_guard_start;
@@ -6685,8 +6713,14 @@ fn loopGuardTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
 
 fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
     var inner_err: ?anyerror = null;
-    runSingleDecodeTickInner(sch, slot) catch |e| {
-        inner_err = e;
+    runSingleDecodeTickInner(sch, slot) catch |e| switch (e) {
+        // A reasoning-protocol dead end is this request's failure; the tick
+        // error path would fail every active slot.
+        error.NoValidProtocolToken, error.InvalidProtocolTransition, error.InvalidProtocolPayload => {
+            log.err("[grammar] reasoning protocol failed ({s}); failing this request only\n", .{@errorName(e)});
+            slot.markError(@errorName(e));
+        },
+        else => inner_err = e,
     };
     mlx.checkErrorDecode() catch |mlx_err| {
         log.err("[scheduler] decode aborted: MLX failure mid-generation ({s}) — failing this request, the server keeps serving\n", .{@errorName(mlx_err)});
@@ -6807,6 +6841,12 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
             lp_take = lp;
             gen.last_logprob = null;
         }
+    }
+    // Publish the reasoning→payload boundary (if this is the token that
+    // carries it) BEFORE the token itself, so a streaming reader handed token
+    // i already sees its span.
+    if (gen.takeConstraintSpan()) |span| {
+        slot.publishConstraintSpan(span.token_index, span.byte_offset);
     }
     slot.pushTokenWithLogprob(t, lp_take);
     if (t != 0) slot.was_pad_only = false;

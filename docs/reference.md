@@ -506,6 +506,14 @@ Moved verbatim from CLAUDE.md on 2026-09-02 (size cap). Stories: `docs/gotchas/e
 - **The ANE program is a procedure BANK (runtime caps ~121 handles)**: symbol indices READ from `procedureInfoForProcedureIndex:` on the `_ANEModel` behind `-model` (NOT `inputSymbolIndicesForProcedureIndex:`, which answers 0 and fails every procedure >0 as a swallowed slowdown; `eval_failures` is the tell). Cap `MLX_SERVE_ANE_BANK_MAX_BYTES` 2 GiB, halves down a ladder; never a coverage decision.
 - **The ANE split's optimum is per SILICON** (`ane.defaultShare`; M4 channel 0.45 → 311/304, 0.50 regresses; M3 Ultra 0.45 ≈ nothing, 0.35 +8.5%/+13.7%). A share change needs its own A/B, never interpolation. fp16 down-conv wears the (1/16..x16) pow2 wrap.
 
+
+## Reasoning with constrained JSON
+
+`src/reasoning_protocol.zig` owns format descriptions, incremental recognition,
+pre-sample boundary validation, recovery planning, and shared HTTP delivery.
+`model_registry.zig` caches immutable tokenizer indexes; `generate.zig` owns
+sampling and the hard token cap. See [reasoning-protocols.md](reasoning-protocols.md)
+for supported spellings, fallback behavior, and the deterministic/live matrix.
 ### Media offload share (2026-09-10)
 
 The LM prefill share is a per-silicon table because the seam races a live decode; a denoise step is a batch job, and its optimum is per **(chip, workload)**. Balance point `s* = A / (A + G)`: A = the ANE's rate on our int8/fp16 MLP program (11.8 TFLOPS, the same 16-core engine on every M1–M4), G = the GPU's rate at this model's MLP shape, which `ane.probeGpuTflops` times with one quantized matmul at a fixed `MEDIA_PROBE_ROWS` (4096). That solve is only the SEED: `ane.calibrate` compiles block 0 alone at it, runs MEDIA_PROBE_ROWS worth of its ANE tiles on a helper thread while the GPU evaluates its complement over the same rows (fed the dtype the MLP really sees: ACE and Krea stream f32), and `calibratedShare` balances the two timings on a 0.01 grid. It costs 0.3-0.7 s once per model. `solveShare` clamps to [0.25, 0.85]; `channelSliceWidthUnits` floors to `CHANNEL_ALIGN`. The plateau near the peak is ~6% wide (M4 base), so landing near is enough. Unknown silicon (M5+, unreadable brand) keeps 0.45. `--ane-split` / `MLX_SERVE_ANE_SPLIT` always wins. Calibration runs ONCE per model: every later build reuses the share of its most recently used compiled set (`ane.cachedShare`, the entry's `calibrated share=X` lineage tag; an explicit share or an uncalibrated seed tags plain `share=X` and is never reused; a build-time cache hit re-tags the entry). A re-solve per build recompiled + pruned the whole set on every request size and on probe jitter.

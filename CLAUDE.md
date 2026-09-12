@@ -28,6 +28,7 @@ Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds)
 | `tokenizer.zig` | BPE; single special-token splitter (first-byte-bucketed); per-model `digit_group` |
 | `transformer.zig` | Forward pass, arch dispatch (attention/MLP/MoE/GatedDeltaNet), quant resolution, custom kernels (`msv_attn_p256`, `verifyQmm` lanes incl. NAX) |
 | `generate.zig` | Generation, sampling, PLD/drafter/MTP orchestration, `StallClock`, prefill chunking, loop-stop tiers |
+| `reasoning_protocol.zig` | Bounded reasoning/header masks, recovery, and authoritative JSON response routing (see `docs/reasoning-protocols.md`) |
 | `chat.zig` | Chat templates (ChatML/Gemma/Llama-3/Jinja2), thinking tags, tool-call parsing/repair/coercion |
 | `vision.zig` / `qwen_vision.zig` + `mrope.zig` | Gemma SigLIP / Qwen3-VL ViT + M-RoPE |
 | `muse_vision.zig` / `lfm2_vision.zig` | Muse-Glimmer ViT / LFM2-VL SigLIP2-NaFlex tower + projector + tiling |
@@ -224,6 +225,7 @@ With `tools`, tokens buffer for detection (all tag families + raw JSON); thinkin
 
 ### Server, HTTP, lifecycle (→ docs/gotchas/server-http.md)
 
+- **A constrained JSON payload offset is AUTHORITATIVE** (`reasoning_protocol.Delivery`, all three surfaces, stream + non-stream): the generator publishes where the schema payload begins and nothing after it is re-parsed, so a marker string inside JSON data stays data; markup cleanup never runs on it, and the routing buffers outlive serialization (Anthropic's thinking block). Guard: `tests/test_json_schema_protocol_routing.py`.
 - **`messages.deinit(allocator)` frees the Message array and NOTHING it points at**: request media is owned by ONE `server.RequestMedia` beside the `messages` list; `Message` BORROWS the slice; a media list is only obtainable from `openImages`/`openVideos`/`openAudio`; slots are INDICES. Guards: source scan + a `std.testing.allocator` test on `RequestMedia`.
 - **Select active-turn media from WIRE METADATA before decoding it**: a stateless client resends every historical data URL every turn, only the active media message is encoded. `activeWireMediaIndex` mirrors the parsed-message assistant/tool boundary on both chat surfaces. Guard: `tests/test_vision_prefix_cache.sh`.
 - **A `seed` binds EVERY sampler with a fresh key PER DRAW** (`generate.seedKey` + `SamplingParams.draw`; `Generator.sampleLazy` is the one lazy sampler): the lazy path used MLX's global RNG (seed worked only with `logprobs`, replaying ONE key every step).
