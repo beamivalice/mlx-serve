@@ -48,6 +48,7 @@
 
 ### Fixes
 
+- Schema-constrained answers can no longer stall on whitespace: the JSON grammar caps free whitespace per run, so a request that used to end as `length` with empty content now produces the JSON.
 - Claude Code no longer loses its SessionStart hook output, `CLAUDE.md` or any other context a client puts in a `system` message inside `messages` on `/v1/messages`. It was discarded without a warning, so the reply looked plausible on a third less prompt. (#365, thanks @nikolai-vysotskyi)
 - A `developer` message is read as the system turn instead of being dropped for an unknown role.
 - Mage-Flow Edit loads again. It had been refused for a missing vision tower, which the loader was dropping before the backend saw it.

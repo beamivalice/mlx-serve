@@ -2099,3 +2099,18 @@ than the first) the request answered 200 with wrong vectors; otherwise it failed
 `computeEmbeddingsBatch`, before every sub-batch. Guard: `tests/test_embeddings.sh` [4c] (the
 later of two equal sub-batches matches the same inputs sent alone, a second sub-batch with more
 rows answers 200, the server still answers afterwards).
+
+
+## A grammar-masked model idled on whitespace until the loop guard cut it (2026-09-12)
+
+Qwen3.8-27B, thinking on, a schema whose enum value spells reasoning markers: on a
+hot-cache hit greedy diverged a little from the cold run and, once the JSON grammar
+was armed, the model's real argmax was off-schema. The only admitted token it liked
+was `\n`, the grammar accepted free whitespace without bound, and thirty of them
+tripped the exact-cycle loop guard: `finish_reason "length"`, empty content, valid
+JSON never produced. Cold requests were fine, and main and PR #407 behaved the same.
+
+Fix: `json_grammar` counts consecutive free-whitespace bytes (`ws_run`, carried by
+snapshots) and rejects past `MAX_FREE_WS` (16) between tokens and after the root, so
+the mask forces the next structural byte. Content is never constrained by it, only
+formatting. Guard: `free whitespace is capped so a masked model cannot idle forever`.
