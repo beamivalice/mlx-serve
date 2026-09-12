@@ -888,10 +888,9 @@ pub fn main(init: std.process.Init) !void {
                 max_resident_mem_explicit = true;
             }
         } else if (std.mem.eql(u8, args[i], "--idle-evict-secs") and i + 1 < args.len) {
-            // Plan 05 Phase D: idle-tick eviction window. When set, the
-            // inference loop's idle path evicts .ready entries (refcount==0)
-            // whose last_used_ns is older than this. Default off — eviction
-            // is on-demand only.
+            // Idle eviction window. When set, `server.idleEvictLoop` unloads
+            // .ready entries (refcount==0) whose last_used_ms is older than
+            // this. Default off — eviction is on-demand only.
             i += 1;
             const n = std.fmt.parseInt(u32, args[i], 10) catch 0;
             idle_evict_secs = if (n > 0) n else null;
@@ -1214,7 +1213,14 @@ pub fn main(init: std.process.Init) !void {
     // error-return path, so pairing it with an errdefer that has the same body
     // frees the resource twice on error (double-free / SIGSEGV). The runtime
     // `owned_by_registry` guard makes the single defer correct on every exit.
-    defer if (!config_owned_by_registry) allocator.destroy(config_storage);
+    // `create` hands back UNINITIALIZED memory and the defer below READS a
+    // field, so the struct gets a valid value before that defer can ever run:
+    // a `parseConfig` failure would otherwise free a garbage pointer.
+    config_storage.* = std.mem.zeroes(model_mod.ModelConfig);
+    defer if (!config_owned_by_registry) {
+        config_storage.deinit(allocator);
+        allocator.destroy(config_storage);
+    };
     config_storage.* = try model_mod.parseConfig(io, allocator, model_dir);
     const config = config_storage;
     scheduler_mod.applyModelSettings(config, model_settings_mod.overrideFor(allocator, io, model_dir));

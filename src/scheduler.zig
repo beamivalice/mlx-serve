@@ -1289,9 +1289,6 @@ pub const Scheduler = struct {
     draft_block_size_explicit: bool,
 
     // ── Borrowed refs (CPU-only state owned by the LoadedModel). ──
-    config: *const ModelConfig,
-    tok: *const Tokenizer,
-    chat_config: *const ChatConfig,
     drafter_path: []const u8,
 
     /// Phase A6 → Plan 05: per-model hot prefix cache. Pre-Plan-05 this was
@@ -1475,13 +1472,6 @@ pub const Scheduler = struct {
             .primary_model_dir = params.model_dir,
             .draft_block_size = params.draft_block_size,
             .draft_block_size_explicit = params.draft_block_size_explicit,
-            // Initial borrowed-view refs point at the (heap-allocated) CPU
-            // state carried on LoadParams; once the inference thread
-            // installs them on `entry`, the views still resolve to the
-            // same addresses (we store pointers, so the moves are no-ops).
-            .config = params.config,
-            .tok = params.tok,
-            .chat_config = params.chat_config,
             .drafter_path = params.drafter_dir,
             .hot_prefix_cache = null,
             .max_concurrent = cap,
@@ -2052,6 +2042,17 @@ pub const Scheduler = struct {
     /// requests (refcount → 0), then hands the mlx free to the inference
     /// thread (stream-bound). Blocks until the free completes.
     pub fn unloadModel(self: *Scheduler, id_or_empty: []const u8) !void {
+        return self.unloadModelIfIdle(id_or_empty, null);
+    }
+
+    /// `unloadModel` with an optional idle precondition, re-checked under the
+    /// registry mutex at the moment we commit.
+    ///
+    /// The sweep picks a victim, drops the mutex, then calls in, so a request
+    /// can arrive in that gap: refcount and age are re-checked under the mutex
+    /// before committing. (`planEvictionsLocked` picks and marks under one
+    /// hold instead; the sweep cannot, because the unload itself is slow.)
+    pub fn unloadModelIfIdle(self: *Scheduler, id_or_empty: []const u8, idle_window_ms: ?i64) !void {
         const entry = try self.registry.resolveEntry(id_or_empty);
         {
             self.registry.mutex.lockUncancelable(self.io);
@@ -2069,6 +2070,13 @@ pub const Scheduler = struct {
                         continue :wait;
                     },
                     .ready => break :wait,
+                }
+            }
+            if (idle_window_ms) |window_ms| {
+                const now_ms = io_util.nowMsMonotonic(self.io);
+                if (!model_registry_mod.ModelRegistry.idleEvictable(entry, now_ms, window_ms)) {
+                    self.registry.mutex.unlock(self.io);
+                    return;
                 }
             }
             self.registry.markEvictingLocked(entry);
@@ -2490,8 +2498,8 @@ const CpuState = struct {
 ///
 /// Errdefer pattern: for each `try ... else error`, the `deinit` errdefer
 /// is registered AFTER the successful init so a downstream failure doesn't
-/// call deinit on uninitialized memory. ModelConfig has no allocator-owned
-/// fields, so `allocator.destroy` is sufficient there.
+/// call deinit on uninitialized memory. `ModelConfig.deinit` frees the config's
+/// one owned field; `allocator.destroy` alone would leak it.
 fn preloadCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8, gguf_ctx_size: u32) !CpuState {
     // GGUF first — mirrors `--model` routing in main.zig, where isGgufPath
     // is checked before any config.json read ("GGUF files bypass the MLX
@@ -2560,6 +2568,7 @@ fn preloadCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []const 
 /// (on success the three pointers transfer to the entry, so this function
 /// is skipped, but the path must still be released).
 fn freeCpuState(allocator: std.mem.Allocator, s: *CpuState) void {
+    s.config.deinit(allocator);
     allocator.destroy(s.config);
     s.tok.deinit();
     allocator.destroy(s.tok);
@@ -2724,6 +2733,7 @@ fn doLoadDs4OnInferenceThread(sch: *Scheduler, params: anytype) !void {
     //    the MLX path's invariant about the per-ptr errdefers above).
     const entry = params.entry;
     entry.ds4_engine = engine;
+    entry.releaseRetainedCpuState();
     entry.config = params.config;
     entry.tokenizer = params.tok;
     entry.chat_config = params.chat_config;
@@ -2797,6 +2807,7 @@ fn doLoadLlamaOnInferenceThread(sch: *Scheduler, params: anytype) !void {
 
     const entry = params.entry;
     entry.llama_engine = engine;
+    entry.releaseRetainedCpuState();
     entry.config = params.config;
     entry.tokenizer = params.tok;
     entry.chat_config = params.chat_config;
@@ -2938,6 +2949,7 @@ fn doLoadGenOnInferenceThread(sch: *Scheduler, params: anytype, modality: gen_mo
     }
 
     // Install stub CPU state (infallible from here, mirroring the ds4 path).
+    entry.releaseRetainedCpuState();
     entry.config = params.config;
     entry.tokenizer = params.tok;
     entry.chat_config = params.chat_config;
@@ -4000,6 +4012,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // Transfer ownership of the heap-allocated CPU state from `params` to
     // the entry. The caller (main.zig) MUST NOT free these — `LoadedModel.deinit`
     // walks them in the same `*X` pointer form they came in.
+    entry.releaseRetainedCpuState();
     entry.config = params.config;
     entry.tokenizer = params.tok;
     entry.chat_config = params.chat_config;
@@ -4218,6 +4231,15 @@ fn hasWorkPendingLocked(sch: *const Scheduler) bool {
         sch.load_queue.items.len > 0 or
         sch.gen_queue.items.len > 0 or
         sch.unload_queue.items.len > 0;
+}
+
+/// Poll interval for the idle-eviction sweep, given the configured window.
+///
+/// A quarter of the window, so a model is evicted within ~1.25x the configured
+/// idle time rather than up to 2x it. Floored at a second so `--idle-evict-secs 1`
+/// does not spin, capped at 30s so a long window still costs ~nothing.
+pub fn idleEvictTickMs(window_ms: i64) i64 {
+    return @max(1000, @min(@divTrunc(window_ms, 4), 30_000));
 }
 
 fn inferenceLoop(ctx: ThreadCtx) void {
@@ -6891,6 +6913,18 @@ test "the cleanup drain commits a cancelled slot before deinit" {
     // The SSD tier has no finishSlot flush on this path — the drain must
     // flush what it just committed itself.
     try testing.expect(std.mem.indexOf(u8, region, "flushPendingDisk") != null);
+}
+
+test "idleEvictTickMs: sweeps well inside the window without spinning" {
+    // Bar: a quarter of the window, clamped to [1s, 30s] — eviction lands near
+    // the configured time without the sweep becoming a busy loop.
+    try testing.expectEqual(@as(i64, 5_000), idleEvictTickMs(20_000));
+    try testing.expectEqual(@as(i64, 15_000), idleEvictTickMs(60_000));
+    try testing.expectEqual(@as(i64, 30_000), idleEvictTickMs(900_000));
+    try testing.expectEqual(@as(i64, 1000), idleEvictTickMs(1000));
+    try testing.expectEqual(@as(i64, 1000), idleEvictTickMs(2000));
+    try testing.expectEqual(@as(i64, 30_000), idleEvictTickMs(28_800_000));
+    try testing.expect(idleEvictTickMs(0) >= 1000);
 }
 
 test "the inference loop parks without holding the sleep-inhibition assertion" {
