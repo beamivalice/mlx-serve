@@ -2,7 +2,7 @@
 
 ## v26.9.3 — dev unreleased
 
-## Highlights
+### Highlights
 - **Long prompts need 2.5 GB less memory on Flash Next and the other conv-cached models.** Each linear-attention layer kept a 3-row view of its whole prefill chunk input alive until its next forward, so a 4096-token chunk pinned about 3 GB on Qwen3.8 Flash Next (by the same arithmetic, 7.5 GB on the 27B at chunk 8192). The tail is now an owned copy evaluated with the layer loop's cadence; output is byte-identical and prefill speed is unchanged. Found by Nikolai V. (#366). The prefill admission bill follows the fix, so a long prompt that used to be refused or narrowed at the memory ceiling now gets its full chunk width.
 - **Flash Next admission stops charging for a buffer that no longer grows.** The sparse-attention indexer's raw keys have been a fixed 32-row ring since #381, but they were still billed as 3 KB per token of context; at 512k tokens that was 1.6 GB of phantom that shrank the advertised context and refused prompts that fit. The ring is billed once per session now.
 - **`--mtp-head-kv-quant` lets Flash Next's speculative head keep its KV at the model's `--kv-quant` precision** (about 1 KB per token of context with MTP on, 1 GB at 1M). Off by default: the head stays dense bf16 as before. Acceptance measured within noise of dense from 4k to 128k with the flag on; the head's KV is now counted in admission either way, and a cached conversation whose speculative snapshot was saved at the other precision is re-saved on its next turn.
@@ -18,13 +18,15 @@
 - The Neural Engine compile cache is capped by the free space on the internal disk, so a full disk no longer ships a silently half-built offload.
 - **Chat with Apple's built-in on-device model.** Pick Apple Intelligence in the model picker and the conversation is answered by macOS itself: nothing to download and no server running. Tools work, but the model's window is a fixed 4k that macOS does not let anyone raise, so keep the tool list short. No thinking mode: the framework does not have one. The row appears only when Apple Intelligence is turned on in System Settings.
 
-## Changes
+### Changes
 
 - The launcher offers a plain Shell beside the coding agents, on this Mac and in the sandbox.
 - Terminals open on click. The sandbox and host terminals no longer ask which folder to work in first; they use the working folder from Settings.
 
-## Fixes
+### Fixes
 
+- Tool arguments whose array or object items repeat a key with the same value are coerced to the declared type again instead of reaching the client as a string (#402).
+- Schema-constrained answers can no longer stall on whitespace: the JSON grammar caps free whitespace per run, so a request that used to end as `length` with empty content now produces the JSON.
 - OpenCode 2 launches again. It was started with a `--model` flag its CLI does not have, and it resolves models in a shared background service that never saw our config, so every session ended the moment it opened.
 - An MLX error while writing the KV cache now fails only the request that hit it, instead of crashing the server when that cache is next reset or freed.
 
@@ -48,7 +50,6 @@
 
 ### Fixes
 
-- Schema-constrained answers can no longer stall on whitespace: the JSON grammar caps free whitespace per run, so a request that used to end as `length` with empty content now produces the JSON.
 - Claude Code no longer loses its SessionStart hook output, `CLAUDE.md` or any other context a client puts in a `system` message inside `messages` on `/v1/messages`. It was discarded without a warning, so the reply looked plausible on a third less prompt. (#365, thanks @nikolai-vysotskyi)
 - A `developer` message is read as the system turn instead of being dropped for an unknown role.
 - Mage-Flow Edit loads again. It had been refused for a missing vision tower, which the loader was dropping before the backend saw it.
