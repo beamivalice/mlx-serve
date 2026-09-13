@@ -3780,6 +3780,9 @@ pub var qwen4_mtp_head_graphs: usize = 0;
 pub var mtp_verify_moe_group_graphs: u64 = 0;
 pub var mtp_verify_moe_group_last_ops: u64 = 0;
 pub var mtp_head_force_batched_override: ?bool = null;
+const SingleVerifyFeature = enum { routing, down_reduce, hc_graph };
+var single_verify_test_features: [3]bool = @splat(true);
+
 var mtp_verify_shared_rows_calls: u64 = 0;
 var mtp_verify_shared_gate_rows_calls: u64 = 0;
 
@@ -19966,6 +19969,15 @@ pub const Transformer = struct {
         return .{ .mixed = mixed, .inj = try standinOnes(&inj_shape, self.s) };
     }
 
+    fn verifyFeatureEnabled(self: *const Transformer, comptime feature: SingleVerifyFeature, grouped: bool, batch: c_int, width: c_int) bool {
+        if (self.qwen4 == null) return false;
+        if (grouped) return true;
+        if (@import("builtin").is_test and !single_verify_test_features[@backingInt(feature)]) return false;
+        // Capture marks speculative verification. A short prefill tail has the
+        // same shape but must keep the ordinary forward path and shared expert.
+        return self.spec_capture_ssm and batch == 1 and width >= 2 and width <= 6;
+    }
+
     fn hcReadPending(self: *Transformer, h: *mlx.mlx_array, w: *const HcWeights, batch: c_int, seq_len: c_int, pending: *?HcPending) !HcRead {
         if (pending.*) |*pd| {
             defer pending.* = null;
@@ -19987,7 +19999,7 @@ pub const Transformer = struct {
         const dqp = self.quantParamsHinted(w.down_w, w.down_s, @intCast(hc * hidden));
         const uqp = self.quantParamsFor(w.up_w, w.up_s);
         if (dqp.bits != uqp.bits or dqp.group_size != uqp.group_size or dqp.mode != .affine or uqp.mode != .affine) return null;
-        if (mtp_verify_hc_prepared_active and batch == 1 and hc == 4 and hidden == 2560 and dqp.bits == 8 and dqp.group_size == 64) {
+        if (self.verifyFeatureEnabled(.hc_graph, mtp_verify_hc_prepared_active, batch, seq_len) and batch == 1 and hc == 4 and hidden == 2560 and dqp.bits == 8 and dqp.group_size == 64) {
             if (try hcReadPrepared(self.s, stream, w.*, seq_len, self.config.rms_norm_eps, pend)) |result| {
                 mtp_verify_hc_prepared_calls +%= 1;
                 const Once = struct {
@@ -19995,7 +20007,7 @@ pub const Transformer = struct {
                 };
                 if (!Once.logged) {
                     Once.logged = true;
-                    log.info("[batched] prepared hyper-connection verifier graphs engaged\n", .{});
+                    log.info("[mtp-verify] prepared hyper-connection verifier graphs engaged\n", .{});
                 }
                 return result;
             }
@@ -28579,7 +28591,7 @@ pub const Transformer = struct {
             defer _ = mlx.mlx_array_free(flat_inds);
             try mlx.check(mlx.mlx_reshape(&flat_inds, inds, &flat_shape, 1, self.s));
 
-            const route_pack = if (skip_shared and self.qwen4 != null) try verifyRoutePack(self.s, flat_inds, K) else null;
+            const route_pack = if (self.verifyFeatureEnabled(.routing, skip_shared, B, S)) try verifyRoutePack(self.s, flat_inds, K) else null;
             var inv_order = if (route_pack) |value| value.inverse else mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(inv_order);
             var sorted_inds = if (route_pack) |value| value.sorted else mlx.mlx_array_new();
@@ -28602,7 +28614,7 @@ pub const Transformer = struct {
                 };
                 if (!Once.logged) {
                     Once.logged = true;
-                    log.info("[batched] fused verifier route packing engaged\n", .{});
+                    log.info("[mtp-verify] fused verifier route packing engaged\n", .{});
                 }
             }
 
@@ -28616,7 +28628,7 @@ pub const Transformer = struct {
             defer if (indexed_lhs.ctx != null) {
                 _ = mlx.mlx_array_free(indexed_lhs);
             };
-            const input_view = if (skip_shared and self.qwen4 != null and
+            const input_view = if (self.verifyFeatureEnabled(.routing, skip_shared, B, S) and
                 gate_qp.bits == 4 and up_qp.bits == 4 and gate_qp.group_size == 64 and up_qp.group_size == 64 and
                 gate_qp.mode == .affine and up_qp.mode == .affine and
                 mlx.getShape(mw.switch_gate_w)[0] == mlx.getShape(mw.switch_up_w)[0])
@@ -28638,7 +28650,7 @@ pub const Transformer = struct {
                 };
                 if (!Once.logged) {
                     Once.logged = true;
-                    log.info("[batched] indexed expert verify inputs engaged (tokens={d})\n", .{B * S});
+                    log.info("[mtp-verify] indexed expert verify inputs engaged (tokens={d})\n", .{B * S});
                 }
             }
 
@@ -28671,7 +28683,7 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_expand_dims(&act_exp, expert_act, -2, self.s));
             var down_3d = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(down_3d);
-            const paired = if (skip_shared and self.qwen4 != null and down_qp.bits == 4 and down_qp.group_size == 64 and down_qp.mode == .affine)
+            const paired = if (self.verifyFeatureEnabled(.down_reduce, skip_shared, B, S) and down_qp.bits == 4 and down_qp.group_size == 64 and down_qp.mode == .affine)
                 try verifyExpertReuse(self.s, act_exp, mw.switch_down_w, mw.switch_down_s, mw.switch_down_b, sorted_inds)
             else
                 null;
@@ -28684,7 +28696,7 @@ pub const Transformer = struct {
                 };
                 if (!Once.logged) {
                     Once.logged = true;
-                    log.info("[batched] paired expert down verify engaged (assignments={d})\n", .{total_inds});
+                    log.info("[mtp-verify] paired expert down verify engaged (assignments={d})\n", .{total_inds});
                 }
             } else try gatherExpertMm(&down_3d, act_exp, mw.switch_down_w, mw.switch_down_s, mw.switch_down_b, no_idx, sorted_inds, down_qp.bits, down_qp.group_size, down_qp.mode, true, self.s);
             var down_squeezed = mlx.mlx_array_new();
@@ -28694,7 +28706,7 @@ pub const Transformer = struct {
             // indexes — the bias must be added before the inverse permutation.
             try self.addExpertBias(&down_squeezed, mw.switch_down_bias, sorted_inds);
 
-            const fused_sum = if (skip_shared and self.qwen4 != null)
+            const fused_sum = if (self.verifyFeatureEnabled(.down_reduce, skip_shared, B, S))
                 try verifyExpertReduce(self.s, down_squeezed, inv_order, norm_scores)
             else
                 null;
@@ -28708,7 +28720,7 @@ pub const Transformer = struct {
                 };
                 if (!Once.logged) {
                     Once.logged = true;
-                    log.info("[batched] fused expert reduction verify engaged (tokens={d})\n", .{B * S});
+                    log.info("[mtp-verify] fused expert reduction verify engaged (tokens={d})\n", .{B * S});
                 }
             } else {
                 // Inverse permute → original order, then reshape back to [B,S,K,hidden].
@@ -60329,7 +60341,7 @@ test "verify expert reuse preserves stock gather reductions" {
         try mlx.check(mlx.mlx_vector_array_get(&w, triple, 0));
         try mlx.check(mlx.mlx_vector_array_get(&sc, triple, 1));
         try mlx.check(mlx.mlx_vector_array_get(&bi, triple, 2));
-        for ([_]c_int{ 20, 40, 80, 200 }) |count| for (0..3) |pattern| {
+        for ([_]c_int{ 20, 30, 40, 50, 60, 80, 200 }) |count| for (0..3) |pattern| {
             var host_ids: [200]u32 = undefined;
             var expert: u32 = 0;
             var remain: usize = 0;
@@ -60406,7 +60418,7 @@ test "verify expert reduction preserves unsort multiply and sum" {
     if (mlx.noGpuBackend() or !verifySharedHardware()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0xE55E);
-    for ([_]c_int{ 4, 6, 8, 10, 12, 20, 32 }) |tokens| {
+    for ([_]c_int{ 2, 3, 4, 5, 6, 8, 10, 12, 20, 32 }) |tokens| {
         const count = tokens * 10;
         const down = try attn256RandBf16(prng.random(), &.{ count, 2560 }, s);
         defer _ = mlx.mlx_array_free(down);
@@ -60489,7 +60501,7 @@ test "verify route packing preserves stable order and row indices" {
     if (mlx.noGpuBackend() or !verifySharedHardware()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     var ids: [320]u32 = undefined;
-    for ([_]c_int{ 20, 40, 80, 120, 200, 320 }) |count| {
+    for ([_]c_int{ 20, 30, 40, 50, 60, 80, 120, 200, 320 }) |count| {
         for (0..3) |pattern| {
             for (ids[0..@intCast(count)], 0..) |*id, i| id.* = switch (pattern) {
                 0 => @intCast((i * 37 + 11) % 17),
@@ -60542,7 +60554,7 @@ test "verify indexed expert inputs preserve projections without activation copie
     try mlx.check(mlx.mlx_vector_array_get(&w, triple, 0));
     try mlx.check(mlx.mlx_vector_array_get(&sc, triple, 1));
     try mlx.check(mlx.mlx_vector_array_get(&bi, triple, 2));
-    for ([_]c_int{ 4, 8, 20 }) |tokens| {
+    for ([_]c_int{ 2, 3, 4, 5, 6, 8, 20 }) |tokens| {
         const count = tokens * 10;
         const x = try attn256RandBf16(prng.random(), &.{ tokens, 2560 }, s);
         defer _ = mlx.mlx_array_free(x);
@@ -60578,7 +60590,12 @@ test "verify indexed expert inputs preserve projections without activation copie
         defer _ = mlx.mlx_array_free(actual);
         try gatherExpertMm(&actual, view, w, sc, bi, lhs, rhs, 4, 64, .affine, true, s);
         try testing.expect(try qsaArraysAllEqual(expected, actual, s));
-        try testing.expect((try verifyIndexedExpertInput(s, x, lhs, 10)) == null);
+        // The sorted-matrix boundary is four assignments per expert. Ten
+        // experts crosses it at width 4, but remains eligible at widths 2–3.
+        const boundary_experts = @divTrunc(count, 4);
+        try testing.expect((try verifyIndexedExpertInput(s, x, lhs, boundary_experts)) == null);
+        const sparse_view = (try verifyIndexedExpertInput(s, x, lhs, boundary_experts + 1)) orelse return error.IndexedExpertInputDeclined;
+        defer _ = mlx.mlx_array_free(sparse_view);
         try testing.expect((try verifyIndexedExpertInput(s, x, lhs, 0)) == null);
         if (tokens == 4) {
             const cpu = mlx.mlx_default_cpu_stream_new();
@@ -60632,5 +60649,150 @@ test "MTP coarse pairs preserve row-kernel logits (MTP_LMHEAD_TEST_FILE)" {
             try mlx.check(mlx.mlx_astype(&x32, x, .float32, s));
             try testing.expect((try mtpCoarsePairs(s, x32, coarse.w, coarse.s, coarse.b, 3, 64)) == null);
         }
+    }
+}
+
+test "single-stream verify feature selection excludes prefill and ordinary decoding" {
+    var xfm: Transformer = undefined;
+    var qwen4: qwen4_mod.Qwen4State = undefined;
+    const old_features = single_verify_test_features;
+    defer single_verify_test_features = old_features;
+    single_verify_test_features = @splat(true);
+    inline for (.{ SingleVerifyFeature.routing, SingleVerifyFeature.down_reduce, SingleVerifyFeature.hc_graph }) |feature| {
+        for ([_]bool{ false, true }) |is_qwen4| {
+            xfm.qwen4 = if (is_qwen4) &qwen4 else null;
+            for ([_]bool{ false, true }) |capture| {
+                xfm.spec_capture_ssm = capture;
+                for ([_]c_int{ 1, 2, 4 }) |batch| {
+                    for ([_]c_int{ 1, 2, 3, 4, 5, 6, 7, 16, 4096 }) |width| {
+                        try testing.expectEqual(is_qwen4 and capture and batch == 1 and width >= 2 and width <= 6, xfm.verifyFeatureEnabled(feature, false, batch, width));
+                        try testing.expectEqual(is_qwen4, xfm.verifyFeatureEnabled(feature, true, batch, width));
+                    }
+                }
+            }
+        }
+        xfm.qwen4 = &qwen4;
+        xfm.spec_capture_ssm = true;
+        single_verify_test_features[@backingInt(feature)] = false;
+        try testing.expect(!xfm.verifyFeatureEnabled(feature, false, 1, 5));
+        try testing.expect(xfm.verifyFeatureEnabled(feature, true, 1, 5));
+        single_verify_test_features[@backingInt(feature)] = true;
+    }
+}
+
+const SingleVerifyTestResult = struct {
+    logits: mlx.mlx_array,
+    last: mlx.mlx_array,
+    all: mlx.mlx_array,
+
+    fn deinit(self: *@This()) void {
+        _ = mlx.mlx_array_free(self.logits);
+        _ = mlx.mlx_array_free(self.last);
+        _ = mlx.mlx_array_free(self.all);
+    }
+};
+
+fn singleVerifyTestRound(xfm: *Transformer, slot: *Qwen4TestSlot, row: mlx.mlx_array) !SingleVerifyTestResult {
+    const Gen = @import("generate.zig").Generator;
+    var gen: Gen = undefined;
+    gen.xfm = xfm;
+    gen.ctx = slot.ctx;
+    defer slot.ctx = gen.ctx;
+    var state: Gen.MtpRoundState = undefined;
+    state.tracing = false;
+    state.verify_input = row;
+    try gen.mtpRoundVerify(&state);
+    var result: SingleVerifyTestResult = .{ .logits = state.verify_logits, .last = state.new_hidden, .all = state.verify_hidden_all };
+    errdefer result.deinit();
+    const values = mlx.mlx_vector_array_new_data(&.{ result.logits, result.last, result.all }, 3);
+    defer _ = mlx.mlx_vector_array_free(values);
+    try mlx.check(mlx.mlx_eval(values));
+    return result;
+}
+
+test "single-stream verify optimizations preserve native outputs and captures (QWEN4_TEST_MODEL)" {
+    const path = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const old_features = single_verify_test_features;
+    defer single_verify_test_features = old_features;
+    var config = try model_mod.parseConfig(io, a, std.mem.span(path));
+    defer if (config.ngram_table_path) |name| a.free(name);
+    var weights = try model_mod.loadWeights(io, a, std.mem.span(path));
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Transformer.init(io, a, config, &weights);
+    defer xfm.deinit();
+    xfm.compileQwen4Hc();
+    xfm.compileGdnGate();
+    xfm.compileMoeRouting();
+    const prefix_len = if (std.c.getenv("SINGLE_MTP_TEST_CONTEXT")) |value| try std.fmt.parseInt(usize, std.mem.span(value), 10) else 4101;
+    const ids = try a.alloc(i32, prefix_len + 64);
+    defer a.free(ids);
+    for (ids, 0..) |*id, i| id.* = @intCast(1 + (i * 7919) % 40000);
+    var slots: [2]*Qwen4TestSlot = undefined;
+    var initialized: usize = 0;
+    defer for (slots[0..initialized]) |slot| slot.deinit(a);
+    const prefill_routes = mtp_verify_kernel_calls[2];
+    const prefill_hc = mtp_verify_hc_prepared_calls;
+    for (&slots, 0..) |*target, arm| {
+        single_verify_test_features = @splat(arm == 1);
+        target.* = try Qwen4TestSlot.init(a, config.num_hidden_layers);
+        initialized += 1;
+        target.*.cache.config = KVQuantConfig.affine(8);
+        target.*.ctx.skip_lm_head = true;
+        var start: usize = 0;
+        while (start < prefix_len) {
+            const end = @min(start + 4096, prefix_len);
+            const output = try target.*.forward(&xfm, ids[start..end]);
+            try mlx.check(mlx.mlx_array_eval(output));
+            _ = mlx.mlx_array_free(output);
+            start = end;
+        }
+        target.*.ctx.skip_lm_head = false;
+    }
+    try testing.expectEqual(prefill_routes, mtp_verify_kernel_calls[2]);
+    try testing.expectEqual(prefill_hc, mtp_verify_hc_prepared_calls);
+    var position = prefix_len;
+    for ([_]usize{ 1, 2, 3, 4, 5, 6, 7 }) |width| {
+        const input = mlx.mlx_array_new_data(@ptrCast(ids[position..][0..width].ptr), &.{ 1, @as(c_int, @intCast(width)) }, 2, .int32);
+        defer _ = mlx.mlx_array_free(input);
+        single_verify_test_features = @splat(false);
+        var reference = try singleVerifyTestRound(&xfm, slots[0], input);
+        defer reference.deinit();
+        const before = [_]u64{ mtp_verify_kernel_calls[2], mtp_verify_indexed_input_calls, mtp_verify_expert_pairs_calls, mtp_verify_expert_reduce_calls, mtp_verify_hc_prepared_calls };
+        single_verify_test_features = @splat(true);
+        var candidate = try singleVerifyTestRound(&xfm, slots[1], input);
+        defer candidate.deinit();
+        const after = [_]u64{ mtp_verify_kernel_calls[2], mtp_verify_indexed_input_calls, mtp_verify_expert_pairs_calls, mtp_verify_expert_reduce_calls, mtp_verify_hc_prepared_calls };
+        inline for (.{ "logits", "last", "all" }) |field| try expectRowsByteEqual(a, xfm.s, @field(reference, field), @field(candidate, field), "single verify " ++ field);
+        for (slots[0].entries, slots[1].entries) |*left, *right| {
+            inline for (.{ "conv_state", "ssm_state", "aux_state", "qsa_pooled", "spec_conv_input", "spec_ple_input" }) |field| {
+                const x = @field(left.*, field);
+                const y = @field(right.*, field);
+                if (x.ctx == null or y.ctx == null) {
+                    try testing.expect(x.ctx == null and y.ctx == null);
+                } else try expectRowsByteEqual(a, xfm.s, x, y, "single verify " ++ field);
+            }
+            if (left.spec_state_seq.ctx != null) {
+                const x = try logicalSsmCapture(xfm.s, left);
+                defer _ = mlx.mlx_array_free(x);
+                const y = try logicalSsmCapture(xfm.s, right);
+                defer _ = mlx.mlx_array_free(y);
+                try expectRowsByteEqual(a, xfm.s, x, y, "single verify logical capture");
+            } else try testing.expect(right.spec_state_seq.ctx == null);
+            try testing.expectEqual(left.ple_prev_valid, right.ple_prev_valid);
+            try testing.expectEqualSlices(u32, &left.ple_prev, &right.ple_prev);
+            ssmFreeSpecCapture(left);
+            ssmFreeSpecCapture(right);
+        }
+        for (before, after) |old, new| {
+            if (verifySharedHardware() and width >= 2 and width <= 6) {
+                try testing.expect(new > old);
+            } else try testing.expectEqual(old, new);
+        }
+        std.debug.print("[single-verify-exact] context={d} width={d} calls={any}\n", .{ prefix_len, width, after });
+        position += width;
     }
 }
