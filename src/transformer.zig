@@ -14583,6 +14583,7 @@ pub const Transformer = struct {
     cost_trace_active: bool = false,
     cost_attention: u8 = 0,
     cost_moe: u8 = 0,
+    verify_laps: VerifyLaps = .{},
     /// Persistence key of `round_cost` (empty = not persisted).
     round_cost_key_buf: [64]u8 = undefined,
     round_cost_key_len: u8 = 0,
@@ -19240,6 +19241,12 @@ pub const Transformer = struct {
         return self.forwardMoeBatchedRows(token_arr, ctxs, rope_offsets, true, hidden_last, hidden_all);
     }
 
+    pub const VerifyLaps = struct {
+        build_ns: u64 = 0,
+        ple_ns: u64 = 0,
+        ple_sync_ns: u64 = 0,
+    };
+
     pub const VerifyRollback = struct {
         const KvMark = struct { offset: usize, initialized: bool };
 
@@ -19328,6 +19335,7 @@ pub const Transformer = struct {
             log.info("[batched] row-axis mtp verify engaged (slots={d}, width={d})\n", .{ token_rows.len, mlx.getShape(token_rows[0])[1] });
         }
         if (row_ns) |ns| @memset(ns[0..token_rows.len], 0);
+        self.verify_laps = .{};
         var rollback: [MAX_BATCH_ROWS]VerifyRollback = undefined;
         var n_rollback: usize = 0;
         defer for (rollback[0..n_rollback]) |*saved| saved.deinit();
@@ -19378,6 +19386,7 @@ pub const Transformer = struct {
             }
             built = token_rows.len;
             const group_ns = lap.read();
+            self.verify_laps.build_ns += group_ns;
             if (row_ns) |ns| {
                 for (ns[0..token_rows.len]) |*value| value.* += group_ns;
             }
@@ -19404,16 +19413,18 @@ pub const Transformer = struct {
                 out_last[i] = last;
                 out_all[i] = all;
                 built = i + 1;
-                if (row_ns) |ns| {
-                    ns[i] += lap.read();
-                    lap.reset();
-                }
+                const row_build_ns = lap.read();
+                self.verify_laps.build_ns += row_build_ns;
+                lap.reset();
+                if (row_ns) |ns| ns[i] += row_build_ns;
             }
         }
         // Fills the deferred PLE leaves and advances every row's n-gram history: after EVERY
         // row's build, before the first eval downstream of a leaf and before any rollback.
         try self.flushDeferredPleGroup(ctxs[0..token_rows.len]);
-        if (row_ns) |ns| ns[0] += lap.read();
+        const ple_ns = lap.read();
+        self.verify_laps.ple_ns = ple_ns;
+        if (row_ns) |ns| ns[0] += ple_ns;
         if (rollback_out) |out| {
             @memcpy(out[0..n_rollback], rollback[0..n_rollback]);
             n_rollback = 0;
@@ -20118,7 +20129,9 @@ pub const Transformer = struct {
             n += 1;
         }
         if (n == 0) return;
+        var sync_lap = io_util_mod.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
         try mlx.check(mlx.mlx_eval(vec));
+        self.verify_laps.ple_sync_ns = sync_lap.read();
         deferred_ple_group_syncs += 1;
         var k: usize = 0;
         for (ctxs) |ctx| {
@@ -20158,7 +20171,9 @@ pub const Transformer = struct {
     fn pleGatherBf16(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array, entry: *SSMCacheEntry, layer: usize, seq_len: c_int, pk: []u16, capture: bool) !void {
         const ids_c = try self.plePrepareIds(token_ids);
         defer _ = mlx.mlx_array_free(ids_c);
+        var sync_lap = io_util_mod.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
         try mlx.check(mlx.mlx_array_eval(ids_c));
+        self.verify_laps.ple_sync_ns = sync_lap.read();
         return self.pleFillFromIds(ctx, ids_c, entry, layer, seq_len, pk, capture);
     }
 

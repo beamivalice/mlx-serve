@@ -7726,10 +7726,19 @@ fn runBatchedMtpHeadTick(sch: *Scheduler, group: []*Slot) !void {
         n_chain = i + 1;
     }
 
+    const chain_lap = generate_mod.Generator.SubLap.start(generate_mod.Generator.mtpTraceOn(), live[0].io);
     generate_mod.Generator.mtpChainBuildBatched(gens[0..n], chains[0..n], 0, depth) catch |e| {
         for (live[0..n]) |slot| slot.markError(@errorName(e));
         return;
     };
+    // Dispatched before the verify build so the chain's GPU time covers the build.
+    generate_mod.Generator.mtpChainDispatchBatched(chains[0..n]) catch |e| {
+        for (live[0..n]) |slot| slot.markError(@errorName(e));
+        return;
+    };
+    if (chain_lap.read()) |chain_ns| {
+        for (gens[0..n]) |gen| gen.mtpTraceSub(.chain, chain_ns);
+    }
 
     const taken = n;
     n = 0;

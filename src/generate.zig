@@ -5456,6 +5456,29 @@ pub const Generator = struct {
         try mlx.check(mlx.mlx_async_eval(ev));
     }
 
+    // One async eval over every row's built draft graphs so the chain runs while the CPU builds
+    // the verify; a lazy sampling op binds its PRNG key at graph build, so the drafts do not move.
+    pub fn mtpChainDispatchBatched(chains: []const MtpPreDraft) !void {
+        const ev = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(ev);
+        var any = false;
+        for (chains) |chain| {
+            const to = chain.n_drafted;
+            if (to == 0) continue;
+            any = true;
+            for (chain.draft_arrs[0..to]) |arr| _ = mlx.mlx_vector_array_append_value(ev, arr);
+            if (chain.q_probs) |slots| {
+                for (slots[0..@min(to, chain.n_qp)]) |arr| _ = mlx.mlx_vector_array_append_value(ev, arr);
+            }
+            if (chain.conf_arrs) |slots| {
+                for (slots[0..chain.n_conf]) |arr| _ = mlx.mlx_vector_array_append_value(ev, arr);
+                if (chain.h_chain) |h| _ = mlx.mlx_vector_array_append_value(ev, h);
+            }
+        }
+        if (!any) return;
+        try mlx.check(mlx.mlx_async_eval(ev));
+    }
+
     fn mtpDraftActiveRows(chains: []const MtpPreDraft, step: u32, indices: []usize) usize {
         var n: usize = 0;
         for (chains, 0..) |chain, row| {
@@ -6261,8 +6284,10 @@ pub const Generator = struct {
                     .round_watch = round_watch,
                 } };
             }
+            const chain_lap = SubLap.start(tracing, self.timer.io);
             try self.mtpChainBuild(&c, 0, plan_now.m_lo);
             if (mtpEarlyDispatchEnabled()) try mtpChainDispatch(&c, 0, plan_now.m_lo);
+            chain_lap.stop(&self.mtp_trace, .chain);
             break :blk c;
         };
         return .{ .verify = try self.mtpRoundAfterChain(allocator, chain, tracing, ph, livecost, round_watch) };
@@ -6271,10 +6296,12 @@ pub const Generator = struct {
     pub fn mtpRoundContinue(self: *Generator, allocator: std.mem.Allocator, open: MtpRoundOpen) !MtpRoundState {
         var chain = open.chain;
         if (chain.n_drafted < chain.m) {
+            const chain_lap = SubLap.start(open.tracing, self.timer.io);
             self.mtpChainBuild(&chain, chain.n_drafted, chain.m) catch |err| {
                 chain.deinit(allocator);
                 return err;
             };
+            chain_lap.stop(&self.mtp_trace, .chain);
         }
         return self.mtpRoundAfterChain(allocator, chain, open.tracing, open.ph, open.livecost, open.round_watch);
     }
@@ -6442,10 +6469,18 @@ pub const Generator = struct {
         errdefer _ = mlx.mlx_array_free(verify_logits);
         self.ctx.ple_defer = false;
         self.ctx.capture_ssm_seq = false;
+        xfm.verify_laps.ple_sync_ns = 0;
         if (tracing) {
-            self.mtp_trace.add(.verify, st.ph.read());
+            const build_ns = st.ph.read();
+            self.mtp_trace.add(.verify, build_ns);
+            self.mtp_trace.addSub(.build, build_ns);
             st.ph.reset();
         }
+        const ple_lap = SubLap.start(tracing, self.timer.io);
+        defer if (tracing) {
+            ple_lap.stop(&self.mtp_trace, .ple);
+            self.mtp_trace.addSub(.ple_sync, xfm.verify_laps.ple_sync_ns);
+        };
         // Fill the deferred PLE leaf: the one host read of the verify ids, and
         // the point at which the entry's n-gram history + `spec_ple_tokens`
         // advance. Must precede BOTH the first eval of anything downstream of
@@ -6490,6 +6525,10 @@ pub const Generator = struct {
             st.verify_hidden_all = out_all[i];
             if (st.tracing) {
                 gen.mtp_trace.add(.verify, row_ns[i]);
+                const laps = xfm.verify_laps;
+                gen.mtp_trace.addSub(.build, laps.build_ns);
+                gen.mtp_trace.addSub(.ple, laps.ple_ns);
+                gen.mtp_trace.addSub(.ple_sync, laps.ple_sync_ns);
                 st.ph.reset();
             }
         }
@@ -6499,6 +6538,16 @@ pub const Generator = struct {
         const n = gens.len;
         std.debug.assert(n == states.len);
         if (n == 0) return;
+        var any_tracing = false;
+        for (states[0..n]) |st| {
+            if (st.tracing) any_tracing = true;
+        }
+        const dispatch_lap = SubLap.start(any_tracing, gens[0].timer.io);
+        defer if (dispatch_lap.read()) |taken| {
+            for (gens[0..n], states[0..n]) |gen, st| {
+                if (st.tracing) gen.mtp_trace.addSub(.dispatch, taken);
+            }
+        };
         for (gens[1..n]) |gen| {
             if (gen.xfm != gens[0].xfm) return error.MtpGroupModelMismatch;
         }
@@ -6761,6 +6810,7 @@ pub const Generator = struct {
         }
 
         // ── Phase 4b: one batched async eval for the whole round ──
+        const dispatch_lap = SubLap.start(tracing, self.timer.io);
         {
             const eval_vec = mlx.mlx_vector_array_new();
             defer _ = mlx.mlx_vector_array_free(eval_vec);
@@ -6780,6 +6830,8 @@ pub const Generator = struct {
             _ = mlx.mlx_vector_array_append_value(eval_vec, verify_hidden_all);
             try mlx.check(mlx.mlx_async_eval(eval_vec));
         }
+        dispatch_lap.stop(&self.mtp_trace, .dispatch);
+        const wait_lap = SubLap.start(tracing, self.timer.io);
         for (draft_arrs[0..m], 0..) |arr, idx| {
             try mlx.check(mlx.mlx_array_eval(arr));
             var v: i32 = 0;
@@ -6791,6 +6843,7 @@ pub const Generator = struct {
             // bulk-reading (see the v26.5.6 0%-acceptance note in nextDrafter).
             try mlx.check(mlx.mlx_array_eval(verify_argmax));
         }
+        wait_lap.stop(&self.mtp_trace, .wait);
 
         var accepted: u32 = 0;
         var greedy_next_pending: u32 = 0;
@@ -7905,9 +7958,14 @@ pub const Generator = struct {
         pub const LOG_EVERY: u32 = 32;
         pub const Phase = enum(u4) { draft, sync, ext, verify, corr, eval, hist, commit, predraft, gap };
         pub const N_PHASES = @typeInfo(Phase).@"enum".field_names.len;
+        // Sub-laps attribute time inside a phase and are not a partition of it: a group's build lap is
+        // stamped into every row while each row's `verify` carries only its own share.
+        pub const Sub = enum(u3) { build, ple, ple_sync, dispatch, wait, chain };
+        pub const N_SUBS = @typeInfo(Sub).@"enum".field_names.len;
 
         rounds: u32 = 0,
         ns: [N_PHASES]u64 = @splat(0),
+        sub_ns: [N_SUBS]u64 = @splat(0),
         drafted: u64 = 0,
         accepted: u64 = 0,
         extended: u32 = 0,
@@ -7917,6 +7975,10 @@ pub const Generator = struct {
 
         pub fn add(self: *MtpTrace, phase: Phase, dur_ns: u64) void {
             self.ns[@backingInt(phase)] += dur_ns;
+        }
+
+        pub fn addSub(self: *MtpTrace, sub: Sub, dur_ns: u64) void {
+            self.sub_ns[@backingInt(sub)] += dur_ns;
         }
 
         /// Close one round; true when a summary line is due (caller logs,
@@ -7950,6 +8012,12 @@ pub const Generator = struct {
                 (@as(f64, @floatFromInt(self.rounds)) * 1e6);
         }
 
+        pub fn subAvgMs(self: *const MtpTrace, sub: Sub) f64 {
+            if (self.rounds == 0) return 0.0;
+            return @as(f64, @floatFromInt(self.sub_ns[@backingInt(sub)])) /
+                (@as(f64, @floatFromInt(self.rounds)) * 1e6);
+        }
+
         pub fn totalAvgMs(self: *const MtpTrace) f64 {
             if (self.rounds == 0) return 0.0;
             var total: u64 = 0;
@@ -7957,8 +8025,27 @@ pub const Generator = struct {
             return @as(f64, @floatFromInt(total)) / (@as(f64, @floatFromInt(self.rounds)) * 1e6);
         }
 
+        // Profilers parse the phase summary as one run from `rounds=` to `acc_idx=`; new fields go behind it.
+        pub const LINE_FMT = "  [mtp-trace] rounds={d} avg_ms draft={d:.2} sync={d:.2} ext={d:.2} verify={d:.2} corr={d:.2} eval={d:.2} hist={d:.2} commit={d:.2} predraft={d:.2} gap={d:.2} total={d:.2} | m_avg={d:.2} acc_avg={d:.2} ext_rate={d:.2} acc_idx={s} | sub_ms build={d:.2} ple={d:.2} ple_sync={d:.2} dispatch={d:.2} wait={d:.2} chain={d:.2}\n";
+
         pub fn reset(self: *MtpTrace) void {
             self.* = .{};
+        }
+    };
+
+    pub const SubLap = struct {
+        watch: ?io_util.Stopwatch,
+
+        pub fn start(on: bool, io: std.Io) SubLap {
+            return .{ .watch = if (on) io_util.Stopwatch.init(io) else null };
+        }
+
+        pub fn read(self: SubLap) ?u64 {
+            return if (self.watch) |w| w.read() else null;
+        }
+
+        pub fn stop(self: SubLap, trace: *MtpTrace, sub: MtpTrace.Sub) void {
+            if (self.read()) |ns| trace.addSub(sub, ns);
         }
     };
 
@@ -8153,6 +8240,15 @@ pub const Generator = struct {
         const on = mtpPredraftEnabledFromEnv(raw);
         mtp_predraft_cache = on;
         return on;
+    }
+
+    pub fn mtpTraceOn() bool {
+        return mtpTraceEnabled();
+    }
+
+    pub fn mtpTraceSub(self: *Generator, sub: MtpTrace.Sub, dur_ns: u64) void {
+        if (!mtpTraceEnabled()) return;
+        self.mtp_trace.addSub(sub, dur_ns);
     }
 
     var mtp_trace_cache: ?bool = null;
@@ -9249,7 +9345,7 @@ pub const Generator = struct {
         const t = &self.mtp_trace;
         var acc_buf: [64]u8 = undefined;
         log.info(
-            "  [mtp-trace] rounds={d} avg_ms draft={d:.2} sync={d:.2} ext={d:.2} verify={d:.2} corr={d:.2} eval={d:.2} hist={d:.2} commit={d:.2} predraft={d:.2} gap={d:.2} total={d:.2} | m_avg={d:.2} acc_avg={d:.2} ext_rate={d:.2} acc_idx={s}\n",
+            MtpTrace.LINE_FMT,
             .{
                 t.rounds,
                 t.avgMs(.draft),
@@ -9267,6 +9363,12 @@ pub const Generator = struct {
                 @as(f64, @floatFromInt(t.accepted)) / @as(f64, @floatFromInt(t.rounds)),
                 @as(f64, @floatFromInt(t.extended)) / @as(f64, @floatFromInt(t.rounds)),
                 t.accIdxStr(&acc_buf),
+                t.subAvgMs(.build),
+                t.subAvgMs(.ple),
+                t.subAvgMs(.ple_sync),
+                t.subAvgMs(.dispatch),
+                t.subAvgMs(.wait),
+                t.subAvgMs(.chain),
             },
         );
         t.reset();
@@ -14635,6 +14737,41 @@ test "MtpTrace: per-phase accumulation, round averaging, log cadence, reset" {
     t.reset();
     try testing.expectEqual(@as(u32, 0), t.rounds);
     try testing.expectApproxEqAbs(@as(f64, 0.0), t.avgMs(.draft), 1e-9);
+}
+
+test "the [mtp-trace] phase summary stays contiguous for its log consumers" {
+    const line = try std.fmt.allocPrint(testing.allocator, Generator.MtpTrace.LINE_FMT, .{
+        @as(u32, 32), 0.45, 0.0, 0.0,         4.09, 56.86, 0.0,  0.0,   0.03, 0.0,  0.07, 61.57,
+        2.0,          1.4,  0.0, "0.91/0.80", 4.09, 7.13,  6.40, 52.28, 0.94, 0.44,
+    });
+    defer testing.allocator.free(line);
+    try testing.expect(std.mem.indexOf(u8, line, "total=61.57 | m_avg=") != null);
+    const acc_at = std.mem.indexOf(u8, line, "acc_idx=").?;
+    const sub_at = std.mem.indexOf(u8, line, "| sub_ms ").?;
+    try testing.expect(acc_at < sub_at);
+}
+
+test "MtpTrace sub-laps attribute inside a phase without changing the round total" {
+    var t = Generator.MtpTrace{};
+    t.add(.verify, 20_000_000);
+    t.addSub(.build, 15_000_000);
+    t.addSub(.ple, 3_000_000);
+    t.addSub(.ple_sync, 2_000_000);
+    t.add(.corr, 6_000_000);
+    t.addSub(.dispatch, 2_000_000);
+    t.add(.eval, 60_000_000);
+    t.addSub(.wait, 58_000_000);
+    t.add(.gap, 12_000_000);
+    t.addSub(.chain, 2_000_000);
+    try testing.expect(!t.endRound(2, 2, false));
+    try testing.expectApproxEqAbs(@as(f64, 98.0), t.totalAvgMs(), 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 20.0), t.avgMs(.verify), 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 20.0), t.subAvgMs(.build) + t.subAvgMs(.ple) + t.subAvgMs(.ple_sync), 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 58.0), t.subAvgMs(.wait), 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 2.0), t.subAvgMs(.chain), 1e-9);
+    t.reset();
+    try testing.expectApproxEqAbs(@as(f64, 0.0), t.subAvgMs(.build), 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 0.0), t.totalAvgMs(), 1e-9);
 }
 
 test "buildPaddedBatch pads to max length with zeros and records lengths" {
