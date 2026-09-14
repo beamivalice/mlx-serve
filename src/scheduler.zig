@@ -4006,6 +4006,12 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         };
         const warmup_ns: u64 = @intCast(warmup_start.untilNow(sch.io, .awake).nanoseconds);
         log.info("Warmup complete ({d} ms).\n", .{warmup_ns / std.time.ns_per_ms});
+        if (mtp_enabled and xfm_ptr.qwen4_mtp != null) {
+            const cap = generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile);
+            xfm_ptr.warmupSpecVerify(cap, params.kv_quant_config) catch |err| {
+                log.warn("[spec-warmup] failed ({s}); the first round at each width pays its kernel compile inside the round.\n", .{@errorName(err)});
+            };
+        }
     }
 
     // ── Phase 05: install everything onto the LoadedModel entry, mark
