@@ -14617,6 +14617,11 @@ pub const Transformer = struct {
     cost_attention: u8 = 0,
     cost_moe: u8 = 0,
     verify_laps: VerifyLaps = .{},
+    /// The joined `[1, Σ(1+m_i), V]` logits of the last row-axis verify whose
+    /// lm_head ran once for the whole group, so the accept side can filter the
+    /// block once instead of one slice per row. Null whenever the projection
+    /// ran per row; the next verify releases it.
+    verify_joined_logits: mlx.mlx_array = .{ .ctx = null },
     /// Persistence key of `round_cost` (empty = not persisted).
     round_cost_key_buf: [64]u8 = undefined,
     round_cost_key_len: u8 = 0,
@@ -16171,6 +16176,7 @@ pub const Transformer = struct {
     }
 
     pub fn deinit(self: *Transformer) void {
+        self.releaseJoinedVerifyLogits();
         if (self.ane_prefill) |eng| {
             eng.deinit();
             self.ane_prefill = null;
@@ -19565,6 +19571,7 @@ pub const Transformer = struct {
         }
         if (row_ns) |ns| @memset(ns[0..token_rows.len], 0);
         self.verify_laps = .{};
+        self.releaseJoinedVerifyLogits();
         var rollback: [MAX_BATCH_ROWS]VerifyRollback = undefined;
         var n_rollback: usize = 0;
         defer for (rollback[0..n_rollback]) |*saved| saved.deinit();
@@ -19658,6 +19665,22 @@ pub const Transformer = struct {
             @memcpy(out[0..n_rollback], rollback[0..n_rollback]);
             n_rollback = 0;
         }
+    }
+
+    /// Drop the published joined verify block. Called before every row-axis
+    /// verify and at teardown; the accept side takes ownership when it wants it.
+    pub fn releaseJoinedVerifyLogits(self: *Transformer) void {
+        if (self.verify_joined_logits.ctx == null) return;
+        _ = mlx.mlx_array_free(self.verify_joined_logits);
+        self.verify_joined_logits = .{ .ctx = null };
+    }
+
+    /// Hand the joined verify block to the caller (null when the projection ran
+    /// per row).
+    pub fn takeJoinedVerifyLogits(self: *Transformer) mlx.mlx_array {
+        const out = self.verify_joined_logits;
+        self.verify_joined_logits = .{ .ctx = null };
+        return out;
     }
 
     /// Row `i` of `[N, S, V]` logits as an owned `[1, S, V]` array, for every row.
@@ -22706,7 +22729,9 @@ pub const Transformer = struct {
             defer _ = mlx.mlx_array_free(joined);
             try mlx.check(mlx.mlx_concatenate_axis(&joined, vec, 1, self.s));
             if (try verifyLmHeadProjection(self.s, joined, self.lm_head_w, self.lm_head_s, self.lm_head_b, lmhead_widths[0..initialized])) |logits| {
-                defer _ = mlx.mlx_array_free(logits);
+                // The block stays published for the accept side; `out_logits`
+                // are views of it either way.
+                self.verify_joined_logits = logits;
                 var offset: c_int = 0;
                 for (rows[0..initialized], 0..) |row, i| {
                     try mlx.check(mlx.mlx_slice(&out_logits[i], logits, &.{ 0, offset, 0 }, 3, &.{ 1, offset + row.seq, mlx.getShape(logits)[2] }, 3, &.{ 1, 1, 1 }, 3, self.s));
@@ -60197,7 +60222,7 @@ test "group round: a row's own argmax and budget decide it, and nothing else doe
     }
     for (0..2) |i| try testing.expectEqualSlices(i32, solo_am[i], grp_am[i]);
 
-    const accept = gen_mod.Generator.mtpAcceptRowGreedy;
+    const accept = gen_mod.Generator.mtpGreedyVerdict;
     var base: [2]gen_mod.Generator.MtpRowVerdict = undefined;
     for (0..2) |i| {
         const solo_v = accept(solo_am[i], drafts[i][0 .. S_row[i] - 1], 0, 400);

@@ -786,6 +786,65 @@ fn applySuppressMask(out: *mlx.mlx_array, logits: mlx.mlx_array, mask: mlx.mlx_a
     try mlx.check(mlx.mlx_where(out, mask, neg_inf, logits, s));
 }
 
+/// A scalar in the array's own dtype, so a masked bf16 block is not widened to
+/// f32 by its own `-inf`.
+fn scalarLike(v: f32, like: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    const raw = mlx.mlx_array_new_float(v);
+    defer _ = mlx.mlx_array_free(raw);
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_astype(&out, raw, mlx.mlx_array_dtype(like), s));
+    return out;
+}
+
+/// A greedy spec-verify argmax whose entries are COMMITTED as next tokens.
+/// `verifyArgmax` is its only constructor and every commit site takes this type,
+/// so a raw `mlx_argmax_axis` cannot reach a commit without the reserved-id mask.
+pub const CommittedArgmax = struct {
+    arr: mlx.mlx_array = .{ .ctx = null },
+
+    pub fn deinit(self: *CommittedArgmax) void {
+        if (self.arr.ctx != null) _ = mlx.mlx_array_free(self.arr);
+        self.arr = .{ .ctx = null };
+    }
+
+    pub fn present(self: CommittedArgmax) bool {
+        return self.arr.ctx != null;
+    }
+
+    /// The lazy handle, for an eval vector or a forced eval - never for a commit.
+    pub fn lazy(self: CommittedArgmax) mlx.mlx_array {
+        return self.arr;
+    }
+
+    /// The realized ids; the caller must have evaluated `lazy()` first.
+    pub fn ids(self: CommittedArgmax, len: usize) ![]const i32 {
+        const data = mlx.mlx_array_data_int32(self.arr) orelse return error.MlxArrayDataNull;
+        return data[0..len];
+    }
+};
+
+/// The greedy spec-verify argmax, over the reserved-id mask when the model has
+/// one. The sampled verify filters through `applySuppressMask` and the rerank
+/// draft select takes the mask, so without this the greedy verify was the one
+/// path that could commit a flagged special or a padding row past the defined
+/// vocabulary — ids the serial sampler can never draw.
+fn verifyArgmax(logits: mlx.mlx_array, mask: ?mlx.mlx_array, s: mlx.mlx_stream) !CommittedArgmax {
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    if (mask) |m| {
+        const neg_inf = try scalarLike(-std.math.inf(f32), logits, s);
+        defer _ = mlx.mlx_array_free(neg_inf);
+        var masked = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(masked);
+        try mlx.check(mlx.mlx_where(&masked, m, neg_inf, logits, s));
+        try mlx.check(mlx.mlx_argmax_axis(&out, masked, 2, false, s));
+    } else {
+        try mlx.check(mlx.mlx_argmax_axis(&out, logits, 2, false, s));
+    }
+    return .{ .arr = out };
+}
+
 /// A speculative decode step (PLD / drafter / MTP) cannot honor a grammar
 /// constraint — the drafts bypass the per-token grammar mask — nor per-token
 /// logprobs, which the draft path never captures. The scheduler and server
@@ -4398,11 +4457,12 @@ pub const Generator = struct {
         }
 
         // Build the greedy argmax tensor lazily; it'll be eval'd alongside
-        // the rest of the round below.
-        var verify_argmax = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(verify_argmax);
+        // the rest of the round below. Its entries are COMMITTED, so they mask
+        // reserved ids like every other block decoder's.
+        var verify_argmax: CommittedArgmax = .{};
+        defer verify_argmax.deinit();
         if (!stochastic) {
-            try mlx.check(mlx.mlx_argmax_axis(&verify_argmax, verify_logits, 2, false, s));
+            verify_argmax = try verifyArgmax(verify_logits, self.sampling.suppress_mask, s);
         }
         _ = mlx.mlx_array_free(verify_logits);
         verify_logits = .{ .ctx = null };
@@ -4428,7 +4488,7 @@ pub const Generator = struct {
             defer _ = mlx.mlx_vector_array_free(eval_vec);
             for (draft_arrs) |arr| _ = mlx.mlx_vector_array_append_value(eval_vec, arr);
             if (!stochastic) {
-                _ = mlx.mlx_vector_array_append_value(eval_vec, verify_argmax);
+                _ = mlx.mlx_vector_array_append_value(eval_vec, verify_argmax.lazy());
             }
             _ = mlx.mlx_vector_array_append_value(eval_vec, new_hidden);
             try mlx.check(mlx.mlx_async_eval(eval_vec));
@@ -4449,7 +4509,7 @@ pub const Generator = struct {
             // produced 0% acceptance on 26B/31B (verify ran longer than the
             // drafter chain, so the data buffer was read while the GPU was
             // still writing it).
-            try mlx.check(mlx.mlx_array_eval(verify_argmax));
+            try mlx.check(mlx.mlx_array_eval(verify_argmax.lazy()));
         }
 
         var accepted: u32 = 0;
@@ -4472,9 +4532,7 @@ pub const Generator = struct {
         } else {
             // Bulk-read the [1, 1+m] argmax indices and scan for first
             // mismatch in CPU. No more GPU syncs in this branch.
-            const argmax_data = mlx.mlx_array_data_int32(verify_argmax) orelse {
-                return error.MlxArrayDataNull;
-            };
+            const argmax_data = try verify_argmax.ids(1 + m);
             var k: u32 = 0;
             while (k < m) : (k += 1) {
                 const target_argmax: u32 = @intCast(argmax_data[k]);
@@ -4515,9 +4573,7 @@ pub const Generator = struct {
             } else {
                 // Greedy: reuse the bulk-read argmax row. Already eval'd in
                 // the single async eval above; no GPU sync here.
-                const argmax_data = mlx.mlx_array_data_int32(verify_argmax) orelse {
-                    return error.MlxArrayDataNull;
-                };
+                const argmax_data = try verify_argmax.ids(1 + m);
                 break :blk @intCast(argmax_data[accepted]);
             }
         };
@@ -4986,10 +5042,11 @@ pub const Generator = struct {
                 try mlx.check(mlx.mlx_slice(slot, verify_logits, &start, 3, &stop, 3, &slice_strides, 3, s));
             }
         }
-        var verify_argmax = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(verify_argmax);
+        // Committed entries: masked like every other block decoder's.
+        var verify_argmax: CommittedArgmax = .{};
+        defer verify_argmax.deinit();
         if (!stochastic) {
-            try mlx.check(mlx.mlx_argmax_axis(&verify_argmax, verify_logits, 2, false, s));
+            verify_argmax = try verifyArgmax(verify_logits, self.sampling.suppress_mask, s);
         }
         _ = mlx.mlx_array_free(verify_logits);
         verify_logits = .{ .ctx = null };
@@ -5001,7 +5058,7 @@ pub const Generator = struct {
             const eval_vec = mlx.mlx_vector_array_new();
             defer _ = mlx.mlx_vector_array_free(eval_vec);
             _ = mlx.mlx_vector_array_append_value(eval_vec, draft_ids);
-            if (!stochastic) _ = mlx.mlx_vector_array_append_value(eval_vec, verify_argmax);
+            if (!stochastic) _ = mlx.mlx_vector_array_append_value(eval_vec, verify_argmax.lazy());
             try mlx.check(mlx.mlx_async_eval(eval_vec));
         }
         var drafts = try allocator.alloc(u32, m);
@@ -5013,7 +5070,7 @@ pub const Generator = struct {
             const draft_data = mlx.mlx_array_data_int32(draft_ids) orelse return error.MlxArrayDataNull;
             for (drafts, 0..) |*d, idx| d.* = @intCast(draft_data[idx]);
         }
-        if (!stochastic) try mlx.check(mlx.mlx_array_eval(verify_argmax));
+        if (!stochastic) try mlx.check(mlx.mlx_array_eval(verify_argmax.lazy()));
 
         var accepted: u32 = 0;
         if (stochastic) {
@@ -5037,7 +5094,7 @@ pub const Generator = struct {
                 accepted += 1;
             }
         } else {
-            const argmax_data = mlx.mlx_array_data_int32(verify_argmax) orelse return error.MlxArrayDataNull;
+            const argmax_data = try verify_argmax.ids(1 + m);
             var k: u32 = 0;
             while (k < m) : (k += 1) {
                 if (@as(u32, @intCast(argmax_data[k])) != drafts[k]) break;
@@ -5077,7 +5134,7 @@ pub const Generator = struct {
                     break :blk try sampleFromProbs(probs, s);
                 }
             } else {
-                const argmax_data = mlx.mlx_array_data_int32(verify_argmax) orelse return error.MlxArrayDataNull;
+                const argmax_data = try verify_argmax.ids(1 + m);
                 break :blk @intCast(argmax_data[accepted]);
             }
         };
@@ -6528,17 +6585,29 @@ pub const Generator = struct {
         retained: u32 = 0,
         verify_rollback: ?Transformer.VerifyRollback = null,
         verify_ctx: ?*ForwardCtx = null,
-        verify_argmax: mlx.mlx_array = .{ .ctx = null },
+        verify_argmax: CommittedArgmax = .{},
         verify_logits: mlx.mlx_array = .{ .ctx = null },
         new_hidden: mlx.mlx_array = .{ .ctx = null },
         verify_hidden_all: mlx.mlx_array = .{ .ctx = null },
+        /// The group's joined `[1, Σ(1+m_i), V]` verify block, held by the FIRST
+        /// row's state; the accept side filters it once for every sampled row.
+        group_logits: mlx.mlx_array = .{ .ctx = null },
+        /// Phase-4 terms the group prepared for this row (sampled rows only):
+        /// the accept graph's own outputs, whichever acceptance mode built them.
+        /// `accept_p` null-ctx = this row builds its own in the finish.
+        accept_p: mlx.mlx_array = .{ .ctx = null },
+        accept_q: mlx.mlx_array = .{ .ctx = null },
+        accept_defer: mlx.mlx_array = .{ .ctx = null },
+        corr: mlx.mlx_array = .{ .ctx = null },
 
         pub fn deinit(self: *MtpRoundState, allocator: std.mem.Allocator) void {
             self.chain.deinit(allocator);
             if (self.kv_snap) |*snap| snap.deinit();
             _ = mlx.mlx_array_free(self.verify_input);
-            if (self.verify_argmax.ctx != null) _ = mlx.mlx_array_free(self.verify_argmax);
+            self.verify_argmax.deinit();
             if (self.verify_logits.ctx != null) _ = mlx.mlx_array_free(self.verify_logits);
+            if (self.group_logits.ctx != null) _ = mlx.mlx_array_free(self.group_logits);
+            self.releasePreparedAccept();
             if (self.new_hidden.ctx != null) _ = mlx.mlx_array_free(self.new_hidden);
             if (self.verify_hidden_all.ctx != null) _ = mlx.mlx_array_free(self.verify_hidden_all);
             if (self.verify_ctx) |ctx| {
@@ -6549,11 +6618,27 @@ pub const Generator = struct {
                 saved.deinit();
             }
         }
+
+        /// Drop the group-prepared Phase-4 terms, so the row's finish builds its own.
+        pub fn releasePreparedAccept(self: *MtpRoundState) void {
+            inline for (.{ &self.accept_p, &self.accept_q, &self.accept_defer, &self.corr }) |slot| {
+                if (slot.ctx != null) {
+                    _ = mlx.mlx_array_free(slot.*);
+                    slot.* = .{ .ctx = null };
+                }
+            }
+        }
     };
 
     pub const MtpRowVerdict = struct { accepted: u32, next_pending: u32 };
 
-    pub fn mtpAcceptRowGreedy(am: []const i32, drafts: []const u32, completion: u32, max_tokens: u32) MtpRowVerdict {
+    /// One row's greedy verdict. Takes the committed-argmax wrapper, so no raw
+    /// argmax can reach a commit; `mtpGreedyVerdict` is the pure core.
+    pub fn mtpAcceptRowGreedy(am: CommittedArgmax, len: u32, drafts: []const u32, completion: u32, max_tokens: u32) !MtpRowVerdict {
+        return mtpGreedyVerdict(try am.ids(len), drafts, completion, max_tokens);
+    }
+
+    pub fn mtpGreedyVerdict(am: []const i32, drafts: []const u32, completion: u32, max_tokens: u32) MtpRowVerdict {
         var accepted: u32 = 0;
         while (accepted < drafts.len and @as(u32, @intCast(am[accepted])) == drafts[accepted]) accepted += 1;
         accepted = capAcceptedForTokenBudget(accepted, completion, max_tokens);
@@ -6973,6 +7058,8 @@ pub const Generator = struct {
             st.verify_logits = out_logits[i];
             st.new_hidden = out_last[i];
             st.verify_hidden_all = out_all[i];
+            // Row 0 owns the joined block for the round when the lm_head ran once.
+            if (i == 0) st.group_logits = xfm.takeJoinedVerifyLogits();
             if (st.tracing) {
                 gen.mtp_trace.add(.verify, row_ns[i]);
                 const laps = xfm.verify_laps;
@@ -7005,25 +7092,106 @@ pub const Generator = struct {
         const eval_vec = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(eval_vec);
         errdefer for (states[0..n]) |st| {
-            if (st.verify_argmax.ctx != null) {
-                _ = mlx.mlx_array_free(st.verify_argmax);
-                st.verify_argmax = .{ .ctx = null };
-            }
+            st.verify_argmax.deinit();
+            st.releasePreparedAccept();
         };
         for (gens[0..n], states[0..n]) |gen, st| {
             for (st.chain.draft_arrs[0..st.chain.m]) |arr| _ = mlx.mlx_vector_array_append_value(eval_vec, arr);
             _ = mlx.mlx_vector_array_append_value(eval_vec, st.new_hidden);
             _ = mlx.mlx_vector_array_append_value(eval_vec, st.verify_hidden_all);
             if (gen.sampling.temperature > 0.01) continue;
-            var am = mlx.mlx_array_new();
-            mlx.check(mlx.mlx_argmax_axis(&am, st.verify_logits, 2, false, s)) catch |e| {
-                _ = mlx.mlx_array_free(am);
-                return e;
-            };
-            st.verify_argmax = am;
-            _ = mlx.mlx_vector_array_append_value(eval_vec, am);
+            st.verify_argmax = try verifyArgmax(st.verify_logits, gen.sampling.suppress_mask, s);
+            _ = mlx.mlx_vector_array_append_value(eval_vec, st.verify_argmax.lazy());
         }
+        try mtpGroupSampledAccept(gens[0..n], states[0..n], eval_vec, s);
         try mlx.check(mlx.mlx_async_eval(eval_vec));
+    }
+
+    /// Whether ONE filtered block can serve every sampled row of a group: the
+    /// filter is per REQUEST, and one categorical cannot carry a per-row key.
+    fn mtpGroupAcceptBatchable(params: []const SamplingParams) bool {
+        if (params.len == 0) return false;
+        return sampleRowsHomogeneous(params) and !sampleRowsAnySeed(params);
+    }
+
+    /// Phase 4 for the sampled rows of a group, built together: ONE
+    /// `probsAllPositions` over their joined verify logits — the block the
+    /// lm_head already projected in one go — and each row's accept graph on the
+    /// group's single async eval, instead of a build-wait-build staircase per
+    /// row. Declines (every row then builds its own in `mtpRoundFinish`) when
+    /// the rows do not share one sampler, any row is seeded, or a row was
+    /// padded past `1 + m`.
+    fn mtpGroupSampledAccept(
+        gens: []const *Generator,
+        states: []const *MtpRoundState,
+        eval_vec: mlx.mlx_vector_array,
+        s: mlx.mlx_stream,
+    ) !void {
+        if (!mtpBatchCorrEnabled()) return;
+        var rows: [MTP_GROUP_ROWS_MAX]usize = undefined;
+        var params: [MTP_GROUP_ROWS_MAX]SamplingParams = undefined;
+        var k: usize = 0;
+        for (gens, states, 0..) |gen, st, i| {
+            if (gen.sampling.temperature <= 0.01) continue;
+            if (st.chain.m == 0 or st.verify_len != 1 + st.chain.m) return;
+            rows[k] = i;
+            params[k] = gen.sampling;
+            k += 1;
+        }
+        if (k == 0 or !mtpGroupAcceptBatchable(params[0..k])) return;
+
+        // Offsets of each sampled row in the block, ascending: the projection's
+        // own `offset += row.seq` walk, which is why the joined array can stand
+        // in for the concatenation whenever every row of it is sampled.
+        var offs: [MTP_GROUP_ROWS_MAX]c_int = undefined;
+        var total: c_int = 0;
+        for (rows[0..k], 0..) |i, j| {
+            offs[j] = total;
+            total += @intCast(states[i].verify_len);
+        }
+
+        const joined = states[0].group_logits;
+        const use_joined = k == gens.len and joined.ctx != null and
+            mlx.getShape(joined).len == 3 and mlx.getShape(joined)[1] == total;
+        var block = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(block);
+        if (use_joined) {
+            try mlx.check(mlx.mlx_array_set(&block, joined));
+        } else {
+            var parts: [MTP_GROUP_ROWS_MAX]mlx.mlx_array = undefined;
+            for (rows[0..k], 0..) |i, j| parts[j] = states[i].verify_logits;
+            const vec = mlx.mlx_vector_array_new_data(&parts, k);
+            defer _ = mlx.mlx_vector_array_free(vec);
+            try mlx.check(mlx.mlx_concatenate_axis(&block, vec, 1, s));
+        }
+
+        const probs = try groupProbsBlock(block, params[0], s);
+        defer _ = mlx.mlx_array_free(probs);
+        for (rows[0..k], 0..) |i, j| {
+            const st = states[i];
+            const row_probs = try groupProbsRow(probs, offs[j], st.verify_len, s);
+            defer _ = mlx.mlx_array_free(row_probs);
+            // The row's OWN acceptance mode, threshold and draw index: only the
+            // filter is shared, so a seeded row keeps its own key.
+            const gen = gens[i];
+            const bg = try gen.mtp_accept_graph(
+                row_probs,
+                st.chain.draft_arrs[0..st.chain.m],
+                if (st.chain.q_probs) |qs| qs[0..st.chain.m] else null,
+                st.chain.m,
+                gen.mtp_accept_param,
+                gen.mtpSamplingDraw(gen.sampling),
+                s,
+            );
+            st.accept_p = bg.accept_p;
+            st.accept_q = bg.accept_q;
+            st.accept_defer = bg.accept_defer;
+            st.corr = bg.corr_samples;
+            _ = mlx.mlx_vector_array_append_value(eval_vec, st.accept_p);
+            if (st.accept_q.ctx != null) _ = mlx.mlx_vector_array_append_value(eval_vec, st.accept_q);
+            if (st.accept_defer.ctx != null) _ = mlx.mlx_vector_array_append_value(eval_vec, st.accept_defer);
+            _ = mlx.mlx_vector_array_append_value(eval_vec, st.corr);
+        }
     }
 
     /// Phases 4–5 of a round: accept, stash the history, commit or roll back.
@@ -7118,7 +7286,20 @@ pub const Generator = struct {
             _ = mlx.mlx_array_free(corr_batch);
         };
 
-        if (stochastic and mtpBatchCorrEnabled()) {
+        // The group already built and dispatched this row's Phase 4 with the rest
+        // of the round (`mtpGroupSampledAccept`); nothing here but the handover.
+        const prepared = stochastic and st.accept_p.ctx != null;
+        if (prepared) {
+            _ = mlx.mlx_array_free(accept_p_vec);
+            accept_p_vec = st.accept_p;
+            accept_q_vec = st.accept_q;
+            accept_defer_vec = st.accept_defer;
+            corr_batch = st.corr;
+            st.accept_p = .{ .ctx = null };
+            st.accept_q = .{ .ctx = null };
+            st.accept_defer = .{ .ctx = null };
+            st.corr = .{ .ctx = null };
+        } else if (stochastic and mtpBatchCorrEnabled()) {
             const probs_all = try probsAllPositions(verify_logits, self.sampling, s);
             defer _ = mlx.mlx_array_free(probs_all);
             const bg = try self.mtp_accept_graph(
@@ -7252,12 +7433,12 @@ pub const Generator = struct {
             }
         }
 
-        const group_argmax = st.verify_argmax.ctx != null;
-        var verify_argmax = if (group_argmax) st.verify_argmax else mlx.mlx_array_new();
-        st.verify_argmax = .{ .ctx = null };
-        defer _ = mlx.mlx_array_free(verify_argmax);
+        const group_argmax = st.verify_argmax.present();
+        var verify_argmax = st.verify_argmax;
+        st.verify_argmax = .{};
+        defer verify_argmax.deinit();
         if (!group_argmax and !stochastic) {
-            try mlx.check(mlx.mlx_argmax_axis(&verify_argmax, verify_logits, 2, false, s));
+            verify_argmax = try verifyArgmax(verify_logits, self.sampling.suppress_mask, s);
         }
         _ = mlx.mlx_array_free(verify_logits);
         verify_logits = .{ .ctx = null };
@@ -7267,8 +7448,9 @@ pub const Generator = struct {
         }
 
         // ── Phase 4b: one batched async eval for the whole round ──
+        // A prepared row rode the group's eval; everything here is already on it.
         const dispatch_lap = SubLap.start(tracing, self.timer.io);
-        {
+        if (!prepared) {
             const eval_vec = mlx.mlx_vector_array_new();
             defer _ = mlx.mlx_vector_array_free(eval_vec);
             for (draft_arrs[0..m]) |arr| _ = mlx.mlx_vector_array_append_value(eval_vec, arr);
@@ -7282,7 +7464,7 @@ pub const Generator = struct {
                     for (corr_samples.?) |arr| _ = mlx.mlx_vector_array_append_value(eval_vec, arr);
                 }
             } else {
-                _ = mlx.mlx_vector_array_append_value(eval_vec, verify_argmax);
+                _ = mlx.mlx_vector_array_append_value(eval_vec, verify_argmax.lazy());
             }
             _ = mlx.mlx_vector_array_append_value(eval_vec, new_hidden);
             _ = mlx.mlx_vector_array_append_value(eval_vec, verify_hidden_all);
@@ -7299,7 +7481,7 @@ pub const Generator = struct {
         if (!stochastic) {
             // Separate graph branch from the draft chain — force it before
             // bulk-reading (see the v26.5.6 0%-acceptance note in nextDrafter).
-            try mlx.check(mlx.mlx_array_eval(verify_argmax));
+            try mlx.check(mlx.mlx_array_eval(verify_argmax.lazy()));
         }
         wait_lap.stop(&self.mtp_trace, .wait);
 
@@ -7334,10 +7516,7 @@ pub const Generator = struct {
                 self.max_tokens,
             );
         } else {
-            const argmax_data = mlx.mlx_array_data_int32(verify_argmax) orelse {
-                return error.MlxArrayDataNull;
-            };
-            const verdict = mtpAcceptRowGreedy(argmax_data[0..st.verify_len], drafts[0..m], self.completion_tokens, self.max_tokens);
+            const verdict = try mtpAcceptRowGreedy(verify_argmax, st.verify_len, drafts[0..m], self.completion_tokens, self.max_tokens);
             accepted = verdict.accepted;
             greedy_next_pending = verdict.next_pending;
         }
@@ -10546,15 +10725,9 @@ fn probsAllPositions(logits_3d: mlx.mlx_array, sampling: SamplingParams, s: mlx.
         _ = mlx.mlx_array_free(current);
         current = scaled;
     }
-    if (sampling.top_k > 0) {
+    if (sampling.top_k > 0 or sampling.top_p < 1.0) {
         var masked = mlx.mlx_array_new();
-        applyTopK(&masked, current, sampling.top_k, s) catch {};
-        _ = mlx.mlx_array_free(current);
-        current = masked;
-    }
-    if (sampling.top_p < 1.0) {
-        var masked = mlx.mlx_array_new();
-        applyTopP(&masked, current, sampling.top_p, sampling.top_k, s) catch {};
+        filterTopKTopP(&masked, current, sampling.top_p, sampling.top_k, s) catch {};
         _ = mlx.mlx_array_free(current);
         current = masked;
     }
@@ -10565,6 +10738,26 @@ fn probsAllPositions(logits_3d: mlx.mlx_array, sampling: SamplingParams, s: mlx.
     _ = mlx.mlx_array_free(current);
     current = .{ .ctx = null };
     return probs;
+}
+
+/// The target densities of a whole GROUP of verify rows in one filtered block:
+/// the rows' `[1, Σ(1+m_i), V]` logits filtered as one. The filter is row-wise
+/// on the last axis, so a row's slice of this block is byte-for-byte the
+/// `probsAllPositions` of that row alone.
+fn groupProbsBlock(block_logits: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) !mlx.mlx_array {
+    return probsAllPositions(block_logits, sampling, s);
+}
+
+/// One row's `[1, 1+m, V]` densities as a VIEW into the group's block.
+fn groupProbsRow(block_probs: mlx.mlx_array, offset: c_int, len: u32, s: mlx.mlx_stream) !mlx.mlx_array {
+    const shape = mlx.getShape(block_probs);
+    const start = [_]c_int{ 0, offset, 0 };
+    const stop = [_]c_int{ shape[0], offset + @as(c_int, @intCast(len)), shape[2] };
+    const strides = [_]c_int{ 1, 1, 1 };
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_slice(&out, block_probs, &start, 3, &stop, 3, &strides, 3, s));
+    return out;
 }
 
 /// Lazy log-confidence of one MTP draft: `logits[draft] − logsumexp(logits)`
@@ -10673,15 +10866,9 @@ fn filteredProbsRows(owned_rows: mlx.mlx_array, sampling: SamplingParams, s: mlx
         _ = mlx.mlx_array_free(current);
         current = scaled;
     }
-    if (sampling.top_k > 0) {
+    if (sampling.top_k > 0 or sampling.top_p < 1.0) {
         var masked = mlx.mlx_array_new();
-        applyTopK(&masked, current, sampling.top_k, s) catch {};
-        _ = mlx.mlx_array_free(current);
-        current = masked;
-    }
-    if (sampling.top_p < 1.0) {
-        var masked = mlx.mlx_array_new();
-        applyTopP(&masked, current, sampling.top_p, sampling.top_k, s) catch {};
+        filterTopKTopP(&masked, current, sampling.top_p, sampling.top_k, s) catch {};
         _ = mlx.mlx_array_free(current);
         current = masked;
     }
@@ -11091,18 +11278,10 @@ pub fn sampleTokenLazy(logits_in: mlx.mlx_array, sampling: SamplingParams, s: ml
         current = next;
     }
 
-    // Apply top-k filtering (lazy)
-    if (sampling.top_k > 0) {
+    // Apply top-k and top-p in one pass (lazy)
+    if (sampling.top_k > 0 or sampling.top_p < 1.0) {
         var next = mlx.mlx_array_new();
-        applyTopK(&next, current, sampling.top_k, s) catch {};
-        _ = mlx.mlx_array_free(current);
-        current = next;
-    }
-
-    // Apply top-p filtering (lazy)
-    if (sampling.top_p < 1.0) {
-        var next = mlx.mlx_array_new();
-        applyTopP(&next, current, sampling.top_p, sampling.top_k, s) catch {};
+        filterTopKTopP(&next, current, sampling.top_p, sampling.top_k, s) catch {};
         _ = mlx.mlx_array_free(current);
         current = next;
     }
@@ -11281,19 +11460,9 @@ fn sampleRowsLazy(row_logits: []const mlx.mlx_array, params: []const SamplingPar
         _ = mlx.mlx_array_free(current);
         current = next;
     }
-    if (p0.top_k > 0) {
+    if (p0.top_k > 0 or p0.top_p < 1.0) {
         var next = mlx.mlx_array_new();
-        applyTopK(&next, current, p0.top_k, s) catch {
-            _ = mlx.mlx_array_free(next);
-            next = current;
-            current = mlx.mlx_array_new();
-        };
-        if (current.ctx != null) _ = mlx.mlx_array_free(current);
-        current = next;
-    }
-    if (p0.top_p < 1.0) {
-        var next = mlx.mlx_array_new();
-        applyTopP(&next, current, p0.top_p, p0.top_k, s) catch {
+        filterTopKTopP(&next, current, p0.top_p, p0.top_k, s) catch {
             _ = mlx.mlx_array_free(next);
             next = current;
             current = mlx.mlx_array_new();
@@ -12441,30 +12610,17 @@ fn sampleToken(allocator: std.mem.Allocator, logits: mlx.mlx_array, sampling: Sa
     // sampling knob.
     const logprobs_logits = last_logits;
 
-    // Apply top-k filtering
-    var after_topk = mlx.mlx_array_new();
-    var topk_owned = false;
-    defer if (topk_owned) {
-        _ = mlx.mlx_array_free(after_topk);
+    // Apply top-k and top-p in one pass
+    var filtered = mlx.mlx_array_new();
+    var filtered_owned = false;
+    defer if (filtered_owned) {
+        _ = mlx.mlx_array_free(filtered);
     };
 
-    if (sampling.top_k > 0) {
-        try applyTopK(&after_topk, current, sampling.top_k, s);
-        current = after_topk;
-        topk_owned = true;
-    }
-
-    // Apply top-p (nucleus) sampling
-    var after_topp = mlx.mlx_array_new();
-    var topp_owned = false;
-    defer if (topp_owned) {
-        _ = mlx.mlx_array_free(after_topp);
-    };
-
-    if (sampling.top_p < 1.0) {
-        try applyTopP(&after_topp, current, sampling.top_p, sampling.top_k, s);
-        current = after_topp;
-        topp_owned = true;
+    if (sampling.top_k > 0 or sampling.top_p < 1.0) {
+        try filterTopKTopP(&filtered, current, sampling.top_p, sampling.top_k, s);
+        current = filtered;
+        filtered_owned = true;
     }
 
     // Sample from categorical distribution
@@ -12875,6 +13031,16 @@ fn keepByIndex(res: *mlx.mlx_array, logits: mlx.mlx_array, keep_idx: mlx.mlx_arr
     const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
     defer _ = mlx.mlx_array_free(neg_inf);
     try mlx.check(mlx.mlx_where(res, mask, logits, neg_inf, s));
+}
+
+/// Top-k and top-p in ONE pass. A bounded `applyTopP` ranks the row's top
+/// `top_k` columns and scatters its keep flags at exactly those column ids, so a
+/// preceding `applyTopK` selects the same shortlist and masks a SUPERSET of what
+/// the nucleus keeps — one full-vocab selection and one full-row `where` of pure
+/// tax on every filtered row. Byte-identical to the pair either way round.
+fn filterTopKTopP(res: *mlx.mlx_array, logits: mlx.mlx_array, top_p: f32, top_k: u32, s: mlx.mlx_stream) !void {
+    if (top_p >= 1.0) return applyTopK(res, logits, top_k, s);
+    return applyTopP(res, logits, top_p, top_k, s);
 }
 
 /// Apply top-p (nucleus) sampling: mask logits outside the top-p probability
@@ -17686,7 +17852,7 @@ test "a block decoder's entry token stops the round before it drafts" {
 }
 
 test "group acceptance: every row's verdict comes from its OWN am, at any accept position" {
-    const accept = Generator.mtpAcceptRowGreedy;
+    const accept = Generator.mtpGreedyVerdict;
     {
         const am = [_]i32{ 11, 22, 33 };
         const drafts = [_]u32{ 11, 22 };
@@ -18870,4 +19036,173 @@ test "shortlist top-p holds on rank-3 [B, L, V] blocks" {
         const kept = samplerTestKeptCount(sd[r * v ..][0..v]);
         try testing.expect(kept > 0 and kept <= 20);
     }
+}
+
+test "a group's joined probability block slices row-for-row into the per-row filter" {
+    // Ragged widths, three rows: the axis-bug class ("one row cannot reveal an
+    // axis bug"), and the offsets the projection's own walk produces.
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const v: usize = 8192;
+    const widths = [_]u32{ 3, 2, 4 };
+    const sampling = SamplingParams{ .temperature = 1.0, .top_p = 0.95, .top_k = 20 };
+
+    var rows: [widths.len]mlx.mlx_array = undefined;
+    var built: usize = 0;
+    defer for (rows[0..built]) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    for (widths, 0..) |w, r| {
+        const host = try allocator.alloc(f32, @as(usize, w) * v);
+        defer allocator.free(host);
+        for (0..w) |p| samplerTestRow(host[p * v ..][0..v], (r * 8 + p + 1) *% 0xD1B54A32D192ED03, 4.0);
+        const shape = [_]c_int{ 1, @intCast(w), @intCast(v) };
+        const f32_rows = mlx.mlx_array_new_data(host.ptr, &shape, 3, .float32);
+        defer _ = mlx.mlx_array_free(f32_rows);
+        rows[r] = mlx.mlx_array_new();
+        built = r + 1;
+        // bf16 like the verify block the lm_head produces.
+        try mlx.check(mlx.mlx_astype(&rows[r], f32_rows, .bfloat16, s));
+    }
+
+    var joined = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(joined);
+    {
+        const vec = mlx.mlx_vector_array_new_data(&rows, widths.len);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_concatenate_axis(&joined, vec, 1, s));
+    }
+    const block = try groupProbsBlock(joined, sampling, s);
+    defer _ = mlx.mlx_array_free(block);
+
+    var offset: c_int = 0;
+    for (widths, 0..) |w, r| {
+        const got = try groupProbsRow(block, offset, w, s);
+        defer _ = mlx.mlx_array_free(got);
+        const want = try probsAllPositions(rows[r], sampling, s);
+        defer _ = mlx.mlx_array_free(want);
+        const g_shape = mlx.getShape(got);
+        try testing.expectEqual(@as(c_int, 1), g_shape[0]);
+        try testing.expectEqual(@as(c_int, @intCast(w)), g_shape[1]);
+        try samplerTestExpectSameBits(got, want, @as(usize, w) * v, s);
+        offset += @intCast(w);
+    }
+}
+
+test "the group accept block declines a mixed sampler and any seeded row" {
+    const a = SamplingParams{ .temperature = 1.0, .top_p = 0.95, .top_k = 20 };
+    var b = a;
+    b.top_k = 40;
+    var seeded = a;
+    seeded.seed = 7;
+    try testing.expect(Generator.mtpGroupAcceptBatchable(&.{ a, a }));
+    try testing.expect(!Generator.mtpGroupAcceptBatchable(&.{ a, b }));
+    try testing.expect(!Generator.mtpGroupAcceptBatchable(&.{ a, seeded }));
+    try testing.expect(!Generator.mtpGroupAcceptBatchable(&.{}));
+}
+
+/// The composition every sampling site ran before `filterTopKTopP`: top-k, then
+/// top-p bounded by that same k. The reference the one-pass filter is pinned to.
+fn samplerTestComposed(res: *mlx.mlx_array, logits: mlx.mlx_array, top_p: f32, top_k: u32, s: mlx.mlx_stream) !void {
+    var after_k = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(after_k);
+    if (top_k > 0) {
+        try applyTopK(&after_k, logits, top_k, s);
+    } else {
+        try mlx.check(mlx.mlx_array_set(&after_k, logits));
+    }
+    if (top_p < 1.0) return applyTopP(res, after_k, top_p, top_k, s);
+    return mlx.check(mlx.mlx_array_set(res, after_k));
+}
+
+test "filterTopKTopP is byte-identical to the two-pass composition" {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const Setting = struct { p: f32, k: u32 };
+    const settings = [_]Setting{
+        .{ .p = 0.95, .k = 20 }, .{ .p = 0.9, .k = 1 },  .{ .p = 1.0, .k = 20 },
+        .{ .p = 0.95, .k = 0 },  .{ .p = 0.5, .k = 50 }, .{ .p = 0.95, .k = 999999 },
+    };
+    for ([_]usize{ 8192, 248320 }) |v| {
+        const rows: usize = 3;
+        const host = try allocator.alloc(f32, rows * v);
+        defer allocator.free(host);
+        samplerTestRow(host[0..v], 0x9E3779B97F4A7C15, 4.0);
+        // Row 1 quantized to 0.25 steps: thousands of exact ties at the cutoff.
+        samplerTestRow(host[v..][0..v], 0xD1B54A32D192ED03, 4.0);
+        for (host[v..][0..v]) |*x| x.* = @round(x.* * 4.0) / 4.0;
+        // Row 2 all equal: every column ties, so the ranking alone decides.
+        @memset(host[2 * v ..][0..v], 1.25);
+
+        // `[m, V]` and `[1, L, V]`: the mask must stay per ROW on both ranks.
+        for ([_]usize{ 2, 3 }) |rank| {
+            const shape2 = [_]c_int{ @intCast(rows), @intCast(v) };
+            const shape3 = [_]c_int{ 1, @intCast(rows), @intCast(v) };
+            const shape: []const c_int = if (rank == 2) &shape2 else &shape3;
+            const f32_block = mlx.mlx_array_new_data(host.ptr, shape.ptr, @intCast(shape.len), .float32);
+            defer _ = mlx.mlx_array_free(f32_block);
+            var block = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(block);
+            try mlx.check(mlx.mlx_astype(&block, f32_block, .bfloat16, s));
+            for (settings) |cfg| {
+                var want = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(want);
+                try samplerTestComposed(&want, block, cfg.p, cfg.k, s);
+                var got = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(got);
+                try filterTopKTopP(&got, block, cfg.p, cfg.k, s);
+                samplerTestExpectSameBits(got, want, rows * v, s) catch |e| {
+                    std.debug.print("v={d} rank={d} top_p={d} top_k={d}\n", .{ v, rank, cfg.p, cfg.k });
+                    return e;
+                };
+            }
+        }
+    }
+}
+
+test "no block decoder commits an argmax over a suppressed id" {
+    // A row whose raw argmax is a padding id past the defined vocabulary, plus a
+    // flagged special: both must lose to the best legal column. Run at the block
+    // widths the committing decoders verify at (MTP and the gemma drafter `1 + m`,
+    // DFlash a whole block), so a per-position axis bug cannot hide. WHICH decoders
+    // are covered is a compile-time property: every commit site takes a
+    // `CommittedArgmax`, and only `verifyArgmax` returns one.
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const v: usize = 512;
+    const defined: usize = 500;
+    const flagged = [_]u32{7};
+    for ([_]usize{ 2, 3, 5 }) |rows| try suppressedArgmaxCase(allocator, s, v, defined, &flagged, rows);
+}
+
+fn suppressedArgmaxCase(allocator: std.mem.Allocator, s: mlx.mlx_stream, v: usize, defined: usize, flagged: []const u32, rows: usize) !void {
+    const host = try allocator.alloc(f32, rows * v);
+    defer allocator.free(host);
+    @memset(host, 0.0);
+    for (0..rows) |r| {
+        const row = host[r * v ..][0..v];
+        row[505] = 9.0; // padding row: highest of all
+        row[7] = 8.0; // flagged special: second
+        row[100 + r] = 7.0; // the best LEGAL id, different per position
+    }
+    const shape = [_]c_int{ 1, @intCast(rows), @intCast(v) };
+    const f32_block = mlx.mlx_array_new_data(host.ptr, &shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(f32_block);
+    var block = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(block);
+    try mlx.check(mlx.mlx_astype(&block, f32_block, .bfloat16, s));
+    const mask = try buildSuppressMask(flagged, defined, v, s);
+    defer _ = mlx.mlx_array_free(mask);
+
+    var raw = try verifyArgmax(block, null, s);
+    defer raw.deinit();
+    const raw_ids = try samplerTestReadFlat(allocator, raw.lazy(), rows, s);
+    defer allocator.free(raw_ids);
+    for (raw_ids) |id| try testing.expectEqual(@as(f32, 505), id);
+
+    var masked = try verifyArgmax(block, mask, s);
+    defer masked.deinit();
+    const ids = try samplerTestReadFlat(allocator, masked.lazy(), rows, s);
+    defer allocator.free(ids);
+    for (ids, 0..) |id, r| try testing.expectEqual(@as(f32, @floatFromInt(100 + r)), id);
 }

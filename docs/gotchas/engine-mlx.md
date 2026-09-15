@@ -5009,3 +5009,53 @@ carries the same layout so batched decode stays bit-identical to solo. The reduc
 from the composed chain, so the parity test moved from bit identity to RMS error against the f32
 truth no worse than the chain's. Rule: a short-K kernel's cost is its reductions and its lane
 balance; hoist per lane, and A/B kernels only interleaved.
+
+### A group's sampled accept was a staircase of one-row filters (2026-09-15)
+On qwen4_exp a concurrent group's MTP round verifies every row in ONE row-axis forward whose lm_head
+projects the whole group at once — and then threw that block away. Each sampled row's `mtpRoundFinish`
+built its own `probsAllPositions` over its slice of it, its own accept graph, its own
+`mlx_async_eval`, and blocked on two host reads, N times in a row with the GPU idle across each read;
+the greedy rows had had their argmax pre-dispatched for the whole group since #412. Fix:
+`Transformer.verify_joined_logits` publishes the joined block, `mtpGroupVerify` hands it to row 0's
+state, and `mtpGroupSampledAccept` filters it once and builds every sampled row's accept graph onto
+the group's single eval, storing the terms on `MtpRoundState.accept_*`. No draw moves: each row still
+takes its own `mtpSamplingDraw` key and its own acceptance mode, and the accept test stays a host loop
+on the row's own prng. It declines to the per-row arm when the rows do not share a sampler, any row is
+seeded, or a row was padded past `1 + m`. Measured (forced depth 2, in-boot greedy control): the
+sampled rows' per-row `gap` excess over the greedy control — 1.78/1.18/0.59 ms at N=4, 0.57 ms at
+N=2 — goes to 0.02/0.01/0.01 and 0.00, and the N=4 creative round drops 1.5% while its greedy control
+moves 0.1%. Guard: a ragged three-row block test pinning each row's slice byte-identical to that row's
+own `probsAllPositions`, plus the decline predicate.
+
+### Two selections and two masks where one of each would do (2026-09-15)
+`applyTopK` and `applyTopP` were written as independent filters, and every sampling site composed
+them. After the rank-based rewrite that composition is redundant: `applyTopP` takes the caller's
+`top_k` as its nucleus bound, ranks exactly those k columns, and scatters its keep flags at those
+column ids — so the preceding `applyTopK` selects the same shortlist and masks a strict superset of
+what the nucleus keeps. `filterTopKTopP` therefore just skips it, which costs one fewer full-vocab
+selection and one fewer full-row `where` per filtered row (at V = 248320 the pair is ~0.7 ms of GPU).
+Byte-identical, because `where(mask_p, where(mask_k, x, -inf), -inf) == where(mask_p, x, -inf)` when
+mask_p is a subset of mask_k. Guard: byte identity against the two-pass composition over `[m, V]` and
+`[1, L, V]` at V = 8192 and 248320, six (top_p, top_k) settings including the degenerate ones, a
+tie-quantized row and an all-equal row.
+
+### Every block decoder that commits an argmax could commit a reserved id (2026-09-15)
+Every other path that turns logits into a token on this model masks the reserved set: the serial
+sampler (`sampleTokenLazy`), the sampled MTP verify (`probsAllPositions`) and the rerank draft select
+all take `suppress_mask`. The greedy MTP verify argmaxed the raw verify logits at both sites (the
+group's pre-dispatch and the solo finish), so a flagged special or one of the 243 padding rows past
+the defined vocabulary could be committed as the correction token — the one id class the request could
+never have drawn serially. Nothing was observed live (the model has to actually rank one of those
+columns first), which is exactly why it needed a test rather than a sighting. `verifyArgmax` masks
+first, with `-inf` in the logits' own dtype so a bf16 verify block is not widened to f32 on the greedy
+fast path. It is a CLASS, not one site: the gemma drafter and DFlash verify the same way and commit
+`verify_argmax[accepted]` as the next token, and both had the same bare argmax. PLD's per-position
+argmax and DFlash's draft and correction argmaxes are acceptance tests and proposals, never committed,
+and stay unmasked. The guard is the TYPE, not a scan: `verifyArgmax` returns a `CommittedArgmax` and is
+its only constructor, and every commit site — the two MTP sites, the drafter, DFlash,
+`MtpRoundState.verify_argmax`, `mtpAcceptRowGreedy` — takes that type, so a raw `mlx_array` argmax
+cannot reach a commit and a future decoder joins the class by construction. A name-keyed source scan
+was written first and was worse than nothing: it enumerated three functions and matched the literal
+`verify_argmax`, so the grouped path's `var am` slipped through it. Behaviour bar: the helper at each
+decoder's own block width — a block whose raw argmax is a padding id must yield the best legal id per
+position, and the unmasked arm must still yield the padding id.
