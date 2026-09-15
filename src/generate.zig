@@ -10046,7 +10046,7 @@ fn probsAllPositions(logits_3d: mlx.mlx_array, sampling: SamplingParams, s: mlx.
     }
     if (sampling.top_p < 1.0) {
         var masked = mlx.mlx_array_new();
-        applyTopP(&masked, current, sampling.top_p, s) catch {};
+        applyTopP(&masked, current, sampling.top_p, sampling.top_k, s) catch {};
         _ = mlx.mlx_array_free(current);
         current = masked;
     }
@@ -10173,7 +10173,7 @@ fn filteredProbsRows(owned_rows: mlx.mlx_array, sampling: SamplingParams, s: mlx
     }
     if (sampling.top_p < 1.0) {
         var masked = mlx.mlx_array_new();
-        applyTopP(&masked, current, sampling.top_p, s) catch {};
+        applyTopP(&masked, current, sampling.top_p, sampling.top_k, s) catch {};
         _ = mlx.mlx_array_free(current);
         current = masked;
     }
@@ -10425,7 +10425,7 @@ pub fn sampleTokenLazy(logits_in: mlx.mlx_array, sampling: SamplingParams, s: ml
     // Apply top-p filtering (lazy)
     if (sampling.top_p < 1.0) {
         var next = mlx.mlx_array_new();
-        applyTopP(&next, current, sampling.top_p, s) catch {};
+        applyTopP(&next, current, sampling.top_p, sampling.top_k, s) catch {};
         _ = mlx.mlx_array_free(current);
         current = next;
     }
@@ -10616,7 +10616,7 @@ fn sampleRowsLazy(row_logits: []const mlx.mlx_array, params: []const SamplingPar
     }
     if (p0.top_p < 1.0) {
         var next = mlx.mlx_array_new();
-        applyTopP(&next, current, p0.top_p, s) catch {
+        applyTopP(&next, current, p0.top_p, p0.top_k, s) catch {
             _ = mlx.mlx_array_free(next);
             next = current;
             current = mlx.mlx_array_new();
@@ -11784,7 +11784,7 @@ fn sampleToken(allocator: std.mem.Allocator, logits: mlx.mlx_array, sampling: Sa
     };
 
     if (sampling.top_p < 1.0) {
-        try applyTopP(&after_topp, current, sampling.top_p, s);
+        try applyTopP(&after_topp, current, sampling.top_p, sampling.top_k, s);
         current = after_topp;
         topp_owned = true;
     }
@@ -11990,31 +11990,204 @@ fn maskForLogitVocab(allocator: std.mem.Allocator, mask: []const bool, vocab_siz
     return .{ .slice = adjusted, .owned = adjusted };
 }
 
-/// Apply top-k filtering: keep only the top k logits, set the rest to -inf.
-fn applyTopK(res: *mlx.mlx_array, logits: mlx.mlx_array, k: u32, s: mlx.mlx_stream) !void {
-    // Per-ROW top-k by RANK: the k largest indices from argpartition, scattered
-    // back as a keep mask. A value cutoff (`logits >= kth largest`) keeps every
-    // token tied with the k-th, and bf16 logits tie at the top constantly on a
-    // 250k vocab — top_k 1 stopped being greedy. `mlx_topk` (no axis) flattens
-    // a [m, V] block, so everything here is axis -1.
-    const shape = mlx.getShape(logits);
-    const vocab: c_int = shape[shape.len - 1];
-    const kk: c_int = @intCast(@min(k, @as(u32, @intCast(vocab))));
+/// Sampler filter route census. The route is a property of the REQUEST, not of
+/// the data, so it is chosen while the graph is built and counted here with no
+/// host read: a request with top_k has a bounded nucleus and serves top-p from
+/// the exact k-shortlist, pure top-p still ranks the whole row.
+pub var sampler_shortlist_draws: u64 = 0;
+pub var sampler_fullsort_draws: u64 = 0;
+
+/// Rank cap for the filter helpers. The widest shape a caller passes is
+/// `[B, S, V]`; anything past this is a named error, never a wrong axis.
+const SAMPLER_MAX_NDIM = 4;
+
+/// `a[..., start..stop]`, every leading axis passed through whole.
+fn sliceLastAxis(res: *mlx.mlx_array, a: mlx.mlx_array, start: usize, stop: usize, s: mlx.mlx_stream) !void {
+    const shape = mlx.getShape(a);
+    if (shape.len > SAMPLER_MAX_NDIM) return error.UnsupportedSamplerRank;
+    var lo: [SAMPLER_MAX_NDIM]c_int = undefined;
+    var hi: [SAMPLER_MAX_NDIM]c_int = undefined;
+    var st: [SAMPLER_MAX_NDIM]c_int = undefined;
+    for (shape, 0..) |dim, i| {
+        const last = i == shape.len - 1;
+        lo[i] = if (last) @intCast(start) else 0;
+        hi[i] = if (last) @intCast(stop) else dim;
+        st[i] = 1;
+    }
+    const n = shape.len;
+    try mlx.check(mlx.mlx_slice(res, a, &lo, n, &hi, n, &st, n, s));
+}
+
+/// Column ids of `a` ranked by value DESCENDING, ties by LOWEST ORIGINAL INDEX.
+///
+/// mlx's merge sort is stable — `ThreadSort` swaps only on a strict less-than and
+/// the merge takes from B only when `b < a` — so an ascending argsort of the
+/// negated row is exactly that order, and it is the `msv_qsa_select` tie rule.
+/// Both filters and both of their routes rank through here, which is what makes a
+/// shortlist cutoff agree with the whole row's on a tie-heavy row. Pinned by
+/// `sampler ranks break ties by the lowest original index`.
+fn ranksDescending(res: *mlx.mlx_array, a: mlx.mlx_array, s: mlx.mlx_stream) !void {
     var neg = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(neg);
-    try mlx.check(mlx.mlx_negative(&neg, logits, s));
-    var order = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(order);
-    try mlx.check(mlx.mlx_argpartition_axis(&order, neg, kk - 1, -1, s));
-    var start = [_]c_int{ 0, 0, 0, 0 };
-    var stop = [_]c_int{ 0, 0, 0, 0 };
-    var strides = [_]c_int{ 1, 1, 1, 1 };
-    for (shape, 0..) |d, i| stop[i] = d;
-    stop[shape.len - 1] = kk;
-    var top_idx = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(top_idx);
-    try mlx.check(mlx.mlx_slice(&top_idx, order, &start, shape.len, &stop, shape.len, &strides, shape.len, s));
-    try keepByIndex(res, logits, top_idx, s);
+    try mlx.check(mlx.mlx_negative(&neg, a, s));
+    try mlx.check(mlx.mlx_argsort_axis(res, neg, -1, s));
+}
+
+/// Candidate-chunk width for `topRanksDescending`: cost is one sort of
+/// `V / chunk` chunk maxima plus one of `m * chunk` candidates, balanced at
+/// sqrt(V / m).
+fn shortlistChunkWidth(v: usize, m: usize) usize {
+    const bal = @sqrt(@as(f64, @floatFromInt(v)) / @as(f64, @floatFromInt(@max(m, 1))));
+    const c: usize = @intFromFloat(@max(16.0, @min(2048.0, bal)));
+    return @min(c, v);
+}
+
+/// The top `m` of every row — values and their column ids, both in
+/// `ranksDescending` order — without ranking the whole row.
+///
+/// Every element of a chunk is at most that chunk's max, so a chunk whose max is
+/// not among the `m` largest chunk maxima holds no top-`m` element: at most `m`
+/// chunks can, and ranking their `m * chunk` candidates is exact. On Metal a
+/// full-row `mlx_argsort_axis` is a multi-block merge sort over the whole
+/// vocabulary — and so are `mlx_topk` and `mlx_argpartition`, which mlx routes to
+/// that same sort, so neither of those buys a shortlist.
+fn topRanksDescending(
+    vals: *mlx.mlx_array,
+    ids: *mlx.mlx_array,
+    logits: mlx.mlx_array,
+    m: u32,
+    s: mlx.mlx_stream,
+) !void {
+    const shape = mlx.getShape(logits);
+    if (shape.len == 0 or shape.len > SAMPLER_MAX_NDIM) return error.UnsupportedSamplerRank;
+    const v: usize = @intCast(shape[shape.len - 1]);
+    const want: usize = @min(@as(usize, m), v);
+    if (want == 0) return error.EmptyShortlist;
+    const chunk = shortlistChunkWidth(v, want);
+    const groups = (v + chunk - 1) / chunk;
+
+    // Nothing left to win once the candidate set is the row itself.
+    if (want >= v or want * chunk >= v) {
+        var order = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(order);
+        try ranksDescending(&order, logits, s);
+        try sliceLastAxis(ids, order, 0, want, s);
+        return mlx.check(mlx.mlx_take_along_axis(vals, logits, ids.*, -1, s));
+    }
+
+    // Pad the last chunk with -inf so the reshape is exact.
+    var padded = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(padded);
+    if (groups * chunk != v) {
+        const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
+        defer _ = mlx.mlx_array_free(neg_inf);
+        var pad_val = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(pad_val);
+        try mlx.check(mlx.mlx_astype(&pad_val, neg_inf, mlx.mlx_array_dtype(logits), s));
+        const axes = [_]c_int{@intCast(shape.len - 1)};
+        const low = [_]c_int{0};
+        const high = [_]c_int{@intCast(groups * chunk - v)};
+        try mlx.check(mlx.mlx_pad(&padded, logits, &axes, 1, &low, 1, &high, 1, pad_val, "constant", s));
+    } else {
+        try mlx.check(mlx.mlx_array_set(&padded, logits));
+    }
+
+    var dims: [SAMPLER_MAX_NDIM + 1]c_int = undefined;
+    @memcpy(dims[0 .. shape.len - 1], shape[0 .. shape.len - 1]);
+    const lead = shape.len - 1;
+    dims[lead] = @intCast(groups);
+    dims[lead + 1] = @intCast(chunk);
+    var blk = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(blk);
+    try mlx.check(mlx.mlx_reshape(&blk, padded, &dims, lead + 2, s));
+
+    var chunk_max = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(chunk_max);
+    try mlx.check(mlx.mlx_max_axis(&chunk_max, blk, -1, false, s));
+
+    // Chunks ranked by max, ties by lowest chunk id. A tie group's contributing
+    // chunks are a PREFIX of its ascending-id list — a lower id holds a lower
+    // column id, which outranks — so taking the lowest ids is what keeps the
+    // shortlist equal to the whole row's ranking.
+    var chunk_ranks = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(chunk_ranks);
+    try ranksDescending(&chunk_ranks, chunk_max, s);
+    var picked = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(picked);
+    try sliceLastAxis(&picked, chunk_ranks, 0, want, s);
+    // Ascending chunk ids lay the candidates out in ascending COLUMN id, so the
+    // stable rank below breaks candidate ties the way the whole row would.
+    var win = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(win);
+    try mlx.check(mlx.mlx_sort_axis(&win, picked, -1, s));
+    var win_i32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(win_i32);
+    try mlx.check(mlx.mlx_astype(&win_i32, win, .int32, s));
+
+    var win_col = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(win_col);
+    try mlx.check(mlx.mlx_expand_dims(&win_col, win_i32, -1, s));
+    dims[lead] = @intCast(want);
+    var gather_idx = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(gather_idx);
+    try mlx.check(mlx.mlx_broadcast_to(&gather_idx, win_col, &dims, lead + 2, s));
+    var cand_2d = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cand_2d);
+    try mlx.check(mlx.mlx_take_along_axis(&cand_2d, blk, gather_idx, @intCast(lead), s));
+
+    // Column id of every candidate: chunk id * chunk + offset within the chunk.
+    const chunk_arr = mlx.mlx_array_new_int(@intCast(chunk));
+    defer _ = mlx.mlx_array_free(chunk_arr);
+    var base = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(base);
+    try mlx.check(mlx.mlx_multiply(&base, win_col, chunk_arr, s));
+    var offsets = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(offsets);
+    try mlx.check(mlx.mlx_arange(&offsets, 0, @floatFromInt(chunk), 1, .int32, s));
+    var cand_ids_2d = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cand_ids_2d);
+    try mlx.check(mlx.mlx_add(&cand_ids_2d, base, offsets, s));
+
+    dims[lead] = @intCast(want * chunk);
+    var cand_vals = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cand_vals);
+    try mlx.check(mlx.mlx_reshape(&cand_vals, cand_2d, &dims, lead + 1, s));
+    var cand_ids_flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cand_ids_flat);
+    try mlx.check(mlx.mlx_reshape(&cand_ids_flat, cand_ids_2d, &dims, lead + 1, s));
+    // A padded tail column is -inf, so it only ranks when the row holds fewer
+    // than `want` finite values; clamp so the scatter stays in range regardless.
+    const last_col = mlx.mlx_array_new_int(@intCast(v - 1));
+    defer _ = mlx.mlx_array_free(last_col);
+    var cand_ids = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cand_ids);
+    try mlx.check(mlx.mlx_minimum(&cand_ids, cand_ids_flat, last_col, s));
+
+    var cand_ranks = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cand_ranks);
+    try ranksDescending(&cand_ranks, cand_vals, s);
+    var sel = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sel);
+    try sliceLastAxis(&sel, cand_ranks, 0, want, s);
+    try mlx.check(mlx.mlx_take_along_axis(vals, cand_vals, sel, -1, s));
+    try mlx.check(mlx.mlx_take_along_axis(ids, cand_ids, sel, -1, s));
+}
+
+/// Apply top-k filtering: keep only the top k logits, set the rest to -inf.
+fn applyTopK(res: *mlx.mlx_array, logits: mlx.mlx_array, k: u32, s: mlx.mlx_stream) !void {
+    // Per-ROW top-k by RANK: the k highest-ranked column ids, scattered back as a
+    // keep mask. A value cutoff (`logits >= kth largest`) keeps every token tied
+    // with the k-th, and bf16 logits tie at the top constantly on a 250k vocab —
+    // top_k 1 stopped being greedy.
+    const shape = mlx.getShape(logits);
+    const v: usize = @intCast(shape[shape.len - 1]);
+    if (k == 0 or k >= v) return mlx.check(mlx.mlx_array_set(res, logits));
+    var vals = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(vals);
+    var ids = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ids);
+    try topRanksDescending(&vals, &ids, logits, k, s);
+    try keepByIndex(res, logits, ids, s);
 }
 
 /// Mask `logits` to -inf everywhere except the per-row `keep_idx` columns.
@@ -12033,35 +12206,70 @@ fn keepByIndex(res: *mlx.mlx_array, logits: mlx.mlx_array, keep_idx: mlx.mlx_arr
     try mlx.check(mlx.mlx_where(res, mask, logits, neg_inf, s));
 }
 
-/// Apply top-p (nucleus) sampling: mask logits outside the top-p probability mass.
-/// The nucleus is decided in sorted space and scattered back by index, so a
-/// token tied with the cutoff value but outside the mass is masked (top_p -> 0
-/// is greedy even on tied bf16 logits).
-fn applyTopP(res: *mlx.mlx_array, logits: mlx.mlx_array, top_p: f32, s: mlx.mlx_stream) !void {
-    // Ascending order: smallest probs first, cumsum reaches 1 at the argmax.
-    var order = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(order);
-    try mlx.check(mlx.mlx_argsort_axis(&order, logits, -1, s));
-    var sorted_logits = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sorted_logits);
-    try mlx.check(mlx.mlx_take_along_axis(&sorted_logits, logits, order, -1, s));
-    var sorted_probs = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sorted_probs);
-    try mlx.check(mlx.mlx_softmax_axis(&sorted_probs, sorted_logits, -1, true, s));
-    var cumsum = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(cumsum);
-    try mlx.check(mlx.mlx_cumsum(&cumsum, sorted_probs, -1, false, true, s));
-    // In the nucleus: cumsum > 1 - top_p (the argmax always is).
-    const threshold = mlx.mlx_array_new_float(1.0 - top_p);
+/// Apply top-p (nucleus) sampling: mask logits outside the top-p probability
+/// mass. The nucleus is decided over ranked values and scattered back by column
+/// id, so a token tied with the cutoff value but outside the mass is masked
+/// (top_p -> 0 is greedy even on tied bf16 logits).
+///
+/// `nucleus_bound` is the caller's top-k. With top-k applied first the row holds
+/// exactly `k` finite columns, so the nucleus cannot reach past the k-shortlist
+/// and the cutoff is exact without ranking the row; 0 means the row is unfiltered
+/// and the nucleus is unbounded.
+fn applyTopP(res: *mlx.mlx_array, logits: mlx.mlx_array, top_p: f32, nucleus_bound: u32, s: mlx.mlx_stream) !void {
+    const shape = mlx.getShape(logits);
+    const v: usize = @intCast(shape[shape.len - 1]);
+    const bounded = nucleus_bound > 0 and nucleus_bound < v;
+
+    var vals = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(vals);
+    var ids = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ids);
+    if (bounded) {
+        _ = @atomicRmw(u64, &sampler_shortlist_draws, .Add, 1, .monotonic);
+        try topRanksDescending(&vals, &ids, logits, nucleus_bound, s);
+    } else {
+        _ = @atomicRmw(u64, &sampler_fullsort_draws, .Add, 1, .monotonic);
+        try ranksDescending(&ids, logits, s);
+        try mlx.check(mlx.mlx_take_along_axis(&vals, logits, ids, -1, s));
+    }
+
+    // The normalizer is the WHOLE row's, never the shortlist's, and f32
+    // throughout: mlx instantiates cumsum at the INPUT dtype and a bf16
+    // accumulator loses nucleus tail mass. bf16 widens exactly.
+    var row_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(row_f32);
+    try mlx.check(mlx.mlx_astype(&row_f32, logits, .float32, s));
+    var lse = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(lse);
+    try mlx.check(mlx.mlx_logsumexp_axis(&lse, row_f32, -1, true, s));
+    var vals_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(vals_f32);
+    try mlx.check(mlx.mlx_astype(&vals_f32, vals, .float32, s));
+    var shifted = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(shifted);
+    try mlx.check(mlx.mlx_subtract(&shifted, vals_f32, lse, s));
+    var probs = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(probs);
+    try mlx.check(mlx.mlx_exp(&probs, shifted, s));
+
+    // Mass STRICTLY above each rank — an exclusive scan down the ranking, so the
+    // term is a function of the shortlist alone (everything outranking a top-k
+    // column is itself top-k). Rank 0 sees 0, so the argmax is always kept.
+    var above = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(above);
+    try mlx.check(mlx.mlx_cumsum(&above, probs, -1, false, false, s));
+    const threshold = mlx.mlx_array_new_float(top_p);
     defer _ = mlx.mlx_array_free(threshold);
     var in_nucleus = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(in_nucleus);
-    try mlx.check(mlx.mlx_greater(&in_nucleus, cumsum, threshold, s));
-    const shape = mlx.getShape(logits);
+    try mlx.check(mlx.mlx_less(&in_nucleus, above, threshold, s));
+
+    var zeros = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(zeros);
+    try mlx.check(mlx.mlx_zeros(&zeros, shape.ptr, shape.len, .bool_, s));
     var mask = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(mask);
-    try mlx.check(mlx.mlx_zeros(&mask, shape.ptr, shape.len, .bool_, s));
-    try mlx.check(mlx.mlx_put_along_axis(&mask, mask, order, in_nucleus, -1, s));
+    try mlx.check(mlx.mlx_put_along_axis(&mask, zeros, ids, in_nucleus, -1, s));
     const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
     defer _ = mlx.mlx_array_free(neg_inf);
     try mlx.check(mlx.mlx_where(res, mask, logits, neg_inf, s));
@@ -12562,7 +12770,7 @@ test "top-k and top-p break exact ties by rank, not by value" {
     for ([_]bool{ true, false }) |use_k| {
         var masked = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(masked);
-        if (use_k) try applyTopK(&masked, logits, 1, s) else try applyTopP(&masked, logits, 1e-6, s);
+        if (use_k) try applyTopK(&masked, logits, 1, s) else try applyTopP(&masked, logits, 1e-6, 0, s);
         try mlx.check(mlx.mlx_array_eval(masked));
         const out = mlx.mlx_array_data_float32(masked).?[0..10];
         var kept0: usize = 0;
@@ -17286,4 +17494,347 @@ test "cold grouped MTP rounds detach and resume exactly like solo heads" {
         try MtpChainTestSlot.equal(rg.mtp_hist_stash.?.ids, bg.mtp_hist_stash.?.ids, xfm.s, "cold resumed stash ids");
         try MtpChainTestSlot.equal(rg.mtp_hist_stash.?.hidden, bg.mtp_hist_stash.?.hidden, xfm.s, "cold resumed stash hidden");
     }
+}
+
+/// Deterministic Gaussian logits (Box-Muller over an xorshift stream): diffuse
+/// enough that the nucleus for top_p 0.95 spans thousands of tokens, which is
+/// where a narrow cumulative accumulator loses the tail.
+fn samplerTestRow(host: []f32, seed: u64, sigma: f32) void {
+    var rng: u64 = seed | 1;
+    var i: usize = 0;
+    while (i < host.len) : (i += 2) {
+        var u: [2]f64 = undefined;
+        for (&u) |*d| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            d.* = (@as(f64, @floatFromInt(rng >> 11)) + 1.0) / 9007199254740994.0;
+        }
+        const r = @sqrt(-2.0 * @log(u[0]));
+        const a = 6.283185307179586 * u[1];
+        host[i] = @floatCast(r * @cos(a) * @as(f64, sigma));
+        if (i + 1 < host.len) host[i + 1] = @floatCast(r * @sin(a) * @as(f64, sigma));
+    }
+}
+
+/// Nucleus the sampler is meant to keep, in f64: ranked descending, a column is
+/// in when less than top_p of the mass outranks it.
+fn samplerTestExactKeep(allocator: std.mem.Allocator, row: []const f32, top_p: f32) !usize {
+    const sorted = try allocator.alloc(f64, row.len);
+    defer allocator.free(sorted);
+    for (row, sorted) |x, *d| d.* = @floatCast(x);
+    std.mem.sort(f64, sorted, {}, comptime std.sort.desc(f64));
+    const mx = sorted[0];
+    var z: f64 = 0;
+    for (sorted) |d| z += @exp(d - mx);
+    var above: f64 = 0;
+    var keep: usize = 0;
+    for (sorted) |d| {
+        if (above >= @as(f64, @floatCast(top_p))) break;
+        above += @exp(d - mx) / z;
+        keep += 1;
+    }
+    return keep;
+}
+
+/// Read an mlx array back as f32 host values. A slice is a strided VIEW, so the
+/// read goes through a contiguous copy and a flat reshape, never the base
+/// pointer.
+fn samplerTestReadFlat(allocator: std.mem.Allocator, arr: mlx.mlx_array, n: usize, s: mlx.mlx_stream) ![]f32 {
+    var as_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(as_f32);
+    try mlx.check(mlx.mlx_astype(&as_f32, arr, .float32, s));
+    var dense = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(dense);
+    try mlx.check(mlx.mlx_contiguous(&dense, as_f32, false, s));
+    const flat_shape = [_]c_int{@intCast(n)};
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    try mlx.check(mlx.mlx_reshape(&flat, dense, &flat_shape, 1, s));
+    try mlx.check(mlx.mlx_array_eval(flat));
+    const out = try allocator.alloc(f32, n);
+    @memcpy(out, mlx.mlx_array_data_float32(flat).?[0..n]);
+    return out;
+}
+
+/// Bit equality of two mlx arrays read back as f32: both routes end in one
+/// `where` over the same logits, so agreeing on the kept columns is agreeing on
+/// every byte.
+fn samplerTestExpectSameBits(a: mlx.mlx_array, b: mlx.mlx_array, n: usize, s: mlx.mlx_stream) !void {
+    const ad = try samplerTestReadFlat(testing.allocator, a, n, s);
+    defer testing.allocator.free(ad);
+    const bd = try samplerTestReadFlat(testing.allocator, b, n, s);
+    defer testing.allocator.free(bd);
+    for (ad, bd, 0..) |x, y, i| {
+        if (@as(u32, @bitCast(x)) != @as(u32, @bitCast(y))) {
+            std.debug.print("mismatch at {d}: {d} vs {d}\n", .{ i, x, y });
+            return error.FilteredLogitsDiffer;
+        }
+    }
+}
+
+fn samplerTestKeptCount(row: []const f32) usize {
+    var n: usize = 0;
+    for (row) |x| {
+        if (x != -std.math.inf(f32)) n += 1;
+    }
+    return n;
+}
+
+test "sampler ranks break ties by the lowest original index" {
+    // The contract both filters and both of their routes share. mlx's stable
+    // merge sort is what delivers it; if a bump breaks stability this fails.
+    const s = mlx.gpuStream();
+    const data = [_]f32{ 2.0, 5.0, 5.0, 5.0, 1.0, 5.0 };
+    const shape = [_]c_int{ 1, 6 };
+    const logits = mlx.mlx_array_new_data(&data, &shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+    var ranks = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ranks);
+    try ranksDescending(&ranks, logits, s);
+    var as_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(as_f32);
+    try mlx.check(mlx.mlx_astype(&as_f32, ranks, .float32, s));
+    const got = try samplerTestReadFlat(testing.allocator, as_f32, 6, s);
+    defer testing.allocator.free(got);
+    // The four tied 5.0s come first in ascending column order, then 2.0, then 1.0.
+    try testing.expectEqualSlices(f32, &[_]f32{ 1, 2, 3, 5, 0, 4 }, got);
+}
+
+test "applyTopP keeps the exact nucleus on a bf16 vocab row" {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const v: usize = 248320;
+    const host = try allocator.alloc(f32, v);
+    defer allocator.free(host);
+    const rounded = try allocator.alloc(f32, v);
+    defer allocator.free(rounded);
+
+    for ([_]u64{ 1, 2, 3, 4, 5, 6 }) |seed| {
+        samplerTestRow(host, seed *% 0x9E3779B97F4A7C15, 4.0);
+        const shape = [_]c_int{ 1, @intCast(v) };
+        const f32_row = mlx.mlx_array_new_data(host.ptr, &shape, 2, .float32);
+        defer _ = mlx.mlx_array_free(f32_row);
+        var bf16_row = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(bf16_row);
+        try mlx.check(mlx.mlx_astype(&bf16_row, f32_row, .bfloat16, s));
+
+        // The reference reads the row the kernel sees: bf16-rounded values.
+        var rt = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(rt);
+        try mlx.check(mlx.mlx_astype(&rt, bf16_row, .float32, s));
+        const rt_host = try samplerTestReadFlat(allocator, rt, v, s);
+        defer allocator.free(rt_host);
+        @memcpy(rounded, rt_host);
+        const want = try samplerTestExactKeep(allocator, rounded, 0.95);
+
+        var res = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(res);
+        try applyTopP(&res, bf16_row, 0.95, 0, s);
+        const res_host = try samplerTestReadFlat(allocator, res, v, s);
+        defer allocator.free(res_host);
+        // The boundary column's own probability is ~1e-5 here while the f32 scan
+        // carries ~1e-7 of error, so the exclusive mass can cross top_p one
+        // column early or late against the f64 reference. The defect this pins
+        // was 148 columns wide.
+        const got = samplerTestKeptCount(res_host);
+        const diff = @as(i64, @intCast(want)) - @as(i64, @intCast(got));
+        try testing.expect(diff >= -1 and diff <= 1);
+    }
+}
+
+test "topRanksDescending returns the exact top m values and column ids" {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    for ([_]usize{ 8192, 248320 }) |v| {
+        const rows: usize = 3;
+        const host = try allocator.alloc(f32, rows * v);
+        defer allocator.free(host);
+        for (0..rows) |r| samplerTestRow(host[r * v ..][0..v], (r + 1) *% 0xD1B54A32D192ED03, 4.0);
+        // Row 2 quantized to 0.25 steps: thousands of exact ties.
+        for (host[2 * v ..][0..v]) |*x| x.* = @round(x.* * 4.0) / 4.0;
+        const shape = [_]c_int{ @intCast(rows), @intCast(v) };
+        const block = mlx.mlx_array_new_data(host.ptr, &shape, 2, .float32);
+        defer _ = mlx.mlx_array_free(block);
+
+        for ([_]u32{ 1, 20, 257 }) |m| {
+            var vals = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(vals);
+            var ids = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(ids);
+            try topRanksDescending(&vals, &ids, block, m, s);
+            // The whole row's ranking, restricted to its first m: the bar the
+            // shortlist has to reproduce, ties included.
+            var order = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(order);
+            try ranksDescending(&order, block, s);
+            var ref_ids = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(ref_ids);
+            try sliceLastAxis(&ref_ids, order, 0, m, s);
+            var ref_vals = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(ref_vals);
+            try mlx.check(mlx.mlx_take_along_axis(&ref_vals, block, ref_ids, -1, s));
+            var ids_f = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(ids_f);
+            try mlx.check(mlx.mlx_astype(&ids_f, ids, .float32, s));
+            var ref_ids_f = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(ref_ids_f);
+            try mlx.check(mlx.mlx_astype(&ref_ids_f, ref_ids, .float32, s));
+            try samplerTestExpectSameBits(vals, ref_vals, rows * m, s);
+            try samplerTestExpectSameBits(ids_f, ref_ids_f, rows * m, s);
+        }
+    }
+}
+
+test "applyTopK keeps exactly k columns, the highest ranked ones" {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const v: usize = 248320;
+    const rows: usize = 3;
+    const host = try allocator.alloc(f32, rows * v);
+    defer allocator.free(host);
+    for (0..rows) |r| samplerTestRow(host[r * v ..][0..v], (r + 7) *% 0xD1B54A32D192ED03, 4.0);
+    // Row 1 quantized to 1.0 steps: a value cutoff would keep thousands here.
+    for (host[v..][0..v]) |*x| x.* = @round(x.*);
+    const shape = [_]c_int{ @intCast(rows), @intCast(v) };
+    const block = mlx.mlx_array_new_data(host.ptr, &shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(block);
+
+    for ([_]u32{ 1, 20, 64 }) |k| {
+        var res = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(res);
+        try applyTopK(&res, block, k, s);
+        const rd = try samplerTestReadFlat(allocator, res, rows * v, s);
+        defer allocator.free(rd);
+        for (0..rows) |r| {
+            try testing.expectEqual(@as(usize, k), samplerTestKeptCount(rd[r * v ..][0..v]));
+        }
+        // Same columns as ranking the whole row.
+        var order = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(order);
+        try ranksDescending(&order, block, s);
+        var ref_ids = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ref_ids);
+        try sliceLastAxis(&ref_ids, order, 0, k, s);
+        var ref = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ref);
+        try keepByIndex(&ref, block, ref_ids, s);
+        try samplerTestExpectSameBits(res, ref, rows * v, s);
+    }
+}
+
+test "shortlist top-p equals the whole row's ranking, ties and 248320-wide rows" {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    for ([_]usize{ 8192, 248320 }) |v| {
+        const rows: usize = 4;
+        const host = try allocator.alloc(f32, rows * v);
+        defer allocator.free(host);
+        for (0..rows) |r| samplerTestRow(host[r * v ..][0..v], (r + 11) *% 0xD1B54A32D192ED03, 4.0);
+        // Row 2: 0.25-step ties. Row 3: every column identical — the extreme the
+        // rank contract exists for.
+        for (host[2 * v ..][0..v]) |*x| x.* = @round(x.* * 4.0) / 4.0;
+        for (host[3 * v ..][0..v]) |*x| x.* = 1.5;
+
+        const shape = [_]c_int{ @intCast(rows), @intCast(v) };
+        const block = mlx.mlx_array_new_data(host.ptr, &shape, 2, .float32);
+        defer _ = mlx.mlx_array_free(block);
+
+        for ([_]struct { p: f32, k: u32 }{
+            .{ .p = 0.95, .k = 20 },
+            .{ .p = 0.8, .k = 50 },
+            .{ .p = 0.99, .k = 5 },
+            .{ .p = 0.5, .k = 1 },
+            .{ .p = 0.95, .k = 257 },
+            .{ .p = 1e-6, .k = 20 },
+        }) |cfg| {
+            var masked = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(masked);
+            try applyTopK(&masked, block, cfg.k, s);
+
+            var short = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(short);
+            try applyTopP(&short, masked, cfg.p, cfg.k, s);
+            var full = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(full);
+            try applyTopP(&full, masked, cfg.p, 0, s);
+            try samplerTestExpectSameBits(short, full, rows * v, s);
+
+            // Same filtered logits and the same key must draw the same token.
+            for (0..8) |d| {
+                const key = seedKey(.{ .seed = 12345, .draw = @intCast(d) });
+                defer _ = mlx.mlx_array_free(key);
+                var a = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(a);
+                var b = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(b);
+                try mlx.check(mlx.mlx_random_categorical(&a, short, -1, key, s));
+                try mlx.check(mlx.mlx_random_categorical(&b, full, -1, key, s));
+                try samplerTestExpectSameBits(a, b, rows, s);
+            }
+        }
+    }
+}
+
+test "shortlist top-p holds on rank-3 [B, L, V] blocks" {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const v: usize = 8192;
+    const rows: usize = 3;
+    const host = try allocator.alloc(f32, rows * v);
+    defer allocator.free(host);
+    for (0..rows) |r| samplerTestRow(host[r * v ..][0..v], (r + 23) *% 0xD1B54A32D192ED03, 4.0);
+    const shape = [_]c_int{ 1, @intCast(rows), @intCast(v) };
+    const block = mlx.mlx_array_new_data(host.ptr, &shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(block);
+
+    var masked = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(masked);
+    try applyTopK(&masked, block, 20, s);
+    var short = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(short);
+    try applyTopP(&short, masked, 0.95, 20, s);
+    var full = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(full);
+    try applyTopP(&full, masked, 0.95, 0, s);
+    try samplerTestExpectSameBits(short, full, rows * v, s);
+
+    // Per-ROW cutoffs: a block-wide filter would mask whole rows to -inf.
+    const sd = try samplerTestReadFlat(allocator, short, rows * v, s);
+    defer allocator.free(sd);
+    for (0..rows) |r| {
+        const kept = samplerTestKeptCount(sd[r * v ..][0..v]);
+        try testing.expect(kept > 0 and kept <= 20);
+    }
+}
+
+test "sampler route census: greedy never enters the shortlist, top_k chooses it" {
+    const s = mlx.gpuStream();
+    const v: usize = 4096;
+    var host: [4096]f32 = undefined;
+    samplerTestRow(&host, 0xABCDEF0123456789, 4.0);
+    const shape = [_]c_int{ 1, 1, @intCast(v) };
+    const logits = mlx.mlx_array_new_data(&host, &shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+    const flat_shape = [_]c_int{ 1, @intCast(v) };
+    var row = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(row);
+    try mlx.check(mlx.mlx_reshape(&row, logits, &flat_shape, 2, s));
+
+    @atomicStore(u64, &sampler_shortlist_draws, 0, .monotonic);
+    @atomicStore(u64, &sampler_fullsort_draws, 0, .monotonic);
+
+    // Greedy returns before any filter runs.
+    const greedy = try sampleToken(testing.allocator, logits, .{ .temperature = 0.0, .top_p = 0.95, .top_k = 20 }, null, 0, s);
+    try testing.expectEqual(try argmax(row, s), greedy.token_id);
+    try testing.expectEqual(@as(u64, 0), @atomicLoad(u64, &sampler_shortlist_draws, .monotonic));
+    try testing.expectEqual(@as(u64, 0), @atomicLoad(u64, &sampler_fullsort_draws, .monotonic));
+
+    _ = try sampleToken(testing.allocator, logits, .{ .temperature = 1.0, .top_p = 0.95, .top_k = 20 }, null, 0, s);
+    try testing.expectEqual(@as(u64, 1), @atomicLoad(u64, &sampler_shortlist_draws, .monotonic));
+    try testing.expectEqual(@as(u64, 0), @atomicLoad(u64, &sampler_fullsort_draws, .monotonic));
+
+    _ = try sampleToken(testing.allocator, logits, .{ .temperature = 1.0, .top_p = 0.95, .top_k = 0 }, null, 0, s);
+    try testing.expectEqual(@as(u64, 1), @atomicLoad(u64, &sampler_shortlist_draws, .monotonic));
+    try testing.expectEqual(@as(u64, 1), @atomicLoad(u64, &sampler_fullsort_draws, .monotonic));
 }
