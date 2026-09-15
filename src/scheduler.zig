@@ -388,11 +388,15 @@ pub const NextResult = union(enum) {
 };
 
 fn firstMediaPlaceholder(
+    has_media: bool,
     tokens: []const u32,
     image_token_id: u32,
     audio_token_id: u32,
     video_token_id: u32,
 ) ?usize {
+    // The placeholder ids are ordinary vocabulary entries, so a text-only
+    // prompt can contain one; a boundary exists only where media rows do.
+    if (!has_media) return null;
     for (tokens, 0..) |token, i| {
         if ((image_token_id > 0 and token == image_token_id) or
             (audio_token_id > 0 and token == audio_token_id) or
@@ -645,6 +649,7 @@ pub const Slot = struct {
         const full_prompt_owned = try allocator.dupe(u32, full_prompt_src);
         errdefer allocator.free(full_prompt_owned);
         const media_start = firstMediaPlaceholder(
+            params.vision_embeddings != null,
             full_prompt_owned,
             config.image_token_id,
             config.audio_token_id,
@@ -6990,11 +6995,11 @@ test "a finish over a latched MLX failure ends the request as an ERROR, never a 
 
 test "firstMediaPlaceholder finds every dynamic media kind and ignores disabled ids" {
     const tokens = [_]u32{ 0, 11, 22, 33, 44 };
-    try testing.expectEqual(@as(?usize, 2), firstMediaPlaceholder(&tokens, 22, 0, 0));
-    try testing.expectEqual(@as(?usize, 3), firstMediaPlaceholder(&tokens, 0, 33, 0));
-    try testing.expectEqual(@as(?usize, 4), firstMediaPlaceholder(&tokens, 0, 0, 44));
-    try testing.expectEqual(@as(?usize, 2), firstMediaPlaceholder(&tokens, 44, 33, 22));
-    try testing.expect(firstMediaPlaceholder(&tokens, 0, 0, 0) == null);
+    try testing.expectEqual(@as(?usize, 2), firstMediaPlaceholder(true, &tokens, 22, 0, 0));
+    try testing.expectEqual(@as(?usize, 3), firstMediaPlaceholder(true, &tokens, 0, 33, 0));
+    try testing.expectEqual(@as(?usize, 4), firstMediaPlaceholder(true, &tokens, 0, 0, 44));
+    try testing.expectEqual(@as(?usize, 2), firstMediaPlaceholder(true, &tokens, 44, 33, 22));
+    try testing.expect(firstMediaPlaceholder(true, &tokens, 0, 0, 0) == null);
 }
 
 test "cancelled-prefill commit length: floor, clamp, and zero" {
@@ -9753,4 +9758,14 @@ test "transition pricing skips the first realized round after prime or width cha
     try testing.expect(!plannerPriceTransition(1, 1, false));
     try testing.expect(plannerPriceTransition(1, 2, false));
     try testing.expect(!plannerPriceTransition(2, 0, true));
+}
+
+test "firstMediaPlaceholder: a placeholder id in ORDINARY TEXT is not a media boundary" {
+    // The ids are ordinary vocabulary entries, so a text-only prompt can carry
+    // one (live: a pasted source file held 248056 at index 18338 of a 73k
+    // prompt). A media boundary exists only where media rows do.
+    const image_id: u32 = 248056;
+    const text_only = [_]u32{ 7, 8, image_id, 9 };
+    try testing.expectEqual(@as(?usize, null), firstMediaPlaceholder(false, &text_only, image_id, 0, 0));
+    try testing.expectEqual(@as(?usize, 2), firstMediaPlaceholder(true, &text_only, image_id, 0, 0));
 }

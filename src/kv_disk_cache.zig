@@ -7075,3 +7075,45 @@ test "DiskTier: entryWholeOnDisk stats what the index NAMES (a truncated chunk f
     try testing.expect(!tier.entryWholeOnDisk(id));
     try testing.expect(!tier.entryWholeOnDisk(id + 999));
 }
+
+test "DiskTier: a fresh tier over the same root ranks by the HIGHEST restorable checkpoint" {
+    // A restart must restore the highest checkpoint at or below the match, not
+    // the first one the manifest lists.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    const N = 8;
+    var tokens: [N * 128]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    {
+        var tier = try DiskTier.init(testing.allocator, io, base, "fp-coldrank", 0, 128);
+        defer tier.deinit();
+        var cache = try KVCache.init(testing.allocator, 3);
+        defer cache.deinit();
+        try fillCache(&cache, s, 3, N * 128, 8, 0.0, .float32);
+        var srcs: [N][3]SSMCacheEntry = undefined;
+        for (&srcs, 0..) |*src, i| src.* = buildHybridEntries(s, @floatFromInt((i + 1) * 1000), @floatFromInt((i + 1) * 2000));
+        defer for (&srcs) |*src| freeHybridEntries(src);
+        var cps: [N]transformer_mod.SSMCheckpoint = undefined;
+        for (&cps, 0..) |*cp, i| cp.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[i], (i + 1) * 128, s);
+        defer for (&cps) |*cp| cp.deinit(testing.allocator);
+        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
+        try testing.expectEqual(@as(usize, N), tier.entries.items[0].ssm_positions.len);
+        const warm = tier.bestHybridMatch(&tokens, false, cache.config, tokens.len).?;
+        try testing.expectEqual(@as(u32, N * 128), warm.cp);
+    }
+
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-coldrank", 0, 128);
+    defer tier2.deinit();
+    try testing.expectEqual(@as(usize, 1), tier2.entryCount());
+    try testing.expectEqual(@as(usize, N), tier2.entries.items[0].ssm_positions.len);
+    const cold = tier2.bestHybridMatch(&tokens, false, kv_quant.KVQuantConfig.dense, tokens.len).?;
+    try testing.expectEqual(@as(u32, N * 128), cold.cp);
+    try testing.expectEqual(@as(u32, N * 128), cold.usable);
+}
+

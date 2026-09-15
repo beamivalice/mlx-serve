@@ -2146,3 +2146,24 @@ refuses engine-backed models by name before anything is queued.
 
 Guard: `tests/test_ds4_serve.sh` (repeat prompt reports `cached_tokens` > 0;
 embeddings return a named 400 and the server stays up).
+
+## A placeholder id in ordinary text capped every SSD restore (2026-09-15)
+
+Qwen3.8-Flash-Next, a text-only 73k-token chat whose pastes were repo sources: after a
+restart the SSD tier restored 16,384 of 73,398 tokens in 34 s where the RAM tier had
+matched 73,293. Every mid-session disk restore in that log landed on the same low
+checkpoint too, at prompt lengths from 61k to 229k.
+
+Cause: `scheduler.firstMediaPlaceholder` scanned the prompt for `image/audio/video_token_id`
+unconditionally. Those are ordinary vocabulary entries — this conversation held 248056 at
+index 18338 — so a text-only request got `media_start = 18338`, which is the disk lookup's
+`limit`. The donor whose checkpoints covered the whole prefix has none below 18338, so it
+was skipped entirely and a stale entry with a checkpoint at 16384 won. The tier itself was
+correct: replayed offline against the same files it picks the right entry.
+
+Fix: the helper takes `has_media` (`params.vision_embeddings != null`) and answers null
+without it — a boundary exists only where media rows do. The same value keys the commit's
+media state, so text entries no longer carry a bogus boundary into checkpoint inheritance
+and thinning. Live: 16,384/73,398 in 34.2 s becomes 73,293/73,375 in 1.6 s.
+
+Guard: `firstMediaPlaceholder: a placeholder id in ORDINARY TEXT is not a media boundary`.
