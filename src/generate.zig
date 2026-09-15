@@ -5662,6 +5662,7 @@ pub const Generator = struct {
                     c.n_qp = step + 1;
                 }
                 c.draft_arrs[step] = id;
+                c.n_drafted = step + 1;
             }
             return;
         }
@@ -5684,11 +5685,13 @@ pub const Generator = struct {
         for (chains, 0..) |*c, row| {
             if (c.q_probs != null) continue;
             c.draft_arrs[step] = try mtp_mod.shortlistArgmax(s, shortlists[row]);
+            c.n_drafted = step + 1;
         }
         if (!batched) {
             for (sampled[0..k_sampled], params[0..k_sampled]) |row, row_params| {
                 const prop = try shortlistProposal(shortlists[row], gens[row].mtpSamplingDraw(row_params), s);
                 chains[row].draft_arrs[step] = prop.id;
+                chains[row].n_drafted = step + 1;
                 chains[row].q_probs.?[step] = prop.q;
                 chains[row].n_qp = step + 1;
             }
@@ -5697,6 +5700,7 @@ pub const Generator = struct {
         const group = try shortlistProposalRows(shortlists[0..n], sampled[0..k_sampled], params[0], s);
         for (sampled[0..k_sampled], 0..) |row, j| {
             chains[row].draft_arrs[step] = group.ids[j];
+            chains[row].n_drafted = step + 1;
             chains[row].q_probs.?[step] = group.qs[j];
             chains[row].n_qp = step + 1;
         }
@@ -10934,13 +10938,13 @@ fn shortlistProposalRows(
         defer _ = mlx.mlx_array_free(picked);
         try mlx.check(mlx.mlx_take_axis(&picked, shortlists[row].cands, pick, 0, s));
         ids[j] = mlx.mlx_array_new();
+        done = j + 1;
         try mlx.check(mlx.mlx_astype(&ids[j], picked, .int32, s));
 
         var q_row = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(q_row);
         try mlx.check(mlx.mlx_slice(&q_row, q_block, &[_]c_int{ j_c, 0 }, 2, &[_]c_int{ j_c + 1, n }, 2, &[_]c_int{ 1, 1 }, 2, s));
         qs[j] = try scatterShortlistQ(shortlists[row], q_row, s);
-        done = j + 1;
     }
     return .{ .ids = ids, .qs = qs };
 }
