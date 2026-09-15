@@ -945,6 +945,18 @@ pub const MtpModel = struct {
         return self.draftFallbackArgmax(target, x, suppress_mask);
     }
 
+    /// The exact re-scored top-32 shortlist for a SAMPLED draft, or null when
+    /// the coarse head is gone (the caller proposes greedily instead). Same
+    /// coarse readout as `draftSelect`; only the tail differs.
+    pub fn draftShortlist(
+        self: *MtpModel,
+        target: *Transformer,
+        x: mlx.mlx_array,
+        suppress_mask: ?mlx.mlx_array,
+    ) !?Shortlist {
+        return rerankShortlist(self.s, target, &self.rerank_coarse, &self.rerank_logged, x, suppress_mask);
+    }
+
     /// Rerank's failure fallback: full trunk-head readout + argmax, same
     /// [1,1] int32 shape as `draftSelect`.
     fn draftFallbackArgmax(
@@ -1123,16 +1135,34 @@ fn rerankMaskCoarse(s: mlx.mlx_stream, logits: *mlx.mlx_array, suppress_mask: ?m
     logits.* = masked;
 }
 
+/// The exact re-scored shortlist behind every rerank draft: the coarse head's
+/// top-32 candidate ids plus their trunk-head logits. A greedy draft is the
+/// argmax over `exact`; a sampled draft is drawn from the filtered softmax over
+/// it, so q's support is exactly these ids.
+pub const Shortlist = struct {
+    /// `[32]` uint32 vocab ids.
+    cands: mlx.mlx_array,
+    /// `[.., 32]` trunk-head logits for those ids.
+    exact: mlx.mlx_array,
+    /// The head's vocab rows — the width a dense proposal row must have.
+    rows: c_int,
+
+    pub fn deinit(self: *Shortlist) void {
+        _ = mlx.mlx_array_free(self.cands);
+        _ = mlx.mlx_array_free(self.exact);
+    }
+};
+
 /// Shortlist one coarse row `flat` `[rows]` and re-score it through the trunk head.
 /// Null retires the coarse head, so every later step lands on the caller's fallback.
-fn rerankRescoreRow(
+fn rerankShortlistRow(
     s: mlx.mlx_stream,
     target: *Transformer,
     coarse: *?RerankCoarse,
     flat: mlx.mlx_array,
     rows: c_int,
     x_row: mlx.mlx_array,
-) !?mlx.mlx_array {
+) !?Shortlist {
     const cands = draftTop32(s, flat, rows) catch |err| {
         log.warn("[mtp] draft rerank shortlist failed ({s}) - dropping to the full readout\n", .{@errorName(err)});
         var dead = coarse.*.?;
@@ -1140,7 +1170,7 @@ fn rerankRescoreRow(
         coarse.* = null;
         return null;
     };
-    defer _ = mlx.mlx_array_free(cands);
+    errdefer _ = mlx.mlx_array_free(cands);
 
     // Re-score the shortlist through the trunk head's own rows: gathered
     // packed rows are self-contained (w [V, K*bits/32], scales/biases
@@ -1158,7 +1188,7 @@ fn rerankRescoreRow(
         try mlx.check(mlx.mlx_take_axis(&b32, target.lm_head_b, cands, 0, s));
 
     var exact = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(exact);
+    errdefer _ = mlx.mlx_array_free(exact);
     try mlx.check(mlx.mlx_quantized_matmul(
         &exact,
         x_row,
@@ -1171,16 +1201,94 @@ fn rerankRescoreRow(
         qp.mode.cstr(),
         s,
     ));
+    return .{ .cands = cands, .exact = exact, .rows = rows };
+}
 
+/// The greedy draft's tail: argmax over the re-scored shortlist, mapped back to
+/// a vocab id as a lazy int32 array.
+pub fn shortlistArgmax(s: mlx.mlx_stream, sl: Shortlist) !mlx.mlx_array {
     var amax = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(amax);
-    try mlx.check(mlx.mlx_argmax_axis(&amax, exact, -1, false, s));
+    try mlx.check(mlx.mlx_argmax_axis(&amax, sl.exact, -1, false, s));
     var picked = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(picked);
-    try mlx.check(mlx.mlx_take_axis(&picked, cands, amax, 0, s));
+    try mlx.check(mlx.mlx_take_axis(&picked, sl.cands, amax, 0, s));
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_astype(&out, picked, .int32, s));
     return out;
+}
+
+fn rerankRescoreRow(
+    s: mlx.mlx_stream,
+    target: *Transformer,
+    coarse: *?RerankCoarse,
+    flat: mlx.mlx_array,
+    rows: c_int,
+    x_row: mlx.mlx_array,
+) !?mlx.mlx_array {
+    var sl = (try rerankShortlistRow(s, target, coarse, flat, rows, x_row)) orelse return null;
+    defer sl.deinit();
+    return try shortlistArgmax(s, sl);
+}
+
+/// The coarse full-vocab readout of one row as a flat `[rows]` array, reserved
+/// ids already at `-inf` — the front half every rerank draft shares.
+fn rerankCoarseFlat(
+    s: mlx.mlx_stream,
+    rc: *const RerankCoarse,
+    x: mlx.mlx_array,
+    suppress_mask: ?mlx.mlx_array,
+) !mlx.mlx_array {
+    var coarse_logits = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(coarse_logits);
+    try mlx.check(mlx.mlx_quantized_matmul(
+        &coarse_logits,
+        x,
+        rc.q.w,
+        rc.q.s,
+        rc.q.b,
+        true,
+        mlx.mlx_optional_int.some(@intCast(rc.group_size)),
+        // The BUILT width and group, never `rerankCoarseBits()`: the packed
+        // geometry implies K, so a per-step env re-read that disagrees with the
+        // build does not read a coarser vocab - it reads a different one.
+        mlx.mlx_optional_int.some(@intCast(rc.bits)),
+        "affine",
+        s,
+    ));
+    try rerankMaskCoarse(s, &coarse_logits, suppress_mask);
+    var flat = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(flat);
+    const flat_shape = [_]c_int{rc.rows};
+    try mlx.check(mlx.mlx_reshape(&flat, coarse_logits, &flat_shape, 1, s));
+    return flat;
+}
+
+/// `rerankSelect` without its argmax tail: the caller owns the shortlist and
+/// decides the proposal over it (argmax for a greedy request, a draw from the
+/// draft sampler's filtered softmax for a sampled one). Null means the coarse
+/// head is unavailable, exactly as in `rerankSelect`.
+pub fn rerankShortlist(
+    s: mlx.mlx_stream,
+    target: *Transformer,
+    coarse: *?RerankCoarse,
+    logged: *bool,
+    x: mlx.mlx_array,
+    suppress_mask: ?mlx.mlx_array,
+) !?Shortlist {
+    const rc = if (coarse.*) |*p| p else return null;
+    const coarse_bits = rc.bits;
+    const rows = rc.rows;
+
+    const flat = try rerankCoarseFlat(s, rc, x, suppress_mask);
+    defer _ = mlx.mlx_array_free(flat);
+
+    const sl = (try rerankShortlistRow(s, target, coarse, flat, rows, x)) orelse return null;
+    if (!logged.*) {
+        log.info("[mtp] draft rerank engaged ({d}-bit coarse -> top-32 -> trunk re-score)\n", .{coarse_bits});
+        logged.* = true;
+    }
+    return sl;
 }
 
 /// One greedy draft proposal via the rerank scheme: coarse full-vocab readout
@@ -1200,39 +1308,9 @@ pub fn rerankSelect(
     x: mlx.mlx_array,
     suppress_mask: ?mlx.mlx_array,
 ) !?mlx.mlx_array {
-    const rc = if (coarse.*) |*p| p else return null;
-    // The BUILT width and group, never `rerankCoarseBits()`: the packed
-    // geometry implies K, so a per-step env re-read that disagrees with the
-    // build does not read a coarser vocab — it reads a different one.
-    const coarse_bits = rc.bits;
-    const rows = rc.rows;
-
-    var coarse_logits = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(coarse_logits);
-    try mlx.check(mlx.mlx_quantized_matmul(
-        &coarse_logits,
-        x,
-        rc.q.w,
-        rc.q.s,
-        rc.q.b,
-        true,
-        mlx.mlx_optional_int.some(@intCast(rc.group_size)),
-        mlx.mlx_optional_int.some(@intCast(coarse_bits)),
-        "affine",
-        s,
-    ));
-    try rerankMaskCoarse(s, &coarse_logits, suppress_mask);
-    var flat = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(flat);
-    const flat_shape = [_]c_int{rows};
-    try mlx.check(mlx.mlx_reshape(&flat, coarse_logits, &flat_shape, 1, s));
-
-    const out = (try rerankRescoreRow(s, target, coarse, flat, rows, x)) orelse return null;
-    if (!logged.*) {
-        log.info("[mtp] draft rerank engaged ({d}-bit coarse -> top-32 -> trunk re-score)\n", .{coarse_bits});
-        logged.* = true;
-    }
-    return out;
+    var sl = (try rerankShortlist(s, target, coarse, logged, x, suppress_mask)) orelse return null;
+    defer sl.deinit();
+    return try shortlistArgmax(s, sl);
 }
 
 fn rerankCoarseRows(s: mlx.mlx_stream, x: mlx.mlx_array, rc: *const RerankCoarse) !mlx.mlx_array {
@@ -1266,20 +1344,23 @@ fn rerankCoarseRows(s: mlx.mlx_stream, x: mlx.mlx_array, rc: *const RerankCoarse
     try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 0, s));
     return out;
 }
-/// Batched greedy draft ids from mixer rows `x` `[N,1,H]`. Same scheme as
-/// `rerankSelect` per row; one coarse readout over N.
-pub fn rerankSelectBatched(
+/// Per-row exact re-scored shortlists from mixer rows `x` `[N,1,H]`: ONE coarse
+/// readout over N, then the top-32 select and the 32-row re-score per row.
+/// False = the coarse head is unavailable (nothing is written to `out`).
+pub fn rerankShortlistsBatched(
     s: mlx.mlx_stream,
     target: *Transformer,
     coarse: *?RerankCoarse,
     logged: *bool,
     x: mlx.mlx_array,
     suppress_mask: ?mlx.mlx_array,
-) !?mlx.mlx_array {
-    const rc = if (coarse.*) |*p| p else return null;
+    out: []Shortlist,
+) !bool {
+    const rc = if (coarse.*) |*p| p else return false;
     const xsh = mlx.getShape(x);
-    const N: c_int = xsh[0];
-    if (N <= 1) return rerankSelect(s, target, coarse, logged, x, suppress_mask);
+    const N: usize = @intCast(xsh[0]);
+    if (N != out.len) return error.MtpRerankBatchLengthMismatch;
+    if (N > 32) return error.MtpRerankBatchTooWide;
 
     var coarse_logits = try rerankCoarseRows(s, x, rc);
     defer _ = mlx.mlx_array_free(coarse_logits);
@@ -1290,16 +1371,11 @@ pub fn rerankSelectBatched(
     }
 
     const rows = rc.rows;
-    var id_parts: [32]mlx.mlx_array = undefined;
-    const n_usize: usize = @intCast(N);
-    if (n_usize > id_parts.len) return error.MtpRerankBatchTooWide;
-    for (id_parts[0..n_usize]) |*p| p.* = .{ .ctx = null };
-    defer for (id_parts[0..n_usize]) |p| {
-        if (p.ctx != null) _ = mlx.mlx_array_free(p);
-    };
+    var built: usize = 0;
+    errdefer for (out[0..built]) |*sl| sl.deinit();
     const csh = mlx.getShape(coarse_logits);
     const last = csh[csh.len - 1];
-    for (0..n_usize) |i| {
+    for (0..N) |i| {
         const i_c: c_int = @intCast(i);
         var row = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(row);
@@ -1314,17 +1390,50 @@ pub fn rerankSelectBatched(
         var xi = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(xi);
         try mlx.check(mlx.mlx_slice(&xi, x, &[_]c_int{ i_c, 0, 0 }, 3, &[_]c_int{ i_c + 1, 1, xsh[xsh.len - 1] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
-        const id = (try rerankRescoreRow(s, target, coarse, flat, rows, xi)) orelse return null;
-        defer _ = mlx.mlx_array_free(id);
-        var id2 = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_reshape(&id2, id, &[_]c_int{ 1, 1 }, 2, s));
-        id_parts[i] = id2;
+        // A shortlist failure retires the coarse head mid-loop; the caller's
+        // fallback answers for the whole group, so the rows already built go.
+        out[i] = (try rerankShortlistRow(s, target, coarse, flat, rows, xi)) orelse {
+            for (out[0..built]) |*sl| sl.deinit();
+            return false;
+        };
+        built = i + 1;
     }
-    const vec = mlx.mlx_vector_array_new_data(id_parts[0..n_usize].ptr, n_usize);
+    return true;
+}
+
+/// Batched greedy draft ids from mixer rows `x` `[N,1,H]`. Same scheme as
+/// `rerankSelect` per row; one coarse readout over N.
+pub fn rerankSelectBatched(
+    s: mlx.mlx_stream,
+    target: *Transformer,
+    coarse: *?RerankCoarse,
+    logged: *bool,
+    x: mlx.mlx_array,
+    suppress_mask: ?mlx.mlx_array,
+) !?mlx.mlx_array {
+    const xsh = mlx.getShape(x);
+    const N: usize = @intCast(xsh[0]);
+    if (N <= 1) return rerankSelect(s, target, coarse, logged, x, suppress_mask);
+    if (N > 32) return error.MtpRerankBatchTooWide;
+
+    var shortlists: [32]Shortlist = undefined;
+    if (!try rerankShortlistsBatched(s, target, coarse, logged, x, suppress_mask, shortlists[0..N])) return null;
+    defer for (shortlists[0..N]) |*sl| sl.deinit();
+
+    var id_parts: [32]mlx.mlx_array = @splat(.{ .ctx = null });
+    defer for (id_parts[0..N]) |p| {
+        if (p.ctx != null) _ = mlx.mlx_array_free(p);
+    };
+    for (0..N) |i| {
+        const id = try shortlistArgmax(s, shortlists[i]);
+        defer _ = mlx.mlx_array_free(id);
+        id_parts[i] = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&id_parts[i], id, &[_]c_int{ 1, 1 }, 2, s));
+    }
+    const vec = mlx.mlx_vector_array_new_data(id_parts[0..N].ptr, N);
     defer _ = mlx.mlx_vector_array_free(vec);
     var stacked = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_concatenate_axis(&stacked, vec, 0, s));
-    for (id_parts[0..n_usize]) |*p| p.* = .{ .ctx = null };
     return stacked;
 }
 

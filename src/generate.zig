@@ -380,6 +380,21 @@ pub const MtpHeadRef = union(enum) {
         };
     }
 
+    /// The exact re-scored top-32 shortlist a SAMPLED draft proposes from, or
+    /// null when the coarse rerank head is unavailable. `x` is the same vector
+    /// `draftSelect` takes.
+    pub fn draftShortlist(
+        self: MtpHeadRef,
+        target: *Transformer,
+        x: mlx.mlx_array,
+        suppress_mask: ?mlx.mlx_array,
+    ) !?mtp_mod.Shortlist {
+        return switch (self) {
+            .qwen => |h| h.draftShortlist(target, x, suppress_mask),
+            .qwen4 => |t| t.qwen4DraftShortlist(x, suppress_mask),
+        };
+    }
+
     /// Every G17/NAX cost surface is calibrated against one exact runtime
     /// geometry — the dense Qwen3.6/3.8-27B sidecars on the `.qwen` arm, the
     /// qwen4_exp in-checkpoint head on its own arm — so every other head
@@ -5346,7 +5361,7 @@ pub const Generator = struct {
     /// Allocate an empty draft chain for `plan` (nothing built yet).
     fn mtpChainInit(self: *Generator, allocator: std.mem.Allocator, plan: MtpRoundPlan, t1: u32) !MtpPreDraft {
         const consider_ext = plan.m_hi > plan.m_lo;
-        const sharp_drafts = mtpDraftSamplingFor(self.sampling, mtpDraftGreedy()).temperature > 0.01;
+        const sharp_drafts = self.mtpDraftSampling().temperature > 0.01;
         const drafts = try allocator.alloc(u32, plan.m_hi);
         errdefer allocator.free(drafts);
         const draft_arrs = try allocator.alloc(mlx.mlx_array, plan.m_hi);
@@ -5385,7 +5400,7 @@ pub const Generator = struct {
         const s = xfm.s;
         const head = self.mtp.?;
         const mc = &self.mtp_cache.?;
-        const draft_sampling = mtpDraftSamplingFor(self.sampling, mtpDraftGreedy());
+        const draft_sampling = self.mtpDraftSampling();
         const mtp_mrope_ctx = self.mtpMropeContext();
         const rerank_drafts = head.canRerankDrafts();
         std.debug.assert(chain.n_drafted == from);
@@ -5394,12 +5409,14 @@ pub const Generator = struct {
             const h_prev_arg: mlx.mlx_array = if (chain.h_chain) |h| h else self.last_hidden;
             const prev_tok_arr: mlx.mlx_array = if (i == 0) chain.t1_arr else chain.draft_arrs[i - 1];
             // Rerank drafts skip the head's own logits projection entirely:
-            // the token comes from `draftSelect` on the chained hidden. The
-            // sharp-proposal (q_probs) and confidence paths still need the
-            // full distribution, so they keep want_logits.
-            const need_logits = chain.q_probs != null or
-                (chain.conf_arrs != null and i < chain.plan.m_lo);
-            const use_rerank = rerank_drafts and !need_logits;
+            // the token comes off the coarse readout's re-scored shortlist,
+            // greedily (argmax) or sampled from a q over those 32 rows.
+            const path = mtpDraftStepPath(
+                rerank_drafts,
+                chain.q_probs != null,
+                chain.conf_arrs != null and i < chain.plan.m_lo,
+            );
+            const use_rerank = path != .full_logits;
             // `want_logits: bool` could not tell a rerank draft from a history
             // append: both skip the vocab projection, but the draft still needs
             // the vector that projection would have consumed.
@@ -5448,7 +5465,25 @@ pub const Generator = struct {
             defer if (step_out.rerank_x.ctx != null) {
                 _ = mlx.mlx_array_free(step_out.rerank_x);
             };
-            if (use_rerank) {
+            if (path == .rerank_sampled) {
+                const rerank_x = if (step_out.rerank_x.ctx != null) step_out.rerank_x else step_out.hidden_next;
+                const slots = chain.q_probs.?;
+                if (try head.draftShortlist(xfm, rerank_x, draft_sampling.suppress_mask)) |shortlist| {
+                    var sl = shortlist;
+                    defer sl.deinit();
+                    const prop = try shortlistProposal(sl, self.mtpSamplingDraw(draft_sampling), s);
+                    chain.draft_arrs[i] = prop.id;
+                    slots[i] = prop.q;
+                } else {
+                    // The coarse head just retired: propose greedily and hand
+                    // the verify the one-hot q that proposal really has.
+                    const id = try head.draftSelect(xfm, rerank_x, draft_sampling.suppress_mask);
+                    errdefer _ = mlx.mlx_array_free(id);
+                    slots[i] = try lazyOneHotRow(id, @intCast(mlx.getShape(xfm.lm_head_w)[0]), s);
+                    chain.draft_arrs[i] = id;
+                }
+                chain.n_qp = i + 1;
+            } else if (use_rerank) {
                 const rerank_x = if (step_out.rerank_x.ctx != null) step_out.rerank_x else step_out.hidden_next;
                 chain.draft_arrs[i] = try head.draftSelect(xfm, rerank_x, draft_sampling.suppress_mask);
             } else if (chain.q_probs) |slots| {
@@ -5536,11 +5571,29 @@ pub const Generator = struct {
         return n;
     }
 
-    /// Whether this row drafts through the rerank shortlist at `step`: a row that still
-    /// owes sampling logits reads the full head instead.
+    /// What one draft step reads. Both rerank paths skip the head's own vocab
+    /// projection (the token comes off the coarse readout's exactly re-scored
+    /// top-32); `full_logits` pays the whole lm_head because something
+    /// downstream needs a density over the vocabulary. A SAMPLED proposal does
+    /// not: q over the shortlist is the proposal's true density, zero off it,
+    /// and the verify's residual covers the rest.
+    pub const DraftStepPath = enum { rerank_greedy, rerank_sampled, full_logits };
+
+    pub fn mtpDraftStepPath(can_rerank: bool, sampled: bool, conf_needed: bool) DraftStepPath {
+        // The chunk-A extension gate wants ln p_head(draft) over the whole
+        // head, which the shortlist cannot answer.
+        if (conf_needed or !can_rerank) return .full_logits;
+        return if (sampled) .rerank_sampled else .rerank_greedy;
+    }
+
+    /// Whether this row drafts through the rerank shortlist at `step`. Greedy and
+    /// sampled rerank rows share the group: same coarse readout, same
+    /// `.mixed_last_row` head forward, only the tail over the 32 candidates
+    /// differs — so a mixed sampled/greedy workload does not split the step into
+    /// two head forwards.
     fn mtpRowRerankMode(g: *Generator, c: *const MtpPreDraft, step: u32) bool {
-        const need_logits = c.q_probs != null or (c.conf_arrs != null and step < c.plan.m_lo);
-        return g.mtp.?.canRerankDrafts() and !need_logits;
+        const conf_needed = c.conf_arrs != null and step < c.plan.m_lo;
+        return mtpDraftStepPath(g.mtp.?.canRerankDrafts(), c.q_probs != null, conf_needed) != .full_logits;
     }
 
     pub fn mtpChainBuildBatched(gens: []const *Generator, chains: []MtpPreDraft, from: u32, to: u32) !void {
@@ -5573,6 +5626,79 @@ pub const Generator = struct {
                 };
                 try mtpChainBuildBatchedActive(active_gens[0..count], active_chains[0..count], step, step + 1);
             }
+        }
+    }
+
+    /// One draft step for a group whose rerank rows include sampled ones:
+    /// per-row shortlists off ONE coarse readout, then one batched proposal
+    /// over the sampled rows when they share a sampler and none is seeded
+    /// (the `sampleRowsLazy` gate), else one proposal per row. Greedy rerank
+    /// rows keep their argmax.
+    fn mtpGroupSampledDrafts(
+        gens: []const *Generator,
+        chains: []MtpPreDraft,
+        stacked_x: mlx.mlx_array,
+        step: u32,
+    ) !void {
+        const xfm = gens[0].xfm;
+        const s = xfm.s;
+        const n = gens.len;
+        var shortlists: [32]mtp_mod.Shortlist = undefined;
+        const have = try xfm.qwen4DraftShortlistsBatched(stacked_x, gens[0].sampling.suppress_mask, shortlists[0..n]);
+        if (!have) {
+            // No coarse head: every row proposes greedily and hands the verify
+            // the one-hot q that proposal really has.
+            const vocab: c_int = @intCast(mlx.getShape(xfm.lm_head_w)[0]);
+            for (gens, chains, 0..) |g, *c, k| {
+                const k_c: c_int = @intCast(k);
+                var xk = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(xk);
+                const xsh = mlx.getShape(stacked_x);
+                try mlx.check(mlx.mlx_slice(&xk, stacked_x, &[_]c_int{ k_c, 0, 0 }, 3, &[_]c_int{ k_c + 1, 1, xsh[xsh.len - 1] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+                const id = try g.mtp.?.draftSelect(xfm, xk, g.sampling.suppress_mask);
+                errdefer _ = mlx.mlx_array_free(id);
+                if (c.q_probs) |slots| {
+                    slots[step] = try lazyOneHotRow(id, vocab, s);
+                    c.n_qp = step + 1;
+                }
+                c.draft_arrs[step] = id;
+            }
+            return;
+        }
+        defer for (shortlists[0..n]) |*sl| sl.deinit();
+
+        // Which rows sample, and whether one batched draw can serve them all.
+        var sampled: [32]usize = undefined;
+        var params: [32]SamplingParams = undefined;
+        var k_sampled: usize = 0;
+        for (gens, chains, 0..) |g, *c, row| {
+            if (c.q_probs == null) continue;
+            sampled[k_sampled] = row;
+            params[k_sampled] = g.mtpDraftSampling();
+            k_sampled += 1;
+        }
+        const batched = k_sampled > 1 and
+            sampleRowsHomogeneous(params[0..k_sampled]) and
+            !sampleRowsAnySeed(params[0..k_sampled]);
+
+        for (chains, 0..) |*c, row| {
+            if (c.q_probs != null) continue;
+            c.draft_arrs[step] = try mtp_mod.shortlistArgmax(s, shortlists[row]);
+        }
+        if (!batched) {
+            for (sampled[0..k_sampled], params[0..k_sampled]) |row, row_params| {
+                const prop = try shortlistProposal(shortlists[row], gens[row].mtpSamplingDraw(row_params), s);
+                chains[row].draft_arrs[step] = prop.id;
+                chains[row].q_probs.?[step] = prop.q;
+                chains[row].n_qp = step + 1;
+            }
+            return;
+        }
+        const group = try shortlistProposalRows(shortlists[0..n], sampled[0..k_sampled], params[0], s);
+        for (sampled[0..k_sampled], 0..) |row, j| {
+            chains[row].draft_arrs[step] = group.ids[j];
+            chains[row].q_probs.?[step] = group.qs[j];
+            chains[row].n_qp = step + 1;
         }
     }
 
@@ -5673,13 +5799,23 @@ pub const Generator = struct {
                 var stacked_x = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(stacked_x);
                 try mlx.check(mlx.mlx_concatenate_axis(&stacked_x, mvec, 0, xfm.s));
-                const ids = try xfm.qwen4DraftSelectBatched(stacked_x, gens[0].sampling.suppress_mask);
-                defer _ = mlx.mlx_array_free(ids);
+                var any_sampled = false;
+                for (chains) |*c| {
+                    if (c.q_probs != null) any_sampled = true;
+                }
+                if (any_sampled) {
+                    try mtpGroupSampledDrafts(gens, chains, stacked_x, i);
+                } else {
+                    const ids = try xfm.qwen4DraftSelectBatched(stacked_x, gens[0].sampling.suppress_mask);
+                    defer _ = mlx.mlx_array_free(ids);
+                    for (chains, 0..) |*c, k| {
+                        const k_c: c_int = @intCast(k);
+                        var one = mlx.mlx_array_new();
+                        try mlx.check(mlx.mlx_slice(&one, ids, &[_]c_int{ k_c, 0 }, 2, &[_]c_int{ k_c + 1, 1 }, 2, &[_]c_int{ 1, 1 }, 2, xfm.s));
+                        c.draft_arrs[i] = one;
+                    }
+                }
                 for (chains, 0..) |*c, k| {
-                    const k_c: c_int = @intCast(k);
-                    var one = mlx.mlx_array_new();
-                    try mlx.check(mlx.mlx_slice(&one, ids, &[_]c_int{ k_c, 0 }, 2, &[_]c_int{ k_c + 1, 1 }, 2, &[_]c_int{ 1, 1 }, 2, xfm.s));
-                    c.draft_arrs[i] = one;
                     c.n_drafted = i + 1;
                     if (c.h_chain) |h_old| _ = mlx.mlx_array_free(h_old);
                     c.h_chain = outs[k].stream;
@@ -5687,7 +5823,7 @@ pub const Generator = struct {
                 }
             } else {
                 for (gens, chains, 0..) |g, *c, k| {
-                    const draft_sampling = mtpDraftSamplingFor(g.sampling, mtpDraftGreedy());
+                    const draft_sampling = g.mtpDraftSampling();
                     if (c.q_probs) |slots| {
                         slots[i] = try probsAtLastPos(outs[k].logits, draft_sampling, xfm.s);
                         c.n_qp = i + 1;
@@ -7453,26 +7589,40 @@ pub const Generator = struct {
     pub const MTP_DISABLE_BELOW: f32 = 0.20; // per-draft rate at depth 1 → disable (sticky)
     pub const MTP_PROMOTE_COOLDOWN: u32 = 32; // rounds promotion stays blocked after a demotion
 
-    /// Greedy (argmax) MTP draft proposals — DEFAULT ON. Measured on the
-    /// Jundot oQ4e head (2026-07-22, ladder coding prompts, temp 0.6): the
-    /// sharpened stochastic proposal + exact Leviathan ratio (oMLX
-    /// Lightning's scheme, see mtpDraftSamplingFor) reads 48-50% per-draft
-    /// vs greedy's 58-63% — on LOW-entropy agent/code content the temp-0.6
-    /// target is sharper than any sampled proposal, so `min(1,
-    /// p_target[argmax])` dominates `1 − TV(p, q)`; draft-head precision
-    /// (3-bit/8-bit/trunk q) moved nothing. MLX_SERVE_MTP_DRAFT_GREEDY=0
-    /// flips to the sharpened sampled proposal (exactness holds either way —
-    /// pinned by the toy-vocab test; only the acceptance RATE differs).
-    var mtp_draft_greedy_cache: ?bool = null;
-    fn mtpDraftGreedy() bool {
-        if (mtp_draft_greedy_cache) |v| return v;
-        var on = true;
+    /// Draft-proposal mode is a property of the REQUEST, not of the process.
+    /// A greedy target keeps the argmax proposal (the temp-0 identity
+    /// contract); a sampled target proposes from the draft sampler, where
+    /// `min(1, p[argmax])` no longer collapses on a flat row.
+    /// MLX_SERVE_MTP_DRAFT_GREEDY overrides for A/Bs: 1 = always greedy,
+    /// 0 = always sampled, absent = the per-request rule.
+    pub const DraftProposal = enum { greedy, sampled, per_request };
+    var mtp_draft_proposal_cache: ?DraftProposal = null;
+    fn mtpDraftProposalEnv() DraftProposal {
+        if (mtp_draft_proposal_cache) |v| return v;
+        var mode: DraftProposal = .per_request;
         if (std.c.getenv("MLX_SERVE_MTP_DRAFT_GREEDY")) |p| {
             const val = std.mem.span(p);
-            if (val.len > 0 and val[0] == '0') on = false;
+            if (val.len > 0 and val[0] == '0') mode = .sampled;
+            if (val.len > 0 and val[0] == '1') mode = .greedy;
         }
-        mtp_draft_greedy_cache = on;
-        return on;
+        mtp_draft_proposal_cache = mode;
+        return mode;
+    }
+
+    /// Target temperature at or below which the GREEDY proposal still wins:
+    /// the argmax accepts with `p_target[argmax]`, high only while the target
+    /// row is sharp. Measured crossover between 0.3 and 0.7 on Flash Next.
+    pub const MTP_SAMPLED_PROPOSAL_MIN_TEMP: f32 = 0.5;
+
+    /// Greedy drafts for THIS request. `top_k == 1` is a deterministic target
+    /// whose filtered p is one-hot, so its argmax proposal is already optimal.
+    pub fn mtpDraftGreedyFor(target: SamplingParams, mode: DraftProposal) bool {
+        return switch (mode) {
+            .greedy => true,
+            // The temp-0 guard in `mtpDraftSamplingFor` still applies.
+            .sampled => false,
+            .per_request => target.temperature <= MTP_SAMPLED_PROPOSAL_MIN_TEMP or target.top_k == 1,
+        };
     }
 
     // ── Sharpened stochastic draft proposals (Lightning-class acceptance) ──
@@ -7489,22 +7639,57 @@ pub const Generator = struct {
     pub const MTP_DRAFT_TOP_P: f32 = 0.95;
     pub const MTP_DRAFT_TOP_K: u32 = 20;
 
+    /// Draft temperature is per FAMILY: the sidecar head's 0.6 does not carry
+    /// over, and Flash Next drafts best at the target's own temperature.
+    /// MLX_SERVE_MTP_DRAFT_TEMP is the sweep lever for the next head.
+    pub const MTP_DRAFT_TEMP_QWEN4: f32 = 1.0;
+
+    /// Only the ENV read is cached; the value is per loaded model.
+    var mtp_draft_temp_env: ??f32 = null;
+    fn mtpDraftTempEnv() ?f32 {
+        if (mtp_draft_temp_env) |v| return v;
+        var parsed: ?f32 = null;
+        if (std.c.getenv("MLX_SERVE_MTP_DRAFT_TEMP")) |p| {
+            if (std.fmt.parseFloat(f32, std.mem.span(p)) catch null) |v| {
+                if (v > 0.01 and v <= 4.0) parsed = v;
+            }
+        }
+        mtp_draft_temp_env = parsed;
+        return parsed;
+    }
+
+    pub fn mtpDraftTempFor(config: *const model_mod.ModelConfig) f32 {
+        if (mtpDraftTempEnv()) |v| return v;
+        return if (std.mem.eql(u8, config.model_type, "qwen4_exp")) MTP_DRAFT_TEMP_QWEN4 else MTP_DRAFT_TEMP;
+    }
+
     /// Draft-proposal sampler for a round: greedy targets keep greedy drafts
     /// (temp-0 identity contract); stochastic targets draft from the fixed
     /// sharpened distribution unless greedy is forced. The constants are not
     /// tunable: swept 2026-08-04 on the oQ4e head (prose@0.6, forced depth 3,
     /// sampled drafts) at draft temp 0.6/0.7/0.85/1.0 and per-draft
     /// acceptance was flat at 49.7-56.9% — no arm beat 0.6.
-    pub fn mtpDraftSamplingFor(target: SamplingParams, force_greedy: bool) SamplingParams {
+    pub fn mtpDraftSamplingFor(target: SamplingParams, force_greedy: bool, draft_temp: f32) SamplingParams {
         var d = target;
         if (force_greedy or target.temperature <= 0.01) {
             d.temperature = 0.0;
             return d;
         }
-        d.temperature = MTP_DRAFT_TEMP;
+        d.temperature = draft_temp;
         d.top_p = MTP_DRAFT_TOP_P;
         d.top_k = MTP_DRAFT_TOP_K;
         return d;
+    }
+
+    /// This request's draft sampler: the per-request proposal mode and the
+    /// loaded family's draft temperature, resolved in ONE place so no call site
+    /// can read a different proposal than the one the verify's q came from.
+    pub fn mtpDraftSampling(self: *const Generator) SamplingParams {
+        return mtpDraftSamplingFor(
+            self.sampling,
+            mtpDraftGreedyFor(self.sampling, mtpDraftProposalEnv()),
+            mtpDraftTempFor(&self.xfm.config),
+        );
     }
 
     /// Full Leviathan acceptance ratio; q clamped so a sampled draft (q > 0
@@ -9403,7 +9588,7 @@ pub const Generator = struct {
     /// One debug line per planned round with every input the planner read.
     pub fn mtpPlannerMode(self: *const Generator) u8 {
         const head = self.mtp orelse return 0;
-        const sharp = mtpDraftSamplingFor(self.sampling, mtpDraftGreedy()).temperature > 0.01;
+        const sharp = self.mtpDraftSampling().temperature > 0.01;
         return group_cost.GroupShape.samplingMode(head.canRerankDrafts(), false, sharp, self.sampling.temperature > 0.01);
     }
 
@@ -10628,6 +10813,175 @@ fn selectorQRow(sp: *const dflash_mod.SelectedPath, step: usize, m: u32, vocab: 
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_put_along_axis(&out, zeros, ids_arr, vals_arr, 1, s));
+    return out;
+}
+
+/// Sampled draft from the exact re-scored top-32: q is the draft sampler's
+/// filtered softmax over the shortlist, the draft is drawn from that q, and q
+/// goes to the verify as a dense `[1, V]` row that is zero off the shortlist.
+/// Leviathan is exact for any q, so the residual reaches the tokens the
+/// shortlist missed; filtering inside 32 rows costs acceptance at most. The
+/// contract: the row the verify sees is the array the draft was drawn from.
+fn shortlistProposal(sl: mtp_mod.Shortlist, sampling: SamplingParams, s: mlx.mlx_stream) !struct {
+    id: mlx.mlx_array,
+    q: mlx.mlx_array,
+} {
+    const shape = mlx.getShape(sl.exact);
+    const n = shape[shape.len - 1];
+
+    // f32: the density `min(1, p/q)` divides by must be the one the
+    // categorical drew from, and a bf16 softmax does not sum to 1.
+    var rows = mlx.mlx_array_new();
+    {
+        var flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(flat);
+        const row_shape = [_]c_int{ 1, n };
+        try mlx.check(mlx.mlx_reshape(&flat, sl.exact, &row_shape, 2, s));
+        errdefer _ = mlx.mlx_array_free(rows);
+        try mlx.check(mlx.mlx_astype(&rows, flat, .float32, s));
+    }
+    // The suppress mask already applied to the coarse readout; the shortlist
+    // holds no reserved id.
+    var draft = sampling;
+    draft.suppress_mask = null;
+    const q32 = try filteredProbsRows(rows, draft, s);
+    errdefer _ = mlx.mlx_array_free(q32);
+
+    var id = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(id);
+    {
+        const pick = try sampleFromProbsLazy(q32, sampling, s);
+        defer _ = mlx.mlx_array_free(pick);
+        var picked = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(picked);
+        try mlx.check(mlx.mlx_take_axis(&picked, sl.cands, pick, 0, s));
+        try mlx.check(mlx.mlx_astype(&id, picked, .int32, s));
+    }
+
+    const q = try scatterShortlistQ(sl, q32, s);
+    _ = mlx.mlx_array_free(q32);
+    return .{ .id = id, .q = q };
+}
+
+/// `shortlistProposal` for K rows at once: ONE filtered block over the
+/// stacked `[K, 32]` logits and ONE categorical (the kernels are launch-bound,
+/// so rows are nearly free and a per-row loop is not). Requires one shared
+/// sampler (`sampleRowsHomogeneous`) and no seeded row: one categorical
+/// cannot carry a per-row key.
+fn shortlistProposalRows(
+    shortlists: []const mtp_mod.Shortlist,
+    rows: []const usize,
+    sampling: SamplingParams,
+    s: mlx.mlx_stream,
+) !struct {
+    ids: [32]mlx.mlx_array,
+    qs: [32]mlx.mlx_array,
+} {
+    const K = rows.len;
+    std.debug.assert(K > 0 and K <= 32);
+    const n = mlx.getShape(shortlists[rows[0]].exact)[mlx.getShape(shortlists[rows[0]].exact).len - 1];
+
+    // [K, 32] f32, for the same reason as the single-row proposal.
+    var block = mlx.mlx_array_new();
+    {
+        var parts: [32]mlx.mlx_array = @splat(.{ .ctx = null });
+        defer for (parts[0..K]) |a| {
+            if (a.ctx != null) _ = mlx.mlx_array_free(a);
+        };
+        for (rows, 0..) |row, j| {
+            parts[j] = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_reshape(&parts[j], shortlists[row].exact, &[_]c_int{ 1, n }, 2, s));
+        }
+        const vec = mlx.mlx_vector_array_new_data(parts[0..K].ptr, K);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        var cat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(cat);
+        try mlx.check(mlx.mlx_concatenate_axis(&cat, vec, 0, s));
+        errdefer _ = mlx.mlx_array_free(block);
+        try mlx.check(mlx.mlx_astype(&block, cat, .float32, s));
+    }
+    // The suppress mask already applied to the coarse readout.
+    var draft = sampling;
+    draft.suppress_mask = null;
+    const q_block = try filteredProbsRows(block, draft, s);
+    defer _ = mlx.mlx_array_free(q_block);
+
+    // ONE categorical over the block -> [K] shortlist indices.
+    var picks = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(picks);
+    {
+        var logq = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(logq);
+        try mlx.check(mlx.mlx_log(&logq, q_block, s));
+        const null_key = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(null_key);
+        try mlx.check(mlx.mlx_random_categorical(&picks, logq, -1, null_key, s));
+    }
+
+    var ids: [32]mlx.mlx_array = @splat(.{ .ctx = null });
+    var qs: [32]mlx.mlx_array = @splat(.{ .ctx = null });
+    var done: usize = 0;
+    errdefer for (0..done) |j| {
+        if (ids[j].ctx != null) _ = mlx.mlx_array_free(ids[j]);
+        if (qs[j].ctx != null) _ = mlx.mlx_array_free(qs[j]);
+    };
+    for (rows, 0..) |row, j| {
+        const j_c: c_int = @intCast(j);
+        var pick = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(pick);
+        try mlx.check(mlx.mlx_slice(&pick, picks, &[_]c_int{j_c}, 1, &[_]c_int{j_c + 1}, 1, &[_]c_int{1}, 1, s));
+        var picked = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(picked);
+        try mlx.check(mlx.mlx_take_axis(&picked, shortlists[row].cands, pick, 0, s));
+        ids[j] = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_astype(&ids[j], picked, .int32, s));
+
+        var q_row = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(q_row);
+        try mlx.check(mlx.mlx_slice(&q_row, q_block, &[_]c_int{ j_c, 0 }, 2, &[_]c_int{ j_c + 1, n }, 2, &[_]c_int{ 1, 1 }, 2, s));
+        qs[j] = try scatterShortlistQ(shortlists[row], q_row, s);
+        done = j + 1;
+    }
+    return .{ .ids = ids, .qs = qs };
+}
+
+/// One row's `[1, 32]` shortlist density as the dense `[1, V]` q the verify
+/// takes, zero off the shortlist.
+fn scatterShortlistQ(sl: mtp_mod.Shortlist, q32: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    const n = mlx.getShape(q32)[mlx.getShape(q32).len - 1];
+    var zeros = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(zeros);
+    try mlx.check(mlx.mlx_zeros(&zeros, &[_]c_int{ 1, sl.rows }, 2, .float32, s));
+    var cand_row = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cand_row);
+    try mlx.check(mlx.mlx_reshape(&cand_row, sl.cands, &[_]c_int{ 1, n }, 2, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_put_along_axis(&out, zeros, cand_row, q32, 1, s));
+    return out;
+}
+
+/// A lazy one-hot `[1, V]` f32 proposal row: the q of an argmax proposal, so
+/// `min(1, p/q) == p`. The sampled path's fallback when the coarse head
+/// retires mid-chain.
+fn lazyOneHotRow(id: mlx.mlx_array, vocab: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    var indices = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(indices);
+    try mlx.check(mlx.mlx_arange(&indices, 0, @as(f64, @floatFromInt(vocab)), 1, .int32, s));
+    var flat_id = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat_id);
+    const one = [_]c_int{1};
+    try mlx.check(mlx.mlx_reshape(&flat_id, id, &one, 1, s));
+    var hit = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(hit);
+    try mlx.check(mlx.mlx_equal(&hit, indices, flat_id, s));
+    var as_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(as_f32);
+    try mlx.check(mlx.mlx_astype(&as_f32, hit, .float32, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    const row_shape = [_]c_int{ 1, vocab };
+    try mlx.check(mlx.mlx_reshape(&out, as_f32, &row_shape, 2, s));
     return out;
 }
 
@@ -14025,12 +14379,159 @@ fn mtpEvTestGenerator() Generator {
     return g;
 }
 
+/// One flat f32 host copy of a lazy array, for the proposal-row assertions.
+fn proposalTestRead(allocator: std.mem.Allocator, arr: mlx.mlx_array, n: usize, s: mlx.mlx_stream) ![]f32 {
+    var as_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(as_f32);
+    try mlx.check(mlx.mlx_astype(&as_f32, arr, .float32, s));
+    var dense = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(dense);
+    try mlx.check(mlx.mlx_contiguous(&dense, as_f32, false, s));
+    const flat_shape = [_]c_int{@intCast(n)};
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    try mlx.check(mlx.mlx_reshape(&flat, dense, &flat_shape, 1, s));
+    try mlx.check(mlx.mlx_array_eval(flat));
+    const out = try allocator.alloc(f32, n);
+    @memcpy(out, mlx.mlx_array_data_float32(flat).?[0..n]);
+    return out;
+}
+
+test "shortlistProposal: q is zero off the shortlist, sums to 1, and peaks on the best candidate" {
+    // Bar: q is a normalized density over the 32 candidates only, and the
+    // draft is one of them.
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+    const V: c_int = 4096;
+    const N: usize = 32;
+
+    var ids: [N]u32 = undefined;
+    var logits: [N]f32 = undefined;
+    for (0..N) |i| {
+        ids[i] = @intCast(37 + i * 101); // spread over the row, none at 0
+        logits[i] = @as(f32, @floatFromInt(i)) * 0.25;
+    }
+    const best_id = ids[N - 1]; // highest logit
+    const id_shape = [_]c_int{@intCast(N)};
+    const cands = mlx.mlx_array_new_data(&ids, &id_shape, 1, .uint32);
+    const exact_shape = [_]c_int{ 1, 1, @intCast(N) };
+    const exact = mlx.mlx_array_new_data(&logits, &exact_shape, 3, .float32);
+    var sl = mtp_mod.Shortlist{ .cands = cands, .exact = exact, .rows = V };
+    defer sl.deinit();
+
+    const sampling = Generator.mtpDraftSamplingFor(.{ .temperature = 1.0 }, false, Generator.MTP_DRAFT_TEMP);
+    const prop = try shortlistProposal(sl, sampling, s);
+    defer _ = mlx.mlx_array_free(prop.id);
+    defer _ = mlx.mlx_array_free(prop.q);
+
+    const q = try proposalTestRead(allocator, prop.q, @intCast(V), s);
+    defer allocator.free(q);
+    var sum: f64 = 0;
+    var nonzero: usize = 0;
+    var peak: usize = 0;
+    for (q, 0..) |v, i| {
+        sum += v;
+        if (v != 0) {
+            nonzero += 1;
+            try testing.expect(std.mem.indexOfScalar(u32, &ids, @intCast(i)) != null);
+        }
+        if (v > q[peak]) peak = i;
+    }
+    try testing.expect(nonzero > 0 and nonzero <= N);
+    try testing.expect(@abs(sum - 1.0) < 1e-4);
+    try testing.expectEqual(best_id, @as(u32, @intCast(peak)));
+
+    // Every draw lands on a candidate — never on a token q calls impossible.
+    var draw: usize = 0;
+    while (draw < 8) : (draw += 1) {
+        const p2 = try shortlistProposal(sl, sampling, s);
+        defer _ = mlx.mlx_array_free(p2.id);
+        defer _ = mlx.mlx_array_free(p2.q);
+        const drawn = try proposalTestRead(allocator, p2.id, 1, s);
+        defer allocator.free(drawn);
+        const tok: u32 = @intFromFloat(drawn[0]);
+        try testing.expect(std.mem.indexOfScalar(u32, &ids, tok) != null);
+    }
+}
+
+test "shortlistProposalRows: every row's q belongs to that row's own shortlist" {
+    // The axis-bug class: one batched filter + one categorical over [K, 32] must
+    // stay row-independent. Three rows with DISJOINT candidate ids and different
+    // logits, so a cross-row leak or a flattened reduction is visible.
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+    const V: c_int = 4096;
+    const N: usize = 3;
+    const M: usize = 32;
+
+    var ids: [N][M]u32 = undefined;
+    var logits: [N][M]f32 = undefined;
+    var sl: [N]mtp_mod.Shortlist = undefined;
+    for (0..N) |r| {
+        for (0..M) |i| {
+            ids[r][i] = @intCast(11 + r * 41 + i * 127); // disjoint per row
+            // Row r peaks at a different position, so an argmax read off the
+            // wrong row lands on the wrong id.
+            logits[r][i] = if (i == (r * 7 + 3) % M) 6.0 else @as(f32, @floatFromInt(i)) * 0.05;
+        }
+        const id_shape = [_]c_int{@intCast(M)};
+        const ex_shape = [_]c_int{ 1, 1, @intCast(M) };
+        sl[r] = .{
+            .cands = mlx.mlx_array_new_data(&ids[r], &id_shape, 1, .uint32),
+            .exact = mlx.mlx_array_new_data(&logits[r], &ex_shape, 3, .float32),
+            .rows = V,
+        };
+    }
+    defer for (&sl) |*x| x.deinit();
+
+    const sampling = Generator.mtpDraftSamplingFor(.{ .temperature = 1.0 }, false, Generator.MTP_DRAFT_TEMP);
+    const rows = [_]usize{ 0, 1, 2 };
+    const out = try shortlistProposalRows(&sl, &rows, sampling, s);
+    defer for (0..N) |j| {
+        _ = mlx.mlx_array_free(out.ids[j]);
+        _ = mlx.mlx_array_free(out.qs[j]);
+    };
+
+    for (0..N) |r| {
+        const q = try proposalTestRead(allocator, out.qs[r], @intCast(V), s);
+        defer allocator.free(q);
+        var sum: f64 = 0;
+        var peak: usize = 0;
+        for (q, 0..) |v, i| {
+            sum += v;
+            if (v != 0) try testing.expect(std.mem.indexOfScalar(u32, &ids[r], @intCast(i)) != null);
+            if (v > q[peak]) peak = i;
+        }
+        try testing.expect(@abs(sum - 1.0) < 1e-4);
+        try testing.expectEqual(ids[r][(r * 7 + 3) % M], @as(u32, @intCast(peak)));
+        const drawn = try proposalTestRead(allocator, out.ids[r], 1, s);
+        defer allocator.free(drawn);
+        try testing.expect(std.mem.indexOfScalar(u32, &ids[r], @intFromFloat(drawn[0])) != null);
+    }
+}
+
+test "mtpDraftStepPath: a sampled proposal keeps the rerank shortlist" {
+    // Bar: a sampled proposal reads the rerank shortlist; only the chunk-A
+    // confidence gate needs the full lm_head.
+    const P = Generator.DraftStepPath;
+    try testing.expectEqual(P.rerank_sampled, Generator.mtpDraftStepPath(true, true, false));
+    try testing.expectEqual(P.rerank_greedy, Generator.mtpDraftStepPath(true, false, false));
+    // The extension gate wants ln p_head over the whole vocabulary.
+    try testing.expectEqual(P.full_logits, Generator.mtpDraftStepPath(true, true, true));
+    try testing.expectEqual(P.full_logits, Generator.mtpDraftStepPath(true, false, true));
+    // No coarse head: nothing to shortlist.
+    try testing.expectEqual(P.full_logits, Generator.mtpDraftStepPath(false, true, false));
+    try testing.expectEqual(P.full_logits, Generator.mtpDraftStepPath(false, false, false));
+}
+
 test "mtpDraftSamplingFor: sharpened fixed proposal for stochastic targets, greedy stays greedy" {
     // Stochastic target: drafts sample from the FIXED sharpened distribution
     // (temp 0.6 / top_p 0.95 / top_k 20 — oMLX Lightning's _DRAFT_SAMPLER_*
     // constants; matched-temp drafting collapses on high-entropy content).
     const target = SamplingParams{ .temperature = 1.0, .top_p = 1.0, .top_k = 0, .repeat_penalty = 1.1 };
-    const d = Generator.mtpDraftSamplingFor(target, false);
+    const d = Generator.mtpDraftSamplingFor(target, false, Generator.MTP_DRAFT_TEMP);
     try testing.expectEqual(@as(f32, 0.6), d.temperature);
     try testing.expectEqual(@as(f32, 0.95), d.top_p);
     try testing.expectEqual(@as(u32, 20), d.top_k);
@@ -14039,12 +14540,43 @@ test "mtpDraftSamplingFor: sharpened fixed proposal for stochastic targets, gree
 
     // Greedy target keeps greedy drafts (the temp-0 identity contract).
     const greedy = SamplingParams{ .temperature = 0.0 };
-    try testing.expectEqual(@as(f32, 0.0), Generator.mtpDraftSamplingFor(greedy, false).temperature);
+    try testing.expectEqual(@as(f32, 0.0), Generator.mtpDraftSamplingFor(greedy, false, Generator.MTP_DRAFT_TEMP).temperature);
     const near_greedy = SamplingParams{ .temperature = 0.005 };
-    try testing.expectEqual(@as(f32, 0.0), Generator.mtpDraftSamplingFor(near_greedy, false).temperature);
+    try testing.expectEqual(@as(f32, 0.0), Generator.mtpDraftSamplingFor(near_greedy, false, Generator.MTP_DRAFT_TEMP).temperature);
 
     // Explicit greedy override (MLX_SERVE_MTP_DRAFT_GREEDY=1) wins.
-    try testing.expectEqual(@as(f32, 0.0), Generator.mtpDraftSamplingFor(target, true).temperature);
+    try testing.expectEqual(@as(f32, 0.0), Generator.mtpDraftSamplingFor(target, true, Generator.MTP_DRAFT_TEMP).temperature);
+
+    // The draft temperature is the FAMILY's, passed in, never a global.
+    try testing.expectEqual(@as(f32, 1.0), Generator.mtpDraftSamplingFor(target, false, 1.0).temperature);
+}
+
+test "mtpDraftGreedyFor: the proposal mode is a property of the REQUEST" {
+    const sampled = SamplingParams{ .temperature = 1.0 };
+    const warm = SamplingParams{ .temperature = 0.7 };
+    const cold = SamplingParams{ .temperature = 0.0 };
+    const near_cold = SamplingParams{ .temperature = 0.005 };
+    // top_k 1 is a deterministic target: its filtered p is one-hot, so the
+    // argmax proposal already accepts with probability 1.
+    const one_way = SamplingParams{ .temperature = 1.0, .top_k = 1 };
+
+    // Absent env: sampled targets propose from the shortlist, greedy ones do not.
+    try testing.expect(!Generator.mtpDraftGreedyFor(sampled, .per_request));
+    try testing.expect(!Generator.mtpDraftGreedyFor(warm, .per_request));
+    try testing.expect(Generator.mtpDraftGreedyFor(cold, .per_request));
+    // Bar: a sharp target keeps the argmax, a flat one samples.
+    try testing.expect(Generator.mtpDraftGreedyFor(.{ .temperature = 0.3 }, .per_request));
+    try testing.expect(Generator.mtpDraftGreedyFor(near_cold, .per_request));
+    try testing.expect(Generator.mtpDraftGreedyFor(one_way, .per_request));
+
+    // MLX_SERVE_MTP_DRAFT_GREEDY=1 forces greedy for every request; =0 leaves
+    // the temp-0 guard in `mtpDraftSamplingFor` to keep a greedy target greedy.
+    try testing.expect(Generator.mtpDraftGreedyFor(sampled, .greedy));
+    try testing.expect(!Generator.mtpDraftGreedyFor(sampled, .sampled));
+    try testing.expectEqual(
+        @as(f32, 0.0),
+        Generator.mtpDraftSamplingFor(cold, Generator.mtpDraftGreedyFor(cold, .sampled), 1.0).temperature,
+    );
 }
 
 test "filteredProbsBlock: every draft row is the SAME density the sample is drawn from" {
@@ -14189,6 +14721,62 @@ test "spec sampling exactness: draft-from-q + ratio-accept + residual reproduces
         const freq = @as(f64, @floatFromInt(counts[i])) / @as(f64, @floatFromInt(N));
         try testing.expect(@abs(freq - p[i]) < 0.01);
     }
+}
+
+test "spec sampling exactness: a SHORTLIST proposal (q zero off the top-k) still reproduces target p" {
+    // Bar: with q supported on a subset, the marginal is still p, and the
+    // off-shortlist tokens arrive only through the residual.
+    const p = [_]f64{ 0.30, 0.25, 0.20, 0.15, 0.10 };
+    const q = [_]f64{ 0.50, 0.30, 0.20, 0.00, 0.00 }; // shortlist = {0, 1, 2}
+    const off_shortlist = [_]usize{ 3, 4 };
+
+    var residual: [5]f64 = undefined;
+    var res_sum: f64 = 0;
+    for (0..5) |i| {
+        residual[i] = @max(p[i] - q[i], 0);
+        res_sum += residual[i];
+    }
+    for (&residual) |*r| r.* /= res_sum;
+
+    var prng = std.Random.DefaultPrng.init(0x51157);
+    const rnd = prng.random();
+    var counts = [_]u64{ 0, 0, 0, 0, 0 };
+    const N: usize = 400_000;
+    for (0..N) |_| {
+        var u = rnd.float(f64);
+        var draft: usize = 0;
+        var acc: f64 = 0;
+        for (q, 0..) |qi, i| {
+            acc += qi;
+            if (u < acc) {
+                draft = i;
+                break;
+            }
+        }
+        // A draft is never drawn off the shortlist, so q[draft] > 0 always.
+        try testing.expect(q[draft] > 0);
+        if (rnd.float(f32) < Generator.specAcceptProb(@floatCast(p[draft]), @floatCast(q[draft]))) {
+            counts[draft] += 1;
+        } else {
+            u = rnd.float(f64);
+            acc = 0;
+            var res_tok: usize = 4;
+            for (residual, 0..) |ri, i| {
+                acc += ri;
+                if (u < acc) {
+                    res_tok = i;
+                    break;
+                }
+            }
+            counts[res_tok] += 1;
+        }
+    }
+    for (0..5) |i| {
+        const freq = @as(f64, @floatFromInt(counts[i])) / @as(f64, @floatFromInt(N));
+        try testing.expect(@abs(freq - p[i]) < 0.01);
+    }
+    // The residual is the ONLY route to a token the shortlist missed.
+    for (off_shortlist) |i| try testing.expect(counts[i] > 0);
 }
 
 test "mtpNextDepth: adaptive depth policy transitions" {

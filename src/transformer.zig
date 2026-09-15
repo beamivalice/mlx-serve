@@ -22407,6 +22407,25 @@ pub const Transformer = struct {
         return mtp_mod.fullReadoutArgmax(self.s, self, x, suppress_mask);
     }
 
+    /// The exact re-scored top-32 shortlist for a SAMPLED draft. Null = the
+    /// coarse head is unavailable and the caller falls back to a greedy draft.
+    pub fn qwen4DraftShortlist(self: *Transformer, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !?mtp_mod.Shortlist {
+        const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
+        return mtp_mod.rerankShortlist(self.s, self, &m.rerank, &m.rerank_logged, x, suppress_mask);
+    }
+
+    /// Per-row exact re-scored shortlists for a batched SAMPLED draft step.
+    /// False = no coarse head; the caller drafts greedily instead.
+    pub fn qwen4DraftShortlistsBatched(
+        self: *Transformer,
+        x: mlx.mlx_array,
+        suppress_mask: ?mlx.mlx_array,
+        out: []mtp_mod.Shortlist,
+    ) !bool {
+        const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
+        return mtp_mod.rerankShortlistsBatched(self.s, self, &m.rerank, &m.rerank_logged, x, suppress_mask, out);
+    }
+
     pub fn qwen4DraftSelectBatched(self: *Transformer, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !mlx.mlx_array {
         const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
         if (try mtp_mod.rerankSelectBatched(self.s, self, &m.rerank, &m.rerank_logged, x, suppress_mask)) |tok| return tok;
