@@ -114,6 +114,7 @@ Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dtest-filter=
 - Chat templates live in model dirs; Jinja renders with fallback formatting.
 - **Diffs are read by a human. Keep them small.** A comment says what the code cannot (a non-obvious WHY, a contract, a unit), in one to three lines. Never: bug history, measurements, audit trails, review item numbers, dates, "PR #NNN", what an older commit did, or a restatement of the code. That belongs in the commit message and, if it is a rule, in `docs/gotchas/*.md`.
 - **No source-scan tests** (`@embedFile` + "this string appears in that function"): they pin text, not behaviour, and pass against their own needles. Test the behaviour or state the rule in a comment. A test comment is one line saying what the bar is.
+- **A test never writes to stdout** (stderr only): under `zig build test` fd 1 is the build runner's protocol pipe, and one stray line hangs the runner forever while the standalone test binary passes. Story: `docs/gotchas/engine-mlx.md`.
 - **One story per gotcha, one line per rule.** A gotcha entry is the defect, the cause, the fix and the guard in under 20 lines, written once after the work lands. No round-by-round logs, no ledgers, no "what the reviewer said". CHANGELOG: one user-facing sentence per change, no provisional numbers.
 
 ## Supported architectures
