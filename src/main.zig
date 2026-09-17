@@ -335,8 +335,8 @@ fn printUsage(io: std.Io) void {
         \\                        decimal-GB cache (default operating point: 60).
         \\  --ssd-budget-gb <n> Enable bf16 qwen4_exp expert streaming with a
         \\                        TOTAL resident target of <n> GiB; the expert
-        \\                        cache is what is left after the trunk, the MTP
-        \\                        head, the prefill union and the fill buffers.
+        \\                        cache is what is left after the trunk, the
+        \\                        prefill union and the fill buffers.
         \\                        --expert-cache-gb wins when both are given.
         \\  --no-ds4-mtp        ds4 only: don't auto-load the MTP draft head
         \\                        (speculative decode). On by default when the

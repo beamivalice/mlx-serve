@@ -34,7 +34,7 @@ pub const Options = struct {
     kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.dense,
     expert_cache_bytes: u64 = 0,
     ssd_budget_bytes: u64 = 0,
-    enable_mtp: bool = true,
+    enable_mtp: bool = false,
 };
 
 pub const ArgError = error{
@@ -168,7 +168,7 @@ pub const USAGE =
     \\  --kv-quant <off|4|8>  KV cache quantization
     \\  --ssd-budget-gb <n>   bf16 expert streaming budget (GiB)
     \\  --expert-cache-gb <n> bf16 expert cache size (GB), outranks --ssd-budget-gb
-    \\  --no-mtp / --mtp      whether an MTP head stays resident in the budget
+    \\  --mtp                 keep the MTP head resident (refused under streaming)
     \\
 ;
 
@@ -792,11 +792,18 @@ pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, opts: Options) !*Load
     )) {
         const budget = kld_budget;
         if (opts.expert_cache_bytes == 0 and budget.bytes == 0) return error.ExpertStreamingRequired;
-        const mtp_resident = self.config.mtp_override orelse opts.enable_mtp;
-        if (expert_stream_mod.mtpRefusal(true, mtp_resident)) |why| {
-            log.err("[expert-stream] {s}; pass --no-mtp\n", .{why});
-            return error.ExpertStreamingMtpUnsupported;
+        switch (expert_stream_mod.mtpUnderStreaming(opts.enable_mtp, self.config.mtp_override)) {
+            .refuse => {
+                log.err("[expert-stream] {s}; drop --mtp\n", .{expert_stream_mod.MTP_UNSUPPORTED});
+                return error.ExpertStreamingMtpUnsupported;
+            },
+            .drop_settings => {
+                log.info("[expert-stream] model-settings mtp=true ignored: {s}\n", .{expert_stream_mod.MTP_UNSUPPORTED});
+                self.config.mtp_override = false;
+            },
+            .off => {},
         }
+        const mtp_resident = false;
         const geometry = scheduler_mod.streamingGeometryOf(&self.config);
         self.config.expert_layout = expert_stream_mod.quant.layoutOfDir(allocator, io, self.config.model_type, opts.model_dir, geometry.layers) orelse
             return error.ExpertStreamingUnsupportedLayout;
@@ -1566,8 +1573,10 @@ test "kld: the argument parser reads every flag and refuses an unknown one" {
     try testing.expectEqual(Command.compare, compare.command);
     try testing.expectEqualStrings("/fixtures/teacher", compare.fixture);
     try testing.expectEqualStrings("/tmp/out.json", compare.json_out);
-    try testing.expect(compare.enable_mtp);
+    try testing.expect(!compare.enable_mtp);
     try testing.expectEqual(@as(u32, 64), compare.tokens);
+    const with_mtp = try parseArgs(&.{ "compare", "--model", "/models/pack", "--fixture", "/fixtures/teacher", "--mtp" });
+    try testing.expect(with_mtp.enable_mtp);
 
     try testing.expectError(error.UnknownFlag, parseArgs(&.{ "compare", "--model", "/m", "--fixture", "/f", "--nope" }));
     try testing.expectError(error.UnknownFlag, parseArgs(&.{ "capture", "--model=/m" }));
@@ -1582,7 +1591,6 @@ test "kld: the argument parser reads every flag and refuses an unknown one" {
     try testing.expectError(error.MissingFixture, parseArgs(&.{ "compare", "--model", "/m" }));
     try testing.expect((try parseArgs(&.{ "capture", "--help" })).help);
 }
-
 
 test "kld: the recorded strict NLL is the teacher's own log-softmax, as the capture wrote it" {
     const allocator = testing.allocator;
