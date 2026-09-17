@@ -1362,7 +1362,7 @@ const BenchArm = struct {
 fn benchPrint(comptime fmt: []const u8, args: anytype) void {
     var buf: [512]u8 = undefined;
     const line = std.fmt.bufPrint(&buf, fmt, args) catch return;
-    _ = std.c.write(1, line.ptr, line.len);
+    _ = std.c.write(2, line.ptr, line.len);
 }
 
 fn unixSeconds() f64 {
