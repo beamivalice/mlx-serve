@@ -253,8 +253,8 @@ pub const GroupResolution = struct {
 pub const CachePolicy = enum { lru, lfu };
 
 pub fn expertCachePolicyFromEnv() CachePolicy {
-    const raw = std.c.getenv("MLX_SERVE_EXPERT_LFU") orelse return .lfu;
-    if (raw[0] == '0') return .lru;
+    const raw = std.c.getenv("MLX_SERVE_EXPERT_LFU") orelse return .lru;
+    if (raw[0] == 0 or raw[0] == '0') return .lru;
     return .lfu;
 }
 
