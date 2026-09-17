@@ -12861,6 +12861,7 @@ test "every load refusal the registry preserves answers under its own name" {
         "SsdBudgetExceedsWiredLimit",
         "ExpertStreamingMtpUnsupported",
         "ExpertStreamingUnsupportedLayout",
+        "ExpertSlabImportCopied",
     };
     for (names) |name| {
         const refusal = loadRefusalFor(model_registry_mod.ModelRegistry.loadErrorFromName(name)) orelse {
@@ -12871,6 +12872,7 @@ test "every load refusal the registry preserves answers under its own name" {
         try t.expect(refusal.message.len > 0);
     }
     try t.expectEqualStrings("expert_streaming_unsupported_layout", loadRefusalFor(error.ExpertStreamingUnsupportedLayout).?.type);
+    try t.expectEqualStrings("expert_slab_import_copied", loadRefusalFor(error.ExpertSlabImportCopied).?.type);
     try t.expect(loadRefusalFor(error.LoadFailed) == null);
     try t.expect(loadRefusalFor(error.UnknownModelId) == null);
 }
@@ -12885,6 +12887,7 @@ pub fn loadRefusalFor(err: anyerror) ?LoadRefusal {
         error.ExpertStreamingMtpUnsupported => .{ .type = "expert_streaming_mtp_unsupported", .message = expert_stream_mod.MTP_UNSUPPORTED },
         error.ExpertStreamingRequired => .{ .type = "expert_streaming_required", .message = "This dense qwen4_exp checkpoint streams its experts from SSD and needs a resident budget: set this model's \"ssd_budget_gb\" in model-settings.json, or launch with --ssd-budget-gb <n> (or --expert-cache-gb <n>)." },
         error.ExpertStreamingUnsupportedLayout => .{ .type = "expert_streaming_unsupported_layout", .message = "This qwen4_exp checkpoint has no expert layout this build can stream: the fused bf16 banks or the nine quantized banks are missing or incomplete. Re-download the pack, or serve a pack this build supports." },
+        error.ExpertSlabImportCopied => .{ .type = "expert_slab_import_copied", .message = "MLX copied the expert slab instead of aliasing it, so this machine cannot stream experts zero-copy. Report the Mac model and macOS version." },
         error.SsdBudgetBelowResident => .{ .type = "ssd_budget_below_resident", .message = "--ssd-budget-gb leaves no room for an expert cache after the resident trunk, the MTP head, the prefill union and the fill buffers. Raise the budget." },
         error.SsdBudgetExceedsWiredLimit => .{ .type = "ssd_budget_exceeds_wired_limit", .message = "--ssd-budget-gb plus the planned KV cache exceeds the machine's residency limit. Raise iogpu.wired_limit_mb (the server log names the value) or lower the budget." },
         else => null,

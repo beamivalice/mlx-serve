@@ -14,6 +14,7 @@ enum LoadFailureVerdict {
         "ssd_budget_exceeds_wired_limit",
         "expert_streaming_mtp_unsupported",
         "expert_streaming_unsupported_layout",
+        "expert_slab_import_copied",
     ]
 
     static func errorType(fromBody data: Data) -> String? {

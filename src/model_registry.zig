@@ -1324,7 +1324,7 @@ pub const ModelRegistry = struct {
     /// (2026-08-08). Merge note: this arm came from the branch's
     /// `scheduler.loadErrorFor`, which this function replaced — the name-based
     /// half survived the refactor, the second name did not.
-    pub fn loadErrorFromName(name: ?[]const u8) error{ LoadFailed, InsufficientMemory, ExpertCacheDoesNotFit, ExpertStreamingRequired, SsdBudgetBelowResident, SsdBudgetExceedsWiredLimit, ExpertStreamingMtpUnsupported, ExpertStreamingUnsupportedLayout } {
+    pub fn loadErrorFromName(name: ?[]const u8) error{ LoadFailed, InsufficientMemory, ExpertCacheDoesNotFit, ExpertStreamingRequired, SsdBudgetBelowResident, SsdBudgetExceedsWiredLimit, ExpertStreamingMtpUnsupported, ExpertStreamingUnsupportedLayout, ExpertSlabImportCopied } {
         if (name) |n| {
             if (std.mem.eql(u8, n, "InsufficientMemory")) return error.InsufficientMemory;
             if (std.mem.eql(u8, n, "OutOfMemory")) return error.InsufficientMemory;
@@ -1334,6 +1334,7 @@ pub const ModelRegistry = struct {
             if (std.mem.eql(u8, n, "SsdBudgetExceedsWiredLimit")) return error.SsdBudgetExceedsWiredLimit;
             if (std.mem.eql(u8, n, "ExpertStreamingMtpUnsupported")) return error.ExpertStreamingMtpUnsupported;
             if (std.mem.eql(u8, n, "ExpertStreamingUnsupportedLayout")) return error.ExpertStreamingUnsupportedLayout;
+            if (std.mem.eql(u8, n, "ExpertSlabImportCopied")) return error.ExpertSlabImportCopied;
         }
         return error.LoadFailed;
     }
@@ -1351,6 +1352,7 @@ pub const ModelRegistry = struct {
         try std.testing.expectEqual(error.SsdBudgetExceedsWiredLimit, loadErrorFromName("SsdBudgetExceedsWiredLimit"));
         try std.testing.expectEqual(error.ExpertStreamingMtpUnsupported, loadErrorFromName("ExpertStreamingMtpUnsupported"));
         try std.testing.expectEqual(error.ExpertStreamingUnsupportedLayout, loadErrorFromName("ExpertStreamingUnsupportedLayout"));
+        try std.testing.expectEqual(error.ExpertSlabImportCopied, loadErrorFromName("ExpertSlabImportCopied"));
         // Everything else stays a load failure — guessing a diagnosis is worse
         // than reporting the honest generic one.
         try std.testing.expectEqual(error.LoadFailed, loadErrorFromName("FileNotFound"));

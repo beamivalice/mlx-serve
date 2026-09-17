@@ -100,7 +100,7 @@ final class LoadFailureVerdictTests: XCTestCase {
     func testNamedRefusalsDoNotRestartTheServer() {
         for t in ["expert_streaming_required", "ssd_budget_below_resident",
                   "ssd_budget_exceeds_wired_limit", "expert_streaming_mtp_unsupported",
-                  "expert_streaming_unsupported_layout"] {
+                  "expert_streaming_unsupported_layout", "expert_slab_import_copied"] {
             XCTAssertFalse(LoadFailureVerdict.shouldRestartAfterLoadFailure(body: body(type: t)), t)
             XCTAssertEqual(LoadFailureVerdict.errorType(fromBody: body(type: t)), t)
         }
