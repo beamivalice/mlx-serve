@@ -250,15 +250,29 @@ pub const GroupResolution = struct {
     }
 };
 
+pub const CachePolicy = enum { lru, lfu };
+
+pub fn expertCachePolicyFromEnv() CachePolicy {
+    const raw = std.c.getenv("MLX_SERVE_EXPERT_LFU") orelse return .lfu;
+    if (raw[0] == '0') return .lru;
+    return .lfu;
+}
+
 pub const GroupCache = struct {
     allocator: std.mem.Allocator,
     expert_to_slot: []i32,
     slot_to_expert: []u16,
     ages: []u64,
+    freq: []u32,
     ready: []bool,
     tick: u64 = 0,
+    policy: CachePolicy = .lru,
 
     pub fn init(allocator: std.mem.Allocator, capacity: u16, expert_count: u16) !GroupCache {
+        return initPolicy(allocator, capacity, expert_count, .lru);
+    }
+
+    pub fn initPolicy(allocator: std.mem.Allocator, capacity: u16, expert_count: u16, policy: CachePolicy) !GroupCache {
         if (capacity == 0 or capacity > expert_count) return error.InvalidCacheCapacity;
         const expert_to_slot = try allocator.alloc(i32, expert_count);
         errdefer allocator.free(expert_to_slot);
@@ -266,18 +280,22 @@ pub const GroupCache = struct {
         errdefer allocator.free(slot_to_expert);
         const ages = try allocator.alloc(u64, capacity);
         errdefer allocator.free(ages);
+        const freq = try allocator.alloc(u32, capacity);
+        errdefer allocator.free(freq);
         const ready = try allocator.alloc(bool, capacity);
         @memset(expert_to_slot, -1);
         @memset(slot_to_expert, std.math.maxInt(u16));
         @memset(ages, 0);
+        @memset(freq, 0);
         @memset(ready, false);
-        return .{ .allocator = allocator, .expert_to_slot = expert_to_slot, .slot_to_expert = slot_to_expert, .ages = ages, .ready = ready };
+        return .{ .allocator = allocator, .expert_to_slot = expert_to_slot, .slot_to_expert = slot_to_expert, .ages = ages, .freq = freq, .ready = ready, .policy = policy };
     }
 
     pub fn deinit(self: *GroupCache) void {
         self.allocator.free(self.expert_to_slot);
         self.allocator.free(self.slot_to_expert);
         self.allocator.free(self.ages);
+        self.allocator.free(self.freq);
         self.allocator.free(self.ready);
         self.* = undefined;
     }
@@ -298,31 +316,51 @@ pub const GroupCache = struct {
         self.slot_to_expert[slot] = std.math.maxInt(u16);
         self.ready[slot] = false;
         self.ages[slot] = 0;
+        self.freq[slot] = 0;
     }
 
     fn touch(self: *GroupCache, slot: u16) void {
         self.tick +%= 1;
         if (self.tick == 0) self.tick = 1;
         self.ages[slot] = self.tick;
+        self.freq[slot] +|= 1;
     }
 
-    fn victim(self: *const GroupCache) u16 {
-        var best: u16 = 0;
+    fn victim(self: *const GroupCache, keep: []const bool) u16 {
+        var best: ?u16 = null;
         for (self.slot_to_expert, 0..) |expert, i| {
             if (expert == std.math.maxInt(u16)) return @intCast(i);
-            if (self.ages[i] < self.ages[best]) best = @intCast(i);
+            if (expert < keep.len and keep[expert]) continue;
+            const idx: u16 = @intCast(i);
+            if (best == null) {
+                best = idx;
+                continue;
+            }
+            const b = best.?;
+            switch (self.policy) {
+                .lru => {
+                    if (self.ages[i] < self.ages[b]) best = idx;
+                },
+                .lfu => {
+                    if (self.freq[i] < self.freq[b] or (self.freq[i] == self.freq[b] and self.ages[i] < self.ages[b])) {
+                        best = idx;
+                    }
+                },
+            }
         }
-        return best;
+        return best orelse 0;
     }
 
-    fn admit(self: *GroupCache, expert: u16) u16 {
-        const slot = self.victim();
+    fn admit(self: *GroupCache, expert: u16, keep: []bool) u16 {
+        const slot = self.victim(keep);
         const old = self.slot_to_expert[slot];
         if (old != std.math.maxInt(u16)) self.expert_to_slot[old] = -1;
         self.slot_to_expert[slot] = expert;
         self.expert_to_slot[expert] = slot;
         self.ready[slot] = false;
+        self.freq[slot] = 0;
         self.touch(slot);
+        if (expert < keep.len) keep[expert] = true;
         return slot;
     }
 
@@ -348,6 +386,9 @@ pub const GroupCache = struct {
         errdefer allocator.free(union_ids);
         const bindings = try allocator.alloc(Binding, union_ids.len);
         errdefer allocator.free(bindings);
+        const keep = try allocator.alloc(bool, self.expert_to_slot.len);
+        defer allocator.free(keep);
+        @memset(keep, false);
 
         var hits: usize = 0;
         var misses: usize = 0;
@@ -357,6 +398,7 @@ pub const GroupCache = struct {
                 const slot: u16 = @intCast(raw_slot);
                 bindings[i] = .{ .expert = expert, .slot = slot, .hit = true };
                 self.touch(slot);
+                keep[expert] = true;
                 hits += 1;
             } else {
                 if (raw_slot >= 0) self.evict(@intCast(raw_slot));
@@ -394,10 +436,10 @@ pub const GroupCache = struct {
             while (taken > 0) {
                 taken -= 1;
                 const i = order[taken];
-                bindings[i].slot = self.admit(bindings[i].expert);
+                bindings[i].slot = self.admit(bindings[i].expert, keep);
             }
         } else {
-            for (order[0..admit_count]) |i| bindings[i].slot = self.admit(bindings[i].expert);
+            for (order[0..admit_count]) |i| bindings[i].slot = self.admit(bindings[i].expert, keep);
         }
         const remapped = try allocator.alloc(u16, occurrences.len);
         errdefer allocator.free(remapped);
@@ -888,6 +930,7 @@ const CacheSnapshot = struct {
     expert_to_slot: []i32,
     slot_to_expert: []u16,
     ages: []u64,
+    freq: []u32,
     ready: []bool,
     tick: u64,
 
@@ -895,6 +938,7 @@ const CacheSnapshot = struct {
         @memcpy(cache.expert_to_slot, self.expert_to_slot);
         @memcpy(cache.slot_to_expert, self.slot_to_expert);
         @memcpy(cache.ages, self.ages);
+        @memcpy(cache.freq, self.freq);
         @memcpy(cache.ready, self.ready);
         cache.tick = self.tick;
     }
@@ -903,6 +947,7 @@ const CacheSnapshot = struct {
         allocator.free(self.expert_to_slot);
         allocator.free(self.slot_to_expert);
         allocator.free(self.ages);
+        allocator.free(self.freq);
         allocator.free(self.ready);
         self.* = undefined;
     }
@@ -1070,8 +1115,9 @@ pub const Engine = struct {
             engine.layers = &.{};
             allocator.free(layers);
         }
+        const cache_policy = expertCachePolicyFromEnv();
         for (layers) |*layer| {
-            var cache = try GroupCache.init(allocator, plan.slots_per_layer, geometry.experts);
+            var cache = try GroupCache.initPolicy(allocator, plan.slots_per_layer, geometry.experts, cache_policy);
             errdefer cache.deinit();
             layer.* = .{ .cache = cache };
             initialized += 1;
@@ -1081,12 +1127,13 @@ pub const Engine = struct {
         engine.union_slabs = try createSlabSet(allocator, &engine.store, geometry.experts, s);
         engine.slab_imports += engine.union_slabs.len;
         engine.fallback_imports = io_mod.fallback_imports.load(.monotonic) - before_fallback;
-        log.info("[expert-stream] cache {d:.3} GB, {d} slots/layer, workspace {d:.3} GB, bounce {d:.3} GB, fallback_imports={d}\n", .{
+        log.info("[expert-stream] cache {d:.3} GB, {d} slots/layer, workspace {d:.3} GB, bounce {d:.3} GB, fallback_imports={d} policy={s}\n", .{
             @as(f64, @floatFromInt(plan.cache_bytes)) / 1e9,
             plan.slots_per_layer,
             @as(f64, @floatFromInt(plan.workspace_bytes)) / 1e9,
             @as(f64, @floatFromInt(plan.bounce_bytes)) / 1e9,
             engine.fallback_imports,
+            @tagName(cache_policy),
         });
         return engine;
     }
@@ -1257,6 +1304,7 @@ pub const Engine = struct {
             .expert_to_slot = try self.allocator.dupe(i32, cache.expert_to_slot),
             .slot_to_expert = try self.allocator.dupe(u16, cache.slot_to_expert),
             .ages = try self.allocator.dupe(u64, cache.ages),
+            .freq = try self.allocator.dupe(u32, cache.freq),
             .ready = try self.allocator.dupe(bool, cache.ready),
             .tick = cache.tick,
         };
@@ -1427,6 +1475,67 @@ fn markResolvedReady(cache: *GroupCache, resolution: *const GroupResolution) voi
         if (binding.hit) continue;
         if (binding.slot) |slot| cache.markReady(slot);
     }
+}
+
+test "LFU admit does not unmap a member of the current group" {
+    const t = std.testing;
+    var cache = try GroupCache.initPolicy(t.allocator, 4, 16, .lfu);
+    defer cache.deinit();
+    var r1 = try cache.resolve(t.allocator, &.{ 0, 1, 2, 3 });
+    defer r1.deinit(t.allocator);
+    markResolvedReady(&cache, &r1);
+    var r2 = try cache.resolve(t.allocator, &.{ 0, 1, 4, 5, 6, 7 });
+    defer r2.deinit(t.allocator);
+    try t.expect(r2.workspace);
+    for (r2.bindings) |b| {
+        if (b.slot) |slot| try t.expectEqual(@as(i32, slot), cache.expert_to_slot[b.expert]);
+    }
+    markResolvedReady(&cache, &r2);
+    var r3 = try cache.resolve(t.allocator, &.{ 0, 4, 5 });
+    defer r3.deinit(t.allocator);
+    try t.expect(!r3.workspace);
+    for (r3.union_ids) |e| try t.expect(cache.expert_to_slot[e] >= 0);
+}
+
+test "expert stream LFU retains a hot expert across a scan that flushes LRU" {
+    const t = std.testing;
+    var lru = try GroupCache.init(t.allocator, 3, 16);
+    defer lru.deinit();
+    var lfu = try GroupCache.initPolicy(t.allocator, 3, 16, .lfu);
+    defer lfu.deinit();
+
+    const Tally = struct { hits: u64 = 0, misses: u64 = 0 };
+    const play = struct {
+        fn run(cache: *GroupCache, alloc: std.mem.Allocator, seq: []const u16) !Tally {
+            var acc = Tally{};
+            for (seq) |e| {
+                var r = try cache.resolve(alloc, &.{e});
+                defer r.deinit(alloc);
+                acc.hits += r.hits;
+                acc.misses += r.misses;
+                markResolvedReady(cache, &r);
+            }
+            return acc;
+        }
+    }.run;
+
+    var seq: [28]u16 = undefined;
+    var i: usize = 0;
+    while (i < 8) : (i += 1) seq[i] = 0;
+    while (i < 16) : (i += 1) seq[i] = 1;
+    var scan: u16 = 2;
+    while (i < 24) : (i += 1) {
+        seq[i] = scan;
+        scan += 1;
+    }
+    _ = try play(&lru, t.allocator, seq[0..24]);
+    _ = try play(&lfu, t.allocator, seq[0..24]);
+    var tail_lru = try lru.resolve(t.allocator, &.{ 0, 1 });
+    defer tail_lru.deinit(t.allocator);
+    var tail_lfu = try lfu.resolve(t.allocator, &.{ 0, 1 });
+    defer tail_lfu.deinit(t.allocator);
+    try t.expectEqual(@as(usize, 0), tail_lru.hits);
+    try t.expectEqual(@as(usize, 2), tail_lfu.hits);
 }
 
 test "expert stream group exact LRU matches replay counts" {
