@@ -839,7 +839,8 @@ const SlabOperand = struct {
             std.Thread.yield() catch {};
         }
         if (self.payload.released.load(.acquire) == 0) {
-            _ = slab_release_timeouts.fetchAdd(1, .monotonic);
+            const timeouts = slab_release_timeouts.fetchAdd(1, .monotonic) + 1;
+            log.warn("[expert-stream] slab release timed out: {d} bytes stay mapped for MLX and are never freed (timeouts so far {d})\n", .{ self.slab.bytes.len, timeouts });
             self.* = undefined;
             return;
         }
@@ -1190,7 +1191,7 @@ pub const Engine = struct {
         const scheduled = self.forward_count <= 2 or self.forward_count % BREAKDOWN_EVERY == 0;
         if (!scheduled and !acc.probe) return;
         const fill_seconds = @as(f64, @floatFromInt(acc.fill_ns)) / 1e9;
-        log.info("[expert-stream] forward={d} rows={d} wall_ms={d:.1} route_ms={d:.1} fill_ms={d:.1} compute_ms={d:.1} other_ms={d:.1} fill_gb={d:.3} fill_gbps={d:.2} fill_bytes_per_row={d} hits={d}/{d}\n", .{
+        log.info("[expert-stream] forward={d} rows={d} wall_ms={d:.1} route_ms={d:.1} fill_ms={d:.1} compute_ms={d:.1} other_ms={d:.1} fill_gb={d:.3} fill_gbps={d:.2} fill_bytes_per_row={d} hits={d}/{d} slab_leaks={d}\n", .{
             acc.forward,
             acc.rows,
             @as(f64, @floatFromInt(acc.wall_ns)) / 1e6,
@@ -1203,6 +1204,7 @@ pub const Engine = struct {
             acc.fill_bytes / @max(rows, 1),
             acc.hits,
             acc.union_members,
+            slab_release_timeouts.load(.monotonic),
         });
         log.info("[expert-stream] route forward={d} rows={d} probe={} linear n={d} build_ms={d:.2} xwait_ms={d:.2} idswait_ms={d:.2} read_ms={d:.2} full n={d} build_ms={d:.2} xwait_ms={d:.2} idswait_ms={d:.2} read_ms={d:.2}\n", .{
             acc.forward,
