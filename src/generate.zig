@@ -2762,6 +2762,9 @@ pub const Generator = struct {
                         _ = mlx.mlx_vector_array_append_value(eval_vec, entry.keys);
                         _ = mlx.mlx_vector_array_append_value(eval_vec, entry.values);
                     }
+                    if (chunk_hidden_all.ctx != null) {
+                        _ = mlx.mlx_vector_array_append_value(eval_vec, chunk_hidden_all);
+                    }
                     // Materialize this chunk's MTP history entries alongside
                     // the trunk KV so the chunk's activation graph (incl. the
                     // full-hidden capture) can be freed before the next chunk.

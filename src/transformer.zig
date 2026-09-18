@@ -11756,6 +11756,22 @@ pub fn materializedOwnedCopy(s: mlx.mlx_stream, x: mlx.mlx_array) !mlx.mlx_array
     return out;
 }
 
+fn capturePrefillHidden(s: mlx.mlx_stream, dest: *mlx.mlx_array, src: mlx.mlx_array) !void {
+    const owned = try materializedOwnedCopy(s, src);
+    defer _ = mlx.mlx_array_free(owned);
+    try mlx.check(mlx.mlx_array_eval(owned));
+    _ = mlx.mlx_array_set(dest, owned);
+}
+
+fn capturePrefillHiddenLast(s: mlx.mlx_stream, dest: *mlx.mlx_array, src: mlx.mlx_array) !void {
+    const sh = mlx.getShape(src);
+    const last = sh[1] - 1;
+    var sliced = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sliced);
+    try mlx.check(mlx.mlx_slice(&sliced, src, &[_]c_int{ 0, last, 0 }, 3, &[_]c_int{ sh[0], sh[1], sh[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+    try capturePrefillHidden(s, dest, sliced);
+}
+
 /// Test seams (inference thread only): the copy/eval counters let the retention and cadence tests see what the loop did.
 pub var compact_conv_state_override: ?bool = null;
 pub var compact_conv_state_copy_count: u64 = 0;
@@ -17597,6 +17613,10 @@ pub const Transformer = struct {
                     _ = mlx.mlx_vector_array_append_value(vec, e.conv_state);
                     extra += 1;
                 }
+                if (e.initialized and e.ssm_state.ctx != null) {
+                    _ = mlx.mlx_vector_array_append_value(vec, e.ssm_state);
+                    extra += 1;
+                }
             }
         }
         if (extra == 0) {
@@ -18982,18 +19002,10 @@ pub const Transformer = struct {
         // (which needs the post-final-norm hidden as h_prev seed). Mirrors
         // the identical block in forwardMoe.
         if (ctx.capture_hidden) |target| {
-            const fn_shape = mlx.getShape(final_normed);
-            const last = fn_shape[1] - 1;
-            const start = [_]c_int{ 0, last, 0 };
-            const stop = [_]c_int{ fn_shape[0], fn_shape[1], fn_shape[2] };
-            const strides = [_]c_int{ 1, 1, 1 };
-            var sliced = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_slice(&sliced, final_normed, &start, 3, &stop, 3, &strides, 3, self.s));
-            _ = mlx.mlx_array_set(target, sliced);
-            _ = mlx.mlx_array_free(sliced);
+            try capturePrefillHiddenLast(self.s, target, final_normed);
         }
         if (ctx.capture_hidden_all) |target_all| {
-            _ = mlx.mlx_array_set(target_all, final_normed);
+            try capturePrefillHidden(self.s, target_all, final_normed);
         }
 
         if (self.embedding_mode) return final_normed;
@@ -22891,6 +22903,7 @@ pub const Transformer = struct {
                 }
             }
             if (is_prefill and prefillEvalCadenceApplies(seq_len) and ((layer_idx + 1) % eval_cadence == 0 or layer_idx + 1 == layerCap(cfg.num_hidden_layers))) {
+                try self.hcFlush(&h, batch, seq_len, &pending);
                 try evalCadencePoint(h, ctx.ssm_entries);
             }
             dt.layer(h, layer_idx);
@@ -22900,21 +22913,13 @@ pub const Transformer = struct {
         ctx.moe_seq_offset.* += @intCast(seq_len);
         dt.end(h);
         prof.report(seq_len, @as(usize, @intCast(offset)) + @as(usize, @intCast(seq_len)), ctx.capture_ssm_seq, cfg.num_hidden_layers - cfg.attnCacheLayerCount(), cfg.attnCacheLayerCount());
-        if (ctx.capture_stream_all) |target| _ = mlx.mlx_array_set(target, h);
+        if (ctx.capture_stream_all) |target| try capturePrefillHidden(self.s, target, h);
         // On this arch the spec "hidden" IS the pre-mixer stream: the MTP head
         // consumes `[B, L, hc*hidden]`, never the mixed 2560 (vLLM/SGLang).
         if (ctx.capture_hidden) |target| {
-            const hs = mlx.getShape(h);
-            const last = hs[1] - 1;
-            const start = [_]c_int{ 0, last, 0 };
-            const stop = [_]c_int{ hs[0], hs[1], hs[2] };
-            const strides = [_]c_int{ 1, 1, 1 };
-            var sliced = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_slice(&sliced, h, &start, 3, &stop, 3, &strides, 3, self.s));
-            _ = mlx.mlx_array_set(target, sliced);
-            _ = mlx.mlx_array_free(sliced);
+            try capturePrefillHiddenLast(self.s, target, h);
         }
-        if (ctx.capture_hidden_all) |target_all| _ = mlx.mlx_array_set(target_all, h);
+        if (ctx.capture_hidden_all) |target_all| try capturePrefillHidden(self.s, target_all, h);
 
         const mix = try self.hcReadPending(&h, &self.qwen4_mixer.?, batch, seq_len, &pending);
         // The function-scope errdefer reads `h` at unwind time, so surrender the handle where it is released.
@@ -23232,18 +23237,10 @@ pub const Transformer = struct {
         // Gemma 4 assistant drafter as `h_prev`. Caller frees the captured
         // array.
         if (ctx.capture_hidden) |target| {
-            const fn_shape = mlx.getShape(final_normed);
-            const last = fn_shape[1] - 1;
-            const start = [_]c_int{ 0, last, 0 };
-            const stop = [_]c_int{ fn_shape[0], fn_shape[1], fn_shape[2] };
-            const strides = [_]c_int{ 1, 1, 1 };
-            var sliced = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_slice(&sliced, final_normed, &start, 3, &stop, 3, &strides, 3, self.s));
-            _ = mlx.mlx_array_set(target, sliced);
-            _ = mlx.mlx_array_free(sliced);
+            try capturePrefillHiddenLast(self.s, target, final_normed);
         }
         if (ctx.capture_hidden_all) |target_all| {
-            _ = mlx.mlx_array_set(target_all, final_normed);
+            try capturePrefillHidden(self.s, target_all, final_normed);
         }
 
         if (self.embedding_mode) return final_normed;
@@ -40922,6 +40919,50 @@ test "captureSsmCheckpoint materializes state copies (parent-buffer retention cl
 
     // Null ssm_state stays null (LFM2 gated_conv shape).
     try testing.expect(cp.layers[0].ssm_state.ctx == null);
+}
+
+test "two-chunk prefill capture drops the chunk parent after the boundary eval" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    const rows: c_int = 2048;
+    const dim: c_int = 2048;
+    const keep: c_int = 8;
+    const parent_bytes: usize = @as(usize, @intCast(rows)) * @as(usize, @intCast(dim)) * 2;
+
+    _ = mlx.mlx_synchronize(s);
+    _ = mlx.mlx_clear_cache();
+    var baseline: usize = 0;
+    _ = mlx.mlx_get_active_memory(&baseline);
+
+    var kept0 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(kept0);
+    var kept1 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(kept1);
+    const kept = [_]*mlx.mlx_array{ &kept0, &kept1 };
+
+    var chunk: usize = 0;
+    while (chunk < 2) : (chunk += 1) {
+        var parent = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_zeros(&parent, &[_]c_int{ 1, rows, dim }, 3, .float16, s));
+        try mlx.check(mlx.mlx_array_eval(parent));
+        var view = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_slice(&view, parent, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ 1, keep, dim }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+        try capturePrefillHidden(s, kept[chunk], view);
+        var dummy = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(dummy);
+        try mlx.check(mlx.mlx_zeros(&dummy, &[_]c_int{1}, 1, .float16, s));
+        try mlx.check(mlx.mlx_array_eval(dummy));
+        _ = mlx.mlx_array_free(view);
+        _ = mlx.mlx_array_free(parent);
+        _ = mlx.mlx_synchronize(s);
+        _ = mlx.mlx_clear_cache();
+    }
+
+    var after: usize = 0;
+    _ = mlx.mlx_get_active_memory(&after);
+    const delta = after -| baseline;
+    try t.expect(delta < parent_bytes);
 }
 
 fn conv1dTailRetentionDelta(batch: c_int, seq: c_int, cdim: c_int, kernel: c_int) !usize {
