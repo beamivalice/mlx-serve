@@ -63,18 +63,6 @@ fn dumpAbsMax(s: mlx.mlx_stream, a: mlx.mlx_array, name: []const u8) !void {
 }
 
 pub const DECODE_ROWS_MAX: usize = 16;
-pub const DECODE_ONCE_MIN_ROWS: u32 = 17;
-var decode_once_min_rows: u32 = DECODE_ONCE_MIN_ROWS;
-pub const DECODE_GROUP_MAX_ROWS: u32 = 8192;
-pub const DECODE_GROUP_MAX_EXPERTS: u32 = 64;
-
-pub fn decodeOnceMaxExperts() u32 {
-    return DECODE_GROUP_MAX_EXPERTS;
-}
-
-pub fn decodeOnceTransientBytes(out_dim: usize, in_dim: usize) usize {
-    return @as(usize, decodeOnceMaxExperts()) * out_dim * in_dim * @sizeOf(u16);
-}
 
 pub fn usesPrefillArm(rows: usize) bool {
     return rows > DECODE_ROWS_MAX;
@@ -235,6 +223,7 @@ const GEMM_SORTED_SOURCE: [:0]const u8 =
     \\const uint start = win * win_size;
     \\const uint ntot = uint(NROWS);
     \\const uint n = (start >= ntot) ? 0u : min(win_size, ntot - start);
+    \\if (n == 0u) return;
     \\const uint pg = sg >> 1u;
     \\const uint th = sg & 1u;
     \\const uint first = th * 128u + lane * 4u;
@@ -263,18 +252,18 @@ const GEMM_SORTED_SOURCE: [:0]const u8 =
     \\uint row = start;
     \\const uint end = start + n;
     \\while (row < end) {
-    \\  const uint eid = uint(eids[row]);
-    \\  uint run_end = row + 1u;
-    \\  while (run_end < end && uint(eids[run_end]) == eid) run_end++;
-    \\  const uint run0 = row;
-    \\  const uint nlive = run_end - row;
-    \\  float4 acc[4][4];
-    \\  for (uint g = 0u; g < 4u; g++) {
-    \\    acc[g][0] = float4(0.0f);
-    \\    acc[g][1] = float4(0.0f);
-    \\    acc[g][2] = float4(0.0f);
-    \\    acc[g][3] = float4(0.0f);
-    \\  }
+    \\const uint run0 = row;
+    \\const uint eid = uint(eids[row]);
+    \\uint run_end = row + 1u;
+    \\while (run_end < end && uint(eids[run_end]) == eid) run_end++;
+    \\const uint nlive = run_end - row;
+    \\float4 acc[8][4];
+    \\for (uint g = 0u; g < 8u; g++) {
+    \\  acc[g][0] = float4(0.0f);
+    \\  acc[g][1] = float4(0.0f);
+    \\  acc[g][2] = float4(0.0f);
+    \\  acc[g][3] = float4(0.0f);
+    \\}
     \\  for (uint tk = pg; tk < IT; tk += 2u) {
     \\    const device uint* words = (const device uint*)(trellis + ((((size_t)eid * (size_t)IT + tk) * (size_t)OT + ot) * 64u));
     \\    const int bits = 4;
@@ -308,7 +297,7 @@ const GEMM_SORTED_SOURCE: [:0]const u8 =
     \\    const float2 whi = float2(fma(hhi, inv, bias));
     \\    const float4 wt = float4(wlo.x, wlo.y, whi.x, whi.y);
     \\    const uint ib = tk * TILE;
-    \\    for (uint g = 0u; g < 4u; g++) {
+    \\    for (uint g = 0u; g < 8u; g++) {
     \\      if (g * 4u >= nlive) break;
     \\      const uint base_r = run0 + g * 4u;
     \\      for (uint s = 0u; s < 4u; s++) {
@@ -322,7 +311,7 @@ const GEMM_SORTED_SOURCE: [:0]const u8 =
     \\      }
     \\    }
     \\  }
-    \\  for (uint g = 0u; g < 4u; g++) {
+    \\  for (uint g = 0u; g < 8u; g++) {
     \\    for (uint r = 0u; r < 4u; r++) {
     \\      const uint rr = g * 4u + r;
     \\      threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -393,48 +382,64 @@ const GEMM_NAX_SOURCE: [:0]const u8 =
     \\auto left = op.get_left_input_cooperative_tensor<half, half, float>();
     \\auto right = op.get_right_input_cooperative_tensor<half, half, float>();
     \\auto destination = op.get_destination_cooperative_tensor<decltype(left), decltype(right), float>();
+    \\auto dest_hi = op.get_destination_cooperative_tensor<decltype(left), decltype(right), float>();
     \\const short2 origin = nax_origin(lane);
     \\const uint output_base = uint(threadgroup_position_in_grid.x) * 128u + sg * 32u;
     \\uint row = start;
     \\const uint end = start + n;
     \\while (row < end) {
-    \\  const uint eid = uint(eids[row]);
-    \\  uint run_end = row + 1u;
-    \\  while (run_end < end && uint(eids[run_end]) == eid) run_end++;
-    \\  const uint run0 = row;
-    \\  const uint nlive = run_end - row;
-    \\  const bool active0 = origin.y < short(nlive);
-    \\  const bool active1 = (origin.y + 8) < short(nlive);
-    \\  for (uint s = 0u; s < destination.get_capacity(); s++) destination[s] = 0.0f;
-    \\  const device uint *trellis_e = (const device uint *)(trellis + ((size_t)eid * (size_t)IT * (size_t)OT) * 64u);
-    \\  for (uint tk = 0u; tk < IT; tk++) {
-    \\    const uint input_base = tk * TILE;
-    \\    nfrag act;
+    \\const uint run0 = row;
+    \\const uint eid = uint(eids[row]);
+    \\uint run_end = row + 1u;
+    \\while (run_end < end && uint(eids[run_end]) == eid) run_end++;
+    \\const uint nlive = run_end - row;
+    \\const uint n_hi = (nlive > 16u) ? (nlive - 16u) : 0u;
+    \\const bool active0 = origin.y < short(nlive);
+    \\const bool active1 = (origin.y + 8) < short(nlive);
+    \\const bool hi0 = origin.y < short(n_hi);
+    \\const bool hi1 = (origin.y + 8) < short(n_hi);
+    \\for (uint s = 0u; s < destination.get_capacity(); s++) destination[s] = 0.0f;
+    \\for (uint s = 0u; s < dest_hi.get_capacity(); s++) dest_hi[s] = 0.0f;
+    \\const device uint *trellis_e = (const device uint *)(trellis + ((size_t)eid * (size_t)IT * (size_t)OT) * 64u);
+    \\for (uint tk = 0u; tk < IT; tk++) {
+    \\  const uint input_base = tk * TILE;
+    \\  nfrag act;
+    \\  for (short c = 0; c < 4; c++) {
+    \\    const uint ic = input_base + uint(origin.x + c);
+    \\    act[c] = active0 ? x[(size_t)(run0 + uint(origin.y)) * (size_t)(IDIM) + ic] : half(0.0h);
+    \\    act[4 + c] = active1 ? x[(size_t)(run0 + uint(origin.y) + 8u) * (size_t)(IDIM) + ic] : half(0.0h);
+    \\  }
+    \\  const device uint *words0 = trellis_e + ((size_t)tk * (size_t)OT + output_base / 16u) * 32u;
+    \\  const nfrag w0 = nax_wfrag(words0, lane);
+    \\  const nfrag w1 = nax_wfrag(words0 + 32u, lane);
+    \\  for (short s = 0; s < 8; s++) {
+    \\    left[s] = act[s];
+    \\    right[s] = w0[s];
+    \\    right[8 + s] = w1[s];
+    \\  }
+    \\  op.run(left, right, destination);
+    \\  if (n_hi > 0u) {
     \\    for (short c = 0; c < 4; c++) {
     \\      const uint ic = input_base + uint(origin.x + c);
-    \\      act[c] = active0 ? x[(size_t)(run0 + uint(origin.y)) * (size_t)(IDIM) + ic] : half(0.0h);
-    \\      act[4 + c] = active1 ? x[(size_t)(run0 + uint(origin.y) + 8u) * (size_t)(IDIM) + ic] : half(0.0h);
+    \\      act[c] = hi0 ? x[(size_t)(run0 + 16u + uint(origin.y)) * (size_t)(IDIM) + ic] : half(0.0h);
+    \\      act[4 + c] = hi1 ? x[(size_t)(run0 + 16u + uint(origin.y) + 8u) * (size_t)(IDIM) + ic] : half(0.0h);
     \\    }
-    \\    const device uint *words0 = trellis_e + ((size_t)tk * (size_t)OT + output_base / 16u) * 32u;
-    \\    const nfrag w0 = nax_wfrag(words0, lane);
-    \\    const nfrag w1 = nax_wfrag(words0 + 32u, lane);
-    \\    for (short s = 0; s < 8; s++) {
-    \\      left[s] = act[s];
-    \\      right[s] = w0[s];
-    \\      right[8 + s] = w1[s];
-    \\    }
-    \\    op.run(left, right, destination);
+    \\    for (short s = 0; s < 8; s++) left[s] = act[s];
+    \\    op.run(left, right, dest_hi);
     \\  }
-    \\  for (short ct = 0; ct < 2; ct++) {
-    \\    for (short c = 0; c < 4; c++) {
-    \\      const uint col = output_base + uint(ct) * 16u + uint(origin.x + c);
-    \\      if (col < uint(ODIM)) {
-    \\        if (active0) y[(size_t)(run0 + uint(origin.y)) * (size_t)(ODIM) + col] = half(destination[uint(ct) * 8u + uint(c)]);
-    \\        if (active1) y[(size_t)(run0 + uint(origin.y) + 8u) * (size_t)(ODIM) + col] = half(destination[uint(ct) * 8u + 4u + uint(c)]);
-    \\      }
+    \\}
+    \\for (short ct = 0; ct < 2; ct++) {
+    \\  for (short c = 0; c < 4; c++) {
+    \\    const uint col = output_base + uint(ct) * 16u + uint(origin.x + c);
+    \\    if (col < uint(ODIM)) {
+    \\      if (active0) y[(size_t)(run0 + uint(origin.y)) * (size_t)(ODIM) + col] = half(destination[uint(ct) * 8u + uint(c)]);
+    \\      if (active1) y[(size_t)(run0 + uint(origin.y) + 8u) * (size_t)(ODIM) + col] = half(destination[uint(ct) * 8u + 4u + uint(c)]);
+    \\      if (hi0) y[(size_t)(run0 + 16u + uint(origin.y)) * (size_t)(ODIM) + col] = half(dest_hi[uint(ct) * 8u + uint(c)]);
+    \\      if (hi1) y[(size_t)(run0 + 16u + uint(origin.y) + 8u) * (size_t)(ODIM) + col] = half(dest_hi[uint(ct) * 8u + 4u + uint(c)]);
     \\    }
     \\  }
-    \\  row = run_end;
+    \\}
+    \\row = run_end;
     \\}
 ;
 const TOKEN_PREPARE_SOURCE: [:0]const u8 =
@@ -547,80 +552,6 @@ const TOKEN_SCATTER_SOURCE: [:0]const u8 =
     \\if (col >= uint(DIM)) return;
     \\const uint orig = uint(order[slot]);
     \\y[(size_t)orig * (size_t)(DIM) + col] = x[(size_t)slot * (size_t)(DIM) + col];
-;
-
-const DECODE_FULL_SOURCE: [:0]const u8 =
-    \\uint input_tile = uint(threadgroup_position_in_grid.x);
-    \\uint ot = uint(threadgroup_position_in_grid.y);
-    \\uint eg = uint(threadgroup_position_in_grid.z);
-    \\uint tid = uint(thread_index_in_threadgroup);
-    \\constexpr uint TILE = 16u;
-    \\constexpr uint IT = uint(IDIM) / TILE;
-    \\constexpr uint OT = uint(ODIM) / TILE;
-    \\constexpr uint PACKED = 32u;
-    \\if (input_tile >= IT || ot >= OT) return;
-    \\const uint eid = uint(eids[eg]);
-    \\const device ushort *tr_e = trellis + ((size_t)eid * (size_t)IT * (size_t)OT) * 64u;
-    \\const device uint *words = (const device uint *)(tr_e + ((size_t)input_tile * (size_t)OT + ot) * 64u);
-    \\const half inv = as_type<half>(ushort(0x1EEEu));
-    \\const half bias = as_type<half>(ushort(0xC931u));
-    \\for (uint k = 0u; k < 4u; k++) {
-    \\  const uint t = tid + k * 32u;
-    \\  const uint column = t >> 3u;
-    \\  const uint row_pair = t & 7u;
-    \\  half2 values;
-    \\  for (uint pair_lane = 0u; pair_lane < 2u; pair_lane++) {
-    \\    const uint row = 2u * row_pair + pair_lane;
-    \\    const uint lane = (column & 7u) * 4u + ((row & 7u) >> 1u);
-    \\    const uint slot = (row >= 8u ? 2u : 0u) + (row & 1u) + (column >= 8u ? 4u : 0u);
-    \\    const uint source = lane * 8u + slot;
-    \\    const int bit0 = int(source >> 1u) * 8 + 4 - 16 + 1024;
-    \\    const int bit2 = bit0 + 4 + 16;
-    \\    const int last_word = (bit2 - 1) / 32;
-    \\    const uint word0 = uint(bit0 / 32) % PACKED;
-    \\    const uint word1 = uint(last_word) % PACKED;
-    \\    const uint sh = uint((last_word + 1) * 32 - bit2) + ((source & 1u) == 0u ? 4u : 0u);
-    \\    const ulong merged = ((ulong)words[word0] << 32) | (ulong)words[word1];
-    \\    const uint cw = uint(merged >> sh) & 0xffffu;
-    \\    const uint mixed = cw * 0x83DCD12Du;
-    \\    const uint pair_sums = (mixed & 0x00FF00FFu) + ((mixed >> 8u) & 0x00FF00FFu);
-    \\    const uint byte_sum = 0x6400u + (pair_sums & 0xFFFFu) + (pair_sums >> 16u);
-    \\    values[pair_lane] = half(fma(as_type<half>(ushort(byte_sum)), inv, bias));
-    \\  }
-    \\  const uint out_i = ot * TILE + column;
-    \\  const uint in_i = input_tile * TILE + 2u * row_pair;
-    \\  const size_t base = ((size_t)eg * (size_t)(ODIM) + out_i) * (size_t)(IDIM) + in_i;
-    \\  y[base] = values.x;
-    \\  y[base + 1u] = values.y;
-    \\}
-;
-
-const PACK_RUNS_SOURCE: [:0]const u8 =
-    \\uint c = uint(thread_position_in_grid.x);
-    \\uint r = uint(threadgroup_position_in_grid.y);
-    \\uint gi = uint(threadgroup_position_in_grid.z);
-    \\if (c >= uint(DIM) || r >= uint(MAXR)) return;
-    \\const uint rl = uint(len[gi]);
-    \\const size_t yo = ((size_t)gi * (size_t)(MAXR) + r) * (size_t)(DIM) + c;
-    \\if (r >= rl) {
-    \\  y[yo] = half(0.0h);
-    \\  return;
-    \\}
-    \\y[yo] = x[(size_t)(uint(start[gi]) + r) * (size_t)(DIM) + c];
-;
-
-const UNPACK_RUNS_SOURCE: [:0]const u8 =
-    \\uint c = uint(thread_position_in_grid.x);
-    \\uint row = uint(threadgroup_position_in_grid.y);
-    \\if (c >= uint(DIM) || row >= uint(NROWS)) return;
-    \\const size_t off = (size_t)row * (size_t)(DIM) + c;
-    \\const int gi = int(map[row]);
-    \\if (gi < 0) {
-    \\  y[off] = y0[off];
-    \\  return;
-    \\}
-    \\const uint r = row - uint(start[uint(gi)]);
-    \\y[off] = x[((size_t)uint(gi) * (size_t)(MAXR) + r) * (size_t)(DIM) + c];
 ;
 
 const TOKEN_REDUCE_SOURCE: [:0]const u8 =
@@ -759,7 +690,7 @@ fn CfgCache(comptime Key: type, comptime CAP: usize) type {
 const IndexedKey = struct { in_dim: c_int, out_dim: c_int, topk: c_int };
 const UnaryKey = struct { dim: c_int, topk: c_int };
 const GemmSortedKey = struct { in_dim: c_int, out_dim: c_int, rows: c_int, win: c_int };
-const GEMM_WINDOW_ROWS: c_int = 16;
+const GEMM_WINDOW_ROWS: c_int = 32;
 var indexed_coop_cfgs: CfgCache(IndexedKey, 8) = .{};
 var prepare_cfgs: CfgCache(UnaryKey, 8) = .{};
 var finish_cfgs: CfgCache(UnaryKey, 8) = .{};
@@ -788,14 +719,6 @@ var token_prepare_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var token_pair_prepare_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var token_scatter_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var token_reduce_kernel: ?mlx.mlx_fast_metal_kernel = null;
-var decode_full_kernel: ?mlx.mlx_fast_metal_kernel = null;
-const DecodeFullKey = struct { in_dim: c_int, out_dim: c_int, n_exp: c_int };
-var decode_full_cfgs: CfgCache(DecodeFullKey, 8) = .{};
-var pack_runs_kernel: ?mlx.mlx_fast_metal_kernel = null;
-var unpack_runs_kernel: ?mlx.mlx_fast_metal_kernel = null;
-const PackKey = struct { dim: c_int, max_r: c_int, n_exp: c_int };
-var pack_runs_cfgs: CfgCache(PackKey, 8) = .{};
-var unpack_runs_cfgs: CfgCache(PackKey, 8) = .{};
 var fused_dispatches: u32 = 0;
 var apply_host_ns: u64 = 0;
 var apply_host_n: u32 = 0;
@@ -983,288 +906,6 @@ fn innerGemmSortedWin(
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
     return out;
-}
-
-pub fn decodeFull(s: mlx.mlx_stream, trellis: mlx.mlx_array, eids: mlx.mlx_array, in_dim: c_int, out_dim: c_int, n_exp: c_int) !mlx.mlx_array {
-    if (n_exp <= 0) return error.BadExl3Shape;
-    const key = DecodeFullKey{ .in_dim = in_dim, .out_dim = out_dim, .n_exp = n_exp };
-    const cfg = decode_full_cfgs.get(key) orelse blk: {
-        const c = mlx.mlx_fast_metal_kernel_config_new();
-        const sh = [_]c_int{ n_exp, out_dim, in_dim };
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &sh, 3, .float16));
-        const in_tiles = @divExact(in_dim, 16);
-        const out_tiles = @divExact(out_dim, 16);
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, in_tiles * 32, out_tiles, n_exp));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 32, 1, 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "IDIM", in_dim));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ODIM", out_dim));
-        decode_full_cfgs.put(key, c);
-        break :blk c;
-    };
-    const ins = [_][*:0]const u8{ "trellis", "eids" };
-    const outs = [_][*:0]const u8{"y"};
-    const kernel = try getNamedKernel(&decode_full_kernel, "mlxserve_exl3_decode_full", &ins, &outs, DECODE_FULL_SOURCE, "");
-    const ov = try applyOuts(s, kernel, &.{ trellis, eids }, cfg, 1);
-    defer _ = mlx.mlx_vector_array_free(ov);
-    var a = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_vector_array_get(&a, ov, 0));
-    return a;
-}
-
-fn copyEidsHost(s: mlx.mlx_stream, eids: mlx.mlx_array, buf: []u32) !void {
-    var contig = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(contig);
-    try mlx.check(mlx.mlx_contiguous(&contig, eids, false, s));
-    try mlx.check(mlx.mlx_array_eval(contig));
-    switch (mlx.mlx_array_dtype(contig)) {
-        .uint32 => {
-            const p = mlx.mlx_array_data_uint32(contig) orelse return error.F16Unreadable;
-            @memcpy(buf, p[0..buf.len]);
-        },
-        .int32 => {
-            const p = mlx.mlx_array_data_int32(contig) orelse return error.F16Unreadable;
-            for (buf, 0..) |*d, i| d.* = @intCast(p[i]);
-        },
-        else => return error.BadExl3Shape,
-    }
-}
-
-fn sliceRows(s: mlx.mlx_stream, a: mlx.mlx_array, start: c_int, stop: c_int, dim1: c_int) !mlx.mlx_array {
-    var out = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(out);
-    const st = [_]c_int{ start, 0 };
-    const en = [_]c_int{ stop, dim1 };
-    const str = [_]c_int{ 1, 1 };
-    try mlx.check(mlx.mlx_slice(&out, a, &st, 2, &en, 2, &str, 2, s));
-    return out;
-}
-
-fn putRows(s: mlx.mlx_stream, dst: mlx.mlx_array, src: mlx.mlx_array, start: c_int, stop: c_int, dim1: c_int) !mlx.mlx_array {
-    var out = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(out);
-    const st = [_]c_int{ start, 0 };
-    const en = [_]c_int{ stop, dim1 };
-    const str = [_]c_int{ 1, 1 };
-    try mlx.check(mlx.mlx_slice_update(&out, dst, src, &st, 2, &en, 2, &str, 2, s));
-    return out;
-}
-
-fn packRuns(s: mlx.mlx_stream, x: mlx.mlx_array, start: mlx.mlx_array, len: mlx.mlx_array, dim: c_int, max_r: c_int, n_exp: c_int) !mlx.mlx_array {
-    const key = PackKey{ .dim = dim, .max_r = max_r, .n_exp = n_exp };
-    const cfg = pack_runs_cfgs.get(key) orelse blk: {
-        const c = mlx.mlx_fast_metal_kernel_config_new();
-        const sh = [_]c_int{ n_exp, max_r, dim };
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &sh, 3, .float16));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, dim, max_r, n_exp));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 32, 1, 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "DIM", dim));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "MAXR", max_r));
-        pack_runs_cfgs.put(key, c);
-        break :blk c;
-    };
-    const ins = [_][*:0]const u8{ "x", "start", "len" };
-    const outs = [_][*:0]const u8{"y"};
-    const kernel = try getNamedKernel(&pack_runs_kernel, "mlxserve_exl3_pack_runs", &ins, &outs, PACK_RUNS_SOURCE, "");
-    const ov = try applyOuts(s, kernel, &.{ x, start, len }, cfg, 1);
-    defer _ = mlx.mlx_vector_array_free(ov);
-    var a = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_vector_array_get(&a, ov, 0));
-    return a;
-}
-
-fn unpackRuns(s: mlx.mlx_stream, dst: mlx.mlx_array, src_pad: mlx.mlx_array, start: mlx.mlx_array, map: mlx.mlx_array, dim: c_int, max_r: c_int, n_rows: c_int) !mlx.mlx_array {
-    const key = PackKey{ .dim = dim, .max_r = max_r, .n_exp = n_rows };
-    const cfg = unpack_runs_cfgs.get(key) orelse blk: {
-        const c = mlx.mlx_fast_metal_kernel_config_new();
-        const sh = [_]c_int{ n_rows, dim };
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &sh, 2, .float16));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, dim, n_rows, 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 32, 1, 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "DIM", dim));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "MAXR", max_r));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "NROWS", n_rows));
-        unpack_runs_cfgs.put(key, c);
-        break :blk c;
-    };
-    const ins = [_][*:0]const u8{ "x", "start", "map", "y0" };
-    const outs = [_][*:0]const u8{"y"};
-    const kernel = try getNamedKernel(&unpack_runs_kernel, "mlxserve_exl3_unpack_runs", &ins, &outs, UNPACK_RUNS_SOURCE, "");
-    const ov = try applyOuts(s, kernel, &.{ src_pad, start, map, dst }, cfg, 1);
-    defer _ = mlx.mlx_vector_array_free(ov);
-    var a = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_vector_array_get(&a, ov, 0));
-    return a;
-}
-
-fn gemmLongGroup(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, runs: RunTable, group: []const u32, in_dim: c_int, out_dim: c_int, y: mlx.mlx_array) !mlx.mlx_array {
-    const n_exp: c_int = @intCast(group.len);
-    const eid_h = try std.heap.page_allocator.alloc(u32, group.len);
-    defer std.heap.page_allocator.free(eid_h);
-    const start_h = try std.heap.page_allocator.alloc(u32, group.len);
-    defer std.heap.page_allocator.free(start_h);
-    const len_h = try std.heap.page_allocator.alloc(u32, group.len);
-    defer std.heap.page_allocator.free(len_h);
-    var max_r: u32 = 0;
-    var live: u32 = 0;
-    for (group, 0..) |ri, i| {
-        eid_h[i] = runs.eid[ri];
-        start_h[i] = runs.start[ri];
-        len_h[i] = runs.len[ri];
-        max_r = @max(max_r, runs.len[ri]);
-        live += runs.len[ri];
-    }
-    const eid_raw = mlx.mlx_array_new_data(eid_h.ptr, &[_]c_int{n_exp}, 1, .uint32);
-    defer _ = mlx.mlx_array_free(eid_raw);
-    var eid_a = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(eid_a);
-    try mlx.check(mlx.mlx_contiguous(&eid_a, eid_raw, false, s));
-    try mlx.check(mlx.mlx_array_eval(eid_a));
-    const start_raw = mlx.mlx_array_new_data(start_h.ptr, &[_]c_int{n_exp}, 1, .uint32);
-    defer _ = mlx.mlx_array_free(start_raw);
-    var start_a = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(start_a);
-    try mlx.check(mlx.mlx_contiguous(&start_a, start_raw, false, s));
-    try mlx.check(mlx.mlx_array_eval(start_a));
-    const len_raw = mlx.mlx_array_new_data(len_h.ptr, &[_]c_int{n_exp}, 1, .uint32);
-    defer _ = mlx.mlx_array_free(len_raw);
-    var len_a = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(len_a);
-    try mlx.check(mlx.mlx_contiguous(&len_a, len_raw, false, s));
-    try mlx.check(mlx.mlx_array_eval(len_a));
-    const w = try decodeFull(s, trellis, eid_a, in_dim, out_dim, n_exp);
-    defer _ = mlx.mlx_array_free(w);
-    try ubenchEval(w, "decode_full");
-    var wt = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(wt);
-    try mlx.check(mlx.mlx_transpose_axes(&wt, w, &[_]c_int{ 0, 2, 1 }, 3, s));
-    const max_rc: c_int = @intCast(max_r);
-    const x_pad = try packRuns(s, x, start_a, len_a, in_dim, max_rc, n_exp);
-    defer _ = mlx.mlx_array_free(x_pad);
-    var y_pad = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(y_pad);
-    try mlx.check(mlx.mlx_matmul(&y_pad, x_pad, wt, s));
-    if (exl3UbenchOn()) {
-        std.debug.print("[exl3-ubench] matmul_pad_rows {d} live_rows {d} n_exp {d}\n", .{ max_r * @as(u32, @intCast(group.len)), live, group.len });
-    }
-    try ubenchEval(y_pad, "matmul_pad");
-    const n_rows = mlx.getShape(y)[0];
-    const map_h = try std.heap.page_allocator.alloc(i32, @intCast(n_rows));
-    defer std.heap.page_allocator.free(map_h);
-    @memset(map_h, -1);
-    for (group, 0..) |ri, gi| {
-        var k: u32 = 0;
-        while (k < runs.len[ri]) : (k += 1) {
-            map_h[runs.start[ri] + k] = @intCast(gi);
-        }
-    }
-    const map_raw = mlx.mlx_array_new_data(map_h.ptr, &[_]c_int{n_rows}, 1, .int32);
-    defer _ = mlx.mlx_array_free(map_raw);
-    var map_a = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(map_a);
-    try mlx.check(mlx.mlx_contiguous(&map_a, map_raw, false, s));
-    try mlx.check(mlx.mlx_array_eval(map_a));
-    return unpackRuns(s, y, y_pad, start_a, map_a, out_dim, max_rc, n_rows);
-}
-
-fn innerGemmByRuns(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, eids: mlx.mlx_array) !mlx.mlx_array {
-    const xsh = mlx.getShape(x);
-    const n = xsh[0];
-    if (n < @as(c_int, @intCast(decode_once_min_rows))) return innerGemmSorted(s, x, trellis, eids);
-    const ids = try std.heap.page_allocator.alloc(u32, @intCast(n));
-    defer std.heap.page_allocator.free(ids);
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var sw = if (exl3UbenchOn()) io_util.Stopwatch.init(io) else undefined;
-    try copyEidsHost(s, eids, ids);
-    const runs = try buildRuns(std.heap.page_allocator, ids);
-    if (exl3UbenchOn()) {
-        const ns = sw.read();
-        std.debug.print("[exl3-ubench] host_group {d:.3} ms eval=1\n", .{@as(f64, @floatFromInt(ns)) / 1e6});
-    }
-    defer std.heap.page_allocator.free(runs.start);
-    defer std.heap.page_allocator.free(runs.len);
-    defer std.heap.page_allocator.free(runs.eid);
-    return innerGemmWithRuns(s, x, trellis, eids, runs);
-}
-
-fn innerGemmWithRuns(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, eids: mlx.mlx_array, runs: RunTable) !mlx.mlx_array {
-    const xsh = mlx.getShape(x);
-    const n = xsh[0];
-    const in_dim = xsh[1];
-    const tsh = mlx.getShape(trellis);
-    const out_dim = tsh[2] * 16;
-    var n_short: usize = 0;
-    var has_long = false;
-    var r: u32 = 0;
-    while (r < runs.n) : (r += 1) {
-        if (runs.len[r] >= decode_once_min_rows) {
-            has_long = true;
-        } else {
-            n_short += runs.len[r];
-        }
-    }
-    if (!has_long) return innerGemmSorted(s, x, trellis, eids);
-    var y = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_zeros(&y, &[_]c_int{ n, out_dim }, 2, .float16, s));
-    if (n_short > 0) {
-        const short_idx = try std.heap.page_allocator.alloc(u32, n_short);
-        defer std.heap.page_allocator.free(short_idx);
-        var w: usize = 0;
-        r = 0;
-        while (r < runs.n) : (r += 1) {
-            if (runs.len[r] >= decode_once_min_rows) continue;
-            var k: u32 = 0;
-            while (k < runs.len[r]) : (k += 1) {
-                short_idx[w] = runs.start[r] + k;
-                w += 1;
-            }
-        }
-        const idx_a = mlx.mlx_array_new_data(short_idx.ptr, &[_]c_int{@intCast(n_short)}, 1, .uint32);
-        defer _ = mlx.mlx_array_free(idx_a);
-        var x_s = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(x_s);
-        try mlx.check(mlx.mlx_take_axis(&x_s, x, idx_a, 0, s));
-        var e_s = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(e_s);
-        try mlx.check(mlx.mlx_take_axis(&e_s, eids, idx_a, 0, s));
-        const y_s = try innerGemmSorted(s, x_s, trellis, e_s);
-        defer _ = mlx.mlx_array_free(y_s);
-        var idx2 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(idx2);
-        try mlx.check(mlx.mlx_reshape(&idx2, idx_a, &[_]c_int{ @intCast(n_short), 1 }, 2, s));
-        var y2 = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_put_along_axis(&y2, y, idx2, y_s, 0, s));
-        try mlx.check(mlx.mlx_array_eval(y2));
-        _ = mlx.mlx_array_free(y);
-        y = y2;
-    }
-    var gi: u32 = 0;
-    while (gi < runs.n) {
-        if (runs.len[gi] < decode_once_min_rows) {
-            gi += 1;
-            continue;
-        }
-        var group_buf: [128]u32 = undefined;
-        var g_n: usize = 0;
-        var g_rows: u32 = 0;
-        while (gi < runs.n) {
-            if (runs.len[gi] < decode_once_min_rows) {
-                gi += 1;
-                continue;
-            }
-            if (g_n > 0 and g_rows + runs.len[gi] > DECODE_GROUP_MAX_ROWS) break;
-            if (g_n == group_buf.len) break;
-            if (g_n == DECODE_GROUP_MAX_EXPERTS) break;
-            group_buf[g_n] = gi;
-            g_rows += runs.len[gi];
-            g_n += 1;
-            gi += 1;
-        }
-        if (g_n == 0) break;
-        const y2 = try gemmLongGroup(s, x, trellis, runs, group_buf[0..g_n], in_dim, out_dim, y);
-        _ = mlx.mlx_array_free(y);
-        y = y2;
-    }
-    return y;
 }
 
 fn getPrepareKernel() !mlx.mlx_fast_metal_kernel {
@@ -3758,57 +3399,7 @@ test "exl3 sorted GEMM 16-row windows match 4-row per row" {
     }
 }
 
-test "exl3 decode-once transient bytes at production dims" {
-    const t = std.testing;
-    try t.expectEqual(@as(u32, 64), decodeOnceMaxExperts());
-    try t.expectEqual(@as(usize, 64 * 2560 * 640 * 2), decodeOnceTransientBytes(2560, 640));
-    try t.expectEqual(@as(usize, 64 * 128 * 128 * 2), decodeOnceTransientBytes(128, 128));
-}
-
-test "exl3 decode-full K4 matches host inner" {
-    const t = std.testing;
-    const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
-    const fixture = @embedFile("fixtures/exl3_k4_linear.safetensors");
-    var arena = std.heap.ArenaAllocator.init(t.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    const header_len = std.mem.readInt(u64, fixture[0..8], .little);
-    const header = fixture[8 .. 8 + header_len];
-    const data = fixture[8 + header_len ..];
-    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, header, .{});
-    defer parsed.deinit();
-    const trellis_meta = parsed.value.object.get("trellis").?.object;
-    const t0: usize = @intCast(trellis_meta.get("data_offsets").?.array.items[0].integer);
-    const t1: usize = @intCast(trellis_meta.get("data_offsets").?.array.items[1].integer);
-    const trellis_bits = std.mem.bytesAsSlice(u16, data[t0..t1]);
-    const dim: usize = 128;
-    const packed_t = try alloc.alloc(u16, trellis_bits.len);
-    @memcpy(packed_t, trellis_bits);
-    const host = try alloc.alloc(u16, dim * dim);
-    exl3.reconstructInner(packed_t, dim, dim, 4, .mul1, host);
-    const eid: u32 = 0;
-    const tr = mlx.mlx_array_new_data(packed_t.ptr, &[_]c_int{ 1, 8, 8, 64 }, 4, .uint16);
-    defer _ = mlx.mlx_array_free(tr);
-    const eid_a = mlx.mlx_array_new_data(&eid, &[_]c_int{1}, 1, .uint32);
-    defer _ = mlx.mlx_array_free(eid_a);
-    const got = try decodeFull(s, tr, eid_a, 128, 128, 1);
-    defer _ = mlx.mlx_array_free(got);
-    var wt = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(wt);
-    try mlx.check(mlx.mlx_transpose_axes(&wt, got, &[_]c_int{ 0, 2, 1 }, 3, s));
-    var contig = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(contig);
-    try mlx.check(mlx.mlx_contiguous(&contig, wt, false, s));
-    try mlx.check(mlx.mlx_array_eval(contig));
-    const src = mlx.mlx_array_data_float16(contig) orelse return error.F16Unreadable;
-    for (0..dim * dim) |i| {
-        const bits: u16 = @bitCast(src[i]);
-        try t.expectEqual(host[i], bits);
-    }
-}
-
-test "exl3 decode-once GEMM matches 16-row windows on long run" {
+test "exl3 sorted GEMM 32-row windows match 16-row per row" {
     const t = std.testing;
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
@@ -3827,17 +3418,18 @@ test "exl3 decode-once GEMM matches 16-row windows on long run" {
     const trellis_bits = std.mem.bytesAsSlice(u16, data[t0..t1]);
     const E: usize = 4;
     const dim: usize = 128;
-    const n: usize = 24;
+    const n: usize = 40;
     const tile_n = 8 * 8 * 64;
     const stacked = try alloc.alloc(u16, E * tile_n);
     for (0..E) |e| @memcpy(stacked[e * tile_n ..][0..tile_n], trellis_bits);
-    var prng = std.Random.DefaultPrng.init(83);
+    var prng = std.Random.DefaultPrng.init(97);
     const rnd = prng.random();
     const xh = try alloc.alloc(u16, n * dim);
     for (xh) |*v| v.* = exl3.f32ToF16Bits(rnd.float(f32) * 2 - 1);
-    var eids: [24]u32 = undefined;
+    var eids: [40]u32 = undefined;
     var i: usize = 0;
-    while (i < 20) : (i += 1) eids[i] = 1;
+    while (i < 24) : (i += 1) eids[i] = 1;
+    while (i < 30) : (i += 1) eids[i] = 0;
     while (i < n) : (i += 1) eids[i] = 2;
     const x_arr = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ @intCast(n), @intCast(dim) }, 2, .float16);
     defer _ = mlx.mlx_array_free(x_arr);
@@ -3845,28 +3437,28 @@ test "exl3 decode-once GEMM matches 16-row windows on long run" {
     defer _ = mlx.mlx_array_free(tr_arr);
     const eid_a = mlx.mlx_array_new_data(&eids, &[_]c_int{@intCast(n)}, 1, .uint32);
     defer _ = mlx.mlx_array_free(eid_a);
-    const win = try innerGemmSorted(s, x_arr, tr_arr, eid_a);
-    defer _ = mlx.mlx_array_free(win);
-    const once = try innerGemmByRuns(s, x_arr, tr_arr, eid_a);
-    defer _ = mlx.mlx_array_free(once);
-    var c0 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(c0);
-    var c1 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(c1);
-    try mlx.check(mlx.mlx_contiguous(&c0, win, false, s));
-    try mlx.check(mlx.mlx_contiguous(&c1, once, false, s));
-    try mlx.check(mlx.mlx_array_eval(c0));
-    try mlx.check(mlx.mlx_array_eval(c1));
-    const a0 = mlx.mlx_array_data_float16(c0) orelse return error.F16Unreadable;
-    const a1 = mlx.mlx_array_data_float16(c1) orelse return error.F16Unreadable;
+    const got16 = try innerGemmSortedWin(s, x_arr, tr_arr, eid_a, 16);
+    defer _ = mlx.mlx_array_free(got16);
+    const got32 = try innerGemmSortedWin(s, x_arr, tr_arr, eid_a, 32);
+    defer _ = mlx.mlx_array_free(got32);
+    var c16 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(c16);
+    var c32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(c32);
+    try mlx.check(mlx.mlx_contiguous(&c16, got16, false, s));
+    try mlx.check(mlx.mlx_contiguous(&c32, got32, false, s));
+    try mlx.check(mlx.mlx_array_eval(c16));
+    try mlx.check(mlx.mlx_array_eval(c32));
+    const a16 = mlx.mlx_array_data_float16(c16) orelse return error.F16Unreadable;
+    const a32 = mlx.mlx_array_data_float16(c32) orelse return error.F16Unreadable;
     for (0..n * dim) |j| {
-        const b0: u16 = @bitCast(a0[j]);
-        const b1: u16 = @bitCast(a1[j]);
-        try t.expectEqual(b0, b1);
+        const b16: u16 = @bitCast(a16[j]);
+        const b32: u16 = @bitCast(a32[j]);
+        try t.expectEqual(b16, b32);
     }
 }
 
-test "exl3 decode-once stage ubench C=2048 sweep N" {
+test "exl3 window 16 vs 32 production C=2048" {
     const t = std.testing;
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
@@ -3882,7 +3474,7 @@ test "exl3 decode-once stage ubench C=2048 sweep N" {
     const tr_g = try alloc.alloc(u16, tr_n);
     const xh = try alloc.alloc(u16, @intCast(R * H));
     const slots_h = try alloc.alloc(u32, @intCast(R * topk));
-    var prng = std.Random.DefaultPrng.init(91);
+    var prng = std.Random.DefaultPrng.init(99);
     const rnd = prng.random();
     for (tr_g) |*v| v.* = @truncate(rnd.int(u32));
     for (xh) |*v| v.* = exl3.f32ToF16Bits(rnd.float(f32) * 0.1);
@@ -3901,68 +3493,26 @@ test "exl3 decode-once stage ubench C=2048 sweep N" {
     try mlx.check(mlx.mlx_take_axis(&sorted, slots, order, 0, s));
     const xr = try repeatRows(s, x_arr, R, topk);
     defer _ = mlx.mlx_array_free(xr);
-    const warm_w = try innerGemmSorted(s, xr, trg, sorted);
-    try mlx.check(mlx.mlx_array_eval(warm_w));
-    _ = mlx.mlx_array_free(warm_w);
+    const w16 = try innerGemmSortedWin(s, xr, trg, sorted, 16);
+    try mlx.check(mlx.mlx_array_eval(w16));
+    _ = mlx.mlx_array_free(w16);
+    const w32 = try innerGemmSortedWin(s, xr, trg, sorted, 32);
+    try mlx.check(mlx.mlx_array_eval(w32));
+    _ = mlx.mlx_array_free(w32);
     const io = std.Io.Threaded.global_single_threaded.io();
     var sw = io_util.Stopwatch.init(io);
-    const win = try innerGemmSorted(s, xr, trg, sorted);
-    try mlx.check(mlx.mlx_array_eval(win));
-    const win_ns = sw.read();
-    _ = mlx.mlx_array_free(win);
-    std.debug.print("window C=2048 {d} us\n", .{win_ns / 1000});
-    ubench_force = true;
-    defer {
-        ubench_force = false;
-    }
-    const ns = [_]u32{ 16, 32, 64 };
-    for (ns) |nmin| {
-        decode_once_min_rows = nmin;
-        sw = io_util.Stopwatch.init(io);
-        const once = try innerGemmByRuns(s, xr, trg, sorted);
-        try mlx.check(mlx.mlx_array_eval(once));
-        const once_ns = sw.read();
-        _ = mlx.mlx_array_free(once);
-        std.debug.print("decode-once N={d} C=2048 {d} us\n", .{ nmin, once_ns / 1000 });
-    }
-    decode_once_min_rows = DECODE_ONCE_MIN_ROWS;
-    try t.expect(win_ns > 0);
-    const R8: c_int = 8192;
-    const xh8 = try alloc.alloc(u16, @intCast(R8 * H));
-    const slots8 = try alloc.alloc(u32, @intCast(R8 * topk));
-    for (xh8) |*v| v.* = exl3.f32ToF16Bits(rnd.float(f32) * 0.1);
-    for (slots8) |*v| v.* = rnd.uintLessThan(u32, @intCast(E));
-    const x8 = mlx.mlx_array_new_data(xh8.ptr, &[_]c_int{ R8, H }, 2, .float16);
-    defer _ = mlx.mlx_array_free(x8);
-    const sl8 = mlx.mlx_array_new_data(slots8.ptr, &[_]c_int{R8 * topk}, 1, .uint32);
-    defer _ = mlx.mlx_array_free(sl8);
-    var order8 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(order8);
-    try mlx.check(mlx.mlx_argsort_axis(&order8, sl8, 0, s));
-    var sorted8 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sorted8);
-    try mlx.check(mlx.mlx_take_axis(&sorted8, sl8, order8, 0, s));
-    const xr8 = try repeatRows(s, x8, R8, topk);
-    defer _ = mlx.mlx_array_free(xr8);
-    const warm8 = try innerGemmSorted(s, xr8, trg, sorted8);
-    try mlx.check(mlx.mlx_array_eval(warm8));
-    _ = mlx.mlx_array_free(warm8);
+    const a16 = try innerGemmSortedWin(s, xr, trg, sorted, 16);
+    try mlx.check(mlx.mlx_array_eval(a16));
+    const ns16 = sw.read();
+    _ = mlx.mlx_array_free(a16);
     sw = io_util.Stopwatch.init(io);
-    const win8 = try innerGemmSorted(s, xr8, trg, sorted8);
-    try mlx.check(mlx.mlx_array_eval(win8));
-    const win8_ns = sw.read();
-    _ = mlx.mlx_array_free(win8);
-    std.debug.print("window C=8192 {d} us\n", .{win8_ns / 1000});
-    ubench_force = true;
-    decode_once_min_rows = 16;
-    sw = io_util.Stopwatch.init(io);
-    const once8 = try innerGemmByRuns(s, xr8, trg, sorted8);
-    try mlx.check(mlx.mlx_array_eval(once8));
-    const once8_ns = sw.read();
-    _ = mlx.mlx_array_free(once8);
-    std.debug.print("decode-once N=16 C=8192 {d} us\n", .{once8_ns / 1000});
-    decode_once_min_rows = DECODE_ONCE_MIN_ROWS;
-    try t.expect(win8_ns > 0);
+    const a32 = try innerGemmSortedWin(s, xr, trg, sorted, 32);
+    try mlx.check(mlx.mlx_array_eval(a32));
+    const ns32 = sw.read();
+    _ = mlx.mlx_array_free(a32);
+    std.debug.print("run-aligned C=2048 win16 {d} us win32 {d} us\n", .{ ns16 / 1000, ns32 / 1000 });
+    try t.expect(ns16 > 0);
+    try t.expect(ns32 > 0);
 }
 
 test "exl3 moePrefill matches staged sorted chain" {

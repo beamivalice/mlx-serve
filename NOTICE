@@ -236,19 +236,6 @@ the recurrence state after every intermediate timestep so speculative decoding
 can roll back without re-running the prefix.
 
 --------------------------------------------------------------------------------
-ExLlamaV3
-https://github.com/turboderp-org/exllamav3
-Copyright (c) 2024-2026 turboderp
-Licensed under the MIT License.
-
-The EXL3 K4 full-trellis decode used in prefill (materialize each expert's
-inner matrix once into a dense f16 buffer, then a stock f16 matmul over the
-rows of that expert) follows ExLlamaV3's codec: MUL1 codeword decode, the
-16x16 tile funnel, and writing a native [out, in] weight so a GEMM can
-consume it. Reimplemented in Zig against mlx-c; the Metal body is K4-only
-and the host groups experts into a bounded transient.
-
---------------------------------------------------------------------------------
 mlx-c
 https://github.com/ml-explore/mlx-c
 Copyright (c) 2023 ml-explore

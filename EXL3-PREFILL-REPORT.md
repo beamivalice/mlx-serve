@@ -6,8 +6,8 @@ Box: Apple M5 Max
 
 ## Files changed
 
-- `src/expert_exl3_kernels.zig` (items 0–2 as merged; item 3 decode-full + decode-once GEMM arm)
-- `NOTICE` (ExLlamaV3 full-trellis decode port)
+- `src/expert_exl3_kernels.zig` (decode-once arm deleted; 32-row window register reuse)
+- `NOTICE` (ExLlamaV3 decode-full entry removed with the arm)
 
 ## Tests added
 
