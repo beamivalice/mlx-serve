@@ -38598,7 +38598,7 @@ test "MTP EXL3 mtpMoeRows fused rows match N solo calls on the same kernel" {
             try t.expectEqual(b, a);
         }
     }
-    try t.expectEqual(@as(u32, 3), n_disp);
+    try t.expectEqual(@as(u32, 5), n_disp);
 }
 
 
