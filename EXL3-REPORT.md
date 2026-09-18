@@ -60,9 +60,11 @@ Measured on one 2560×640 expert, imatrix-like `v`, 256 rows `X[:,i]~N(0,√v_i)
 | direct, rows × √v | 0.06869 | 0.06883 | — |
 | LDLQ diag(v) | 0.06868 | 0.06881 | 0.594 s |
 
-All EXL3 arms beat affine-4. **Pick direct** (fastest). Row-√v imatrix weighting did not move the needle.
+**Pick deferred.** That table used synthetic Gaussian rows and an invented `v`. Under a near-isotropic Hessian, LDLQ collapses to direct, which is why the two arms printed identical numbers. It is **not** evidence that LDLQ with the real imatrix has no win. Keep “all EXL3 arms beat affine-4 on the synthetic weighting” as that only.
 
-Batched direct projections/s (2560×640, Metal):
+Window 1 of the box grant collects the real imatrix, then re-runs one-expert comparison on **three real experts** (hot / median / cold by routed-token count) with the real per-expert diagonal: imatrix-weighted output error and plain relRMS, for direct vs LDLQ-diag vs affine 4-bit g64. Batch LDLQ the same way as direct and report proj/s. Pick by output error at the fastest rate that still fits the resumable plan; **only then convert**.
+
+Batched direct projections/s (2560×640, Metal) — rate only, not the quality pick:
 
 | N | wall | proj/s | full pack (73,728) |
 |---|---:|---:|---:|
@@ -70,9 +72,9 @@ Batched direct projections/s (2560×640, Metal):
 | 32 | 10.422 s | 3.07 | 6.67 h |
 | 64 | 21.290 s | 3.01 | 6.80 h |
 
-N=16 is the plateau. 6.63 h > 4 h, so conversion is **resumable**: `model-exl3-L{layer:02d}-{gate,up,down}.safetensors`, skip if header shape validates. A 2 h window does ~3.09×7200 ≈ 22k projections ≈ **14 layers**. ~4 windows of 2 h finish the pack.
+N=16 is the direct-search plateau (~6.6 h). LDLQ batch rate is **not yet measured** (same concat-out path as direct, still owed). Conversion stays resumable: `model-exl3-L{layer:02d}-{gate,up,down}.safetensors`. Window 1 = imatrix collect, not convert.
 
-Imatrix collect (step 0, still grant-gated) checkpoints `*.safetensors.layers/LXX.safetensors` and skips complete layers. Tag stays `imatrix-diagonal` when `--imatrix` is passed (used for LDLQ / zero-routed listing); the picked search arm is direct.
+Imatrix collect checkpoints `*.safetensors.layers/LXX.safetensors`.
 
 Unit tests: plan + layout + imatrix-diagonal + resume skip. `--self-test` → 12/12.
 
@@ -101,16 +103,16 @@ The naive inner GEMV unpacks 256 codewords per output lane per tile; it is the p
 
 ## Prefill arm chosen
 
-Per-row indexed GEMV is used only for **rows ≤ 16** (decode + verify widths). Above that, `moePrefill` (expand rows × topk, one indexed GEMV family — the rows kernel).
+Per-row indexed GEMV only for **rows ≤ 16**. Prefill (rows > 16) is a **sorted-gather GEMM**: argsort slots, one run table, decode each 16×16 K4 tile **once** into threadgroup `W[256]` and reuse it across that expert’s rows (chunks of 128). Decode cost follows expert bytes, not rows×bytes. suh/svh H128 is a 32-lane simdgroup shuffle.
 
-Measured on a synthetic layer, 512 rows, E=4, H=I=128, topk=2, GPU:
+Measured (warmup + 5–20 iters, GPU):
 
-| arm | time |
-|---|---|
-| (b) rows kernel (`moePrefill`) | **197 ms** |
-| (a) decode-to-f16 once + `gather_mm` (public banks already on GPU) | **13 ms** |
+| synthetic layer | sorted-GEMM layer (3 proj) | affine `gather_qmm` one proj | vs 3× qmm |
+|---|---:|---:|---:|
+| 512 rows, E=4, H=128, topk=2 | **2511 µs** | 175 µs | **4.8×** |
+| 512 rows, E=4, H=2560, I=640, topk=2 | **18047 µs** | 302 µs | **20×** |
 
-**Pick (a)** by the number: 15× faster when public W is materialized. Production still runs (b) until a Metal full-matrix decode writes those banks per chunk (host reconstruct of 2560×640 × hundreds of experts is not a prefill). Next grant work: Metal decode-full of unique experts, then `gather_mm`.
+The 197 ms naive rows kernel is gone (~77× on 128-d). The 2×-of-affine-gather_qmm bar is **not met** at production geometry (20×); 128-d is launch-heavy at 4.8×. Next kernel step is a rows4 FMA body (four rows per simdgroup, no 160-deep serial tile loop). Do not ship prefill until that lands. Decode GEMV ≤16 rows is unchanged.
 
 ## Live results
 
@@ -180,8 +182,8 @@ HEAD after this round (batched direct + resumable shards). Clone base `7264fe15`
 ## Open questions
 
 - Naive GEMV will not hit the 15% speed bar; need the simdgroup K4 indexed-pair port and a rows4 prefill kernel.
-- Convert is 6.63 h at 3.09 proj/s; needs ~4× 2 h windows. Imatrix collect still grant-gated.
-- Production prefill should switch to decode-to-bf16 + gather_mm once Metal weight decode exists (synthetic pick is 13 ms vs 197 ms).
+- Quantizer pick waits on real imatrix + 3-expert comparison. Direct batch rate 3.09 proj/s is not the pick.
+- Prefill sorted-GEMM is 4.8× (128-d) / 20× (2560-d) affine gather_qmm; rows4 FMA body still owed before ship.
 - suh/svh Hadamard Metal path is a naive matvec; F16 rounding vs host FWHT/Sylvester association needs a dedicated parity test at 2560-d.
 - MTP EXL3 experts load via trellis triples; the MTP forward reuses the trunk MoE hook.
 
