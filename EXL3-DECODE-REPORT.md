@@ -1,98 +1,103 @@
-# EXL3-DECODE-REPORT (round 5)
+# EXL3-DECODE-REPORT (round 7)
 
-Reset onto integration `63367221` (`git fetch … feat/qwen4-exl3 && git reset --hard FETCH_HEAD`). Dropped `2e000c53` (f32 down inner). Cap-2 + union hist present on pair-f32 `47ef9ece`. Down GEMV inner is f16 (`half(sum)`). Restored local `lib/ds4` (and mlx-src/mlxc-src/opencode2) worktree symlinks emptied by reset; not git-added.
+Reset onto `2f876392` (`feat/qwen4-exl3`: cap-scope `a9598bd0` + B13 `00ef132a` + prefill config reuse). Shared-decode (`6e523afb`, `62520f81`) and half-product acc (`f84a794d`) dropped with the reset. Start-at-2 never on this head. Restored `lib/ds4`, `lib/mlx-src`, `lib/mlxc-src`, `lib/opencode2-mlx-serve` worktree symlinks; not git-added.
 
-Compile on `63367221`: `.zig-toolchain/zig build -Doptimize=ReleaseFast` succeeded.
-`-Dtest-filter="exl3"`: **27/27**. `-Dtest-filter="mtp"`: **125 passed, 1 skipped**.
+Quality chain stays at f32 finish reduce (bar 0.0679 / 0.923). 0.0676 bisect closed as exhausted.
 
-## (1) Equivalence 11/11 on `63367221`
+Leases: AUTO one 20m lock, unlock; forced-d2 one 20m lock, unlock. Not a combined lease.
 
-`MTP_FORCE_ENABLE=1 MTP_TEST_MODEL=<exl3k4 pack> tests/test_mtp_equivalence.sh` → **10 passed, 1 failed**.
+## Shared-decode null (deleted)
 
-PASS: no-mtp baseline, auto-load, chat non-stream/stream, messages (near-tie gap 0.125), acceptance floor avg_per_round=1.00, fused QK-norm, packed prework, enable_mtp:false, EV ext_rounds=28.
+Whole-forward, shared ON, handbook 512-decode, round 6 (contaminated for merging, kept as the null):
 
-FAIL: `[adaptive kill switch]: depth=2 ext_rounds=0 (want depth=3 ext_rounds=0)`. `applyExl3DepthCap` also clamps `MLX_SERVE_MTP_ADAPTIVE=0` (DEFAULT_DEPTH 3) to 2. AUTO path is the intended cap-2; kill-switch contract is leaked. Loadavg at lock 6.36 6.72 4.92.
+| ctx | serial EXL3 | shared-ON MTP EXL3 | delta |
+|---|---:|---:|---:|
+| 4k | 53.682 | 45.054 | −8.6 tok/s (−16%) |
+| 16k | 54.353 | 48.016 | −6.3 tok/s (−12%) |
+| 64k | 52.521 | 49.651 | −2.9 tok/s (−5%) |
 
-## (1) AUTO MTP-vs-MTP 3-boot, cap-2 live, no FORCE_DEPTH
+Live MTP widths on EXL3 AUTO/d2 are S≈2 (cap 2 / force 2). That is a loss vs per-row serial. S=3..5 were not a winning in-situ arm (no live EXL3 path drafts that wide under cap-2). Kernel, descriptor, buckets, and tests deleted with the reset. No width kept behind a predicate.
 
-`--mtp --kv-quant 8 --prefill-chunk 8192 --no-vision`. Profile off. Box Apple M5 Max. `[admission] width=8192`. `[mtp] adaptive depth cap 2 (m5-max-exl3 row, default 6)`. sha `63367221`.
+## Half-product float acc null (deleted)
 
-### persist 0
+KLD to-EOS **0.068517 / top-1 0.9222** vs bar 0.0676 / 0.924 (worse than f32 finish 0.06787 / 0.9228). Dropped.
 
-| boot | arm | short | 4k | loadavg | depth | short avg_per_round | 4k avg_per_round |
-|---|---|---:|---:|---|---:|---:|---:|
-| r1 | exl3 | 77.885 | 77.851 | 1.61 3.04 3.77 | 2 | 0.92 | 1.46 |
-| r1 | aff | 98.111 | 64.720 | 1.81 2.97 3.72 | 6 | 1.27 | 2.05 |
-| r2 | exl3 | 78.019 | 77.831 | 1.86 2.85 3.65 | 2 | 0.92 | 1.46 |
-| r2 | aff | 97.968 | 85.631 | 2.02 2.85 3.64 | 6 | 1.27 | 2.05 |
-| r3 | exl3 | 77.684 | 77.286 | 2.00 2.77 3.58 | 2 | 0.92 | 1.46 |
-| r3 | aff | 97.163 | 88.980 | 1.83 2.70 3.54 | 6 | 1.27 | 2.05 |
+## New-standard MTP on clean `2f876392`
 
-Medians: EXL3 **77.885 / 77.831**, affine **97.968 / 85.631**. 4k **beats ~70**. Short **77.9 vs ~82** (FORCE_DEPTH=2 was 80.3; AUTO starts `mtp_depth_current=1` and climbs; short is 12 rounds). Affine r1 4k 64.7 is a w3 trial outlier.
+Handbook prompts `/Users/beam/claude-tmp/exl3-bench/prompt-{4k,16k,64k}.txt`, nonce prefix, max_tokens 512. Every row **completion_tokens=512**, **finish_reason=length**. kv8, width=8192, persist 0, no `MLX_SERVE_NGRAM_WARM=0`. Affine first, interleaved, 3 boots, medians. Box Apple M5 Max.
 
-### persist 1 (warmup request then timed short+4k)
+`spec-stats depth=` is the **cap** (`mtp_depth`), not the round width. AUTO EXL3 prints depth=2 (cap-2). FORCE_DEPTH=2 unclamps the cap (prints 6) but every round drafts exactly 2 (`accepts / (attempts * 2)` matches `per_draft_pct`).
 
-| boot | short | 4k | loadavg | depth | short avg | 4k avg |
-|---|---:|---:|---|---:|---:|---:|
-| r1 | 68.471 | 77.285 | 1.72 2.87 3.67 | 2 | 0.92 / 1.00 | 1.29 |
-| r2 | 71.310 | 81.601 | 2.08 2.83 3.62 | 2 | 0.92 / 1.00 | 1.67 |
-| r3 | 79.746 | 77.875 | 1.81 2.65 3.51 | 2 | 0.92 / 1.09 | 1.37 |
+### AUTO (cap 2, persist 0) — one lease
 
-Median **71.310 / 77.875**. 4k holds ~78–82; short noisier (w1 trials on the matured `<2k` table). persist 0 is the stabler cap-2 AUTO cell.
+| arm | boot | loadavg | 4k tok/s avg/ms | 16k tok/s avg/ms | 64k tok/s avg/ms |
+|---|---|---|---|---|---|
+| aff | r1 | 2.11 2.00 1.86 | 76.192 1.23/33.54 | 74.470 1.28/29.40 | 70.167 1.12/27.83 |
+| exl3 | r1 | 2.78 2.21 1.95 | 60.327 0.82/37.70 | 58.204 1.43/36.48 | 60.660 1.12/35.57 |
+| aff | r2 | 2.20 2.23 1.99 | 72.474 1.35/34.53 | 74.969 1.42/29.38 | 76.721 1.37/30.63 |
+| exl3 | r2 | 1.66 2.15 1.99 | 61.754 0.94/28.73 | 63.202 0.90/34.30 | 66.498 1.20/31.87 |
+| aff | r3 | 1.95 2.33 2.09 | 72.783 1.17/34.59 | 75.264 1.59/37.74 | 78.205 1.67/35.63 |
+| exl3 | r3 | 2.35 2.47 2.17 | 61.801 1.23/38.85 | 66.629 1.27/35.96 | 63.674 0.85/27.58 |
 
-## (2) Quality: finish reduce f32 through H128+svh+score, T(·) at store
+Medians: affine decode **72.783 / 74.969 / 76.721**, avg **1.23 / 1.42 / 1.37**, round_ms **34.53 / 29.40 / 30.63**, cap 6. EXL3 decode **61.754 / 63.202 / 63.674**, avg **0.94 / 1.27 / 1.12**, round_ms **37.70 / 35.96 / 31.87**, cap 2. Decode ratio **84.8% / 84.3% / 83.0%**. `[mtp] adaptive depth cap 2`. `[expert-exl3] engaged`.
 
-Down inner stays f16. REDUCE_SOURCE: `threadgroup float vals`, float score accum, `y = T(a0)` at the end.
+### Forced d2 — one lease
 
-TDD: `exl3 down finish reduce keeps f32 through score fold` — red (half vals / `half a0`), then green. `moePrefill matches staged sorted chain` 1–8 ULP vs half staged tokenReduce (envelope). Exl3 filter **28/28**.
+Both packs `MLX_SERVE_MTP_FORCE_DEPTH=2` (every round drafts 2).
 
-KLD vs teacher, kv off, no MTP, `/tmp/exl3-decode-logs/kld-reduce-f32.json` (dirty tree on `63367221` + this change):
+| arm | boot | loadavg | 4k tok/s avg/ms | 16k tok/s avg/ms | 64k tok/s avg/ms |
+|---|---|---|---|---|---|
+| aff | r1 | 1.84 2.18 2.09 | 76.013 1.13/28.05 | 82.591 1.26/27.55 | 78.928 1.30/29.66 |
+| exl3 | r1 | 2.82 2.39 2.18 | 59.529 1.19/33.97 | 69.794 1.28/32.42 | 65.931 1.21/33.44 |
+| aff | r2 | 2.83 2.55 2.27 | 76.898 1.19/28.77 | 79.181 1.18/27.97 | 81.605 1.29/28.29 |
+| exl3 | r2 | 2.54 2.57 2.30 | 66.271 1.17/34.05 | 69.639 1.24/32.85 | 67.962 1.27/33.54 |
+| aff | r3 | 2.21 2.40 2.26 | 76.691 1.12/28.02 | 83.144 1.24/27.12 | 83.242 1.34/28.39 |
+| exl3 | r3 | 1.87 2.27 2.22 | 65.995 1.16/33.69 | 71.334 1.27/32.43 | 67.710 1.21/33.32 |
 
-| stage | sha | mean to-EOS | top-1 |
-|---|---|---|---|
-| original | — | 0.0676 | 0.924 |
-| f32 pair inner + split-2 | 47ef9ece / 63367221 | 0.06840 | 0.9235 |
-| **f32 finish reduce** | **this commit** | **0.06787** | **0.9228** |
+Medians: affine decode **76.691 / 82.591 / 81.605**, avg **1.13 / 1.24 / 1.30**, round_ms **28.05 / 27.55 / 28.39**. EXL3 decode **65.995 / 69.794 / 67.710**, avg **1.17 / 1.27 / 1.21**, round_ms **33.97 / 32.43 / 33.44**. Decode ratio **86.1% / 84.5% / 83.0%**.
 
-Moved: KLD **0.06840 → 0.06787** (−0.00053), +0.00027 vs original 0.0676. top-1 0.9235 → 0.9228 (−0.00073 vs pair, −0.0012 vs 0.924). **Not a null.** Bar 0.0676/0.924 not fully met (KLD close, top-1 still short). No serial cost measured this stage.
+## EXL3/affine MTP ratio and cause
 
-## (3) Union kernel
+Handbook affine MTP is **73–77 AUTO / 77–83 forced-d2**, not the 95–98 short-prose band. Acceptance on this prompt is low: affine avg_per_round **1.13–1.42** (handbook) vs ~2+ on short prose.
 
-No rows-kernel redesign. Astra study 2 owns the shared-decode plan.
+At **matched force-d2**, acceptance is the same (EXL3 1.17/1.27/1.21 vs affine 1.13/1.24/1.30). EXL3 **round_ms is 18–21% higher** (34.0/32.4/33.4 vs 28.1/27.6/28.4). The MTP ratio **83–86%** is verify-row cost, not acceptance.
+
+AUTO ratio is the same **83–85%**: affine’s extra cap-6 width does not pay on this prompt (affine forced-d2 is *faster* than affine AUTO). EXL3 cap-2 is not the limiter here.
+
+vs serial EXL3 53.7/54.4/52.5, clean AUTO 61.8/63.2/63.7 is still a real MTP gain.
 
 ## Files changed
 
-- `src/expert_exl3_kernels.zig` — REDUCE_SOURCE f32 vals + score fold; test; moePrefill 8-ULP envelope
-- `EXL3-DECODE-REPORT.md`
+- `EXL3-DECODE-REPORT.md` only (reset dropped shared-decode, half-product acc, start-at-2)
 
 ## Tests added
 
-- `exl3 down finish reduce keeps f32 through score fold`
+none this turn
 
 ## Red-first evidence
 
-- `exl3 down finish reduce keeps f32 through score fold` failed without output (half vals / half a0)
-- then green after float vals + float accum
+n/a (reset; no new kernel)
 
 ## Suite counts
 
-On `63367221` before this change: exl3 **27/27**, mtp **125 pass / 1 skip**.
-After REDUCE_SOURCE: exl3 **28/28**. Full suite not re-run.
+not re-run this turn
 
 ## Commit sha
 
-- reset/verify/live AUTO/equiv: `63367221`
-- finish-reduce f32: this commit
+- integration reset: `2f876392`
+- cap-scope (on that head): `a9598bd0`
+- B13 (on that head): `00ef132a`
+- tables measured on `2f876392`
 
-## Live table (every row with box, chunk, engagement)
+## Live table
 
-Box Apple M5 Max. `[admission] width=8192`. `[expert-exl3] engaged`. kv affine 8. Cap-2 log on EXL3 AUTO boots. See tables above. Extracts `/tmp/exl3-decode-logs/live-auto-*.extract`. Equiv `/tmp/exl3-decode-logs/equiv-11.log`.
+Box Apple M5 Max. `[admission] width=8192`. kv affine 8. `[expert-exl3] engaged`. AUTO: `[mtp] adaptive depth cap 2`. Logs `/tmp/exl3-decode-logs/clean-{auto,d2}.log`. JSON `/tmp/exl3-decode-logs/live-clean-{auto,d2}-*-std.json`.
 
 ## Open questions
 
-- AUTO short 77.9 vs FORCE d2 80.3: climb from depth 1 on a 12-round short. Starting `mtp_depth_current` at 2 would close it.
-- 11/11 kill-switch: cap-2 should not bind `MLX_SERVE_MTP_ADAPTIVE=0`.
-- top-1 still 0.9228 vs 0.924 after reduce-f32; KLD is the closer of the two.
+- Shared-decode is a journal null; no width kept.
+- Half-product acc is a journal null; quality stays f32 finish reduce.
+- Handbook MTP is acceptance-limited for affine; EXL3 gap at matched d2 is round_ms.
 
 ## Comments
 
