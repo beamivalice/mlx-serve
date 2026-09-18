@@ -4072,6 +4072,96 @@ test "exl3 K3 sorted GEMM matches host MUL1 on small shape" {
     }
 }
 
+test "exl3 K3 sorted GEMM matches host MUL1 on 20-40 row runs" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!gemmNaxOn()) return error.SkipZigTest;
+    const fixture = @embedFile("fixtures/exl3_k3_linear.safetensors");
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const header_len = std.mem.readInt(u64, fixture[0..8], .little);
+    const header = fixture[8 .. 8 + header_len];
+    const data = fixture[8 + header_len ..];
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, header, .{});
+    defer parsed.deinit();
+    const trellis_meta = parsed.value.object.get("trellis").?.object;
+    const t0: usize = @intCast(trellis_meta.get("data_offsets").?.array.items[0].integer);
+    const t1: usize = @intCast(trellis_meta.get("data_offsets").?.array.items[1].integer);
+    const trellis_bits = std.mem.bytesAsSlice(u16, data[t0..t1]);
+    const E: usize = 4;
+    const dim: usize = 128;
+    const n: usize = 52;
+    const tile_n = 8 * 8 * 48;
+    const stacked = try alloc.alloc(u16, E * tile_n);
+    for (0..E) |e| @memcpy(stacked[e * tile_n ..][0..tile_n], trellis_bits);
+    var prng = std.Random.DefaultPrng.init(53);
+    const rnd = prng.random();
+    const xh = try alloc.alloc(u16, n * dim);
+    for (xh) |*v| v.* = exl3.f32ToF16Bits(rnd.float(f32) * 2 - 1);
+    var eids: [52]u32 = undefined;
+    var i: usize = 0;
+    while (i < 20) : (i += 1) eids[i] = 0;
+    while (i < n) : (i += 1) eids[i] = 1;
+    const x_arr = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ @intCast(n), @intCast(dim) }, 2, .float16);
+    defer _ = mlx.mlx_array_free(x_arr);
+    const tr_arr = mlx.mlx_array_new_data(stacked.ptr, &[_]c_int{ @intCast(E), 8, 8, 48 }, 4, .uint16);
+    defer _ = mlx.mlx_array_free(tr_arr);
+    const eid_a = mlx.mlx_array_new_data(&eids, &[_]c_int{@intCast(n)}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(eid_a);
+    const got = try innerGemmSortedWin(s, x_arr, tr_arr, eid_a, 32);
+    defer _ = mlx.mlx_array_free(got);
+    var contig = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(contig);
+    try mlx.check(mlx.mlx_contiguous(&contig, got, false, s));
+    try mlx.check(mlx.mlx_array_eval(contig));
+    const src = mlx.mlx_array_data_float16(contig) orelse return error.F16Unreadable;
+    const xf = try alloc.alloc(f32, dim);
+    const host16 = try alloc.alloc(f32, dim);
+    const host32 = try alloc.alloc(f32, dim);
+    const pos_acc = try alloc.alloc(f32, dim * 16);
+    const host_pos = try alloc.alloc(f32, dim);
+    const in_tiles = dim / 16;
+    const out_tiles = dim / 16;
+    const packed_n = tile_n / (in_tiles * out_tiles);
+    for (0..n) |r| {
+        for (0..dim) |j| xf[j] = exl3.f16BitsToF32(xh[r * dim + j]);
+        const e: usize = eids[r];
+        const trellis = stacked[e * tile_n ..][0..tile_n];
+        exl3.innerGemv(trellis, xf, dim, dim, 3, .mul1, host16);
+        exl3.innerGemvF32(trellis, xf, dim, dim, 3, .mul1, host32);
+        @memset(pos_acc, 0);
+        var tile_w: [exl3.TILE_VALUES]u16 = undefined;
+        for (0..in_tiles) |tk| {
+            for (0..out_tiles) |tn| {
+                const off = (tk * out_tiles + tn) * packed_n;
+                exl3.decodeTile(trellis[off..][0..packed_n], 3, .mul1, &tile_w);
+                for (0..16) |tr| {
+                    const xv = xf[tk * 16 + tr];
+                    for (0..16) |c| {
+                        pos_acc[(tn * 16 + c) * 16 + tr] += xv * exl3.f16BitsToF32(tile_w[tr * 16 + c]);
+                    }
+                }
+            }
+        }
+        for (0..dim) |o| {
+            var psum: f32 = 0;
+            for (0..16) |tr| psum += pos_acc[o * 16 + tr];
+            host_pos[o] = psum;
+        }
+        for (0..dim) |o| {
+            const gpu = @as(f32, @floatCast(src[r * dim + o]));
+            expectGemvEnvelope(gpu, host16[o], host32[o]) catch {
+                const hp16 = exl3.f16BitsToF32(exl3.f32ToF16Bits(host_pos[o]));
+                expectGemvEnvelope(gpu, hp16, host_pos[o]) catch {
+                    try expectGemvEnvelope(gpu, host16[o], host_pos[o]);
+                };
+            };
+        }
+    }
+}
+
 test "exl3 NAX K3 GEMM within 1.15x of K4 at C=2048 and 8192" {
     const t = std.testing;
     const s = mlx.gpuStream();
