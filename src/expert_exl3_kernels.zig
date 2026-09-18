@@ -700,7 +700,7 @@ fn CfgCache(comptime Key: type, comptime CAP: usize) type {
 
 const IndexedKey = struct { in_dim: c_int, out_dim: c_int, topk: c_int };
 const UnaryKey = struct { dim: c_int, topk: c_int };
-const GemmSortedKey = struct { in_dim: c_int, out_dim: c_int, rows: c_int, win: c_int, nwin: c_int };
+const GemmSortedKey = struct { in_dim: c_int, out_dim: c_int, rows: c_int, win: c_int };
 
 const GEMM_WINDOW_ROWS: c_int = 32;
 
@@ -881,6 +881,21 @@ fn getGemmSortedKernel() !mlx.mlx_fast_metal_kernel {
 
 const WindowTable = struct { starts: mlx.mlx_array, nlives: mlx.mlx_array, nwin: c_int };
 
+var gemm_sel_logged: bool = false;
+
+fn logGemmSelector(win: c_int, aligned: bool, nwin: c_int, n: c_int) void {
+    if (n < 2048) return;
+    if (gemm_sel_logged) return;
+    gemm_sel_logged = true;
+    log.info("[exl3-gemm] win={d} aligned={d} nwin={d} mixed={d} n={d}\n", .{
+        win,
+        @intFromBool(aligned),
+        nwin,
+        @as(u32, if (aligned) 0 else 1),
+        n,
+    });
+}
+
 fn buildWindowTable(s: mlx.mlx_stream, eids: mlx.mlx_array, n: c_int, win: c_int) !WindowTable {
     return buildWindowTableHost(s, eids, n, win);
 }
@@ -1053,7 +1068,8 @@ fn innerGemmSortedWinAlign(
     defer _ = mlx.mlx_array_free(tab.nlives);
     const nwin = tab.nwin;
     if (nwin <= 0) return error.BadExl3Shape;
-    const key = GemmSortedKey{ .in_dim = in_dim, .out_dim = out_dim, .rows = n, .win = win, .nwin = nwin };
+    logGemmSelector(win, aligned, nwin, n);
+    const key = GemmSortedKey{ .in_dim = in_dim, .out_dim = out_dim, .rows = n, .win = win };
     if (gemmNaxOn() and @rem(out_dim, 128) == 0) {
         // The fallback below answers a NAX build or dispatch that failed, so the
         // failure's latch is ours to drop: left standing it becomes the next
@@ -1063,7 +1079,6 @@ fn innerGemmSortedWinAlign(
             const ncfg = gemm_nax_cfgs.get(key) orelse blk: {
                 const c = mlx.mlx_fast_metal_kernel_config_new();
                 try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &[_]c_int{ n, out_dim }, 2, .float16));
-                try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, out_dim, nwin, 1));
                 try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 128, 1, 1));
                 try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "IDIM", in_dim));
                 try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ODIM", out_dim));
@@ -1072,6 +1087,7 @@ fn innerGemmSortedWinAlign(
                 gemm_nax_cfgs.put(key, c);
                 break :blk c;
             };
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(ncfg, out_dim, nwin, 1));
             const ninputs = [_]mlx.mlx_array{ x, trellis, eids, tab.starts, tab.nlives };
             const ninputs_vec = mlx.mlx_vector_array_new_data(&ninputs, ninputs.len);
             defer _ = mlx.mlx_vector_array_free(ninputs_vec);
@@ -1092,7 +1108,6 @@ fn innerGemmSortedWinAlign(
     const cfg = gemm_sorted_cfgs.get(key) orelse blk: {
         const c = mlx.mlx_fast_metal_kernel_config_new();
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &[_]c_int{ n, out_dim }, 2, .float16));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, out_tiles * 128, nwin, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 128, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "IDIM", in_dim));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ODIM", out_dim));
@@ -1101,6 +1116,7 @@ fn innerGemmSortedWinAlign(
         gemm_sorted_cfgs.put(key, c);
         break :blk c;
     };
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, out_tiles * 128, nwin, 1));
     const inputs = [_]mlx.mlx_array{ x, trellis, eids, tab.starts, tab.nlives };
     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
@@ -3696,6 +3712,70 @@ test "exl3 run-aligned windows match stride per row" {
             const ba: u16 = @bitCast(aa[j]);
             try t.expectEqual(bs, ba);
         }
+    }
+}
+
+test "exl3 aligned GEMM reuses config across nwin" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    const fixture = @embedFile("fixtures/exl3_k4_linear.safetensors");
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const header_len = std.mem.readInt(u64, fixture[0..8], .little);
+    const header = fixture[8 .. 8 + header_len];
+    const data = fixture[8 + header_len ..];
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, header, .{});
+    defer parsed.deinit();
+    const trellis_meta = parsed.value.object.get("trellis").?.object;
+    const t0: usize = @intCast(trellis_meta.get("data_offsets").?.array.items[0].integer);
+    const t1: usize = @intCast(trellis_meta.get("data_offsets").?.array.items[1].integer);
+    const trellis_bits = std.mem.bytesAsSlice(u16, data[t0..t1]);
+    const E: usize = 4;
+    const dim: usize = 128;
+    const n: usize = 40;
+    const tile_n = 8 * 8 * 64;
+    const stacked = try alloc.alloc(u16, E * tile_n);
+    for (0..E) |e| @memcpy(stacked[e * tile_n ..][0..tile_n], trellis_bits);
+    var prng = std.Random.DefaultPrng.init(113);
+    const rnd = prng.random();
+    const xh = try alloc.alloc(u16, n * dim);
+    for (xh) |*v| v.* = exl3.f32ToF16Bits(rnd.float(f32) * 2 - 1);
+    var long_runs: [40]u32 = undefined;
+    for (&long_runs) |*v| v.* = 1;
+    var short_runs: [40]u32 = undefined;
+    for (&short_runs, 0..) |*v, i| v.* = @intCast(i % 4);
+    try t.expect(windowStats(long_runs[0..], 32, true).nwin < windowStats(short_runs[0..], 32, true).nwin);
+    const x_arr = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ @intCast(n), @intCast(dim) }, 2, .float16);
+    defer _ = mlx.mlx_array_free(x_arr);
+    const tr_arr = mlx.mlx_array_new_data(stacked.ptr, &[_]c_int{ @intCast(E), 8, 8, 64 }, 4, .uint16);
+    defer _ = mlx.mlx_array_free(tr_arr);
+    const eid_long = mlx.mlx_array_new_data(&long_runs, &[_]c_int{@intCast(n)}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(eid_long);
+    const eid_short = mlx.mlx_array_new_data(&short_runs, &[_]c_int{@intCast(n)}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(eid_short);
+    const a_long = try innerGemmSortedWinAlign(s, x_arr, tr_arr, eid_long, 32, true);
+    defer _ = mlx.mlx_array_free(a_long);
+    try mlx.check(mlx.mlx_array_eval(a_long));
+    const stride_short = try innerGemmSortedWinAlign(s, x_arr, tr_arr, eid_short, 32, false);
+    defer _ = mlx.mlx_array_free(stride_short);
+    const aligned_short = try innerGemmSortedWinAlign(s, x_arr, tr_arr, eid_short, 32, true);
+    defer _ = mlx.mlx_array_free(aligned_short);
+    var cs = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cs);
+    var ca = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ca);
+    try mlx.check(mlx.mlx_contiguous(&cs, stride_short, false, s));
+    try mlx.check(mlx.mlx_contiguous(&ca, aligned_short, false, s));
+    try mlx.check(mlx.mlx_array_eval(cs));
+    try mlx.check(mlx.mlx_array_eval(ca));
+    const as = mlx.mlx_array_data_float16(cs) orelse return error.F16Unreadable;
+    const aa = mlx.mlx_array_data_float16(ca) orelse return error.F16Unreadable;
+    for (0..n * dim) |j| {
+        const bs: u16 = @bitCast(as[j]);
+        const ba: u16 = @bitCast(aa[j]);
+        try t.expectEqual(bs, ba);
     }
 }
 

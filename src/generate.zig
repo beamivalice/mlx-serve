@@ -2716,7 +2716,14 @@ pub const Generator = struct {
                         a.* = .{ .ctx = null };
                     }
                 }
-                if (trace_enabled) chunked_ns += prefill_sw.read() - chunk_start_ns;
+                if (trace_enabled) {
+                    const dt = prefill_sw.read() - chunk_start_ns;
+                    chunked_ns += dt;
+                    std.debug.print(
+                        "  [prefill-trace] chunk pos={d} end={d} width={d} ms={d}\n",
+                        .{ pos, end, end - pos, dt / std.time.ns_per_ms },
+                    );
+                }
 
                 // MTP history for this chunk: hiddens [pos, end) pair with
                 // tokens [pos+1, end+1) — prompt_ids[end] always exists since
