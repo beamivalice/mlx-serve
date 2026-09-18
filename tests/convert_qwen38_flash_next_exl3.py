@@ -432,10 +432,23 @@ def restack_from_exl3(src_dir: str | Path, pack_dir: str | Path, dst: str | Path
             raise RuntimeError(f"not K4 packed dim {tshape}")
         suh_shape = list(header_of(e0["suh"][0])[0][e0["suh"][1]]["shape"])
         svh_shape = list(header_of(e0["svh"][0])[0][e0["svh"][1]]["shape"])
+        tdtype = h0[e0["trellis"][1]]["dtype"]
+
+        def check(suffix, want_shape, want_dtype, ei):
+            fname, key = experts[ei][suffix]
+            meta = header_of(fname)[0][key]
+            if list(meta["shape"]) != list(want_shape) or meta["dtype"] != want_dtype:
+                raise RuntimeError(
+                    f"{key} is {meta['dtype']}{list(meta['shape'])}, expected {want_dtype}{list(want_shape)}"
+                )
+
         stacked_t = np.empty((n_exp, *tshape), dtype=np.uint16)
         stacked_suh = np.empty((n_exp, *suh_shape), dtype=np.float16)
         stacked_svh = np.empty((n_exp, *svh_shape), dtype=np.float16)
         for ei in range(n_exp):
+            check("trellis", tshape, tdtype, ei)
+            check("suh", suh_shape, "F16", ei)
+            check("svh", svh_shape, "F16", ei)
             tf, tk = experts[ei]["trellis"]
             hf, ho = header_of(tf)
             tb = _raw_bytes(src_dir / tf, hf, tk, ho)
@@ -681,20 +694,26 @@ class RestackTests(unittest.TestCase):
             "language_model.mtp.layers.0.mlp.switch_mlp.down_proj.svh",
         )
 
-    def test_restack_two_experts_into_stacked_banks(self):
+    def _write_case(self, td, *, odd_expert=None):
         rng = np.random.default_rng(4)
-        with tempfile.TemporaryDirectory() as td:
-            td = Path(td)
-            src, pack, dst = td / "src", td / "pack", td / "out"
-            src.mkdir(); pack.mkdir()
-            e, h, i = 2, 128, 128
+        src, pack, dst = td / "src", td / "pack", td / "out"
+        src.mkdir(); pack.mkdir()
+        e, h, i = 2, 128, 256
+        if True:
             tensors = {}
             for ei in range(e):
                 for proj, inn, outn in (("gate", h, i), ("up", h, i), ("down", i, h)):
                     base = f"model.language_model.layers.0.mlp.experts.{ei}.{proj}_proj"
                     trellis = rng.integers(0, 65535, (inn // 16, outn // 16, PACKED_K4), dtype=np.uint16)
-                    tensors[base + ".trellis"] = ("I16", trellis.shape, trellis.tobytes())
-                    tensors[base + ".suh"] = ("F16", (inn,), np.zeros(inn, np.float16).tobytes())
+                    tshape = trellis.shape
+                    suh_dtype = "F16"
+                    if odd_expert is not None and ei == odd_expert[0] and proj == "gate":
+                        if odd_expert[1] == "shape":
+                            tshape = (outn // 16, inn // 16, PACKED_K4)
+                        else:
+                            suh_dtype = "BF16"
+                    tensors[base + ".trellis"] = ("I16", tshape, trellis.tobytes())
+                    tensors[base + ".suh"] = (suh_dtype, (inn,), np.zeros(inn, np.float16).tobytes())
                     tensors[base + ".svh"] = ("F16", (outn,), np.ones(outn, np.float16).tobytes())
                     tensors[base + ".mul1"] = ("I32", (), np.int32(1).tobytes())
             write_safetensors_raw(str(src / "model-00001-of-00001.safetensors"), tensors)
@@ -741,6 +760,12 @@ class RestackTests(unittest.TestCase):
             }))
             (pack / "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
             (pack / "tokenizer.json").write_text("{}")
+        return src, pack, dst, e, h, i
+
+    def test_restack_two_experts_into_stacked_banks(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            src, pack, dst, e, h, i = self._write_case(td)
             restack_from_exl3(src, pack, dst)
             cfg = json.loads((dst / "config.json").read_text())
             self.assertEqual(cfg["expert_quant"]["codebook"], "mul1")
@@ -767,6 +792,15 @@ class RestackTests(unittest.TestCase):
                 os.stat(dst / "model-00001.safetensors").st_ino,
                 os.stat(pack / "model-00001.safetensors").st_ino,
             )
+
+    def test_an_expert_whose_own_header_disagrees_is_refused(self):
+        # Every expert is read with expert 0's shape and dtype; a source whose
+        # element count matches but whose header does not must not restack.
+        for odd in (("shape",), ("dtype",)):
+            with tempfile.TemporaryDirectory() as td:
+                src, pack, dst, _, _, _ = self._write_case(Path(td), odd_expert=(1, odd[0]))
+                with self.assertRaises(RuntimeError):
+                    restack_from_exl3(src, pack, dst)
 
 
 class ResumeTests(unittest.TestCase):
