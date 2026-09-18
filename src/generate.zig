@@ -15564,6 +15564,7 @@ test "mtpEvCostsFor: G17 profiles are explicit and env tuning stays generic" {
 
     const qwen4 = Generator.mtpEvCostsForProfile(.g17_nax_qwen4_q4_gs64, null);
     try testing.expectEqual(Generator.MTP_EV_G17_NAX_QWEN4_Q4_GS64_COSTS, qwen4);
+    try testing.expect(!std.meta.eql(generic, qwen4));
 
     // An explicit four-value override retains its historical meaning instead
     // of inheriting an implicit hardware-only third region, for every profile.

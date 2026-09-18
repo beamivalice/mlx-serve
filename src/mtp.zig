@@ -39,6 +39,7 @@ const ane_mod = @import("ane.zig");
 const Transformer = transformer_mod.Transformer;
 const KVCache = transformer_mod.KVCache;
 const Weights = model_mod.Weights;
+const expert_quant = @import("expert_quant.zig");
 
 /// Default draft depth (tokens drafted per round). Flipped 1 -> 3 after the
 /// round-v2 rebuild made rejected drafts ~free (scalar-anchor rollback + the
@@ -173,7 +174,9 @@ pub fn qwen4G17CostProfileForFingerprint(
     trunk_group_size: u32,
     head_packs_match: bool,
     nax_lane_live: bool,
+    expert_layout: expert_quant.Layout,
 ) MtpCostProfile {
+    if (expert_layout != .quantized_split) return .generic;
     if (!trunk_affine or trunk_bits != 4 or trunk_group_size != 64) return .generic;
     if (!head_packs_match) return .generic;
     if (!nax_lane_live) return .generic;
@@ -375,6 +378,7 @@ pub fn qwen4G17CostProfile(target: *const Transformer) MtpCostProfile {
 /// override. The original all-4-bit classifier retains its existing scope.
 pub fn qwen4G17CostProfileForKv(target: *const Transformer, kv: transformer_mod.KVQuantConfig) MtpCostProfile {
     if (!qwen4G17EnvEnabled()) return .generic;
+    if (target.config.expert_layout == .exl3_k4) return .generic;
     const head = if (target.qwen4_mtp) |*h| h else return .generic;
     const cfg = &target.config;
     const geometry = Qwen4MixedGeometry{
@@ -410,6 +414,7 @@ pub fn qwen4G17CostProfileForKv(target: *const Transformer, kv: transformer_mod.
         cfg.quant_group_size,
         packs,
         transformer_mod.naxLaneEnvEnabled() and transformer_mod.verifyQmmNaxAvailable(),
+        cfg.expert_layout,
     );
     if (profile != .generic and !qwen4_g17_profile_logged) {
         qwen4_g17_profile_logged = true;
@@ -3963,12 +3968,25 @@ test "mtp: M5 NAX cost profiles require exact sidecar and draft-head quant geome
     // never reach the sidecar fingerprint path above. Only the measured
     // uniform affine-4/gs-64 runtime with the NAX lane live is calibrated;
     // every degraded condition falls back to generic, one at a time.
-    try testing.expectEqual(MtpCostProfile.g17_nax_qwen4_q4_gs64, qwen4G17CostProfileForFingerprint(true, 4, 64, true, true));
-    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForFingerprint(false, 4, 64, true, true));
-    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForFingerprint(true, 8, 64, true, true));
-    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForFingerprint(true, 4, 32, true, true));
-    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForFingerprint(true, 4, 64, false, true));
-    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForFingerprint(true, 4, 64, true, false));
+    try testing.expectEqual(MtpCostProfile.g17_nax_qwen4_q4_gs64, qwen4G17CostProfileForFingerprint(true, 4, 64, true, true, .quantized_split));
+    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForFingerprint(false, 4, 64, true, true, .quantized_split));
+    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForFingerprint(true, 8, 64, true, true, .quantized_split));
+    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForFingerprint(true, 4, 32, true, true, .quantized_split));
+    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForFingerprint(true, 4, 64, false, true, .quantized_split));
+    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForFingerprint(true, 4, 64, true, false, .quantized_split));
+    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForFingerprint(true, 4, 64, true, true, .exl3_k4));
+    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForFingerprint(true, 4, 64, true, true, .bf16_fused));
+
+    var xfm: Transformer = undefined;
+    xfm.config = .{
+        .expert_layout = .exl3_k4,
+        .quant_mode = .affine,
+        .quant_bits = 4,
+        .quant_group_size = 64,
+        .hidden_size = 2560,
+    };
+    xfm.qwen4_mtp = null;
+    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForKv(&xfm, transformer_mod.KVQuantConfig.affine(8)));
 
     var sidecar = try mk.qlinear(IN, OUT, 8, 32, s);
     defer sidecar.deinit();
