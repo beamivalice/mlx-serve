@@ -69,6 +69,12 @@ pub fn parseExpertQuant(obj: std.json.ObjectMap) !Exl3Spec {
 /// `quantized_split` the MLX pack's nine (three projections x weight/scales/biases).
 pub const Layout = enum { bf16_fused, quantized_split, exl3_k4 };
 
+pub const REDUCE_BANK_TOPK: u32 = 32;
+
+pub fn admitExl3TopK(topk: u32) !void {
+    if (topk > REDUCE_BANK_TOPK) return error.Exl3TopKExceedsReduceBank;
+}
+
 pub const Component = enum(u4) {
     gate_w,
     gate_s,
@@ -470,6 +476,14 @@ test "routed expert layout is read off the weight map" {
     try t.expect(isRoutedExpertKey(.exl3_k4, "language_model.model.layers.3.mlp.switch_mlp.gate_proj.trellis"));
     try t.expect(isRoutedExpertKey(.exl3_k4, "language_model.mtp.layers.0.mlp.switch_mlp.down_proj.suh"));
     try t.expect(!isRoutedExpertKey(.exl3_k4, "language_model.model.layers.3.mlp.shared_expert.down_proj.weight"));
+}
+
+test "exl3 top-k above reduce-bank is a named refusal" {
+    const t = std.testing;
+    try admitExl3TopK(10);
+    try admitExl3TopK(16);
+    try admitExl3TopK(32);
+    try t.expectError(error.Exl3TopKExceedsReduceBank, admitExl3TopK(33));
 }
 
 test "exl3 expert_quant admits uniform K4 mul1 and refuses any other codebook or k" {

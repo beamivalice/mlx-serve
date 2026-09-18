@@ -12863,6 +12863,7 @@ test "every load refusal the registry preserves answers under its own name" {
         "ExpertStreamingUnsupportedLayout",
         "ExpertSlabImportCopied",
         "ExpertLayoutUnsupported",
+        "Exl3TopKExceedsReduceBank",
     };
     for (names) |name| {
         const refusal = loadRefusalFor(model_registry_mod.ModelRegistry.loadErrorFromName(name)) orelse {
@@ -12875,6 +12876,7 @@ test "every load refusal the registry preserves answers under its own name" {
     try t.expectEqualStrings("expert_streaming_unsupported_layout", loadRefusalFor(error.ExpertStreamingUnsupportedLayout).?.type);
     try t.expectEqualStrings("expert_slab_import_copied", loadRefusalFor(error.ExpertSlabImportCopied).?.type);
     try t.expectEqualStrings("expert_layout_unsupported", loadRefusalFor(error.ExpertLayoutUnsupported).?.type);
+    try t.expectEqualStrings("exl3_topk_exceeds_reduce_bank", loadRefusalFor(error.Exl3TopKExceedsReduceBank).?.type);
     try t.expect(loadRefusalFor(error.LoadFailed) == null);
     try t.expect(loadRefusalFor(error.UnknownModelId) == null);
 }
@@ -12891,6 +12893,7 @@ pub fn loadRefusalFor(err: anyerror) ?LoadRefusal {
         error.ExpertStreamingUnsupportedLayout => .{ .type = "expert_streaming_unsupported_layout", .message = "This qwen4_exp checkpoint has no expert layout this build can stream: the fused bf16 banks or the nine quantized banks are missing or incomplete. Re-download the pack, or serve a pack this build supports." },
         error.ExpertSlabImportCopied => .{ .type = "expert_slab_import_copied", .message = "MLX copied the expert slab instead of aliasing it, so this machine cannot stream experts zero-copy. Report the Mac model and macOS version." },
         error.ExpertLayoutUnsupported => .{ .type = "expert_layout_unsupported", .message = "This qwen4_exp checkpoint's routed experts are not a uniform EXL3 K4 MUL1 pack this build can load. Re-convert with k=4 and codebook mul1, or serve an affine pack." },
+        error.Exl3TopKExceedsReduceBank => .{ .type = "exl3_topk_exceeds_reduce_bank", .message = "This EXL3 pack's num_experts_per_tok exceeds the decode reduce-bank (32). Re-convert with top-k <= 32." },
         error.SsdBudgetBelowResident => .{ .type = "ssd_budget_below_resident", .message = "--ssd-budget-gb leaves no room for an expert cache after the resident trunk, the prefill union and the fill buffers. Raise the budget." },
         error.SsdBudgetExceedsWiredLimit => .{ .type = "ssd_budget_exceeds_wired_limit", .message = "--ssd-budget-gb plus the planned KV cache exceeds the machine's residency limit. Raise iogpu.wired_limit_mb (the server log names the value) or lower the budget." },
         else => null,

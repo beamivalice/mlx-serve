@@ -1377,6 +1377,7 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
                 defer parsed.deinit();
                 if (parsed.value != .object) return error.ExpertLayoutUnsupported;
                 _ = try expert_quant.parseExpertQuant(parsed.value.object);
+                try expert_quant.admitExl3TopK(config.num_experts_per_tok);
                 log.info("[expert-exl3] engaged\n", .{});
             }
         }
