@@ -30653,19 +30653,30 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
             // `mlx_matmul`; they no-op on already-quantized AND on empty handles.
             const stream_bank = shouldStreamExpertBank(&config, prefix);
             const exl3 = config.expert_layout == .exl3_k4;
+            const switch_bank: SwitchMlpBank = if (stream_bank) .{
+                .gate_w = mlx.mlx_array_new(),
+                .gate_s = mlx.mlx_array_new(),
+                .gate_b = mlx.mlx_array_new(),
+                .up_w = mlx.mlx_array_new(),
+                .up_s = mlx.mlx_array_new(),
+                .up_b = mlx.mlx_array_new(),
+                .down_w = mlx.mlx_array_new(),
+                .down_s = mlx.mlx_array_new(),
+                .down_b = mlx.mlx_array_new(),
+            } else try loadSwitchMlpBank(weights, name_buf, prefix, li, exl3);
             lw.mlp = .{ .moe = .{
                 .router_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.gate.weight"),
                 .router_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.scales") orelse mlx.mlx_array_new(),
                 .router_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.biases") orelse mlx.mlx_array_new(),
-                .switch_gate_w = if (stream_bank) mlx.mlx_array_new() else try getLayerWeight(weights, name_buf, prefix, li, if (exl3) "mlp.switch_mlp.gate_proj.trellis" else "mlp.switch_mlp.gate_proj.weight"),
-                .switch_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, if (exl3) "mlp.switch_mlp.gate_proj.suh" else "mlp.switch_mlp.gate_proj.scales") orelse mlx.mlx_array_new(),
-                .switch_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, if (exl3) "mlp.switch_mlp.gate_proj.svh" else "mlp.switch_mlp.gate_proj.biases") orelse mlx.mlx_array_new(),
-                .switch_up_w = if (stream_bank) mlx.mlx_array_new() else try getLayerWeight(weights, name_buf, prefix, li, if (exl3) "mlp.switch_mlp.up_proj.trellis" else "mlp.switch_mlp.up_proj.weight"),
-                .switch_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, if (exl3) "mlp.switch_mlp.up_proj.suh" else "mlp.switch_mlp.up_proj.scales") orelse mlx.mlx_array_new(),
-                .switch_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, if (exl3) "mlp.switch_mlp.up_proj.svh" else "mlp.switch_mlp.up_proj.biases") orelse mlx.mlx_array_new(),
-                .switch_down_w = if (stream_bank) mlx.mlx_array_new() else try getLayerWeight(weights, name_buf, prefix, li, if (exl3) "mlp.switch_mlp.down_proj.trellis" else "mlp.switch_mlp.down_proj.weight"),
-                .switch_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, if (exl3) "mlp.switch_mlp.down_proj.suh" else "mlp.switch_mlp.down_proj.scales") orelse mlx.mlx_array_new(),
-                .switch_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, if (exl3) "mlp.switch_mlp.down_proj.svh" else "mlp.switch_mlp.down_proj.biases") orelse mlx.mlx_array_new(),
+                .switch_gate_w = switch_bank.gate_w,
+                .switch_gate_s = switch_bank.gate_s,
+                .switch_gate_b = switch_bank.gate_b,
+                .switch_up_w = switch_bank.up_w,
+                .switch_up_s = switch_bank.up_s,
+                .switch_up_b = switch_bank.up_b,
+                .switch_down_w = switch_bank.down_w,
+                .switch_down_s = switch_bank.down_s,
+                .switch_down_b = switch_bank.down_b,
                 .shared_gate_w = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.gate_proj.weight") orelse mlx.mlx_array_new(),
                 .shared_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.gate_proj.scales") orelse mlx.mlx_array_new(),
                 .shared_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.gate_proj.biases") orelse mlx.mlx_array_new(),
@@ -38313,6 +38324,259 @@ test "a missing weight is a load ERROR, not a process exit (issue #217)" {
     try std.testing.expectError(error.MissingWeight, getWeightFmt(&w, &buf, "{s}.norm.weight", "model"));
 }
 
+test "MTP EXL3 switch_mlp binds restacked trellis/suh/svh under the head prefix" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    const put = struct {
+        fn add(w: *Weights, name: []const u8, dtype: mlx.mlx_dtype, shape: []const c_int, st: mlx.mlx_stream) !void {
+            var arr = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_zeros(&arr, shape.ptr, @intCast(shape.len), dtype, st));
+            try w.map.put(try w.allocator.dupe(u8, name), arr);
+        }
+    }.add;
+    var w = Weights.init(t.allocator);
+    defer w.deinit();
+    const trellis = [_]c_int{ 4, 8, 8, 64 };
+    const suh = [_]c_int{ 4, 128 };
+    const svh = [_]c_int{ 4, 128 };
+    for ([_][]const u8{ "gate", "up", "down" }) |proj| {
+        var tbuf: [96]u8 = undefined;
+        const tk = try std.fmt.bufPrint(&tbuf, "language_model.mtp.layers.0.mlp.switch_mlp.{s}_proj.trellis", .{proj});
+        try put(&w, tk, .uint16, &trellis, s);
+        const sk = try std.fmt.bufPrint(&tbuf, "language_model.mtp.layers.0.mlp.switch_mlp.{s}_proj.suh", .{proj});
+        try put(&w, sk, .float16, &suh, s);
+        const vk = try std.fmt.bufPrint(&tbuf, "language_model.mtp.layers.0.mlp.switch_mlp.{s}_proj.svh", .{proj});
+        try put(&w, vk, .float16, &svh, s);
+    }
+    var buf: [256]u8 = undefined;
+    const bank = try loadSwitchMlpBank(&w, &buf, "language_model.mtp", 0, true);
+    try t.expectEqual(@as(usize, 4), mlx.getShape(bank.gate_w).len);
+    try t.expectEqual(@as(c_int, 4), mlx.getShape(bank.gate_w)[0]);
+    try t.expectEqual(mlx.mlx_dtype.uint16, mlx.mlx_array_dtype(bank.gate_w));
+    try t.expectEqual(mlx.mlx_dtype.float16, mlx.mlx_array_dtype(bank.gate_s));
+    try t.expectEqual(mlx.mlx_dtype.float16, mlx.mlx_array_dtype(bank.gate_b));
+    try t.expectEqualSlices(c_int, mlx.getShape(bank.gate_w), mlx.getShape(bank.up_w));
+    try t.expectEqualSlices(c_int, mlx.getShape(bank.down_s), mlx.getShape(bank.gate_s));
+}
+
+test "MTP EXL3 switch_mlp refuses a missing restacked tensor by MissingWeight" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    const put = struct {
+        fn add(w: *Weights, name: []const u8, dtype: mlx.mlx_dtype, shape: []const c_int, st: mlx.mlx_stream) !void {
+            var arr = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_zeros(&arr, shape.ptr, @intCast(shape.len), dtype, st));
+            try w.map.put(try w.allocator.dupe(u8, name), arr);
+        }
+    }.add;
+    var w = Weights.init(t.allocator);
+    defer w.deinit();
+    const trellis = [_]c_int{ 4, 8, 8, 64 };
+    const svh = [_]c_int{ 4, 128 };
+    for ([_][]const u8{ "gate", "up", "down" }) |proj| {
+        var tbuf: [96]u8 = undefined;
+        const tk = try std.fmt.bufPrint(&tbuf, "language_model.mtp.layers.0.mlp.switch_mlp.{s}_proj.trellis", .{proj});
+        try put(&w, tk, .uint16, &trellis, s);
+        const vk = try std.fmt.bufPrint(&tbuf, "language_model.mtp.layers.0.mlp.switch_mlp.{s}_proj.svh", .{proj});
+        try put(&w, vk, .float16, &svh, s);
+    }
+    var buf: [256]u8 = undefined;
+    try t.expectError(error.MissingWeight, loadSwitchMlpBank(&w, &buf, "language_model.mtp", 0, true));
+}
+
+test "MTP EXL3 mtpMoeRows refuses a verify wider than 16 by MtpExl3RowsTooWide" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    var xfm: Transformer = undefined;
+    xfm.s = s;
+    xfm.config = .{
+        .expert_layout = .exl3_k4,
+        .num_experts = 4,
+        .num_experts_per_tok = 4,
+        .hidden_size = 8,
+        .moe_intermediate_size = 8,
+        .quant_bits = 0,
+        .quant_group_size = 64,
+        .quant_mode = .affine,
+    };
+    xfm.one = mlx.mlx_array_new_float(1.0);
+    defer _ = mlx.mlx_array_free(xfm.one);
+    xfm.bits_cache = .{};
+    xfm.compiled_moe_routing = null;
+    xfm.cost_trace_active = false;
+    var mw: MoeMlpWeights = .{
+        .router_w = mlx.mlx_array_new(),
+        .router_s = mlx.mlx_array_new(),
+        .router_b = mlx.mlx_array_new(),
+        .switch_gate_w = mlx.mlx_array_new(),
+        .switch_gate_s = mlx.mlx_array_new(),
+        .switch_gate_b = mlx.mlx_array_new(),
+        .switch_up_w = mlx.mlx_array_new(),
+        .switch_up_s = mlx.mlx_array_new(),
+        .switch_up_b = mlx.mlx_array_new(),
+        .switch_down_w = mlx.mlx_array_new(),
+        .switch_down_s = mlx.mlx_array_new(),
+        .switch_down_b = mlx.mlx_array_new(),
+        .shared_gate_w = mlx.mlx_array_new(),
+        .shared_gate_s = mlx.mlx_array_new(),
+        .shared_gate_b = mlx.mlx_array_new(),
+        .shared_up_w = mlx.mlx_array_new(),
+        .shared_up_s = mlx.mlx_array_new(),
+        .shared_up_b = mlx.mlx_array_new(),
+        .shared_down_w = mlx.mlx_array_new(),
+        .shared_down_s = mlx.mlx_array_new(),
+        .shared_down_b = mlx.mlx_array_new(),
+    };
+    defer {
+        const arrs = [_]mlx.mlx_array{
+            mw.router_w,      mw.router_s,      mw.router_b,
+            mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b,
+            mw.switch_up_w,   mw.switch_up_s,   mw.switch_up_b,
+            mw.switch_down_w, mw.switch_down_s, mw.switch_down_b,
+            mw.shared_gate_w, mw.shared_gate_s, mw.shared_gate_b,
+            mw.shared_up_w,   mw.shared_up_s,   mw.shared_up_b,
+            mw.shared_down_w, mw.shared_down_s, mw.shared_down_b,
+        };
+        for (arrs) |a| _ = mlx.mlx_array_free(a);
+    }
+    const shape = [_]c_int{ 17, 1, 8 };
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_zeros(&x, &shape, 3, .float16, s));
+    try t.expectError(error.Exl3MtpRowsExceedDecode, xfm.mtpMoeRows(x, &mw));
+}
+
+test "MTP EXL3 mtpMoeRows fused rows match N solo calls on the same kernel" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    const exl3 = @import("expert_exl3.zig");
+    const fixture = @embedFile("fixtures/exl3_k4_linear.safetensors");
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const header_len = std.mem.readInt(u64, fixture[0..8], .little);
+    const header = fixture[8 .. 8 + header_len];
+    const data = fixture[8 + header_len ..];
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, header, .{});
+    defer parsed.deinit();
+    const trellis_meta = parsed.value.object.get("trellis").?.object;
+    const suh_meta = parsed.value.object.get("suh").?.object;
+    const svh_meta = parsed.value.object.get("svh").?.object;
+    const t0: usize = @intCast(trellis_meta.get("data_offsets").?.array.items[0].integer);
+    const t1: usize = @intCast(trellis_meta.get("data_offsets").?.array.items[1].integer);
+    const s0: usize = @intCast(suh_meta.get("data_offsets").?.array.items[0].integer);
+    const s1: usize = @intCast(suh_meta.get("data_offsets").?.array.items[1].integer);
+    const v0: usize = @intCast(svh_meta.get("data_offsets").?.array.items[0].integer);
+    const v1: usize = @intCast(svh_meta.get("data_offsets").?.array.items[1].integer);
+    const trellis_bits = std.mem.bytesAsSlice(u16, data[t0..t1]);
+    const suh_bits = std.mem.bytesAsSlice(u16, data[s0..s1]);
+    const svh_bits = std.mem.bytesAsSlice(u16, data[v0..v1]);
+    const E: usize = 4;
+    const dim: usize = 128;
+    const rows: usize = 8;
+    const tile_n = 8 * 8 * 64;
+    const stacked_t = try alloc.alloc(u16, E * tile_n);
+    const stacked_suh = try alloc.alloc(u16, E * dim);
+    const stacked_svh = try alloc.alloc(u16, E * dim);
+    for (0..E) |e| {
+        @memcpy(stacked_t[e * tile_n ..][0..tile_n], trellis_bits);
+        @memcpy(stacked_suh[e * dim ..][0..dim], suh_bits);
+        @memcpy(stacked_svh[e * dim ..][0..dim], svh_bits);
+    }
+    var prng = std.Random.DefaultPrng.init(47);
+    const rnd = prng.random();
+    const xh = try alloc.alloc(u16, rows * dim);
+    for (xh) |*v| v.* = exl3.f32ToF16Bits(rnd.float(f32) * 2 - 1);
+    const rw = try alloc.alloc(u16, dim * E);
+    for (rw) |*v| v.* = exl3.f32ToF16Bits(rnd.float(f32) * 0.05);
+    var xfm: Transformer = undefined;
+    xfm.s = s;
+    xfm.config = .{
+        .expert_layout = .exl3_k4,
+        .num_experts = @intCast(E),
+        .num_experts_per_tok = @intCast(E),
+        .hidden_size = @intCast(dim),
+        .moe_intermediate_size = @intCast(dim),
+        .quant_bits = 0,
+        .quant_group_size = 64,
+        .quant_mode = .affine,
+    };
+    xfm.one = mlx.mlx_array_new_float(1.0);
+    defer _ = mlx.mlx_array_free(xfm.one);
+    xfm.bits_cache = .{};
+    xfm.compiled_moe_routing = null;
+    xfm.cost_trace_active = false;
+    const tr = mlx.mlx_array_new_data(stacked_t.ptr, &[_]c_int{ @intCast(E), 8, 8, 64 }, 4, .uint16);
+    defer _ = mlx.mlx_array_free(tr);
+    const suh = mlx.mlx_array_new_data(stacked_suh.ptr, &[_]c_int{ @intCast(E), @intCast(dim) }, 2, .float16);
+    defer _ = mlx.mlx_array_free(suh);
+    const svh = mlx.mlx_array_new_data(stacked_svh.ptr, &[_]c_int{ @intCast(E), @intCast(dim) }, 2, .float16);
+    defer _ = mlx.mlx_array_free(svh);
+    const router = mlx.mlx_array_new_data(rw.ptr, &[_]c_int{ @intCast(dim), @intCast(E) }, 2, .float16);
+    defer _ = mlx.mlx_array_free(router);
+    const empty = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(empty);
+    var mw: MoeMlpWeights = .{
+        .router_w = router,
+        .router_s = empty,
+        .router_b = empty,
+        .switch_gate_w = tr,
+        .switch_gate_s = suh,
+        .switch_gate_b = svh,
+        .switch_up_w = tr,
+        .switch_up_s = suh,
+        .switch_up_b = svh,
+        .switch_down_w = tr,
+        .switch_down_s = suh,
+        .switch_down_b = svh,
+        .shared_gate_w = empty,
+        .shared_gate_s = empty,
+        .shared_gate_b = empty,
+        .shared_up_w = empty,
+        .shared_up_s = empty,
+        .shared_up_b = empty,
+        .shared_down_w = empty,
+        .shared_down_s = empty,
+        .shared_down_b = empty,
+    };
+    const x_arr = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ @intCast(rows), 1, @intCast(dim) }, 3, .float16);
+    defer _ = mlx.mlx_array_free(x_arr);
+    try mlx.check(mlx.mlx_array_eval(tr));
+    try mlx.check(mlx.mlx_array_eval(suh));
+    try mlx.check(mlx.mlx_array_eval(svh));
+    try mlx.check(mlx.mlx_array_eval(router));
+    try mlx.check(mlx.mlx_array_eval(x_arr));
+    expert_exl3_kernels.resetFusedDispatchCount();
+    const fused = try xfm.mtpMoeRows(x_arr, &mw);
+    defer _ = mlx.mlx_array_free(fused);
+    const n_disp = expert_exl3_kernels.fusedDispatchCount();
+    var c_f = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(c_f);
+    try mlx.check(mlx.mlx_contiguous(&c_f, fused, false, s));
+    try mlx.check(mlx.mlx_array_eval(c_f));
+    const sf = mlx.mlx_array_data_float16(c_f) orelse return error.F16Unreadable;
+    var r: usize = 0;
+    while (r < rows) : (r += 1) {
+        const x1 = mlx.mlx_array_new_data(xh[r * dim ..][0..dim].ptr, &[_]c_int{ 1, 1, @intCast(dim) }, 3, .float16);
+        defer _ = mlx.mlx_array_free(x1);
+        const solo = try xfm.mtpMoeRows(x1, &mw);
+        defer _ = mlx.mlx_array_free(solo);
+        var c_s = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(c_s);
+        try mlx.check(mlx.mlx_contiguous(&c_s, solo, false, s));
+        try mlx.check(mlx.mlx_array_eval(c_s));
+        const ss = mlx.mlx_array_data_float16(c_s) orelse return error.F16Unreadable;
+        for (0..dim) |i| {
+            const a: u16 = @bitCast(sf[r * dim + i]);
+            const b: u16 = @bitCast(ss[i]);
+            try t.expectEqual(b, a);
+        }
+    }
+    try t.expectEqual(@as(u32, 5), n_disp);
+}
+
+
 /// `{prefix}.{base}.{suffix}` with a RUNTIME base — the embedding table's name
 /// is the checkpoint's (embed_tokens / word_embeddings / embed / embeddings)
 /// and its three lookups must agree, which a comptime format can't express
@@ -38343,6 +38607,45 @@ fn getLayerWeight(weights: *const Weights, buf: *[256]u8, prefix: []const u8, la
     return weights.get(name) orelse {
         log.err("MISSING WEIGHT: {s}\n", .{name});
         return error.MissingWeight;
+    };
+}
+
+const SwitchMlpBank = struct {
+    gate_w: mlx.mlx_array,
+    gate_s: mlx.mlx_array,
+    gate_b: mlx.mlx_array,
+    up_w: mlx.mlx_array,
+    up_s: mlx.mlx_array,
+    up_b: mlx.mlx_array,
+    down_w: mlx.mlx_array,
+    down_s: mlx.mlx_array,
+    down_b: mlx.mlx_array,
+};
+
+fn loadSwitchMlpBank(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, exl3: bool) error{MissingWeight}!SwitchMlpBank {
+    if (exl3) {
+        return .{
+            .gate_w = try getLayerWeight(weights, buf, prefix, layer, "mlp.switch_mlp.gate_proj.trellis"),
+            .gate_s = try getLayerWeight(weights, buf, prefix, layer, "mlp.switch_mlp.gate_proj.suh"),
+            .gate_b = try getLayerWeight(weights, buf, prefix, layer, "mlp.switch_mlp.gate_proj.svh"),
+            .up_w = try getLayerWeight(weights, buf, prefix, layer, "mlp.switch_mlp.up_proj.trellis"),
+            .up_s = try getLayerWeight(weights, buf, prefix, layer, "mlp.switch_mlp.up_proj.suh"),
+            .up_b = try getLayerWeight(weights, buf, prefix, layer, "mlp.switch_mlp.up_proj.svh"),
+            .down_w = try getLayerWeight(weights, buf, prefix, layer, "mlp.switch_mlp.down_proj.trellis"),
+            .down_s = try getLayerWeight(weights, buf, prefix, layer, "mlp.switch_mlp.down_proj.suh"),
+            .down_b = try getLayerWeight(weights, buf, prefix, layer, "mlp.switch_mlp.down_proj.svh"),
+        };
+    }
+    return .{
+        .gate_w = try getLayerWeight(weights, buf, prefix, layer, "mlp.switch_mlp.gate_proj.weight"),
+        .gate_s = getLayerWeightOpt(weights, buf, prefix, layer, "mlp.switch_mlp.gate_proj.scales") orelse mlx.mlx_array_new(),
+        .gate_b = getLayerWeightOpt(weights, buf, prefix, layer, "mlp.switch_mlp.gate_proj.biases") orelse mlx.mlx_array_new(),
+        .up_w = try getLayerWeight(weights, buf, prefix, layer, "mlp.switch_mlp.up_proj.weight"),
+        .up_s = getLayerWeightOpt(weights, buf, prefix, layer, "mlp.switch_mlp.up_proj.scales") orelse mlx.mlx_array_new(),
+        .up_b = getLayerWeightOpt(weights, buf, prefix, layer, "mlp.switch_mlp.up_proj.biases") orelse mlx.mlx_array_new(),
+        .down_w = try getLayerWeight(weights, buf, prefix, layer, "mlp.switch_mlp.down_proj.weight"),
+        .down_s = getLayerWeightOpt(weights, buf, prefix, layer, "mlp.switch_mlp.down_proj.scales") orelse mlx.mlx_array_new(),
+        .down_b = getLayerWeightOpt(weights, buf, prefix, layer, "mlp.switch_mlp.down_proj.biases") orelse mlx.mlx_array_new(),
     };
 }
 
