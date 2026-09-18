@@ -2709,6 +2709,7 @@ pub fn moeSwigluHost(
     in_tiles_h: usize,
     out_tiles_i: usize,
 ) ![]f32 {
+    const kbits = exl3.kFromPackedDim(packed_n) orelse return error.BadExl3Shape;
     const topk = slots.len;
     const y = try alloc.alloc(f32, hidden);
     @memset(y, 0);
@@ -2731,13 +2732,13 @@ pub fn moeSwigluHost(
         const g_off = e * tstride_gu;
         const u_off = e * tstride_gu;
         const d_off = e * tstride_d;
-        exl3.project(x, gate_t[g_off..][0..tstride_gu], gate_suh[e * hidden ..][0..hidden], gate_svh[e * inter ..][0..inter], hidden, inter, 4, .mul1, transformed, inner[0..inter], gate_y);
-        exl3.project(x, up_t[u_off..][0..tstride_gu], up_suh[e * hidden ..][0..hidden], up_svh[e * inter ..][0..inter], hidden, inter, 4, .mul1, transformed, inner[0..inter], up_y);
+        exl3.project(x, gate_t[g_off..][0..tstride_gu], gate_suh[e * hidden ..][0..hidden], gate_svh[e * inter ..][0..inter], hidden, inter, kbits, .mul1, transformed, inner[0..inter], gate_y);
+        exl3.project(x, up_t[u_off..][0..tstride_gu], up_suh[e * hidden ..][0..hidden], up_svh[e * inter ..][0..inter], hidden, inter, kbits, .mul1, transformed, inner[0..inter], up_y);
         for (0..inter) |i| {
             const g = gate_y[i];
             h[i] = (g / (1.0 + @exp(-g))) * up_y[i];
         }
-        exl3.project(h, down_t[d_off..][0..tstride_d], down_suh[e * inter ..][0..inter], down_svh[e * hidden ..][0..hidden], inter, hidden, 4, .mul1, inner[0..inter], transformed, down_y);
+        exl3.project(h, down_t[d_off..][0..tstride_d], down_suh[e * inter ..][0..inter], down_svh[e * hidden ..][0..hidden], inter, hidden, kbits, .mul1, inner[0..inter], transformed, down_y);
         const w = weights[k];
         for (0..hidden) |i| y[i] += w * down_y[i];
     }
@@ -5325,4 +5326,78 @@ test "exl3 a diagnostic env switch set to nothing is off" {
     try t.expect(!diagEnvValueOn("0"));
     try t.expect(!diagEnvValueOn(""));
     try t.expect(diagEnvValueOn("1"));
+}
+
+test "exl3 the host SwiGLU oracle decodes at the K its packed dim names" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const dim: usize = 128;
+    const tiles: usize = dim / 16;
+    const E: usize = 2;
+    const k: u32 = 3;
+    const packed_n = exl3.packedHalfwords(k);
+    const stride = tiles * tiles * packed_n;
+    // Sized for K4 so a K4 misread stays inside the buffer and shows as a value.
+    const room = tiles * tiles * exl3.packedHalfwords(4);
+    var prng = std.Random.DefaultPrng.init(3);
+    const rnd = prng.random();
+    const banks = try alloc.alloc(u16, 3 * E * room);
+    for (banks) |*v| v.* = @truncate(rnd.int(u32));
+    const gate_t = banks[0 .. E * room];
+    const up_t = banks[E * room .. 2 * E * room];
+    const down_t = banks[2 * E * room ..];
+    const scales = try alloc.alloc(u16, 6 * E * dim);
+    for (scales) |*v| v.* = exl3.f32ToF16Bits(rnd.float(f32) * 0.5 + 0.75);
+    const gate_suh = scales[0 .. E * dim];
+    const gate_svh = scales[E * dim .. 2 * E * dim];
+    const up_suh = scales[2 * E * dim .. 3 * E * dim];
+    const up_svh = scales[3 * E * dim .. 4 * E * dim];
+    const down_suh = scales[4 * E * dim .. 5 * E * dim];
+    const down_svh = scales[5 * E * dim ..];
+    const x = try alloc.alloc(f32, dim);
+    for (x) |*v| v.* = rnd.float(f32) * 2 - 1;
+    const slots = [_]u32{ 1, 0 };
+    const weights = [_]f32{ 0.625, 0.375 };
+    const got = try moeSwigluHost(
+        alloc,
+        x,
+        gate_t,
+        gate_suh,
+        gate_svh,
+        up_t,
+        up_suh,
+        up_svh,
+        down_t,
+        down_suh,
+        down_svh,
+        &slots,
+        &weights,
+        dim,
+        dim,
+        packed_n,
+        tiles,
+        tiles,
+    );
+    const want = try alloc.alloc(f32, dim);
+    @memset(want, 0);
+    const scratch_a = try alloc.alloc(f32, dim);
+    const scratch_b = try alloc.alloc(f32, dim);
+    const gate_y = try alloc.alloc(f32, dim);
+    const up_y = try alloc.alloc(f32, dim);
+    const h = try alloc.alloc(f32, dim);
+    const down_y = try alloc.alloc(f32, dim);
+    for (slots, weights) |e, w| {
+        const off = e * stride;
+        exl3.project(x, gate_t[off..][0..stride], gate_suh[e * dim ..][0..dim], gate_svh[e * dim ..][0..dim], dim, dim, k, .mul1, scratch_a, scratch_b, gate_y);
+        exl3.project(x, up_t[off..][0..stride], up_suh[e * dim ..][0..dim], up_svh[e * dim ..][0..dim], dim, dim, k, .mul1, scratch_a, scratch_b, up_y);
+        for (0..dim) |i| {
+            const g = gate_y[i];
+            h[i] = (g / (1.0 + @exp(-g))) * up_y[i];
+        }
+        exl3.project(h, down_t[off..][0..stride], down_suh[e * dim ..][0..dim], down_svh[e * dim ..][0..dim], dim, dim, k, .mul1, scratch_a, scratch_b, down_y);
+        for (0..dim) |i| want[i] += w * down_y[i];
+    }
+    try t.expectEqualSlices(f32, want, got);
 }
