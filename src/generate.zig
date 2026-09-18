@@ -2793,7 +2793,13 @@ pub const Generator = struct {
                     _ = mlx.mlx_eval(eval_vec);
                 }
                 _ = mlx.mlx_clear_cache();
-                if (trace_enabled) eval_ns += prefill_sw.read() - eval_start_ns;
+                if (trace_enabled) {
+                    const eval_dt = prefill_sw.read() - eval_start_ns;
+                    eval_ns += eval_dt;
+                    var mem_buf: [256]u8 = undefined;
+                    const line = formatPrefillMemLine(&mem_buf, pos, end, eval_dt / std.time.ns_per_ms, mlxPrefillMem());
+                    std.debug.print("{s}", .{line});
+                }
 
                 // This chunk's latch, read before anything persists it, snapshots it or yields
                 // the thread: Metal returns zeros before it aborts, so a later read let the
@@ -13548,6 +13554,38 @@ test "tokensPerSec basic and zero-time" {
     try testing.expectApproxEqAbs(@as(f64, 100.0), tokensPerSec(50, std.time.ns_per_s / 2), 1e-6);
     // Zero elapsed → 0, never inf/NaN.
     try testing.expectEqual(@as(f64, 0.0), tokensPerSec(100, 0));
+}
+
+const PrefillMem = struct { active: usize, cache: usize, peak: usize };
+
+fn mlxPrefillMem() PrefillMem {
+    var active: usize = 0;
+    var cache: usize = 0;
+    var peak: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active);
+    _ = mlx.mlx_get_cache_memory(&cache);
+    _ = mlx.mlx_get_peak_memory(&peak);
+    return .{ .active = active, .cache = cache, .peak = peak };
+}
+
+fn formatPrefillMemLine(buf: []u8, pos: usize, end: usize, eval_ms: u64, mem: PrefillMem) []const u8 {
+    return std.fmt.bufPrint(buf, "  [prefill-trace] mem pos={d} end={d} eval_ms={d} active_bytes={d} cache_bytes={d} peak_bytes={d}\n", .{
+        pos,
+        end,
+        eval_ms,
+        mem.active,
+        mem.cache,
+        mem.peak,
+    }) catch "";
+}
+
+test "prefill-trace mem line names active_bytes and cache_bytes" {
+    var buf: [256]u8 = undefined;
+    const line = formatPrefillMemLine(&buf, 8192, 16384, 12, .{ .active = 11, .cache = 22, .peak = 33 });
+    try std.testing.expect(std.mem.indexOf(u8, line, "active_bytes=11") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "cache_bytes=22") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "peak_bytes=33") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "eval_ms=12") != null);
 }
 
 test "prefillTokensPerSec divides by uncached tokens" {
