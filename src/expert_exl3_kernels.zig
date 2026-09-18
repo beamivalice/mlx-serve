@@ -703,21 +703,39 @@ const GEMM_WINDOW_ROWS: c_int = 32;
 /// own `n > WIN` guard still admits the window and the extra rows go unwritten.
 const GEMM_WINDOW_MAX_ROWS: c_int = 32;
 
+var gemm_win_cached: ?c_int = null;
+var gemm_align_cached: ?bool = null;
+
+/// null = not a window these kernels run, so the default stands.
+fn resolveGemmWindowRows(raw: ?[]const u8) ?c_int {
+    const v = raw orelse return null;
+    const n = std.fmt.parseInt(c_int, v, 10) catch return null;
+    if (n < 1 or n > GEMM_WINDOW_MAX_ROWS) return null;
+    return n;
+}
+
 fn gemmWindowRows() c_int {
-    if (std.c.getenv("MLX_SERVE_EXL3_GEMM_WIN")) |p| {
-        const v = std.mem.span(p);
-        if (v.len >= 2 and v[0] == '3' and v[1] == '2') return 32;
-        if (v.len >= 2 and v[0] == '1' and v[1] == '6') return 16;
-    }
-    return GEMM_WINDOW_ROWS;
+    if (gemm_win_cached) |v| return v;
+    const v = blk: {
+        const p = std.c.getenv("MLX_SERVE_EXL3_GEMM_WIN") orelse break :blk GEMM_WINDOW_ROWS;
+        const raw = std.mem.span(p);
+        if (resolveGemmWindowRows(raw)) |n| break :blk n;
+        log.warn("[exl3] MLX_SERVE_EXL3_GEMM_WIN={s} is not a window in 1..{d}; keeping {d}\n", .{ raw, GEMM_WINDOW_MAX_ROWS, GEMM_WINDOW_ROWS });
+        break :blk GEMM_WINDOW_ROWS;
+    };
+    gemm_win_cached = v;
+    return v;
 }
 
 fn gemmWindowAligned() bool {
+    if (gemm_align_cached) |v| return v;
+    var on = true;
     if (std.c.getenv("MLX_SERVE_EXL3_WIN_ALIGN")) |p| {
         const v = std.mem.span(p);
-        if (v.len > 0 and v[0] == '0') return false;
+        if (v.len > 0 and v[0] == '0') on = false;
     }
-    return true;
+    gemm_align_cached = on;
+    return on;
 }
 var indexed_coop_cfgs: CfgCache(IndexedKey, 8) = .{};
 var prepare_cfgs: CfgCache(UnaryKey, 8) = .{};
@@ -4487,4 +4505,17 @@ test "exl3 a window wider than the kernel row capacity refuses" {
     const ok = try innerGemmSortedWin(s, x_arr, tr_arr, eid_a, 32);
     defer _ = mlx.mlx_array_free(ok);
     try t.expectEqual(@as(c_int, n), mlx.getShape(ok)[0]);
+}
+
+test "exl3 the GEMM window selector answers the window it was asked for" {
+    const t = std.testing;
+    try t.expectEqual(@as(?c_int, 4), resolveGemmWindowRows("4"));
+    try t.expectEqual(@as(?c_int, 8), resolveGemmWindowRows("8"));
+    try t.expectEqual(@as(?c_int, 16), resolveGemmWindowRows("16"));
+    try t.expectEqual(@as(?c_int, 32), resolveGemmWindowRows("32"));
+    try t.expectEqual(@as(?c_int, null), resolveGemmWindowRows(null));
+    try t.expectEqual(@as(?c_int, null), resolveGemmWindowRows(""));
+    try t.expectEqual(@as(?c_int, null), resolveGemmWindowRows("0"));
+    try t.expectEqual(@as(?c_int, null), resolveGemmWindowRows("64"));
+    try t.expectEqual(@as(?c_int, null), resolveGemmWindowRows("16x"));
 }
