@@ -2560,13 +2560,6 @@ test "exl3 K4 Metal inner GEMV matches the host tile decode" {
     }
 }
 
-test "exl3 down finish reduce keeps f32 through score fold" {
-    const t = std.testing;
-    try t.expect(std.mem.indexOf(u8, REDUCE_SOURCE, "threadgroup float vals") != null);
-    try t.expect(std.mem.indexOf(u8, REDUCE_SOURCE, "half a0") == null);
-    try t.expect(std.mem.indexOf(u8, REDUCE_SOURCE, "float a0") != null);
-}
-
 test "exl3 verify group union unique vs assignment count" {
     const t = std.testing;
     var eids: [20]u32 = undefined;
@@ -4608,4 +4601,70 @@ test "exl3 prefill output carries the activation dtype" {
         if (std.math.isFinite(p[j])) finite += 1;
     }
     try t.expectEqual(@as(usize, @intCast(rows * dim)), finite);
+}
+
+test "exl3 the decode reduce folds the scores in f32" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const E: c_int = 2;
+    const out_dim: c_int = 128;
+    const rows: c_int = 2;
+    const topk: c_int = 2;
+    const nslots: usize = @intCast(rows * topk);
+    const od: usize = @intCast(out_dim);
+    var prng = std.Random.DefaultPrng.init(37);
+    const rnd = prng.random();
+    const inner_h = try alloc.alloc(u16, nslots * od);
+    for (inner_h) |*v| v.* = exl3.f32ToF16Bits((rnd.float(f32) * 2 - 1) * 10);
+    // svh puts the per-slot partials past the f16 range while the score fold
+    // brings the answer back: an f16 bank saturates here, an f32 one does not.
+    const svh_h = try alloc.alloc(u16, @intCast(E * out_dim));
+    for (svh_h) |*v| v.* = exl3.f32ToF16Bits(60000.0);
+    const slots_h = try alloc.alloc(u32, nslots);
+    for (slots_h, 0..) |*v, i| v.* = @intCast(i % @as(usize, @intCast(E)));
+    const sc_h = try alloc.alloc(f32, nslots);
+    for (sc_h) |*v| v.* = 1e-4;
+    const inner = mlx.mlx_array_new_data(inner_h.ptr, &[_]c_int{ @intCast(nslots), out_dim }, 2, .float16);
+    defer _ = mlx.mlx_array_free(inner);
+    const svh = mlx.mlx_array_new_data(svh_h.ptr, &[_]c_int{ E, out_dim }, 2, .float16);
+    defer _ = mlx.mlx_array_free(svh);
+    const slots = mlx.mlx_array_new_data(slots_h.ptr, &[_]c_int{@intCast(nslots)}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(slots);
+    const scores = mlx.mlx_array_new_data(sc_h.ptr, &[_]c_int{@intCast(nslots)}, 1, .float32);
+    defer _ = mlx.mlx_array_free(scores);
+    const got = try downFinishReduce(s, inner, svh, slots, scores, out_dim, rows, topk, .float32);
+    defer _ = mlx.mlx_array_free(got);
+    var c = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(c);
+    try mlx.check(mlx.mlx_contiguous(&c, got, false, s));
+    try mlx.check(mlx.mlx_array_eval(c));
+    const gp = mlx.mlx_array_data_float32(c) orelse return error.F16Unreadable;
+    const nrows: usize = @intCast(rows);
+    const host = try alloc.alloc(f32, nrows * od);
+    @memset(host, 0);
+    var vec: [128]f32 = undefined;
+    const ntopk: usize = @intCast(topk);
+    for (0..nrows) |r| {
+        for (0..ntopk) |k| {
+            const slot = r * ntopk + k;
+            for (0..od) |j| vec[j] = exl3.f16BitsToF32(inner_h[slot * od + j]);
+            exl3.hadamard128(&vec);
+            const eid: usize = slots_h[slot];
+            for (0..od) |j| host[r * od + j] += vec[j] * exl3.f16BitsToF32(svh_h[eid * od + j]) * sc_h[slot];
+        }
+    }
+    var worst: f32 = 0;
+    for (host, 0..) |h, j| {
+        try t.expect(std.math.isFinite(gp[j]));
+        const rel = @abs(gp[j] - h) / @max(@abs(h), 1e-6);
+        if (rel > worst) worst = rel;
+    }
+    if (!(worst < 1e-4)) {
+        std.debug.print("exl3 reduce worst rel {d:.8}\n", .{worst});
+        return error.TestExpectedEqual;
+    }
 }
