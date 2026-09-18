@@ -693,8 +693,17 @@ fn gemmWindowRows() c_int {
     if (std.c.getenv("MLX_SERVE_EXL3_GEMM_WIN")) |p| {
         const v = std.mem.span(p);
         if (v.len >= 2 and v[0] == '3' and v[1] == '2') return 32;
+        if (v.len >= 2 and v[0] == '1' and v[1] == '6') return 16;
     }
     return GEMM_WINDOW_ROWS;
+}
+
+fn gemmWindowAligned() bool {
+    if (std.c.getenv("MLX_SERVE_EXL3_WIN_ALIGN")) |p| {
+        const v = std.mem.span(p);
+        if (v.len > 0 and v[0] == '0') return false;
+    }
+    return true;
 }
 var indexed_coop_cfgs: CfgCache(IndexedKey, 8) = .{};
 var prepare_cfgs: CfgCache(UnaryKey, 8) = .{};
@@ -898,13 +907,74 @@ fn buildWindowTableHost(s: mlx.mlx_stream, eids: mlx.mlx_array, n: c_int, win: c
     return .{ .starts = starts, .nlives = nlives, .nwin = @intCast(nwin_u) };
 }
 
+fn buildStrideTable(s: mlx.mlx_stream, n: c_int, win: c_int) !WindowTable {
+    const w: u32 = @intCast(win);
+    const nn: u32 = @intCast(n);
+    const nwin_u = (nn + w - 1) / w;
+    const sh = try std.heap.page_allocator.alloc(u32, nwin_u);
+    defer std.heap.page_allocator.free(sh);
+    const lh = try std.heap.page_allocator.alloc(u32, nwin_u);
+    defer std.heap.page_allocator.free(lh);
+    var i: u32 = 0;
+    while (i < nwin_u) : (i += 1) {
+        const st = i * w;
+        sh[i] = st;
+        lh[i] = @min(w, nn - st);
+    }
+    const starts_raw = mlx.mlx_array_new_data(sh.ptr, &[_]c_int{@intCast(nwin_u)}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(starts_raw);
+    const nlives_raw = mlx.mlx_array_new_data(lh.ptr, &[_]c_int{@intCast(nwin_u)}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(nlives_raw);
+    var starts = mlx.mlx_array_new();
+    var nlives = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_contiguous(&starts, starts_raw, false, s));
+    try mlx.check(mlx.mlx_contiguous(&nlives, nlives_raw, false, s));
+    try mlx.check(mlx.mlx_array_eval(starts));
+    try mlx.check(mlx.mlx_array_eval(nlives));
+    if (exl3UbenchOn()) {
+        std.debug.print("[exl3-ubench] win_table_stride nwin={d} n={d} win={d}\n", .{ nwin_u, n, win });
+    }
+    return .{ .starts = starts, .nlives = nlives, .nwin = @intCast(nwin_u) };
+}
+
+fn windowStats(ids: []const u32, win: u32, aligned: bool) struct { nwin: u32, mixed: u32, decodes: u32 } {
+    if (aligned) {
+        const runs = buildRuns(std.heap.page_allocator, ids) catch return .{ .nwin = 0, .mixed = 0, .decodes = 0 };
+        defer std.heap.page_allocator.free(runs.start);
+        defer std.heap.page_allocator.free(runs.len);
+        defer std.heap.page_allocator.free(runs.eid);
+        var nwin: u32 = 0;
+        var r: u32 = 0;
+        while (r < runs.n) : (r += 1) {
+            nwin += (runs.len[r] + win - 1) / win;
+        }
+        return .{ .nwin = nwin, .mixed = 0, .decodes = nwin };
+    }
+    const nwin = (@as(u32, @intCast(ids.len)) + win - 1) / win;
+    var mixed: u32 = 0;
+    var decodes: u32 = 0;
+    var w: u32 = 0;
+    while (w < nwin) : (w += 1) {
+        const st = w * win;
+        const nlive = @min(win, @as(u32, @intCast(ids.len)) - st);
+        var runs_here: u32 = 1;
+        var i: u32 = 1;
+        while (i < nlive) : (i += 1) {
+            if (ids[st + i] != ids[st + i - 1]) runs_here += 1;
+        }
+        decodes += runs_here;
+        if (runs_here > 1) mixed += 1;
+    }
+    return .{ .nwin = nwin, .mixed = mixed, .decodes = decodes };
+}
+
 pub fn innerGemmSorted(
     s: mlx.mlx_stream,
     x: mlx.mlx_array,
     trellis: mlx.mlx_array,
     eids: mlx.mlx_array,
 ) !mlx.mlx_array {
-    return innerGemmSortedWin(s, x, trellis, eids, gemmWindowRows());
+    return innerGemmSortedWinAlign(s, x, trellis, eids, gemmWindowRows(), gemmWindowAligned());
 }
 
 fn innerGemmSortedWin(
@@ -914,6 +984,17 @@ fn innerGemmSortedWin(
     eids: mlx.mlx_array,
     win: c_int,
 ) !mlx.mlx_array {
+    return innerGemmSortedWinAlign(s, x, trellis, eids, win, true);
+}
+
+fn innerGemmSortedWinAlign(
+    s: mlx.mlx_stream,
+    x: mlx.mlx_array,
+    trellis: mlx.mlx_array,
+    eids: mlx.mlx_array,
+    win: c_int,
+    aligned: bool,
+) !mlx.mlx_array {
     const xsh = mlx.getShape(x);
     const tsh = mlx.getShape(trellis);
     if (xsh.len != 2 or tsh.len != 4) return error.BadExl3Shape;
@@ -922,7 +1003,10 @@ fn innerGemmSortedWin(
     const in_dim = xsh[1];
     const out_dim = tsh[2] * 16;
     const out_tiles = tsh[2];
-    const tab = try buildWindowTable(s, eids, n, win);
+    const tab = if (aligned)
+        try buildWindowTable(s, eids, n, win)
+    else
+        try buildStrideTable(s, n, win);
     defer _ = mlx.mlx_array_free(tab.starts);
     defer _ = mlx.mlx_array_free(tab.nlives);
     const nwin = tab.nwin;
@@ -3474,6 +3558,73 @@ test "exl3 sorted GEMM 16-row windows match 4-row per row" {
     }
 }
 
+test "exl3 run-aligned windows match stride per row" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    const fixture = @embedFile("fixtures/exl3_k4_linear.safetensors");
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const header_len = std.mem.readInt(u64, fixture[0..8], .little);
+    const header = fixture[8 .. 8 + header_len];
+    const data = fixture[8 + header_len ..];
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, header, .{});
+    defer parsed.deinit();
+    const trellis_meta = parsed.value.object.get("trellis").?.object;
+    const t0: usize = @intCast(trellis_meta.get("data_offsets").?.array.items[0].integer);
+    const t1: usize = @intCast(trellis_meta.get("data_offsets").?.array.items[1].integer);
+    const trellis_bits = std.mem.bytesAsSlice(u16, data[t0..t1]);
+    const E: usize = 4;
+    const dim: usize = 128;
+    const n: usize = 40;
+    const tile_n = 8 * 8 * 64;
+    const stacked = try alloc.alloc(u16, E * tile_n);
+    for (0..E) |e| @memcpy(stacked[e * tile_n ..][0..tile_n], trellis_bits);
+    var prng = std.Random.DefaultPrng.init(101);
+    const rnd = prng.random();
+    const xh = try alloc.alloc(u16, n * dim);
+    for (xh) |*v| v.* = exl3.f32ToF16Bits(rnd.float(f32) * 2 - 1);
+    var eids: [40]u32 = undefined;
+    var i: usize = 0;
+    while (i < 7) : (i += 1) eids[i] = 0;
+    while (i < 23) : (i += 1) eids[i] = 1;
+    while (i < 27) : (i += 1) eids[i] = 2;
+    while (i < n) : (i += 1) eids[i] = 3;
+    const st = windowStats(eids[0..], 16, false);
+    const al = windowStats(eids[0..], 16, true);
+    try t.expect(st.mixed > 0);
+    try t.expectEqual(@as(u32, 0), al.mixed);
+    const x_arr = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ @intCast(n), @intCast(dim) }, 2, .float16);
+    defer _ = mlx.mlx_array_free(x_arr);
+    const tr_arr = mlx.mlx_array_new_data(stacked.ptr, &[_]c_int{ @intCast(E), 8, 8, 64 }, 4, .uint16);
+    defer _ = mlx.mlx_array_free(tr_arr);
+    const eid_a = mlx.mlx_array_new_data(&eids, &[_]c_int{@intCast(n)}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(eid_a);
+    const wins = [_]c_int{ 16, 32 };
+    for (wins) |w| {
+        const stride = try innerGemmSortedWinAlign(s, x_arr, tr_arr, eid_a, w, false);
+        defer _ = mlx.mlx_array_free(stride);
+        const aligned = try innerGemmSortedWinAlign(s, x_arr, tr_arr, eid_a, w, true);
+        defer _ = mlx.mlx_array_free(aligned);
+        var cs = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(cs);
+        var ca = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ca);
+        try mlx.check(mlx.mlx_contiguous(&cs, stride, false, s));
+        try mlx.check(mlx.mlx_contiguous(&ca, aligned, false, s));
+        try mlx.check(mlx.mlx_array_eval(cs));
+        try mlx.check(mlx.mlx_array_eval(ca));
+        const as = mlx.mlx_array_data_float16(cs) orelse return error.F16Unreadable;
+        const aa = mlx.mlx_array_data_float16(ca) orelse return error.F16Unreadable;
+        for (0..n * dim) |j| {
+            const bs: u16 = @bitCast(as[j]);
+            const ba: u16 = @bitCast(aa[j]);
+            try t.expectEqual(bs, ba);
+        }
+    }
+}
+
 test "exl3 sorted GEMM 32-row windows match 16-row per row" {
     const t = std.testing;
     const s = mlx.gpuStream();
@@ -3568,26 +3719,76 @@ test "exl3 window 16 vs 32 production C=2048" {
     try mlx.check(mlx.mlx_take_axis(&sorted, slots, order, 0, s));
     const xr = try repeatRows(s, x_arr, R, topk);
     defer _ = mlx.mlx_array_free(xr);
-    const w16 = try innerGemmSortedWin(s, xr, trg, sorted, 16);
-    try mlx.check(mlx.mlx_array_eval(w16));
-    _ = mlx.mlx_array_free(w16);
-    const w32 = try innerGemmSortedWin(s, xr, trg, sorted, 32);
-    try mlx.check(mlx.mlx_array_eval(w32));
-    _ = mlx.mlx_array_free(w32);
+    var sc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc);
+    try mlx.check(mlx.mlx_contiguous(&sc, sorted, false, s));
+    try mlx.check(mlx.mlx_array_eval(sc));
+    const nslots: usize = @intCast(R * topk);
+    const ids = try alloc.alloc(u32, nslots);
+    const sp = mlx.mlx_array_data_uint32(sc) orelse return error.F16Unreadable;
+    @memcpy(ids, sp[0..nslots]);
     const io = std.Io.Threaded.global_single_threaded.io();
-    var sw = io_util.Stopwatch.init(io);
-    const a16 = try innerGemmSortedWin(s, xr, trg, sorted, 16);
-    try mlx.check(mlx.mlx_array_eval(a16));
-    const ns16 = sw.read();
-    _ = mlx.mlx_array_free(a16);
-    sw = io_util.Stopwatch.init(io);
-    const a32 = try innerGemmSortedWin(s, xr, trg, sorted, 32);
-    try mlx.check(mlx.mlx_array_eval(a32));
-    const ns32 = sw.read();
-    _ = mlx.mlx_array_free(a32);
-    std.debug.print("run-aligned C=2048 win16 {d} us win32 {d} us\n", .{ ns16 / 1000, ns32 / 1000 });
-    try t.expect(ns16 > 0);
-    try t.expect(ns32 > 0);
+    const arms = [_]struct { win: c_int, aligned: bool, name: []const u8 }{
+        .{ .win = 16, .aligned = false, .name = "stride-16" },
+        .{ .win = 16, .aligned = true, .name = "aligned-16" },
+        .{ .win = 32, .aligned = true, .name = "aligned-32" },
+        .{ .win = 32, .aligned = false, .name = "stride-32" },
+    };
+    for (arms) |arm| {
+        const st = windowStats(ids, @intCast(arm.win), arm.aligned);
+        const warm = try innerGemmSortedWinAlign(s, xr, trg, sorted, arm.win, arm.aligned);
+        try mlx.check(mlx.mlx_array_eval(warm));
+        _ = mlx.mlx_array_free(warm);
+        var sw = io_util.Stopwatch.init(io);
+        const got = try innerGemmSortedWinAlign(s, xr, trg, sorted, arm.win, arm.aligned);
+        try mlx.check(mlx.mlx_array_eval(got));
+        const ns = sw.read();
+        _ = mlx.mlx_array_free(got);
+        std.debug.print("C=2048 {s} {d} us nwin={d} mixed={d} decodes={d}\n", .{
+            arm.name, ns / 1000, st.nwin, st.mixed, st.decodes,
+        });
+        try t.expect(ns > 0);
+    }
+    const R8: c_int = 8192;
+    const xh8 = try alloc.alloc(u16, @intCast(R8 * H));
+    const slots8 = try alloc.alloc(u32, @intCast(R8 * topk));
+    for (xh8) |*v| v.* = exl3.f32ToF16Bits(rnd.float(f32) * 0.1);
+    for (slots8) |*v| v.* = rnd.uintLessThan(u32, @intCast(E));
+    const x8 = mlx.mlx_array_new_data(xh8.ptr, &[_]c_int{ R8, H }, 2, .float16);
+    defer _ = mlx.mlx_array_free(x8);
+    const sl8 = mlx.mlx_array_new_data(slots8.ptr, &[_]c_int{R8 * topk}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(sl8);
+    var order8 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(order8);
+    try mlx.check(mlx.mlx_argsort_axis(&order8, sl8, 0, s));
+    var sorted8 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sorted8);
+    try mlx.check(mlx.mlx_take_axis(&sorted8, sl8, order8, 0, s));
+    const xr8 = try repeatRows(s, x8, R8, topk);
+    defer _ = mlx.mlx_array_free(xr8);
+    var sc8 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc8);
+    try mlx.check(mlx.mlx_contiguous(&sc8, sorted8, false, s));
+    try mlx.check(mlx.mlx_array_eval(sc8));
+    const n8: usize = @intCast(R8 * topk);
+    const ids8 = try alloc.alloc(u32, n8);
+    const sp8 = mlx.mlx_array_data_uint32(sc8) orelse return error.F16Unreadable;
+    @memcpy(ids8, sp8[0..n8]);
+    for (arms) |arm| {
+        const st = windowStats(ids8, @intCast(arm.win), arm.aligned);
+        const warm = try innerGemmSortedWinAlign(s, xr8, trg, sorted8, arm.win, arm.aligned);
+        try mlx.check(mlx.mlx_array_eval(warm));
+        _ = mlx.mlx_array_free(warm);
+        var sw = io_util.Stopwatch.init(io);
+        const got = try innerGemmSortedWinAlign(s, xr8, trg, sorted8, arm.win, arm.aligned);
+        try mlx.check(mlx.mlx_array_eval(got));
+        const ns = sw.read();
+        _ = mlx.mlx_array_free(got);
+        std.debug.print("C=8192 {s} {d} us nwin={d} mixed={d} decodes={d}\n", .{
+            arm.name, ns / 1000, st.nwin, st.mixed, st.decodes,
+        });
+        try t.expect(ns > 0);
+    }
 }
 
 test "exl3 moePrefill matches staged sorted chain" {
