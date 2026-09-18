@@ -20,8 +20,8 @@ fn pairSplitCount() u32 {
     if (pair_splits_force) |v| return v;
     if (pair_splits_env) |v| return v;
     const raw = std.c.getenv("MLX_SERVE_EXL3_PAIR_SPLITS");
-    const n: u32 = if (raw) |r| std.fmt.parseInt(u32, std.mem.sliceTo(r, 0), 10) catch 2 else 2;
-    const v: u32 = if (n == 1 or n == 2 or n == 4) n else 2;
+    const n: u32 = if (raw) |r| std.fmt.parseInt(u32, std.mem.sliceTo(r, 0), 10) catch 1 else 1;
+    const v: u32 = if (n == 1 or n == 2 or n == 4) n else 1;
     pair_splits_env = v;
     return v;
 }
