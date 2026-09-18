@@ -5,11 +5,19 @@ const exl3 = @import("expert_exl3.zig");
 const io_util = @import("io_util.zig");
 
 var ubench_force: bool = false;
+var ubench_env: ?bool = null;
+
+fn diagEnvValueOn(raw: ?[*:0]const u8) bool {
+    const v = raw orelse return false;
+    return v[0] != '0';
+}
 
 fn exl3UbenchOn() bool {
     if (ubench_force) return true;
-    const p = std.c.getenv("MLX_SERVE_EXL3_LAYER_UBENCH") orelse return false;
-    return p[0] == '1';
+    if (ubench_env) |v| return v;
+    const v = diagEnvValueOn(std.c.getenv("MLX_SERVE_EXL3_LAYER_UBENCH"));
+    ubench_env = v;
+    return v;
 }
 
 fn ubenchEval(a: mlx.mlx_array, name: []const u8) !void {
@@ -1485,22 +1493,22 @@ pub fn moeSwigluFused(
     const prep = try pairPrepare(s, x, gate_suh, up_suh, slots, hidden, nslots, topk);
     defer _ = mlx.mlx_array_free(prep[0]);
     defer _ = mlx.mlx_array_free(prep[1]);
-    try ubenchEval( prep[0], "pair_prepare");
+    try ubenchEval(prep[0], "pair_prepare");
     if (exl3UbenchOn()) try mlx.check(mlx.mlx_array_eval(prep[1]));
     const inners = try pairGemv(s, prep[0], prep[1], gate_t, up_t, slots, hidden, inter, nslots);
     defer _ = mlx.mlx_array_free(inners[0]);
     defer _ = mlx.mlx_array_free(inners[1]);
-    try ubenchEval( inners[0], "pair_gemv");
+    try ubenchEval(inners[0], "pair_gemv");
     if (exl3UbenchOn()) try mlx.check(mlx.mlx_array_eval(inners[1]));
     const down_x = try midSwigluPrep(s, inners[0], inners[1], gate_svh, up_svh, down_suh, slots, inter, nslots);
     defer _ = mlx.mlx_array_free(down_x);
-    try ubenchEval( down_x, "mid");
+    try ubenchEval(down_x, "mid");
     const down_inner = try indexedGemvCoopF16(s, down_x, down_t, slots);
     defer _ = mlx.mlx_array_free(down_inner);
-    try ubenchEval( down_inner, "down_gemv");
+    try ubenchEval(down_inner, "down_gemv");
     fused_dispatches += 1;
     const out = try downFinishReduce(s, down_inner, down_svh, slots, scores, hidden, rows, topk);
-    try ubenchEval( out, "reduce");
+    try ubenchEval(out, "reduce");
     return out;
 }
 
@@ -1562,7 +1570,7 @@ fn repeatRows(s: mlx.mlx_stream, x: mlx.mlx_array, rows: c_int, topk: c_int) !ml
     try mlx.check(mlx.mlx_broadcast_to(&wide, col, &shape, 2, s));
     var idx = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(idx);
-    try mlx.check(mlx.mlx_reshape(&idx, wide, &[_]c_int{ rows * topk }, 1, s));
+    try mlx.check(mlx.mlx_reshape(&idx, wide, &[_]c_int{rows * topk}, 1, s));
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_take_axis(&out, x, idx, 0, s));
@@ -1638,19 +1646,19 @@ pub fn moePrefill(
     var sorted_slots = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(sorted_slots);
     try mlx.check(mlx.mlx_take_axis(&sorted_slots, slots, order, 0, s));
-    try ubenchEval( sorted_slots, "sort");
+    try ubenchEval(sorted_slots, "sort");
     const g_prep = try prepareFromTokens(s, x, gate_suh, sorted_slots, order_u, hidden, nslots, topk);
     defer _ = mlx.mlx_array_free(g_prep);
     const u_prep = try prepareFromTokens(s, x, up_suh, sorted_slots, order_u, hidden, nslots, topk);
     defer _ = mlx.mlx_array_free(u_prep);
-    try ubenchEval( g_prep, "token_prepare");
+    try ubenchEval(g_prep, "token_prepare");
     if (exl3UbenchOn()) try mlx.check(mlx.mlx_array_eval(u_prep));
     const g_inner = try innerGemmSorted(s, g_prep, gate_t, sorted_slots);
     defer _ = mlx.mlx_array_free(g_inner);
-    try ubenchEval( g_inner, "gemm_gate");
+    try ubenchEval(g_inner, "gemm_gate");
     const u_inner = try innerGemmSorted(s, u_prep, up_t, sorted_slots);
     defer _ = mlx.mlx_array_free(u_inner);
-    try ubenchEval( u_inner, "gemm_up");
+    try ubenchEval(u_inner, "gemm_up");
     const g = try finishIndexed(s, g_inner, gate_svh, sorted_slots);
     defer _ = mlx.mlx_array_free(g);
     const u = try finishIndexed(s, u_inner, up_svh, sorted_slots);
@@ -1670,7 +1678,7 @@ pub fn moePrefill(
     try mlx.check(mlx.mlx_multiply(&h, silu, u, s));
     const d_sorted = try projectSortedWithRuns(s, h, down_t, down_suh, down_svh, sorted_slots);
     defer _ = mlx.mlx_array_free(d_sorted);
-    try ubenchEval( d_sorted, "gemm_down");
+    try ubenchEval(d_sorted, "gemm_down");
     var inv = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(inv);
     try mlx.check(mlx.mlx_argsort_axis(&inv, order, 0, s));
@@ -1678,7 +1686,7 @@ pub fn moePrefill(
     defer _ = mlx.mlx_array_free(inv_u);
     try mlx.check(mlx.mlx_astype(&inv_u, inv, .uint32, s));
     const out = try tokenReduce(s, d_sorted, inv_u, scores, hidden, rows, topk);
-    try ubenchEval( out, "token_reduce");
+    try ubenchEval(out, "token_reduce");
     return out;
 }
 
@@ -1959,11 +1967,11 @@ test "exl3 512-row prefill: decode-to-f16 gather_mm vs rows kernel" {
     for (scores_h) |*v| v.* = 0.5;
     const x_arr = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ R, dim }, 2, .float16);
     defer _ = mlx.mlx_array_free(x_arr);
-    const slots = mlx.mlx_array_new_data(slots_h.ptr, &[_]c_int{ R * topk }, 1, .uint32);
+    const slots = mlx.mlx_array_new_data(slots_h.ptr, &[_]c_int{R * topk}, 1, .uint32);
     defer _ = mlx.mlx_array_free(slots);
     const slots2 = mlx.mlx_array_new_data(slots_h.ptr, &[_]c_int{ R, topk }, 2, .uint32);
     defer _ = mlx.mlx_array_free(slots2);
-    const scores = mlx.mlx_array_new_data(scores_h.ptr, &[_]c_int{ R * topk }, 1, .float32);
+    const scores = mlx.mlx_array_new_data(scores_h.ptr, &[_]c_int{R * topk}, 1, .float32);
     defer _ = mlx.mlx_array_free(scores);
     const tr = mlx.mlx_array_new_data(stacked_t.ptr, &[_]c_int{ E, 8, 8, 64 }, 4, .uint16);
     defer _ = mlx.mlx_array_free(tr);
@@ -2075,9 +2083,9 @@ test "exl3 512-row production-shape sorted gemm vs affine gather_qmm" {
     for (scores_h) |*v| v.* = 0.5;
     const x_arr = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ R, H }, 2, .float16);
     defer _ = mlx.mlx_array_free(x_arr);
-    const slots = mlx.mlx_array_new_data(slots_h.ptr, &[_]c_int{ R * topk }, 1, .uint32);
+    const slots = mlx.mlx_array_new_data(slots_h.ptr, &[_]c_int{R * topk}, 1, .uint32);
     defer _ = mlx.mlx_array_free(slots);
-    const scores = mlx.mlx_array_new_data(scores_h.ptr, &[_]c_int{ R * topk }, 1, .float32);
+    const scores = mlx.mlx_array_new_data(scores_h.ptr, &[_]c_int{R * topk}, 1, .float32);
     defer _ = mlx.mlx_array_free(scores);
     const trg = mlx.mlx_array_new_data(tr_g.ptr, &[_]c_int{ E, H / 16, I / 16, 64 }, 4, .uint16);
     defer _ = mlx.mlx_array_free(trg);
@@ -2687,9 +2695,9 @@ test "exl3 512-row E=512 topk=10 layer within 2x affine" {
     for (scores_h) |*v| v.* = 0.5;
     const x_arr = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ R, H }, 2, .float16);
     defer _ = mlx.mlx_array_free(x_arr);
-    const slots = mlx.mlx_array_new_data(slots_h.ptr, &[_]c_int{ R * topk }, 1, .uint32);
+    const slots = mlx.mlx_array_new_data(slots_h.ptr, &[_]c_int{R * topk}, 1, .uint32);
     defer _ = mlx.mlx_array_free(slots);
-    const scores = mlx.mlx_array_new_data(scores_h.ptr, &[_]c_int{ R * topk }, 1, .float32);
+    const scores = mlx.mlx_array_new_data(scores_h.ptr, &[_]c_int{R * topk}, 1, .float32);
     defer _ = mlx.mlx_array_free(scores);
     const trg = mlx.mlx_array_new_data(tr_g.ptr, &[_]c_int{ E, H / 16, I / 16, 64 }, 4, .uint16);
     defer _ = mlx.mlx_array_free(trg);
