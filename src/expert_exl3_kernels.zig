@@ -6,6 +6,8 @@ const io_util = @import("io_util.zig");
 
 var ubench_force: bool = false;
 var ubench_env: ?bool = null;
+var swiglu_maxabs_env: ?bool = null;
+var swiglu_maxabs_dumped: bool = false;
 
 fn diagEnvValueOn(raw: ?[*:0]const u8) bool {
     const v = raw orelse return false;
@@ -28,6 +30,26 @@ fn ubenchEval(a: mlx.mlx_array, name: []const u8) !void {
     const ns = sw.read();
     std.debug.print("[exl3-ubench] {s} {d:.3} ms\n", .{ name, @as(f64, @floatFromInt(ns)) / 1e6 });
     log.info("[exl3-ubench] {s} {d:.3} ms\n", .{ name, @as(f64, @floatFromInt(ns)) / 1e6 });
+}
+
+fn swigluMaxabsOn() bool {
+    if (swiglu_maxabs_env) |v| return v;
+    const v = diagEnvValueOn(std.c.getenv("MLX_SERVE_EXL3_SWIGLU_MAXABS"));
+    swiglu_maxabs_env = v;
+    return v;
+}
+
+fn dumpAbsMax(s: mlx.mlx_stream, a: mlx.mlx_array, name: []const u8) !void {
+    var ab = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ab);
+    try mlx.check(mlx.mlx_abs(&ab, a, s));
+    var mx = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mx);
+    try mlx.check(mlx.mlx_max(&mx, ab, false, s));
+    try mlx.check(mlx.mlx_array_eval(mx));
+    var v: f32 = 0;
+    try mlx.check(mlx.mlx_array_item_float32(&v, mx));
+    log.info("[exl3-maxabs] {s} {d:.6}\n", .{ name, v });
 }
 
 pub const DECODE_ROWS_MAX: usize = 16;
@@ -602,10 +624,12 @@ const PairPrepKey = struct { in_dim: c_int, nslots: c_int, topk: c_int };
 const PairGemvKey = struct { in_dim: c_int, out_dim: c_int, nslots: c_int };
 const MidKey = struct { dim: c_int, nslots: c_int };
 const ReduceKey = struct { out_dim: c_int, rows: c_int, topk: c_int };
+const DecodeReduceKey = struct { out_dim: c_int, rows: c_int, topk: c_int, dtype: mlx.mlx_dtype };
 var pair_prep_cfgs: CfgCache(PairPrepKey, 8) = .{};
 var pair_gemv_cfgs: CfgCache(PairGemvKey, 8) = .{};
 var mid_cfgs: CfgCache(MidKey, 8) = .{};
-var reduce_cfgs: CfgCache(ReduceKey, 8) = .{};
+var reduce_cfgs: CfgCache(DecodeReduceKey, 8) = .{};
+var down_fused_cfgs: CfgCache(IndexedKey, 8) = .{};
 var token_prep_cfgs: CfgCache(PairPrepKey, 8) = .{};
 var token_pair_prep_cfgs: CfgCache(PairPrepKey, 8) = .{};
 var token_reduce_cfgs: CfgCache(ReduceKey, 8) = .{};
@@ -1088,6 +1112,200 @@ pub fn indexedGemvCoopF16(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_
     return out;
 }
 
+const DOWN_FUSED_SOURCE: [:0]const u8 =
+    \\threadgroup float partial[4 * 256];
+    \\threadgroup half prepared[uint(IDIM)];
+    \\uint ot = uint(threadgroup_position_in_grid.x);
+    \\uint slot = uint(threadgroup_position_in_grid.y);
+    \\uint split = uint(threadgroup_position_in_grid.z);
+    \\uint sg = uint(simdgroup_index_in_threadgroup);
+    \\uint lane = uint(thread_index_in_simdgroup);
+    \\uint lid = uint(thread_index_in_threadgroup);
+    \\constexpr uint TILE = 16u;
+    \\constexpr uint IT = uint(IDIM) / TILE;
+    \\constexpr uint OT = uint(ODIM) / TILE;
+    \\constexpr uint SGS = 4u;
+    \\constexpr uint SPLITS = 1u;
+    \\const uint eid = uint(slots[slot]);
+    \\const float sc = 0.08838834764831845f;
+    \\const uint nblocks = uint(IDIM) / 128u;
+    \\for (uint block = sg; block < nblocks; block += SGS) {
+    \\  const uint base = block * 128u;
+    \\  const size_t xb = (size_t)slot * (size_t)(IDIM) + base;
+    \\  const size_t sb = (size_t)eid * (size_t)(IDIM) + base;
+    \\  float4 v = float4(float(ig[xb + lane]), float(ig[xb + lane + 32u]), float(ig[xb + lane + 64u]), float(ig[xb + lane + 96u]));
+    \\  for (ushort bit = 1u; bit <= 16u; bit <<= 1u) {
+    \\    const float p0 = simd_shuffle_xor(v.x, bit);
+    \\    const float p1 = simd_shuffle_xor(v.y, bit);
+    \\    const float p2 = simd_shuffle_xor(v.z, bit);
+    \\    const float p3 = simd_shuffle_xor(v.w, bit);
+    \\    const bool lower = (lane & bit) == 0u;
+    \\    v.x = lower ? v.x + p0 : p0 - v.x;
+    \\    v.y = lower ? v.y + p1 : p1 - v.y;
+    \\    v.z = lower ? v.z + p2 : p2 - v.z;
+    \\    v.w = lower ? v.w + p3 : p3 - v.w;
+    \\  }
+    \\  float s0 = v.x + v.y;
+    \\  float s1 = v.x - v.y;
+    \\  float s2 = v.z + v.w;
+    \\  float s3 = v.z - v.w;
+    \\  const half g0 = half((s0 + s2) * sc * float(svhg[sb + lane]));
+    \\  const half g1 = half((s1 + s3) * sc * float(svhg[sb + lane + 32u]));
+    \\  const half g2 = half((s0 - s2) * sc * float(svhg[sb + lane + 64u]));
+    \\  const half g3 = half((s1 - s3) * sc * float(svhg[sb + lane + 96u]));
+    \\  v = float4(float(iu[xb + lane]), float(iu[xb + lane + 32u]), float(iu[xb + lane + 64u]), float(iu[xb + lane + 96u]));
+    \\  for (ushort bit = 1u; bit <= 16u; bit <<= 1u) {
+    \\    const float p0 = simd_shuffle_xor(v.x, bit);
+    \\    const float p1 = simd_shuffle_xor(v.y, bit);
+    \\    const float p2 = simd_shuffle_xor(v.z, bit);
+    \\    const float p3 = simd_shuffle_xor(v.w, bit);
+    \\    const bool lower = (lane & bit) == 0u;
+    \\    v.x = lower ? v.x + p0 : p0 - v.x;
+    \\    v.y = lower ? v.y + p1 : p1 - v.y;
+    \\    v.z = lower ? v.z + p2 : p2 - v.z;
+    \\    v.w = lower ? v.w + p3 : p3 - v.w;
+    \\  }
+    \\  s0 = v.x + v.y;
+    \\  s1 = v.x - v.y;
+    \\  s2 = v.z + v.w;
+    \\  s3 = v.z - v.w;
+    \\  const half u0 = half((s0 + s2) * sc * float(svhu[sb + lane]));
+    \\  const half u1 = half((s1 + s3) * sc * float(svhu[sb + lane + 32u]));
+    \\  const half u2 = half((s0 - s2) * sc * float(svhu[sb + lane + 64u]));
+    \\  const half u3 = half((s1 - s3) * sc * float(svhu[sb + lane + 96u]));
+    \\  const half ysig0 = 1 / (1 + exp(abs(g0)));
+    \\  const half ysig1 = 1 / (1 + exp(abs(g1)));
+    \\  const half ysig2 = 1 / (1 + exp(abs(g2)));
+    \\  const half ysig3 = 1 / (1 + exp(abs(g3)));
+    \\  const half sig0 = (g0 < 0) ? ysig0 : 1 - ysig0;
+    \\  const half sig1 = (g1 < 0) ? ysig1 : 1 - ysig1;
+    \\  const half sig2 = (g2 < 0) ? ysig2 : 1 - ysig2;
+    \\  const half sig3 = (g3 < 0) ? ysig3 : 1 - ysig3;
+    \\  const half silu0 = half(float(g0) * float(sig0));
+    \\  const half silu1 = half(float(g1) * float(sig1));
+    \\  const half silu2 = half(float(g2) * float(sig2));
+    \\  const half silu3 = half(float(g3) * float(sig3));
+    \\  const half h0 = half(float(silu0) * float(u0));
+    \\  const half h1 = half(float(silu1) * float(u1));
+    \\  const half h2 = half(float(silu2) * float(u2));
+    \\  const half h3 = half(float(silu3) * float(u3));
+    \\  v = float4(float(h0) * float(suhd[sb + lane]), float(h1) * float(suhd[sb + lane + 32u]), float(h2) * float(suhd[sb + lane + 64u]), float(h3) * float(suhd[sb + lane + 96u]));
+    \\  for (ushort bit = 1u; bit <= 16u; bit <<= 1u) {
+    \\    const float p0 = simd_shuffle_xor(v.x, bit);
+    \\    const float p1 = simd_shuffle_xor(v.y, bit);
+    \\    const float p2 = simd_shuffle_xor(v.z, bit);
+    \\    const float p3 = simd_shuffle_xor(v.w, bit);
+    \\    const bool lower = (lane & bit) == 0u;
+    \\    v.x = lower ? v.x + p0 : p0 - v.x;
+    \\    v.y = lower ? v.y + p1 : p1 - v.y;
+    \\    v.z = lower ? v.z + p2 : p2 - v.z;
+    \\    v.w = lower ? v.w + p3 : p3 - v.w;
+    \\  }
+    \\  s0 = v.x + v.y;
+    \\  s1 = v.x - v.y;
+    \\  s2 = v.z + v.w;
+    \\  s3 = v.z - v.w;
+    \\  prepared[base + lane] = half((s0 + s2) * sc);
+    \\  prepared[base + lane + 32u] = half((s1 + s3) * sc);
+    \\  prepared[base + lane + 64u] = half((s0 - s2) * sc);
+    \\  prepared[base + lane + 96u] = half((s1 - s3) * sc);
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\const uint tiles_per_split = (IT + SPLITS - 1u) / SPLITS;
+    \\const uint tk0 = split * tiles_per_split;
+    \\const uint tk1 = min(tk0 + tiles_per_split, IT);
+    \\const uint prow = (lane & 3u) * 2u;
+    \\const uint pcol = lane >> 2u;
+    \\uint pos[8];
+    \\pos[0] = prow * 16u + pcol;
+    \\pos[1] = (prow + 1u) * 16u + pcol;
+    \\pos[2] = (prow + 8u) * 16u + pcol;
+    \\pos[3] = (prow + 9u) * 16u + pcol;
+    \\pos[4] = prow * 16u + pcol + 8u;
+    \\pos[5] = (prow + 1u) * 16u + pcol + 8u;
+    \\pos[6] = (prow + 8u) * 16u + pcol + 8u;
+    \\pos[7] = (prow + 9u) * 16u + pcol + 8u;
+    \\const uint row0 = pos[0] >> 4u;
+    \\const uint row1 = pos[1] >> 4u;
+    \\const uint row2 = pos[2] >> 4u;
+    \\const uint row3 = pos[3] >> 4u;
+    \\float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    \\const device uint* trellis_e = (const device uint*)(trellis + ((size_t)eid * (size_t)IT * (size_t)OT) * 64u);
+    \\for (uint tk = tk0 + sg; tk < tk1; tk += SGS) {
+    \\  const device uint* words = trellis_e + ((size_t)tk * (size_t)OT + ot) * 32u;
+    \\  const ulong merged = ((ulong)words[(lane + 31u) & 31u] << 32) | (ulong)words[lane];
+    \\  const float in0 = float(prepared[tk * TILE + row0]);
+    \\  const float in1 = float(prepared[tk * TILE + row1]);
+    \\  const float in2 = float(prepared[tk * TILE + row2]);
+    \\  const float in3 = float(prepared[tk * TILE + row3]);
+    \\  const uint sh[8] = {28u, 24u, 20u, 16u, 12u, 8u, 4u, 0u};
+    \\  const float ins[8] = {in0, in1, in2, in3, in0, in1, in2, in3};
+    \\  for (uint p = 0u; p < 4u; p++) {
+    \\    const uint2 cw = uint2(uint(merged >> sh[p * 2u]), uint(merged >> sh[p * 2u + 1u])) & uint2(0xffffu);
+    \\    const uint2 mixed = cw * uint2(0x83DCD12Du);
+    \\    const uint2 pair_sums = (mixed & uint2(0x00FF00FFu)) + ((mixed >> uint2(8u)) & uint2(0x00FF00FFu));
+    \\    const uint2 byte_sum = uint2(0x6400u) + (pair_sums & uint2(0xFFFFu)) + (pair_sums >> uint2(16u));
+    \\    const half2 hh = as_type<half2>(ushort2(byte_sum & uint2(0xFFFFu)));
+    \\    const half2 inv = as_type<half2>(ushort2(0x1EEEu));
+    \\    const half2 bias = as_type<half2>(ushort2(0xC931u));
+    \\    const float2 w = float2(fma(hh, inv, bias));
+    \\    acc[p * 2u] = fma(ins[p * 2u], w.x, acc[p * 2u]);
+    \\    acc[p * 2u + 1u] = fma(ins[p * 2u + 1u], w.y, acc[p * 2u + 1u]);
+    \\  }
+    \\}
+    \\for (uint si = 0u; si < 8u; si++) {
+    \\  partial[sg * 256u + pos[si]] = acc[si];
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\if (lid < 16u) {
+    \\  float sum = 0.0f;
+    \\  for (uint r = 0u; r < 16u; r++) {
+    \\    const uint p = r * 16u + lid;
+    \\    for (uint g = 0u; g < SGS; g++) {
+    \\      sum += partial[g * 256u + p];
+    \\    }
+    \\  }
+    \\  y[(size_t)slot * (size_t)(ODIM) + ot * TILE + lid] = half(sum);
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+;
+
+fn downGemvFusedMid(
+    s: mlx.mlx_stream,
+    ig: mlx.mlx_array,
+    iu: mlx.mlx_array,
+    trellis: mlx.mlx_array,
+    svhg: mlx.mlx_array,
+    svhu: mlx.mlx_array,
+    suhd: mlx.mlx_array,
+    slots: mlx.mlx_array,
+    in_dim: c_int,
+    out_dim: c_int,
+    nslots: c_int,
+) !mlx.mlx_array {
+    const out_tiles = @divExact(out_dim, 16);
+    const key = IndexedKey{ .in_dim = in_dim, .out_dim = out_dim, .topk = nslots };
+    const cfg = down_fused_cfgs.get(key) orelse blk: {
+        const c = mlx.mlx_fast_metal_kernel_config_new();
+        const sh = [_]c_int{ nslots, out_dim };
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &sh, 2, .float16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, out_tiles * 128, nslots, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 128, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "IDIM", in_dim));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ODIM", out_dim));
+        down_fused_cfgs.put(key, c);
+        break :blk c;
+    };
+    const ins = [_][*:0]const u8{ "ig", "iu", "trellis", "svhg", "svhu", "suhd", "slots" };
+    const outs = [_][*:0]const u8{"y"};
+    const kernel = try getNamedKernel(&down_fused_kernel, "mlxserve_exl3_k4_down_fused", &ins, &outs, DOWN_FUSED_SOURCE, "");
+    const ov = try applyOuts(s, kernel, &.{ ig, iu, trellis, svhg, svhu, suhd, slots }, cfg, 1);
+    defer _ = mlx.mlx_vector_array_free(ov);
+    var a = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&a, ov, 0));
+    return a;
+}
+
 pub fn projectIndexed(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, slots: mlx.mlx_array) !mlx.mlx_array {
     const prepared = try prepareIndexed(s, x, suh, slots);
     defer _ = mlx.mlx_array_free(prepared);
@@ -1097,9 +1315,12 @@ pub fn projectIndexed(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_arra
 }
 
 const PAIR_PREPARE_SOURCE: [:0]const u8 =
-    \\uint block = uint(threadgroup_position_in_grid.x);
+    \\uint tg = uint(threadgroup_position_in_grid.x);
     \\uint slot = uint(threadgroup_position_in_grid.y);
+    \\uint sg = uint(simdgroup_index_in_threadgroup);
     \\ushort lane = thread_index_in_simdgroup;
+    \\const uint block = tg * 4u + sg;
+    \\if (block >= uint(IDIM) / 128u) return;
     \\const uint eid = uint(slots[slot]);
     \\const uint base = block * 128u;
     \\const uint row = slot / uint(TOPK);
@@ -1368,10 +1589,10 @@ const REDUCE_SOURCE: [:0]const u8 =
     \\    a3 += half(float(vals[k * 128u + lane + 96u]) * w);
     \\  }
     \\  const size_t yb = (size_t)row * (size_t)(ODIM) + base;
-    \\  y[yb + lane] = a0;
-    \\  y[yb + lane + 32u] = a1;
-    \\  y[yb + lane + 64u] = a2;
-    \\  y[yb + lane + 96u] = a3;
+    \\  y[yb + lane] = T(a0);
+    \\  y[yb + lane + 32u] = T(a1);
+    \\  y[yb + lane + 64u] = T(a2);
+    \\  y[yb + lane + 96u] = T(a3);
     \\}
 ;
 
@@ -1379,6 +1600,7 @@ var pair_prepare_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var pair_gemv_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var mid_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var reduce_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var down_fused_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
 fn getNamedKernel(slot: *?mlx.mlx_fast_metal_kernel, name: [*:0]const u8, ins: []const [*:0]const u8, outs: []const [*:0]const u8, source: [:0]const u8, header: [:0]const u8) !mlx.mlx_fast_metal_kernel {
     if (slot.*) |k| return k;
@@ -1419,9 +1641,9 @@ fn pairPrepare(s: mlx.mlx_stream, x: mlx.mlx_array, suhg: mlx.mlx_array, suhu: m
         const sh = [_]c_int{ nslots, in_dim };
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &sh, 2, .float16));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &sh, 2, .float16));
-        const blocks = @divExact(in_dim, 128);
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, 32 * blocks, nslots, 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 32, 1, 1));
+        const tgs = @divFloor(in_dim + 511, 512);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, 128 * tgs, nslots, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 128, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "IDIM", in_dim));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "TOPK", topk));
         pair_prep_cfgs.put(key, c);
@@ -1489,16 +1711,17 @@ fn midSwigluPrep(s: mlx.mlx_stream, ig: mlx.mlx_array, iu: mlx.mlx_array, svhg: 
     return a;
 }
 
-fn downFinishReduce(s: mlx.mlx_stream, inner: mlx.mlx_array, svh: mlx.mlx_array, slots: mlx.mlx_array, scores: mlx.mlx_array, out_dim: c_int, rows: c_int, topk: c_int) !mlx.mlx_array {
-    const key = ReduceKey{ .out_dim = out_dim, .rows = rows, .topk = topk };
+fn downFinishReduce(s: mlx.mlx_stream, inner: mlx.mlx_array, svh: mlx.mlx_array, slots: mlx.mlx_array, scores: mlx.mlx_array, out_dim: c_int, rows: c_int, topk: c_int, out_dtype: mlx.mlx_dtype) !mlx.mlx_array {
+    const key = DecodeReduceKey{ .out_dim = out_dim, .rows = rows, .topk = topk, .dtype = out_dtype };
     const cfg = reduce_cfgs.get(key) orelse blk: {
         const c = mlx.mlx_fast_metal_kernel_config_new();
         const sh = if (rows == 1) [_]c_int{out_dim} ++ [_]c_int{0} else [_]c_int{ rows, out_dim };
         const ndim: usize = if (rows == 1) 1 else 2;
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &sh, ndim, .float16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &sh, ndim, out_dtype));
         const blocks = @divExact(out_dim, 128);
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, 32 * topk * blocks, rows, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 32 * topk, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "T", out_dtype));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ODIM", out_dim));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "TOPK", topk));
         reduce_cfgs.put(key, c);
@@ -1624,6 +1847,7 @@ pub fn moeSwigluFused(
     down_svh: mlx.mlx_array,
     slots: mlx.mlx_array,
     scores: mlx.mlx_array,
+    out_dtype: mlx.mlx_dtype,
 ) !mlx.mlx_array {
     const xsh = mlx.getShape(x);
     const ssh = mlx.getShape(slots);
@@ -1643,14 +1867,15 @@ pub fn moeSwigluFused(
     defer _ = mlx.mlx_array_free(inners[1]);
     try ubenchEval(inners[0], "pair_gemv");
     if (exl3UbenchOn()) try mlx.check(mlx.mlx_array_eval(inners[1]));
-    const down_x = try midSwigluPrep(s, inners[0], inners[1], gate_svh, up_svh, down_suh, slots, inter, nslots);
-    defer _ = mlx.mlx_array_free(down_x);
-    try ubenchEval(down_x, "mid");
-    const down_inner = try indexedGemvCoopF16(s, down_x, down_t, slots);
+    if (swigluMaxabsOn() and !swiglu_maxabs_dumped) {
+        try dumpAbsMax(s, inners[0], "ig");
+        try dumpAbsMax(s, inners[1], "iu");
+        swiglu_maxabs_dumped = true;
+    }
+    const down_inner = try downGemvFusedMid(s, inners[0], inners[1], down_t, gate_svh, up_svh, down_suh, slots, inter, hidden, nslots);
     defer _ = mlx.mlx_array_free(down_inner);
     try ubenchEval(down_inner, "down_gemv");
-    fused_dispatches += 1;
-    const out = try downFinishReduce(s, down_inner, down_svh, slots, scores, hidden, rows, topk);
+    const out = try downFinishReduce(s, down_inner, down_svh, slots, scores, hidden, rows, topk, out_dtype);
     try ubenchEval(out, "reduce");
     if (applyUbenchOn()) {
         apply_host_layers += 1;
@@ -2549,12 +2774,12 @@ test "exl3 layer ubench production shape rows=1 and 512" {
     const scores1 = mlx.mlx_array_new_data(sc1.ptr, &[_]c_int{@intCast(topk)}, 1, .float32);
     defer _ = mlx.mlx_array_free(scores1);
     ubench_force = false;
-    const warm1 = try moeSwigluFused(s, x1, trg, sugh, svgi, trg, sugh, svgi, trd, sudi, svdh, slots1, scores1);
+    const warm1 = try moeSwigluFused(s, x1, trg, sugh, svgi, trg, sugh, svgi, trd, sudi, svdh, slots1, scores1, .float16);
     try mlx.check(mlx.mlx_array_eval(warm1));
     _ = mlx.mlx_array_free(warm1);
     ubench_force = true;
     std.debug.print("exl3-ubench rows=1\n", .{});
-    const y1 = try moeSwigluFused(s, x1, trg, sugh, svgi, trg, sugh, svgi, trd, sudi, svdh, slots1, scores1);
+    const y1 = try moeSwigluFused(s, x1, trg, sugh, svgi, trg, sugh, svgi, trd, sudi, svdh, slots1, scores1, .float16);
     try mlx.check(mlx.mlx_array_eval(y1));
     _ = mlx.mlx_array_free(y1);
     const R: usize = 512;
@@ -2639,7 +2864,7 @@ test "exl3 fused decode chain matches indexed SwiGLU on one row" {
     const scores = mlx.mlx_array_new_data(scores_h.ptr, &[_]c_int{@intCast(topk)}, 1, .float32);
     defer _ = mlx.mlx_array_free(scores);
     resetFusedDispatchCount();
-    const fused = try moeSwigluFused(s, x_arr, tr, suh, svh, tr, suh, svh, tr, suh, svh, slots, scores);
+    const fused = try moeSwigluFused(s, x_arr, tr, suh, svh, tr, suh, svh, tr, suh, svh, slots, scores, .float16);
     defer _ = mlx.mlx_array_free(fused);
     const n_disp = fusedDispatchCount();
     const old = try moeSwigluIndexed(s, x_arr, tr, suh, svh, tr, suh, svh, tr, suh, svh, slots, scores);
@@ -2659,7 +2884,10 @@ test "exl3 fused decode chain matches indexed SwiGLU on one row" {
         const b: u16 = @bitCast(so[i]);
         try t.expectEqual(b, a);
     }
-    try t.expectEqual(@as(u32, 5), n_disp);
+    try t.expectEqual(@as(u32, 4), n_disp);
+    const fused_bf = try moeSwigluFused(s, x_arr, tr, suh, svh, tr, suh, svh, tr, suh, svh, slots, scores, .bfloat16);
+    defer _ = mlx.mlx_array_free(fused_bf);
+    try t.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(fused_bf));
 }
 
 test "exl3 fused decode chain rows match N solo calls" {
@@ -2720,7 +2948,7 @@ test "exl3 fused decode chain rows match N solo calls" {
     defer _ = mlx.mlx_array_free(slots);
     const scores = mlx.mlx_array_new_data(scores_h.ptr, &[_]c_int{@intCast(rows * topk)}, 1, .float32);
     defer _ = mlx.mlx_array_free(scores);
-    const fused = try moeSwigluFused(s, x_arr, tr, suh, svh, tr, suh, svh, tr, suh, svh, slots, scores);
+    const fused = try moeSwigluFused(s, x_arr, tr, suh, svh, tr, suh, svh, tr, suh, svh, slots, scores, .float16);
     defer _ = mlx.mlx_array_free(fused);
     var c_f = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(c_f);

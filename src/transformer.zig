@@ -28667,6 +28667,7 @@ pub const Transformer = struct {
         try mlx.check(mlx.mlx_astype(&slots_u, slots, .uint32, self.s));
         const rows: usize = @intCast(B * S);
         if (rows <= expert_exl3_kernels.DECODE_ROWS_MAX) {
+            const xd = mlx.mlx_array_dtype(expert_x);
             const y = try expert_exl3_kernels.moeSwigluFused(
                 self.s,
                 x2,
@@ -28681,12 +28682,12 @@ pub const Transformer = struct {
                 mw.switch_down_b,
                 slots_u,
                 sc,
+                xd,
             );
             var out = mlx.mlx_array_new();
             errdefer _ = mlx.mlx_array_free(out);
             try mlx.check(mlx.mlx_reshape(&out, y, xsh.ptr, @intCast(xsh.len), self.s));
             _ = mlx.mlx_array_free(y);
-            const xd = mlx.mlx_array_dtype(expert_x);
             if (mlx.mlx_array_dtype(out) != xd) {
                 var cast = mlx.mlx_array_new();
                 try mlx.check(mlx.mlx_astype(&cast, out, xd, self.s));
@@ -38598,7 +38599,7 @@ test "MTP EXL3 mtpMoeRows fused rows match N solo calls on the same kernel" {
             try t.expectEqual(b, a);
         }
     }
-    try t.expectEqual(@as(u32, 5), n_disp);
+    try t.expectEqual(@as(u32, 4), n_disp);
 }
 
 
