@@ -1,12 +1,12 @@
 # EXL3 K4 routed experts for Qwen3.8-Flash-Next (qwen4_exp)
 
-Status: converter, loader, host decoder, and Metal inner/indexed GEMV are in tree. Live conversion and timed KLD/speed are blocked on a box grant.
+Status: codebook of record is **MUL1**. Metal paths and loader require mul1. `--from-exl3` restack is unit-tested. Waiting on turboderp 9-shard download to restack and run gates.
 
 ## Format (phase 0)
 
 Trellis packing at K=4: a tile is 16×16 = 256 weights. Each weight contributes **4 bits**, so the tile is 1024 bits = **64 uint16** = **32 uint32**. Pack walks 16 spans of 16 values, stuffing the low-K bits of each codeword from the top of a 32-bit buffer; whenever fewer than 16 bits remain it emits the high halfword. After the spans, the uint32 view is SWAP16 (`(w<<16)|(w>>16)`). Unpack is the inverse bitshift trellis: for thread t in 0..127 a (K+16)-bit funnel from two u32 words (wrapped mod 32) yields 16-bit sliding windows `cw[2t]`, `cw[2t+1]`. Last dim is always `256*K/16 = 64`.
 
-Codebook: **MCG**, not MUL1. `mixed = (codeword & 0xFFFF) * 0xCBAC1FED`; `pair = 0x3B603B60 ^ (mixed & 0x8FFF8FFF)`; the two packed f16 lanes are added in f32 and rounded back to f16. Why MCG: it is the codebook every 4.00bpw expert conversion of this family ships (`mcg_multiplier = 3417055213`); MUL1 (`* 0x83DCD12D`, byte-sum, then `0x1EEE`/`0xC931`) is a different reconstruction and is not required. The host implements MUL1 only as a decoder twin.
+Codebook of record: **MUL1**. `mixed = codeword * 0x83DCD12D`; byte-sum of the four bytes plus `0x6400`; `fma(h, 0x1EEE, 0xC931)` in f32, round to f16. Metal paths are MUL1-only (no MCG switch). Host keeps MCG for the old pin test. `out_scales: always` from exllamav3 1.4.4 is **svh** (output-channel scales); suh is the input-channel sign/Hadamard scale.
 
 suh / svh: f16 vectors, length `in_features` and `out_features`. There is **no separate per-tensor scalar**; the encode-time codebook scale `1.24371088` is folded into suh by `regularize_public_weight`. Decode:
 
@@ -34,7 +34,7 @@ Stacked per-layer dialect, E on axis 0 so gather is `bank[eid]`. Production geom
 
 Names: `language_model.model.layers.{L}.mlp.switch_mlp.{gate,up,down}_proj.{trellis,suh,svh}`. MTP: `language_model.mtp.layers.0.mlp.switch_mlp.*`. Same `switch_mlp` / `language_model.model.` prefix as the affine pack. Bytes: each trellis bank is 512×160×40×64×2 = 400 MiB, so three projections ≈ 1.2 GiB trellis + ~6.5 MiB suh/svh per layer; 48 layers ≈ 57.6 GiB experts.
 
-`config.json`: `"expert_quant": {"format":"exl3","k":4,"codebook":"mcg","mcg_multiplier":3417055213,"calibration":"imatrix-diagonal"}`.
+`config.json`: `"expert_quant": {"format":"exl3","k":4,"codebook":"mul1","out_scales":"svh"}`. Loader refuses any other codebook.
 
 Host decoder: `src/expert_exl3.zig`. Fixture: `src/fixtures/exl3_k4_linear.safetensors`.
 
@@ -60,9 +60,19 @@ Measured on one 2560×640 expert, imatrix-like `v`, 256 rows `X[:,i]~N(0,√v_i)
 | direct, rows × √v | 0.06869 | 0.06883 | — |
 | LDLQ diag(v) | 0.06868 | 0.06881 | 0.594 s |
 
-**Pick deferred.** That table used synthetic Gaussian rows and an invented `v`. Under a near-isotropic Hessian, LDLQ collapses to direct, which is why the two arms printed identical numbers. It is **not** evidence that LDLQ with the real imatrix has no win. Keep “all EXL3 arms beat affine-4 on the synthetic weighting” as that only.
+Window 1 grant (2026-09-18): imatrix collected, then three **real** layer-0 experts scored with the real per-expert diagonal. Synthetic Gaussian table above is **not** the pick.
 
-Window 1 of the box grant collects the real imatrix, then re-runs one-expert comparison on **three real experts** (hot / median / cold by routed-token count) with the real per-expert diagonal: imatrix-weighted output error and plain relRMS, for direct vs LDLQ-diag vs affine 4-bit g64. Batch LDLQ the same way as direct and report proj/s. Pick by output error at the fastest rate that still fits the resumable plan; **only then convert**.
+Imatrix: `/Users/beam/llm/models/calib/qwen38-flash-next-imatrix.safetensors` (866 tensors, 165094 tokens, **59 min** wall). Zero-routed (10): L0#137,181,193,244,271,413,424; L1#116; L2#204; L47#371.
+
+Layer 0 real experts (imatrix-weighted relRMS / output relRMS on 256 rows ~ N(0,√v)):
+
+| expert | tokens | affine-4 out | direct out | LDLQ-diag out | direct s | LDLQ s |
+|---|---:|---:|---:|---:|---:|---:|
+| cold e=181 | 0 | 0.09597 | **0.06873** | 0.06873 | 0.356 | 0.581 |
+| median e=49 | 3083 | 0.09360 | **0.06858** | 0.06858 | 0.346 | 0.581 |
+| hot e=390 | 16591 | 0.09409 | **0.06825** | 0.06825 | 0.346 | 0.565 |
+
+LDLQ-diag matched direct to 5 decimals on all three. Direct is faster. Batch N=16: **direct 2.95 proj/s**, LDLQ-serial 1.81, LDLQ-concat-out 2.71 proj/s (5.91 s). **Pick direct K4 MCG, batch 16.** Full pack ~73728/2.95/3600 ≈ **6.9 h**, resumable. Do not convert in window 1.
 
 Batched direct projections/s (2560×640, Metal) — rate only, not the quality pick:
 
@@ -72,7 +82,7 @@ Batched direct projections/s (2560×640, Metal) — rate only, not the quality p
 | 32 | 10.422 s | 3.07 | 6.67 h |
 | 64 | 21.290 s | 3.01 | 6.80 h |
 
-N=16 is the direct-search plateau (~6.6 h). LDLQ batch rate is **not yet measured** (same concat-out path as direct, still owed). Conversion stays resumable: `model-exl3-L{layer:02d}-{gate,up,down}.safetensors`. Window 1 = imatrix collect, not convert.
+N=16 direct 2.95 proj/s on real experts. LDLQ-concat-out 2.71 proj/s, no quality win. Conversion stays resumable; next grant window runs `--quantizer direct --batch-size 16 --imatrix ...`.
 
 Imatrix collect checkpoints `*.safetensors.layers/LXX.safetensors`.
 

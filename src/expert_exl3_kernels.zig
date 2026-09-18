@@ -85,11 +85,13 @@ const GEMV_SOURCE: [:0]const u8 =
     \\      default: pos = (row0 + 9u) * 16u + col0 + 8u; break;
     \\    }
     \\    if ((pos % 16u) != local) continue;
-    \\    const uint mixed = uint(cw[slot]) * 0xCBAC1FEDu;
-    \\    const uint pair = 0x3B603B60u ^ (mixed & 0x8FFF8FFFu);
-    \\    const half lo = as_type<half>(ushort(pair));
-    \\    const half hi = as_type<half>(ushort(pair >> 16u));
-    \\    const float w = float(half(float(lo) + float(hi)));
+    \\    const uint mixed = uint(cw[slot]) * 0x83DCD12Du;
+    \\    const uint pair_sums = (mixed & 0x00FF00FFu) + ((mixed >> 8u) & 0x00FF00FFu);
+    \\    const uint byte_sum = 0x6400u + (pair_sums & 0xFFFFu) + (pair_sums >> 16u);
+    \\    const half hh = as_type<half>(ushort(byte_sum));
+    \\    const half inv = as_type<half>(ushort(0x1EEEu));
+    \\    const half bias = as_type<half>(ushort(0xC931u));
+    \\    const float w = float(fma(hh, inv, bias));
     \\    acc += float(x[tk * TILE + (pos / 16u)]) * w;
     \\  }
     \\}
@@ -98,7 +100,7 @@ const GEMV_SOURCE: [:0]const u8 =
 
 const GEMM_SORTED_SOURCE: [:0]const u8 =
     \\threadgroup float W[256];
-    \\threadgroup float Acc[128 * 16];
+    \\threadgroup float Xs[8 * 16];
     \\uint ot = uint(threadgroup_position_in_grid.x);
     \\uint run = uint(threadgroup_position_in_grid.y);
     \\uint lane = uint(thread_index_in_threadgroup);
@@ -106,25 +108,25 @@ const GEMM_SORTED_SOURCE: [:0]const u8 =
     \\constexpr uint TILE = 16u;
     \\constexpr uint IT = uint(IDIM) / TILE;
     \\constexpr uint OT = uint(ODIM) / TILE;
-    \\constexpr uint CHUNK = 128u;
+    \\constexpr uint ROWS = 4u;
     \\const uint start = run_start[run];
     \\const uint rlen = run_len[run];
     \\const uint eid = run_eid[run];
-    \\const uint row0 = (lane & 3u) * 2u;
-    \\const uint col0 = lane >> 2u;
+    \\const uint prow = (lane & 3u) * 2u;
+    \\const uint pcol = lane >> 2u;
     \\uint pos[8];
-    \\pos[0] = row0 * 16u + col0;
-    \\pos[1] = (row0 + 1u) * 16u + col0;
-    \\pos[2] = (row0 + 8u) * 16u + col0;
-    \\pos[3] = (row0 + 9u) * 16u + col0;
-    \\pos[4] = row0 * 16u + col0 + 8u;
-    \\pos[5] = (row0 + 1u) * 16u + col0 + 8u;
-    \\pos[6] = (row0 + 8u) * 16u + col0 + 8u;
-    \\pos[7] = (row0 + 9u) * 16u + col0 + 8u;
-    \\for (uint r0 = 0u; r0 < rlen; r0 += CHUNK) {
-    \\  const uint n = min(CHUNK, rlen - r0);
-    \\  if (lane < 16u) { for (uint r = 0u; r < n; r++) Acc[r * 16u + lane] = 0.0f; }
-    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\pos[0] = prow * 16u + pcol;
+    \\pos[1] = (prow + 1u) * 16u + pcol;
+    \\pos[2] = (prow + 8u) * 16u + pcol;
+    \\pos[3] = (prow + 9u) * 16u + pcol;
+    \\pos[4] = prow * 16u + pcol + 8u;
+    \\pos[5] = (prow + 1u) * 16u + pcol + 8u;
+    \\pos[6] = (prow + 8u) * 16u + pcol + 8u;
+    \\pos[7] = (prow + 9u) * 16u + pcol + 8u;
+    \\for (uint r0 = 0u; r0 < rlen; r0 += ROWS) {
+    \\  const uint n = min(ROWS, rlen - r0);
+    \\  float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    \\  if (lane < 32u) { Xs[lane] = 0.0f; Xs[32u + lane] = 0.0f; Xs[64u + lane] = 0.0f; Xs[96u + lane] = 0.0f; }
     \\  for (uint tk = 0u; tk < IT; tk++) {
     \\    const device ushort* tile = trellis + (((size_t)eid * (size_t)IT + tk) * (size_t)OT + ot) * 64u;
     \\    const device uint* words = (const device uint*)tile;
@@ -132,29 +134,36 @@ const GEMM_SORTED_SOURCE: [:0]const u8 =
     \\    const uint sh[8] = {28u, 24u, 20u, 16u, 12u, 8u, 4u, 0u};
     \\    for (uint s = 0u; s < 8u; s++) {
     \\      const uint cw = uint(merged >> sh[s]) & 0xffffu;
-    \\      const uint mixed = cw * 0xCBAC1FEDu;
-    \\      const uint pair = 0x3B603B60u ^ (mixed & 0x8FFF8FFFu);
-    \\      const half lo = as_type<half>(ushort(pair));
-    \\      const half hi = as_type<half>(ushort(pair >> 16u));
-    \\      W[pos[s]] = float(half(float(lo) + float(hi)));
+    \\      const uint mixed = cw * 0x83DCD12Du;
+    \\      const uint pair_sums = (mixed & 0x00FF00FFu) + ((mixed >> 8u) & 0x00FF00FFu);
+    \\      const uint byte_sum = 0x6400u + (pair_sums & 0xFFFFu) + (pair_sums >> 16u);
+    \\      const half hh = as_type<half>(ushort(byte_sum));
+    \\      const half inv = as_type<half>(ushort(0x1EEEu));
+    \\      const half bias = as_type<half>(ushort(0xC931u));
+    \\      W[pos[s]] = float(fma(hh, inv, bias));
+    \\    }
+    \\    for (uint t = 0u; t < 4u; t++) {
+    \\      const uint lin = lane + t * 32u;
+    \\      const uint rr = lin / 16u;
+    \\      const uint kk = lin % 16u;
+    \\      if (rr < n) Xs[rr * 16u + kk] = float(x[(size_t)(start + r0 + rr) * (size_t)(IDIM) + tk * TILE + kk]);
     \\    }
     \\    threadgroup_barrier(mem_flags::mem_threadgroup);
     \\    if (lane < 16u) {
-    \\      for (uint r = 0u; r < n; r++) {
-    \\        float acc = Acc[r * 16u + lane];
-    \\        const size_t xb = (size_t)(start + r0 + r) * (size_t)(IDIM) + tk * TILE;
-    \\        for (uint k = 0u; k < TILE; k++) acc += float(x[xb + k]) * W[k * TILE + lane];
-    \\        Acc[r * 16u + lane] = acc;
+    \\      float4 a = float4(acc[0], acc[1], acc[2], acc[3]);
+    \\      for (uint k = 0u; k < TILE; k++) {
+    \\        const float w = W[k * TILE + lane];
+    \\        a = fma(float4(Xs[k], Xs[16u + k], Xs[32u + k], Xs[48u + k]), float4(w), a);
     \\      }
+    \\      acc[0] = a.x; acc[1] = a.y; acc[2] = a.z; acc[3] = a.w;
     \\    }
     \\    threadgroup_barrier(mem_flags::mem_threadgroup);
     \\  }
     \\  if (lane < 16u) {
     \\    for (uint r = 0u; r < n; r++) {
-    \\      y[(size_t)(start + r0 + r) * (size_t)(ODIM) + ot * TILE + lane] = half(Acc[r * 16u + lane]);
+    \\      y[(size_t)(start + r0 + r) * (size_t)(ODIM) + ot * TILE + lane] = half(acc[r]);
     \\    }
     \\  }
-    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
     \\}
 ;
 
@@ -493,11 +502,13 @@ const INDEXED_SOURCE: [:0]const u8 =
     \\      default: pos = (row0 + 9u) * 16u + col0 + 8u; break;
     \\    }
     \\    if ((pos % 16u) != local) continue;
-    \\    const uint mixed = uint(cw[si]) * 0xCBAC1FEDu;
-    \\    const uint pair = 0x3B603B60u ^ (mixed & 0x8FFF8FFFu);
-    \\    const half lo = as_type<half>(ushort(pair));
-    \\    const half hi = as_type<half>(ushort(pair >> 16u));
-    \\    const float w = float(half(float(lo) + float(hi)));
+    \\    const uint mixed = uint(cw[si]) * 0x83DCD12Du;
+    \\    const uint pair_sums = (mixed & 0x00FF00FFu) + ((mixed >> 8u) & 0x00FF00FFu);
+    \\    const uint byte_sum = 0x6400u + (pair_sums & 0xFFFFu) + (pair_sums >> 16u);
+    \\    const half hh = as_type<half>(ushort(byte_sum));
+    \\    const half inv = as_type<half>(ushort(0x1EEEu));
+    \\    const half bias = as_type<half>(ushort(0xC931u));
+    \\    const float w = float(fma(hh, inv, bias));
     \\    acc += float(x[(size_t)slot * (size_t)(IDIM) + tk * TILE + (pos / 16u)]) * w;
     \\  }
     \\}

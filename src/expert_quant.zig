@@ -60,7 +60,7 @@ pub fn parseExpertQuant(obj: std.json.ObjectMap) !Exl3Spec {
     const cb_v = block.object.get("codebook") orelse return error.ExpertLayoutUnsupported;
     if (cb_v != .string) return error.ExpertLayoutUnsupported;
     if (k != 4) return error.ExpertLayoutUnsupported;
-    if (!std.mem.eql(u8, cb_v.string, "mcg")) return error.ExpertLayoutUnsupported;
+    if (!std.mem.eql(u8, cb_v.string, "mul1")) return error.ExpertLayoutUnsupported;
     return .{ .k = k, .codebook = cb_v.string };
 }
 
@@ -472,22 +472,22 @@ test "routed expert layout is read off the weight map" {
     try t.expect(!isRoutedExpertKey(.exl3_k4, "language_model.model.layers.3.mlp.shared_expert.down_proj.weight"));
 }
 
-test "exl3 expert_quant admits uniform K4 mcg and refuses any other codebook or k" {
+test "exl3 expert_quant admits uniform K4 mul1 and refuses any other codebook or k" {
     const t = std.testing;
     const ok = try std.json.parseFromSlice(std.json.Value, t.allocator,
-        \\{"expert_quant":{"format":"exl3","k":4,"codebook":"mcg"}}
+        \\{"expert_quant":{"format":"exl3","k":4,"codebook":"mul1"}}
     , .{});
     defer ok.deinit();
     const spec = try parseExpertQuant(ok.value.object);
     try t.expectEqual(@as(u8, 4), spec.k);
-    try t.expectEqualStrings("mcg", spec.codebook);
+    try t.expectEqualStrings("mul1", spec.codebook);
     const bad_k = try std.json.parseFromSlice(std.json.Value, t.allocator,
-        \\{"expert_quant":{"format":"exl3","k":6,"codebook":"mcg"}}
+        \\{"expert_quant":{"format":"exl3","k":6,"codebook":"mul1"}}
     , .{});
     defer bad_k.deinit();
     try t.expectError(error.ExpertLayoutUnsupported, parseExpertQuant(bad_k.value.object));
     const bad_cb = try std.json.parseFromSlice(std.json.Value, t.allocator,
-        \\{"expert_quant":{"format":"exl3","k":4,"codebook":"mul1"}}
+        \\{"expert_quant":{"format":"exl3","k":4,"codebook":"mcg"}}
     , .{});
     defer bad_cb.deinit();
     try t.expectError(error.ExpertLayoutUnsupported, parseExpertQuant(bad_cb.value.object));

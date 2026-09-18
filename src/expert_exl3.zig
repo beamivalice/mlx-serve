@@ -324,6 +324,27 @@ fn asU16(view: TensorView) []const u16 {
     return @alignCast(std.mem.bytesAsSlice(u16, view.bytes));
 }
 
+test "exl3 MUL1 codebook pins known codewords" {
+    const t = std.testing;
+    try t.expectEqual(@as(u16, 49896), decodeMul1(0));
+    try t.expectEqual(@as(u16, 14625), decodeMul1(1));
+    try t.expectEqual(@as(u16, 47511), decodeMul1(7));
+}
+
+test "exl3 MUL1 codebook maps a zero codeword to the finite half" {
+    const t = std.testing;
+    const bits = decodeMul1(0);
+    const mixed: u32 = 0;
+    var byte_sum: u32 = 0x6400;
+    const b = std.mem.toBytes(mixed);
+    for (b) |x| byte_sum += x;
+    const h = f16BitsToF32(@truncate(byte_sum));
+    const inverse = f16BitsToF32(0x1EEE);
+    const bias = f16BitsToF32(0xC931);
+    const want = f32ToF16Bits(@mulAdd(f32, h, inverse, bias));
+    try t.expectEqual(want, bits);
+}
+
 test "exl3 MCG codebook maps a zero codeword to the finite half pair" {
     const t = std.testing;
     const bits = decodeMcg(0);
@@ -355,10 +376,10 @@ test "exl3 K4 packed fixture decodes to the library inner and public f16" {
     const in_features: usize = 128;
     const out_features: usize = 128;
     const got_inner = try alloc.alloc(u16, in_features * out_features);
-    reconstructInner(asU16(trellis), in_features, out_features, K4, .mcg, got_inner);
+    reconstructInner(asU16(trellis), in_features, out_features, K4, .mul1, got_inner);
     try t.expectEqualSlices(u16, asU16(inner), got_inner);
     const got_public = try alloc.alloc(u16, in_features * out_features);
-    try reconstructPublic(alloc, asU16(trellis), asU16(suh), asU16(svh), in_features, out_features, K4, .mcg, got_public);
+    try reconstructPublic(alloc, asU16(trellis), asU16(suh), asU16(svh), in_features, out_features, K4, .mul1, got_public);
     try t.expectEqualSlices(u16, asU16(public), got_public);
 
     var x: [128]f32 = undefined;
@@ -368,7 +389,7 @@ test "exl3 K4 packed fixture decodes to the library inner and public f16" {
     const transformed = try alloc.alloc(f32, 128);
     const inner_y = try alloc.alloc(f32, 128);
     const y = try alloc.alloc(f32, 128);
-    project(&x, asU16(trellis), asU16(suh), asU16(svh), 128, 128, K4, .mcg, transformed, inner_y, y);
+    project(&x, asU16(trellis), asU16(suh), asU16(svh), 128, 128, K4, .mul1, transformed, inner_y, y);
     const dense = try alloc.alloc(f32, 128);
     @memset(dense, 0);
     const pub_w = asU16(public);

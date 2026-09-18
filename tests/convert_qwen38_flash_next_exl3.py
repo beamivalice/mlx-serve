@@ -38,7 +38,7 @@ from convert_dsv4_weights import write_safetensors_raw  # noqa: E402
 from convert_qwen38_flash_next import read_header, read_raw, rename  # noqa: E402
 
 K = 4
-CODEBOOK = "mcg"
+CODEBOOK = "mul1"
 PACKED_K4 = 256 * K // 16
 HAD = 128
 MCG_MULT = 0xCBAC1FED
@@ -359,6 +359,120 @@ def bench_batch_quality() -> int:
     return 0
 
 
+def _raw_bytes(path: Path, header: dict, key: str, data_off: int) -> bytes:
+    meta = header[key]
+    start, end = meta["data_offsets"]
+    with open(path, "rb") as f:
+        f.seek(data_off + start)
+        return f.read(end - start)
+
+
+def restack_from_exl3(src_dir: str | Path, pack_dir: str | Path, dst: str | Path) -> dict:
+    src_dir, pack_dir, dst = Path(src_dir), Path(pack_dir), Path(dst)
+    dst.mkdir(parents=True, exist_ok=True)
+    src_idx = json.loads((src_dir / "model.safetensors.index.json").read_text())
+    src_cfg = json.loads((src_dir / "config.json").read_text())
+    qcfg = src_cfg.get("quantization_config") or {}
+    if str(qcfg.get("codebook", "")).lower() != "mul1":
+        raise RuntimeError("source codebook is not mul1")
+    tcfg = src_cfg.get("text_config") or src_cfg
+    n_exp = int(tcfg["num_experts"])
+    n_layers = int(tcfg["num_hidden_layers"])
+    groups: dict[tuple, dict] = {}
+    for key, fname in src_idx["weight_map"].items():
+        parsed = parse_src_expert_key(key)
+        if parsed is None:
+            continue
+        prefix, layer, ei, proj, suffix = parsed
+        g = groups.setdefault((prefix, layer, proj), {})
+        g.setdefault(ei, {})[suffix] = (fname, key)
+    for (prefix, layer, proj), experts in groups.items():
+        missing = [i for i in range(n_exp) if i not in experts]
+        if missing:
+            raise RuntimeError(f"missing experts {missing[:5]} for {prefix} L{layer} {proj}")
+        for ei in range(n_exp):
+            if "mul1" not in experts[ei] or "trellis" not in experts[ei]:
+                raise RuntimeError(f"no mul1/trellis for expert {ei} L{layer} {proj}")
+    pack_index = json.loads((pack_dir / "model.safetensors.index.json").read_text())
+    plan = plan_pack(pack_index)
+    for fname in plan["hardlink"]:
+        src, out = pack_dir / fname, dst / fname
+        if out.exists() or out.is_symlink():
+            out.unlink()
+        os.link(src, out)
+    for name in sorted(os.listdir(pack_dir)):
+        if name.startswith(".") or (name.startswith("model-") and name.endswith(".safetensors")):
+            continue
+        if name in ("model.safetensors.index.json", "config.json"):
+            continue
+        srcp = pack_dir / name
+        if not srcp.is_file():
+            continue
+        out = dst / name
+        if out.exists() or out.is_symlink():
+            out.unlink()
+        os.link(srcp, out)
+    for i, fname in enumerate(plan["rewrite"]):
+        other_keys = plan["files"][fname]["other"]
+        write_safetensors_raw(str(dst / fname), _copy_raw_tensors(pack_dir / fname, other_keys))
+    weight_map = {key: pack_index["weight_map"][key] for key in plan["keep_keys"]}
+    header_cache: dict[str, tuple] = {}
+
+    def header_of(fname: str):
+        if fname not in header_cache:
+            header_cache[fname] = read_header(src_dir / fname)
+        return header_cache[fname]
+
+    for (prefix, layer, proj), experts in sorted(groups.items()):
+        shard = layer_proj_shard(layer, proj) if not prefix.startswith("mtp") else f"model-exl3-mtp-L{layer:02d}-{proj}.safetensors"
+        e0 = experts[0]
+        h0, off0 = header_of(e0["trellis"][0])
+        tshape = list(h0[e0["trellis"][1]]["shape"])
+        if tshape[-1] != PACKED_K4:
+            raise RuntimeError(f"not K4 packed dim {tshape}")
+        suh_shape = list(header_of(e0["suh"][0])[0][e0["suh"][1]]["shape"])
+        svh_shape = list(header_of(e0["svh"][0])[0][e0["svh"][1]]["shape"])
+        stacked_t = np.empty((n_exp, *tshape), dtype=np.uint16)
+        stacked_suh = np.empty((n_exp, *suh_shape), dtype=np.float16)
+        stacked_svh = np.empty((n_exp, *svh_shape), dtype=np.float16)
+        for ei in range(n_exp):
+            tf, tk = experts[ei]["trellis"]
+            hf, ho = header_of(tf)
+            tb = _raw_bytes(src_dir / tf, hf, tk, ho)
+            stacked_t[ei] = np.frombuffer(tb, dtype=np.uint16).reshape(tshape)
+            sf, sk = experts[ei]["suh"]
+            hf, ho = header_of(sf)
+            stacked_suh[ei] = np.frombuffer(_raw_bytes(src_dir / sf, hf, sk, ho), dtype=np.float16).reshape(suh_shape)
+            vf, vk = experts[ei]["svh"]
+            hf, ho = header_of(vf)
+            stacked_svh[ei] = np.frombuffer(_raw_bytes(src_dir / vf, hf, vk, ho), dtype=np.float16).reshape(svh_shape)
+        base = dest_switch_key(prefix, layer, proj, "x")[:-2]
+        named = {
+            base + ".trellis": ("U16", stacked_t.shape, np.ascontiguousarray(stacked_t).tobytes()),
+            base + ".suh": ("F16", stacked_suh.shape, np.ascontiguousarray(stacked_suh).tobytes()),
+            base + ".svh": ("F16", stacked_svh.shape, np.ascontiguousarray(stacked_svh).tobytes()),
+        }
+        write_safetensors_raw(str(dst / shard), named)
+        for key in named:
+            weight_map[key] = shard
+        print(f"restack {shard}", flush=True)
+        del stacked_t, stacked_suh, stacked_svh
+    total = sum(os.path.getsize(dst / f) for f in sorted(set(weight_map.values())))
+    (dst / "model.safetensors.index.json").write_text(json.dumps(
+        {"metadata": {"total_size": total}, "weight_map": weight_map}, indent=2
+    ))
+    cfg = json.loads((pack_dir / "config.json").read_text())
+    cfg["expert_quant"] = {
+        "format": "exl3",
+        "k": 4,
+        "codebook": "mul1",
+        "out_scales": "svh",
+        "source": "restack",
+    }
+    (dst / "config.json").write_text(json.dumps(cfg, indent=2))
+    return {"weight_map": weight_map}
+
+
 def load_imatrix(path: str | Path) -> dict[str, np.ndarray]:
     from safetensors.numpy import load_file
     return load_file(str(path))
@@ -427,9 +541,11 @@ def convert_pack(
         dest = dst / shard
         if shard_is_valid(dest, e, in_dim, out_dim):
             skipped += 1
+            print(f"skip {shard}", flush=True)
             for suffix in (".trellis", ".suh", ".svh"):
                 weight_map[base + suffix] = shard
             return
+        t0 = __import__("time").perf_counter()
         stacked = _stack_experts(
             bank, k=k, codebook=codebook, quantizer=quantizer, calibration=calibration, seed=seed,
             routed_rows=rows_vec, imatrix_flat=imat_flat, zero_routed=zero_routed, layer_key=lkey,
@@ -440,6 +556,7 @@ def convert_pack(
         write_safetensors_raw(str(dest), named)
         for key in named:
             weight_map[key] = shard
+        print(f"wrote {shard}  {__import__('time').perf_counter() - t0:.1f}s  e={e} in={in_dim} out={out_dim}", flush=True)
 
     for hf_key, hf_file in hf_map.items():
         if hf_key.endswith("experts.gate_up_proj"):
@@ -536,6 +653,126 @@ def imatrix_layer_keys(layer: int) -> tuple[str, str, str]:
 def imatrix_layer_complete(store: dict[str, np.ndarray], layer: int) -> bool:
     a, b, c = imatrix_layer_keys(layer)
     return a in store and b in store and c in store
+
+
+SRC_EXPERT_RE = __import__("re").compile(
+    r"^(model\.language_model\.|mtp\.)layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate|up|down)_proj\.(trellis|suh|svh|mul1)$"
+)
+
+
+def dest_switch_key(src_prefix: str, layer: int, proj: str, suffix: str) -> str:
+    if src_prefix.startswith("mtp"):
+        return f"language_model.mtp.layers.{layer}.mlp.switch_mlp.{proj}_proj.{suffix}"
+    return f"language_model.model.layers.{layer}.mlp.switch_mlp.{proj}_proj.{suffix}"
+
+
+def parse_src_expert_key(key: str):
+    m = SRC_EXPERT_RE.match(key)
+    if not m:
+        return None
+    return m.group(1), int(m.group(2)), int(m.group(3)), m.group(4), m.group(5)
+
+
+class RestackTests(unittest.TestCase):
+    def test_src_expert_key_parse(self):
+        p = parse_src_expert_key("model.language_model.layers.3.mlp.experts.9.gate_proj.trellis")
+        self.assertEqual(p[1:], (3, 9, "gate", "trellis"))
+        self.assertEqual(
+            dest_switch_key(p[0], 3, "gate", "trellis"),
+            "language_model.model.layers.3.mlp.switch_mlp.gate_proj.trellis",
+        )
+        p = parse_src_expert_key("mtp.layers.0.mlp.experts.1.down_proj.mul1")
+        self.assertEqual(
+            dest_switch_key(p[0], 0, "down", "svh"),
+            "language_model.mtp.layers.0.mlp.switch_mlp.down_proj.svh",
+        )
+
+    def test_restack_two_experts_into_stacked_banks(self):
+        rng = np.random.default_rng(4)
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            src, pack, dst = td / "src", td / "pack", td / "out"
+            src.mkdir(); pack.mkdir()
+            e, h, i = 2, 128, 128
+            tensors = {}
+            for ei in range(e):
+                for proj, inn, outn in (("gate", h, i), ("up", h, i), ("down", i, h)):
+                    base = f"model.language_model.layers.0.mlp.experts.{ei}.{proj}_proj"
+                    trellis = rng.integers(0, 65535, (inn // 16, outn // 16, PACKED_K4), dtype=np.uint16)
+                    tensors[base + ".trellis"] = ("I16", trellis.shape, trellis.tobytes())
+                    tensors[base + ".suh"] = ("F16", (inn,), np.zeros(inn, np.float16).tobytes())
+                    tensors[base + ".svh"] = ("F16", (outn,), np.ones(outn, np.float16).tobytes())
+                    tensors[base + ".mul1"] = ("I32", (), np.int32(1).tobytes())
+            write_safetensors_raw(str(src / "model-00001-of-00001.safetensors"), tensors)
+            (src / "model.safetensors.index.json").write_text(json.dumps({
+                "weight_map": {k: "model-00001-of-00001.safetensors" for k in tensors}
+            }))
+            (src / "config.json").write_text(json.dumps({
+                "quantization_config": {"codebook": "mul1", "bits": 4.05, "out_scales": "always"},
+                "text_config": {"num_experts": e, "hidden_size": h, "moe_intermediate_size": i, "num_hidden_layers": 1},
+            }))
+            write_safetensors_raw(str(pack / "model-00001.safetensors"), {
+                "language_model.model.embed_tokens.weight": ("F32", (4,), np.zeros(4, np.float32).tobytes()),
+            })
+            dummy = np.zeros((e, 8), np.uint32)
+            write_safetensors_raw(str(pack / "model-00002.safetensors"), {
+                "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight": ("U32", dummy.shape, dummy.tobytes()),
+                "language_model.model.layers.0.mlp.switch_mlp.gate_proj.scales": ("F16", (e, 2), np.zeros((e, 2), np.float16).tobytes()),
+                "language_model.model.layers.0.mlp.switch_mlp.gate_proj.biases": ("F16", (e, 2), np.zeros((e, 2), np.float16).tobytes()),
+                "language_model.model.layers.0.mlp.switch_mlp.up_proj.weight": ("U32", dummy.shape, dummy.tobytes()),
+                "language_model.model.layers.0.mlp.switch_mlp.up_proj.scales": ("F16", (e, 2), np.zeros((e, 2), np.float16).tobytes()),
+                "language_model.model.layers.0.mlp.switch_mlp.up_proj.biases": ("F16", (e, 2), np.zeros((e, 2), np.float16).tobytes()),
+            })
+            write_safetensors_raw(str(pack / "model-00003.safetensors"), {
+                "language_model.model.layers.0.mlp.switch_mlp.down_proj.weight": ("U32", dummy.shape, dummy.tobytes()),
+                "language_model.model.layers.0.mlp.switch_mlp.down_proj.scales": ("F16", (e, 2), np.zeros((e, 2), np.float16).tobytes()),
+                "language_model.model.layers.0.mlp.switch_mlp.down_proj.biases": ("F16", (e, 2), np.zeros((e, 2), np.float16).tobytes()),
+                "language_model.model.layers.0.mlp.gate.weight": ("F32", (e, h), np.zeros((e, h), np.float32).tobytes()),
+            })
+            (pack / "model.safetensors.index.json").write_text(json.dumps({
+                "metadata": {"total_size": 1},
+                "weight_map": {
+                    "language_model.model.embed_tokens.weight": "model-00001.safetensors",
+                    "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight": "model-00002.safetensors",
+                    "language_model.model.layers.0.mlp.switch_mlp.gate_proj.scales": "model-00002.safetensors",
+                    "language_model.model.layers.0.mlp.switch_mlp.gate_proj.biases": "model-00002.safetensors",
+                    "language_model.model.layers.0.mlp.switch_mlp.up_proj.weight": ("model-00002.safetensors"),
+                    "language_model.model.layers.0.mlp.switch_mlp.up_proj.scales": "model-00002.safetensors",
+                    "language_model.model.layers.0.mlp.switch_mlp.up_proj.biases": "model-00002.safetensors",
+                    "language_model.model.layers.0.mlp.switch_mlp.down_proj.weight": "model-00003.safetensors",
+                    "language_model.model.layers.0.mlp.switch_mlp.down_proj.scales": "model-00003.safetensors",
+                    "language_model.model.layers.0.mlp.switch_mlp.down_proj.biases": "model-00003.safetensors",
+                    "language_model.model.layers.0.mlp.gate.weight": "model-00003.safetensors",
+                },
+            }))
+            (pack / "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
+            (pack / "tokenizer.json").write_text("{}")
+            restack_from_exl3(src, pack, dst)
+            cfg = json.loads((dst / "config.json").read_text())
+            self.assertEqual(cfg["expert_quant"]["codebook"], "mul1")
+            self.assertEqual(cfg["expert_quant"]["k"], 4)
+            idx = json.loads((dst / "model.safetensors.index.json").read_text())
+            wm = idx["weight_map"]
+            gkey = "language_model.model.layers.0.mlp.switch_mlp.gate_proj.trellis"
+            self.assertIn(gkey, wm)
+            header, _ = read_header(dst / wm[gkey])
+            self.assertEqual(tuple(header[gkey]["shape"]), (e, h // 16, i // 16, PACKED_K4))
+            src_header, src_off = read_header(src / "model-00001-of-00001.safetensors")
+            src_t = np.frombuffer(
+                _raw_bytes(src / "model-00001-of-00001.safetensors", src_header,
+                           "model.language_model.layers.0.mlp.experts.1.gate_proj.trellis", src_off),
+                dtype=np.uint16,
+            ).reshape((h // 16, i // 16, PACKED_K4))
+            stacked_h, stacked_off = read_header(dst / wm[gkey])
+            st_meta = stacked_h[gkey]
+            stacked = np.frombuffer(
+                _raw_bytes(dst / wm[gkey], stacked_h, gkey, stacked_off), dtype=np.uint16
+            ).reshape(st_meta["shape"])
+            np.testing.assert_array_equal(stacked[1], src_t)
+            self.assertEqual(
+                os.stat(dst / "model-00001.safetensors").st_ino,
+                os.stat(pack / "model-00001.safetensors").st_ino,
+            )
 
 
 class ResumeTests(unittest.TestCase):
@@ -858,7 +1095,7 @@ class LayoutTests(unittest.TestCase):
             cfg = json.loads((dst / "config.json").read_text())
             self.assertEqual(cfg["expert_quant"]["format"], "exl3")
             self.assertEqual(cfg["expert_quant"]["k"], 4)
-            self.assertEqual(cfg["expert_quant"]["codebook"], "mcg")
+            self.assertEqual(cfg["expert_quant"]["codebook"], "mul1")
             self.assertEqual(
                 os.stat(dst / "model-00001.safetensors").st_ino,
                 os.stat(pack / "model-00001.safetensors").st_ino,
@@ -890,9 +1127,109 @@ class LayoutTests(unittest.TestCase):
             np.testing.assert_array_equal(got, router)
 
 
+def pick_real_experts(hf_dir: str | Path, imatrix_path: str | Path, layer: int = 0) -> int:
+    import time
+    _ensure_lib()
+    from ponyexl3.convert.direct import quantize_inner_matrix_direct
+    from ponyexl3.convert.hessian import block_ldl, ldlq_inner_matrix, prepare_hessian_for_ldl
+    from ponyexl3.convert.regularize import regularize_public_weight
+    from ponyexl3.ref.codebook import CodebookMode
+    from ponyexl3.ref.reconstruct import reconstruct_public_weights
+    from convert_dsv4_weights import mlx_affine_dequant_f32, mlx_affine_quant
+    import mlx.core as mx
+
+    hf_dir = Path(hf_dir)
+    imat = load_imatrix(imatrix_path)
+    rows_key = f"model.language_model.layers.{layer}.mlp.experts.gate_up_proj.rows"
+    gu_key = f"model.language_model.layers.{layer}.mlp.experts.gate_up_proj"
+    rows = np.asarray(imat[rows_key], dtype=np.float32)
+    gu_flat = np.asarray(imat[gu_key], dtype=np.float32)
+    order = np.argsort(rows)
+    cold, med, hot = int(order[0]), int(order[len(order) // 2]), int(order[-1])
+    picks = [("cold", cold), ("median", med), ("hot", hot)]
+    print(f"layer {layer} routed tokens: cold={rows[cold]:.0f} e={cold}  median={rows[med]:.0f} e={med}  hot={rows[hot]:.0f} e={hot}", flush=True)
+    idx = json.loads((hf_dir / "model.safetensors.index.json").read_text())
+    hf_file = hf_dir / idx["weight_map"][gu_key]
+    header, data_off = read_header(hf_file)
+    bank = read_raw(hf_file, data_off, header[gu_key])
+    if bank.dtype == np.uint16:
+        from convert_dsv4_weights import bf16_to_f32
+        bank = bf16_to_f32(bank)
+    bank = np.asarray(bank, dtype=np.float32)
+    half = bank.shape[1] // 2
+    hidden = bank.shape[2]
+    cb = CodebookMode.MCG
+
+    def score(w, what, v):
+        return _weighted_row_err(w, what, v), _output_err(w, what, v)
+
+    for tag, ei in picks:
+        w = np.ascontiguousarray(bank[ei, :half].T)
+        v = imatrix_expert_vector(gu_flat, ei, hidden)
+        v = np.maximum(v, 1e-8)
+        mx.set_default_device(mx.cpu)
+        wq, sc, bi = mlx_affine_quant(w.T, 4, 64)
+        w_aff = mlx_affine_dequant_f32(
+            np.frombuffer(wq[2], dtype=np.uint32).reshape(wq[1]),
+            np.frombuffer(sc[2], dtype=np.uint16).reshape(sc[1]),
+            np.frombuffer(bi[2], dtype=np.uint16).reshape(bi[1]),
+            4, 64,
+        ).T
+        mx.set_default_device(mx.gpu)
+        q_aff = score(w, w_aff, v)
+        reg = regularize_public_weight(w, seed=1)
+        t0 = time.perf_counter()
+        packed, _, _ = quantize_inner_matrix_direct(reg.inner, k=4, cb=cb, search_backend="metal", return_states=False)
+        t_direct = time.perf_counter() - t0
+        w_direct = reconstruct_public_weights(packed, reg.suh.astype(np.float16), reg.svh.astype(np.float16), 4, mcg=True).astype(np.float32)
+        q_direct = score(w, w_direct, v)
+        t1 = time.perf_counter()
+        prep = prepare_hessian_for_ldl(diag_hessian(v))
+        ldl = block_ldl(prep.hessian)
+        res = ldlq_inner_matrix(reg.inner, ldl.l, k=4, cb=cb, hessian=prep.hessian, search_backend="metal", collect_states=False, compute_proxy=False)
+        t_ldlq = time.perf_counter() - t1
+        w_ldlq = reconstruct_public_weights(res.packed, reg.suh.astype(np.float16), reg.svh.astype(np.float16), 4, mcg=True).astype(np.float32)
+        q_ldlq = score(w, w_ldlq, v)
+        print(f"  {tag} e={ei} tokens={rows[ei]:.0f}", flush=True)
+        print(f"    affine-4-g64     wRMS={q_aff[0]:.5f} out={q_aff[1]:.5f}", flush=True)
+        print(f"    direct           wRMS={q_direct[0]:.5f} out={q_direct[1]:.5f} {t_direct:.3f}s", flush=True)
+        print(f"    ldlq-diag        wRMS={q_ldlq[0]:.5f} out={q_ldlq[1]:.5f} {t_ldlq:.3f}s", flush=True)
+
+    n = 16
+    regs = []
+    for i in range(n):
+        ei = int(order[-(i + 1)])
+        w = np.ascontiguousarray(bank[ei, :half].T)
+        regs.append(regularize_public_weight(w, seed=2 + i))
+    inners = [r.inner for r in regs]
+    vs = [imatrix_expert_vector(gu_flat, int(order[-(i + 1)]), hidden) for i in range(n)]
+    t2 = time.perf_counter()
+    _quantize_direct_batch(inners, 4, cb)
+    dt_direct = time.perf_counter() - t2
+    t3 = time.perf_counter()
+    for inner, vv in zip(inners, vs):
+        prep = prepare_hessian_for_ldl(diag_hessian(np.maximum(vv, 1e-8)))
+        ldl = block_ldl(prep.hessian)
+        ldlq_inner_matrix(inner, ldl.l, k=4, cb=cb, hessian=prep.hessian, search_backend="metal", collect_states=False, compute_proxy=False)
+    dt_ldlq = time.perf_counter() - t3
+    print(f"batch N={n} direct {n / dt_direct:.2f} proj/s  ldlq-serial {n / dt_ldlq:.2f} proj/s", flush=True)
+    fat = np.concatenate(inners, axis=1)
+    vmean = np.mean(np.stack(vs, 0), 0)
+    t4 = time.perf_counter()
+    prep = prepare_hessian_for_ldl(diag_hessian(np.maximum(vmean, 1e-8)))
+    ldl = block_ldl(prep.hessian)
+    ldlq_inner_matrix(fat, ldl.l, k=4, cb=cb, hessian=prep.hessian, search_backend="metal", collect_states=False, compute_proxy=False)
+    dt_fat = time.perf_counter() - t4
+    print(f"batch N={n} ldlq-concat-out {n / dt_fat:.2f} proj/s ({dt_fat:.2f}s wall)", flush=True)
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bench", action="store_true")
+    ap.add_argument("--pick-experts", action="store_true")
+    ap.add_argument("--from-exl3", default=None)
+    ap.add_argument("--layer", type=int, default=0)
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--hf", default=None)
     ap.add_argument("--pack", default=None)
@@ -904,6 +1241,15 @@ def main():
     args = ap.parse_args()
     if args.bench:
         return bench_batch_quality()
+    if args.from_exl3:
+        if not (args.pack and args.dst):
+            ap.error("--from-exl3 needs --pack and --dst")
+        restack_from_exl3(args.from_exl3, args.pack, args.dst)
+        return 0
+    if args.pick_experts:
+        if not (args.hf and args.imatrix):
+            ap.error("--pick-experts needs --hf and --imatrix")
+        return pick_real_experts(args.hf, args.imatrix, layer=args.layer)
     if args.self_test:
         suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
         result = unittest.TextTestRunner(verbosity=2).run(suite)
