@@ -6,8 +6,8 @@ Box: Apple M5 Max
 
 ## Files changed
 
-- `src/expert_exl3_kernels.zig` (decode-once arm deleted; 32-row window register reuse)
-- `NOTICE` (ExLlamaV3 decode-full entry removed with the arm)
+- `src/expert_exl3_kernels.zig` (run-aligned window table from buildRuns; default 32 after 4k/8k 3-boot win)
+- `NOTICE` (decode-full entry already removed)
 
 ## Tests added
 

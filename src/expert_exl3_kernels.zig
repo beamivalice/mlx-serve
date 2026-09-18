@@ -219,11 +219,9 @@ const GEMM_SORTED_SOURCE: [:0]const u8 =
     \\constexpr uint TILE = 16u;
     \\constexpr uint IT = uint(IDIM) / TILE;
     \\constexpr uint OT = uint(ODIM) / TILE;
-    \\const uint win_size = uint(WIN);
-    \\const uint start = win * win_size;
-    \\const uint ntot = uint(NROWS);
-    \\const uint n = (start >= ntot) ? 0u : min(win_size, ntot - start);
-    \\if (n == 0u) return;
+    \\const uint start = wstarts[win];
+    \\const uint n = wnlive[win];
+    \\if (n == 0u || n > uint(WIN)) return;
     \\const uint pg = sg >> 1u;
     \\const uint th = sg & 1u;
     \\const uint first = th * 128u + lane * 4u;
@@ -372,11 +370,9 @@ const GEMM_NAX_SOURCE: [:0]const u8 =
     \\constexpr uint TILE = 16u;
     \\constexpr uint IT = uint(IDIM) / TILE;
     \\constexpr uint OT = uint(ODIM) / TILE;
-    \\const uint win_size = uint(WIN);
-    \\const uint start = win * win_size;
-    \\const uint ntot = uint(NROWS);
-    \\const uint n = (start >= ntot) ? 0u : min(win_size, ntot - start);
-    \\if (n == 0u) return;
+    \\const uint start = wstarts[win];
+    \\const uint n = wnlive[win];
+    \\if (n == 0u || n > uint(WIN)) return;
     \\constexpr auto desc = matmul2d_descriptor(16, 32, 16, false, true, true, matmul2d_descriptor::mode::multiply_accumulate);
     \\matmul2d<desc, execution_simdgroup> op;
     \\auto left = op.get_left_input_cooperative_tensor<half, half, float>();
@@ -689,8 +685,17 @@ fn CfgCache(comptime Key: type, comptime CAP: usize) type {
 
 const IndexedKey = struct { in_dim: c_int, out_dim: c_int, topk: c_int };
 const UnaryKey = struct { dim: c_int, topk: c_int };
-const GemmSortedKey = struct { in_dim: c_int, out_dim: c_int, rows: c_int, win: c_int };
+const GemmSortedKey = struct { in_dim: c_int, out_dim: c_int, rows: c_int, win: c_int, nwin: c_int };
+
 const GEMM_WINDOW_ROWS: c_int = 32;
+
+fn gemmWindowRows() c_int {
+    if (std.c.getenv("MLX_SERVE_EXL3_GEMM_WIN")) |p| {
+        const v = std.mem.span(p);
+        if (v.len >= 2 and v[0] == '3' and v[1] == '2') return 32;
+    }
+    return GEMM_WINDOW_ROWS;
+}
 var indexed_coop_cfgs: CfgCache(IndexedKey, 8) = .{};
 var prepare_cfgs: CfgCache(UnaryKey, 8) = .{};
 var finish_cfgs: CfgCache(UnaryKey, 8) = .{};
@@ -782,7 +787,7 @@ fn gemmNaxOn() bool {
 
 fn getGemmNaxKernel() !mlx.mlx_fast_metal_kernel {
     if (gemm_nax_kernel) |k| return k;
-    const input_names = [_][*:0]const u8{ "x", "trellis", "eids" };
+    const input_names = [_][*:0]const u8{ "x", "trellis", "eids", "wstarts", "wnlive" };
     const output_names = [_][*:0]const u8{"y"};
     const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
     defer _ = mlx.mlx_vector_string_free(in_vec);
@@ -807,7 +812,7 @@ fn getGemmNaxKernel() !mlx.mlx_fast_metal_kernel {
 
 fn getGemmSortedKernel() !mlx.mlx_fast_metal_kernel {
     if (gemm_sorted_kernel) |k| return k;
-    const input_names = [_][*:0]const u8{ "x", "trellis", "eids" };
+    const input_names = [_][*:0]const u8{ "x", "trellis", "eids", "wstarts", "wnlive" };
     const output_names = [_][*:0]const u8{"y"};
     const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
     defer _ = mlx.mlx_vector_string_free(in_vec);
@@ -827,13 +832,79 @@ fn getGemmSortedKernel() !mlx.mlx_fast_metal_kernel {
     return kernel;
 }
 
+const WindowTable = struct { starts: mlx.mlx_array, nlives: mlx.mlx_array, nwin: c_int };
+
+fn buildWindowTable(s: mlx.mlx_stream, eids: mlx.mlx_array, n: c_int, win: c_int) !WindowTable {
+    return buildWindowTableHost(s, eids, n, win);
+}
+
+fn buildWindowTableHost(s: mlx.mlx_stream, eids: mlx.mlx_array, n: c_int, win: c_int) !WindowTable {
+    const ids = try std.heap.page_allocator.alloc(u32, @intCast(n));
+    defer std.heap.page_allocator.free(ids);
+    var contig = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(contig);
+    try mlx.check(mlx.mlx_contiguous(&contig, eids, false, s));
+    try mlx.check(mlx.mlx_array_eval(contig));
+    switch (mlx.mlx_array_dtype(contig)) {
+        .uint32 => {
+            const p = mlx.mlx_array_data_uint32(contig) orelse return error.F16Unreadable;
+            @memcpy(ids, p[0..ids.len]);
+        },
+        .int32 => {
+            const p = mlx.mlx_array_data_int32(contig) orelse return error.F16Unreadable;
+            for (ids, 0..) |*d, i| d.* = @intCast(p[i]);
+        },
+        else => return error.BadExl3Shape,
+    }
+    const runs = try buildRuns(std.heap.page_allocator, ids);
+    defer std.heap.page_allocator.free(runs.start);
+    defer std.heap.page_allocator.free(runs.len);
+    defer std.heap.page_allocator.free(runs.eid);
+    const w: u32 = @intCast(win);
+    var nwin_u: u32 = 0;
+    var r: u32 = 0;
+    while (r < runs.n) : (r += 1) {
+        nwin_u += (runs.len[r] + w - 1) / w;
+    }
+    const sh = try std.heap.page_allocator.alloc(u32, nwin_u);
+    defer std.heap.page_allocator.free(sh);
+    const lh = try std.heap.page_allocator.alloc(u32, nwin_u);
+    defer std.heap.page_allocator.free(lh);
+    var k: u32 = 0;
+    r = 0;
+    while (r < runs.n) : (r += 1) {
+        var off: u32 = 0;
+        while (off < runs.len[r]) {
+            const live = @min(w, runs.len[r] - off);
+            sh[k] = runs.start[r] + off;
+            lh[k] = live;
+            k += 1;
+            off += live;
+        }
+    }
+    const starts_raw = mlx.mlx_array_new_data(sh.ptr, &[_]c_int{@intCast(nwin_u)}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(starts_raw);
+    const nlives_raw = mlx.mlx_array_new_data(lh.ptr, &[_]c_int{@intCast(nwin_u)}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(nlives_raw);
+    var starts = mlx.mlx_array_new();
+    var nlives = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_contiguous(&starts, starts_raw, false, s));
+    try mlx.check(mlx.mlx_contiguous(&nlives, nlives_raw, false, s));
+    try mlx.check(mlx.mlx_array_eval(starts));
+    try mlx.check(mlx.mlx_array_eval(nlives));
+    if (exl3UbenchOn()) {
+        std.debug.print("[exl3-ubench] win_table_host nwin={d} n={d} win={d} eval=eids\n", .{ nwin_u, n, win });
+    }
+    return .{ .starts = starts, .nlives = nlives, .nwin = @intCast(nwin_u) };
+}
+
 pub fn innerGemmSorted(
     s: mlx.mlx_stream,
     x: mlx.mlx_array,
     trellis: mlx.mlx_array,
     eids: mlx.mlx_array,
 ) !mlx.mlx_array {
-    return innerGemmSortedWin(s, x, trellis, eids, GEMM_WINDOW_ROWS);
+    return innerGemmSortedWin(s, x, trellis, eids, gemmWindowRows());
 }
 
 fn innerGemmSortedWin(
@@ -851,8 +922,12 @@ fn innerGemmSortedWin(
     const in_dim = xsh[1];
     const out_dim = tsh[2] * 16;
     const out_tiles = tsh[2];
-    const nwin = @divFloor(n + win - 1, win);
-    const key = GemmSortedKey{ .in_dim = in_dim, .out_dim = out_dim, .rows = n, .win = win };
+    const tab = try buildWindowTable(s, eids, n, win);
+    defer _ = mlx.mlx_array_free(tab.starts);
+    defer _ = mlx.mlx_array_free(tab.nlives);
+    const nwin = tab.nwin;
+    if (nwin <= 0) return error.BadExl3Shape;
+    const key = GemmSortedKey{ .in_dim = in_dim, .out_dim = out_dim, .rows = n, .win = win, .nwin = nwin };
     if (gemmNaxOn() and @rem(out_dim, 128) == 0) {
         if (getGemmNaxKernel()) |nk| {
             const ncfg = gemm_nax_cfgs.get(key) orelse blk: {
@@ -867,7 +942,7 @@ fn innerGemmSortedWin(
                 gemm_nax_cfgs.put(key, c);
                 break :blk c;
             };
-            const ninputs = [_]mlx.mlx_array{ x, trellis, eids };
+            const ninputs = [_]mlx.mlx_array{ x, trellis, eids, tab.starts, tab.nlives };
             const ninputs_vec = mlx.mlx_vector_array_new_data(&ninputs, ninputs.len);
             defer _ = mlx.mlx_vector_array_free(ninputs_vec);
             var noutputs = mlx.mlx_vector_array_new();
@@ -895,7 +970,7 @@ fn innerGemmSortedWin(
         gemm_sorted_cfgs.put(key, c);
         break :blk c;
     };
-    const inputs = [_]mlx.mlx_array{ x, trellis, eids };
+    const inputs = [_]mlx.mlx_array{ x, trellis, eids, tab.starts, tab.nlives };
     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
     var outputs_vec = mlx.mlx_vector_array_new();
