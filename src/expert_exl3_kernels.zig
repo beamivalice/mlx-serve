@@ -420,7 +420,6 @@ fn CfgCache(comptime Key: type, comptime CAP: usize) type {
 const IndexedKey = struct { in_dim: c_int, out_dim: c_int, topk: c_int };
 const UnaryKey = struct { dim: c_int, topk: c_int };
 const GemmSortedKey = struct { in_dim: c_int, out_dim: c_int, rows: c_int };
-var indexed_cfgs: CfgCache(IndexedKey, 8) = .{};
 var indexed_coop_cfgs: CfgCache(IndexedKey, 8) = .{};
 var prepare_cfgs: CfgCache(UnaryKey, 8) = .{};
 var finish_cfgs: CfgCache(UnaryKey, 8) = .{};
@@ -656,124 +655,6 @@ fn gemvConfig(in_dim: c_int, out_dim: c_int) !mlx.mlx_fast_metal_kernel_config {
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "ODIM", out_dim));
     inner_gemv_cfgs.put(key, cfg);
     return cfg;
-}
-
-const INDEXED_SOURCE: [:0]const u8 =
-    \\uint gid = uint(thread_position_in_grid.x);
-    \\uint slot = uint(thread_position_in_grid.z);
-    \\if (gid >= uint(ODIM)) return;
-    \\constexpr uint TILE = 16u;
-    \\constexpr uint IN_TILES = uint(IDIM) / TILE;
-    \\constexpr uint OUT_TILES = uint(ODIM) / TILE;
-    \\const uint eid = uint(slots[slot]);
-    \\const device ushort* trellis_e = trellis + eid * IN_TILES * OUT_TILES * 64u;
-    \\const uint tn = gid / TILE;
-    \\const uint local = gid % TILE;
-    \\float acc = 0.0f;
-    \\for (uint tk = 0u; tk < IN_TILES; tk++) {
-    \\  const device ushort* tile = trellis_e + (tk * OUT_TILES + tn) * 64u;
-    \\  ushort cw[256];
-    \\  const uint word_count = 32u;
-    \\  for (uint th = 0u; th < 128u; th++) {
-    \\    const int bit0 = int(th) * 8 + 4 + 1024 - 16;
-    \\    const int bit2 = bit0 + 4 + 16;
-    \\    const int index0 = bit0 / 32;
-    \\    const int index1 = (bit2 - 1) / 32;
-    \\    const uint shift = uint((index1 + 1) * 32 - bit2);
-    \\    const uint a = uint(tile[(uint(index0) % word_count) * 2u]) | (uint(tile[(uint(index0) % word_count) * 2u + 1u]) << 16u);
-    \\    const uint b = uint(tile[(uint(index1) % word_count) * 2u]) | (uint(tile[(uint(index1) % word_count) * 2u + 1u]) << 16u);
-    \\    const ulong merged = (ulong(a) << 32) | ulong(b);
-    \\    const uint funnel = uint(merged >> shift);
-    \\    cw[th * 2u] = ushort((funnel >> 4u) & 0xffffu);
-    \\    cw[th * 2u + 1u] = ushort(funnel & 0xffffu);
-    \\  }
-    \\  for (uint si = 0u; si < 256u; si++) {
-    \\    const uint lane = si / 8u;
-    \\    const uint s = si % 8u;
-    \\    const uint row0 = (lane & 3u) * 2u;
-    \\    const uint col0 = lane >> 2u;
-    \\    uint pos;
-    \\    switch (s) {
-    \\      case 0u: pos = row0 * 16u + col0; break;
-    \\      case 1u: pos = (row0 + 1u) * 16u + col0; break;
-    \\      case 2u: pos = (row0 + 8u) * 16u + col0; break;
-    \\      case 3u: pos = (row0 + 9u) * 16u + col0; break;
-    \\      case 4u: pos = row0 * 16u + col0 + 8u; break;
-    \\      case 5u: pos = (row0 + 1u) * 16u + col0 + 8u; break;
-    \\      case 6u: pos = (row0 + 8u) * 16u + col0 + 8u; break;
-    \\      default: pos = (row0 + 9u) * 16u + col0 + 8u; break;
-    \\    }
-    \\    if ((pos % 16u) != local) continue;
-    \\    const uint mixed = uint(cw[si]) * 0x83DCD12Du;
-    \\    const uint pair_sums = (mixed & 0x00FF00FFu) + ((mixed >> 8u) & 0x00FF00FFu);
-    \\    const uint byte_sum = 0x6400u + (pair_sums & 0xFFFFu) + (pair_sums >> 16u);
-    \\    const half hh = as_type<half>(ushort(byte_sum));
-    \\    const half inv = as_type<half>(ushort(0x1EEEu));
-    \\    const half bias = as_type<half>(ushort(0xC931u));
-    \\    const float w = float(fma(hh, inv, bias));
-    \\    acc += float(x[(size_t)slot * (size_t)(IDIM) + tk * TILE + (pos / 16u)]) * w;
-    \\  }
-    \\}
-    \\y[(size_t)slot * (size_t)(ODIM) + gid] = half(acc);
-;
-
-var indexed_kernel: ?mlx.mlx_fast_metal_kernel = null;
-
-fn getIndexedKernel() !mlx.mlx_fast_metal_kernel {
-    if (indexed_kernel) |k| return k;
-    const input_names = [_][*:0]const u8{ "x", "trellis", "slots" };
-    const output_names = [_][*:0]const u8{"y"};
-    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
-    defer _ = mlx.mlx_vector_string_free(in_vec);
-    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
-    defer _ = mlx.mlx_vector_string_free(out_vec);
-    const kernel = mlx.mlx_fast_metal_kernel_new(
-        "mlxserve_exl3_k4_mcg_gemv_indexed",
-        in_vec,
-        out_vec,
-        INDEXED_SOURCE,
-        "",
-        true,
-        false,
-    );
-    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
-    indexed_kernel = kernel;
-    return kernel;
-}
-
-pub fn indexedGemvF16(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, slots: mlx.mlx_array) !mlx.mlx_array {
-    const xsh = mlx.getShape(x);
-    const tsh = mlx.getShape(trellis);
-    const ssh = mlx.getShape(slots);
-    if ((xsh.len != 1 and xsh.len != 2) or tsh.len != 4 or ssh.len != 1) return error.BadExl3Shape;
-    const in_dim = xsh[xsh.len - 1];
-    const out_dim = tsh[2] * 16;
-    const topk = ssh[0];
-    if (tsh[1] * 16 != in_dim or tsh[3] != 64) return error.BadExl3Shape;
-    const key = IndexedKey{ .in_dim = in_dim, .out_dim = out_dim, .topk = topk };
-    const cfg = indexed_cfgs.get(key) orelse blk: {
-        const c = mlx.mlx_fast_metal_kernel_config_new();
-        const out_shape = [_]c_int{ topk, out_dim };
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &out_shape, 2, .float16));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, out_dim, 1, topk));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 32, 1, 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "IDIM", in_dim));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ODIM", out_dim));
-        indexed_cfgs.put(key, c);
-        break :blk c;
-    };
-    const inputs_arr = [_]mlx.mlx_array{ x, trellis, slots };
-    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
-    defer _ = mlx.mlx_vector_array_free(inputs_vec);
-    const kernel = try getIndexedKernel();
-    var outputs_vec = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(outputs_vec);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, cfg, s));
-    if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
-    var out = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
-    return out;
 }
 
 const INDEXED_COOP_SOURCE: [:0]const u8 =
@@ -2180,7 +2061,7 @@ test "exl3 K4 cooperative indexed GEMV matches host MUL1 on production shape" {
     }
 }
 
-test "exl3 K4 cooperative indexed GEMV is at least 4x the scalar indexed GEMV" {
+test "exl3 K4 cooperative indexed GEMV runs at production shape" {
     const t = std.testing;
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
@@ -2208,36 +2089,24 @@ test "exl3 K4 cooperative indexed GEMV is at least 4x the scalar indexed GEMV" {
     defer _ = mlx.mlx_array_free(tr_arr);
     const slots = mlx.mlx_array_new_data(slots_h.ptr, &[_]c_int{@intCast(topk)}, 1, .uint32);
     defer _ = mlx.mlx_array_free(slots);
-    const warm_old = try indexedGemvF16(s, x_arr, tr_arr, slots);
-    try mlx.check(mlx.mlx_array_eval(warm_old));
-    _ = mlx.mlx_array_free(warm_old);
     const warm_new = try indexedGemvCoopF16(s, x_arr, tr_arr, slots);
     try mlx.check(mlx.mlx_array_eval(warm_new));
     _ = mlx.mlx_array_free(warm_new);
     const io_util = @import("io_util.zig");
-    var old_ns: u64 = 0;
     var new_ns: u64 = 0;
     var it: usize = 0;
     while (it < 10) : (it += 1) {
         var sw = io_util.Stopwatch.init(t.io);
-        const a = try indexedGemvF16(s, x_arr, tr_arr, slots);
-        try mlx.check(mlx.mlx_array_eval(a));
-        old_ns += sw.read();
-        _ = mlx.mlx_array_free(a);
-        sw = io_util.Stopwatch.init(t.io);
         const b = try indexedGemvCoopF16(s, x_arr, tr_arr, slots);
         try mlx.check(mlx.mlx_array_eval(b));
         new_ns += sw.read();
         _ = mlx.mlx_array_free(b);
     }
-    old_ns /= 10;
     new_ns /= 10;
-    std.debug.print("exl3 indexed GEMV H=2560 I=640 topk=10: scalar {d} us  coop {d} us  ratio {d}/100\n", .{
-        old_ns / 1000,
+    std.debug.print("exl3 indexed GEMV H=2560 I=640 topk=10: coop {d} us\n", .{
         new_ns / 1000,
-        if (new_ns == 0) 0 else (old_ns * 100) / new_ns,
     });
-    try t.expect(new_ns * 5 <= old_ns);
+    try t.expect(new_ns > 0);
 }
 
 test "exl3 fused decode chain matches indexed SwiGLU on one row" {
