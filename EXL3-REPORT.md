@@ -46,27 +46,35 @@ Host decoder: `src/expert_exl3.zig`. Fixture: `src/fixtures/exl3_k4_linear.safet
 - Plan: files with only expert affine banks are dropped; files with no expert keys are hard-linked; mixed shards are rewritten with remaining tensors copied as raw bytes.
 - Experts: HF `mlp.experts.gate_up_proj` `[E,2I,H]` split and transposed to public `[H,I]`; `down_proj` `[E,H,I]` transposed to `[I,H]`; stacked on axis 0.
 
-ponyexl3 entry points the real conversion calls, per expert linear:
+ponyexl3 entry points:
 
-1. `ponyexl3.convert.regularize.regularize_public_weight` — suh/svh + inner-domain target (codebook scale folded into suh).
-2. Hessian: `diag_hessian(v)` = `np.diag(v)` from the imatrix channel vector, then `ponyexl3.convert.hessian.prepare_hessian_for_ldl` + `block_ldl`. (LDLQ has no diagonal-H shortcut; we build `H = diag(v)` ourselves.)
-3. `ponyexl3.convert.hessian.ldlq_inner_matrix(..., search_backend="metal")` — reverse 16-row LDLQ, Metal tile search, MCG K=4.
-4. Fallback if that expert’s routed-token count is 0: `capture_hessian` on 256 Gaussian rows (isotropic H ≈ direct), listed in `plan["zero_routed"]`.
+- Direct (picked): `regularize_public_weight` then `quantize_inner_matrix_direct` on a **concatenated-out batch** of N same-shape experts (`_quantize_direct_batch`). Metal trellis search is already GPU-resident and splits on scratch; stacking out-features is the grouped-search analogue of `ldlq_quantize_group`.
+- LDLQ (slower, no quality win here): `prepare_hessian_for_ldl(diag(v))` + `block_ldl` + `ldlq_inner_matrix`.
 
-`--quantizer direct` is the synthetic-test path (`quantize_inner_matrix_direct` only).
+Measured on one 2560×640 expert, imatrix-like `v`, 256 rows `X[:,i]~N(0,√v_i)`:
 
-Calibration data for routed experts (after box-grant collect):
+| arm | weighted relRMS | output relRMS | time |
+|---|---:|---:|---:|
+| affine 4-bit g64 (`mx.quantize`) | 0.09110 | 0.09126 | — |
+| **direct K4 MCG** | **0.06868** | **0.06881** | **0.353 s** |
+| direct, rows × √v | 0.06869 | 0.06883 | — |
+| LDLQ diag(v) | 0.06868 | 0.06881 | 0.594 s |
 
-- File: `/Users/beam/llm/models/calib/qwen38-flash-next-imatrix.safetensors` from `tests/qwen38_flash_next_imatrix_collect.py` on `/Users/beam/llm/models/Qwen/Qwen3.8-Flash-Next`.
-- `model.language_model.layers.{L}.mlp.experts.gate_up_proj` `[E*2560]` — per-expert, per-input-channel mean-squared MLP inputs (`sum(x^2)/corpus_tokens`). **gate and up share this vector.**
-- `...mlp.experts.down_proj` `[E*640]` — same for the SwiGLU intermediate (down’s input).
-- `...mlp.experts.gate_up_proj.rows` `[E]` — tokens routed to each expert. Zero → Gaussian fallback.
-- Tag in config: `"calibration": "imatrix-diagonal"`.
-- Collect is **not run yet** (loads the 360 GB bf16 checkpoint; waits for BOX-GRANT). Wall time TBD from the collector’s per-layer print; expect ~1–3 min/layer × 48 ≈ **1–2.5 h** plus embed.
+All EXL3 arms beat affine-4. **Pick direct** (fastest). Row-√v imatrix weighting did not move the needle.
 
-Wall-clock estimate for the **full pack conversion** (measured): one 2560×640 K4 Metal LDLQ is **1.272 s** (regularize 7 ms, block-LDL 132 ms, search 1.133 s). 48 layers × 512 experts × 3 projections = 73,728 linears × 1.272 s ≈ **26.0 h** serial, plus ~0.5 h MTP experts, plus rewrite/hardlink. Grant size: **imatrix collect 1–2.5 h + convert ~26 h + KLD/bench ~1 h ≈ 29 h**. Do not start until BOX-GRANT.
+Batched direct projections/s (2560×640, Metal):
 
-Unit tests: plan + layout/hardlinks + imatrix-diagonal Hessian/zero-routed tag. `python3 tests/convert_qwen38_flash_next_exl3.py --self-test` → 8/8.
+| N | wall | proj/s | full pack (73,728) |
+|---|---:|---:|---:|
+| 16 | 5.173 s | **3.09** | **6.63 h** |
+| 32 | 10.422 s | 3.07 | 6.67 h |
+| 64 | 21.290 s | 3.01 | 6.80 h |
+
+N=16 is the plateau. 6.63 h > 4 h, so conversion is **resumable**: `model-exl3-L{layer:02d}-{gate,up,down}.safetensors`, skip if header shape validates. A 2 h window does ~3.09×7200 ≈ 22k projections ≈ **14 layers**. ~4 windows of 2 h finish the pack.
+
+Imatrix collect (step 0, still grant-gated) checkpoints `*.safetensors.layers/LXX.safetensors` and skips complete layers. Tag stays `imatrix-diagonal` when `--imatrix` is passed (used for LDLQ / zero-routed listing); the picked search arm is direct.
+
+Unit tests: plan + layout + imatrix-diagonal + resume skip. `--self-test` → 12/12.
 
 ## Loader
 
@@ -167,12 +175,12 @@ Every algorithm taken from another tree (do not copy these names into mlx-serve 
 
 ## Commit sha
 
-See git HEAD after this round. Prior stack: `b578cb05` host decoder, `5b9c48fb` converter, `b3e3e219` loader, `259f3b16` GEMV, `84a25c08` indexed MoE, `43c5c1d1` report. Clone base `7264fe15`.
+HEAD after this round (batched direct + resumable shards). Clone base `7264fe15`.
 
 ## Open questions
 
 - Naive GEMV will not hit the 15% speed bar; need the simdgroup K4 indexed-pair port and a rows4 prefill kernel.
-- Imatrix collect + 26 h conversion wait on BOX-GRANT (speed executor A/B ~1 h).
+- Convert is 6.63 h at 3.09 proj/s; needs ~4× 2 h windows. Imatrix collect still grant-gated.
 - Production prefill should switch to decode-to-bf16 + gather_mm once Metal weight decode exists (synthetic pick is 13 ms vs 197 ms).
 - suh/svh Hadamard Metal path is a naive matvec; F16 rounding vs host FWHT/Sylvester association needs a dedicated parity test at 2560-d.
 - MTP EXL3 experts load via trellis triples; the MTP forward reuses the trunk MoE hook.
