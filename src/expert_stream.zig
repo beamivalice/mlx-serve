@@ -253,8 +253,8 @@ pub const GroupResolution = struct {
 pub const CachePolicy = enum { lru, lfu };
 
 pub fn expertCachePolicyFromEnv() CachePolicy {
-    const raw = std.c.getenv("MLX_SERVE_EXPERT_LFU") orelse return .lru;
-    if (raw[0] == 0 or raw[0] == '0') return .lru;
+    const raw = std.c.getenv("MLX_SERVE_EXPERT_LFU");
+    if (raw != null and raw.?[0] == '0') return .lru;
     return .lfu;
 }
 
@@ -267,6 +267,8 @@ pub const GroupCache = struct {
     ready: []bool,
     tick: u64 = 0,
     policy: CachePolicy = .lru,
+    resolves: u32 = 0,
+    decay_period: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, capacity: u16, expert_count: u16) !GroupCache {
         return initPolicy(allocator, capacity, expert_count, .lru);
@@ -288,7 +290,16 @@ pub const GroupCache = struct {
         @memset(ages, 0);
         @memset(freq, 0);
         @memset(ready, false);
-        return .{ .allocator = allocator, .expert_to_slot = expert_to_slot, .slot_to_expert = slot_to_expert, .ages = ages, .freq = freq, .ready = ready, .policy = policy };
+        return .{
+            .allocator = allocator,
+            .expert_to_slot = expert_to_slot,
+            .slot_to_expert = slot_to_expert,
+            .ages = ages,
+            .freq = freq,
+            .ready = ready,
+            .policy = policy,
+            .decay_period = if (policy == .lfu) 64 else 0,
+        };
     }
 
     pub fn deinit(self: *GroupCache) void {
@@ -317,6 +328,18 @@ pub const GroupCache = struct {
         self.ready[slot] = false;
         self.ages[slot] = 0;
         self.freq[slot] = 0;
+    }
+
+    pub fn resetFrequencies(self: *GroupCache) void {
+        for (self.freq, 0..) |*f, i| {
+            if (self.slot_to_expert[i] != std.math.maxInt(u16) and f.* > 1) f.* = 1;
+        }
+    }
+
+    fn decayFrequencies(self: *GroupCache) void {
+        for (self.freq, 0..) |*f, i| {
+            if (self.slot_to_expert[i] != std.math.maxInt(u16) and f.* > 1) f.* = @max(1, f.* / 2);
+        }
     }
 
     fn touch(self: *GroupCache, slot: u16) void {
@@ -365,6 +388,8 @@ pub const GroupCache = struct {
     }
 
     pub fn resolve(self: *GroupCache, allocator: std.mem.Allocator, occurrences: []const u16) !GroupResolution {
+        self.resolves +%= 1;
+        if (self.decay_period > 0 and self.resolves % self.decay_period == 0) self.decayFrequencies();
         const last = try allocator.alloc(usize, self.expert_to_slot.len);
         defer allocator.free(last);
         @memset(last, std.math.maxInt(usize));
@@ -1052,6 +1077,7 @@ pub const Engine = struct {
     route_linear: RouteClass = .{},
     route_full: RouteClass = .{},
     pending: [PENDING_READERS_MAX]?HeldLease = @splat(null),
+    last_occ_len: usize = 0,
 
     pub fn pendingReaders(self: *const Engine) usize {
         var n: usize = 0;
@@ -1296,6 +1322,12 @@ pub const Engine = struct {
     pub fn prepareHost(self: *Engine, layer_index: u16, occurrences: []const u16) !Prepared {
         if (layer_index >= self.layers.len) return error.ExpertLayerOutOfRange;
         self.drainPendingReaders();
+        if (layer_index == 0) {
+            if (occurrences.len > 10 and self.last_occ_len <= 10) {
+                for (self.layers) |*layer| layer.cache.resetFrequencies();
+            }
+            self.last_occ_len = occurrences.len;
+        }
         return self.prepareSlab(layer_index, occurrences);
     }
 
