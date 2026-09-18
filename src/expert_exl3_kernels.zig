@@ -120,6 +120,15 @@ pub fn dumpUnionHist(slots_u: mlx.mlx_array, S: usize, K: usize) !void {
     log.info("[exl3-union] S={d} K={d} assignments={d} unique={d} shared={d} max_mult={d}\n", .{ S, K, n, unique, shared, max_m });
 }
 
+/// Rows a routed-expert call sees: the product of every leading dim, never the
+/// activation width.
+pub fn rowsOfShape(shape: []const c_int) usize {
+    if (shape.len < 2) return 1;
+    var n: usize = 1;
+    for (shape[0 .. shape.len - 1]) |d| n *= @intCast(@max(d, 0));
+    return n;
+}
+
 pub const RunTable = struct {
     start: []u32,
     len: []u32,
@@ -2558,6 +2567,16 @@ test "exl3 buildRuns groups sorted expert ids" {
     try t.expectEqual(@as(u32, 5), runs.start[2]);
     try t.expectEqual(@as(u32, 1), runs.len[2]);
     try t.expectEqual(@as(u32, 1), runs.eid[2]);
+}
+
+test "exl3 row count is the leading dims, not the activation width" {
+    const t = std.testing;
+    try t.expectEqual(@as(usize, 1), rowsOfShape(&[_]c_int{2560}));
+    try t.expectEqual(@as(usize, 2), rowsOfShape(&[_]c_int{ 2, 2560 }));
+    try t.expectEqual(@as(usize, 6), rowsOfShape(&[_]c_int{ 2, 3, 2560 }));
+    try t.expect(!usesPrefillArm(rowsOfShape(&[_]c_int{ 16, 1, 2560 })));
+    try t.expect(usesPrefillArm(rowsOfShape(&[_]c_int{ 17, 1, 2560 })));
+    try t.expect(!usesPrefillArm(rowsOfShape(&[_]c_int{ 4, 2560 })));
 }
 
 test "exl3 prefill arm is used only above 16 rows" {

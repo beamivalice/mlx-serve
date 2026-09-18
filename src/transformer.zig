@@ -22016,10 +22016,8 @@ pub const Transformer = struct {
 
     fn mtpMoeRows(self: *Transformer, x: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
         if (self.config.expert_layout == .exl3_k4) {
-            const sh = mlx.getShape(x);
-            var n: usize = 1;
-            if (sh.len >= 2) n = @intCast(sh[0] * sh[1]) else n = @intCast(sh[0]);
-            if (n > expert_exl3_kernels.DECODE_ROWS_MAX) return error.Exl3MtpRowsExceedDecode;
+            if (expert_exl3_kernels.usesPrefillArm(expert_exl3_kernels.rowsOfShape(mlx.getShape(x))))
+                return error.Exl3MtpRowsExceedDecode;
         }
         if (mw.shared_ungated or mw.shared_expert_gate_w == null or qwen4Standin().moe_shared) return self.moeMLP(x, mw);
         var routed = mw.*;
