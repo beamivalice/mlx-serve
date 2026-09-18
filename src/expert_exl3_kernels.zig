@@ -555,6 +555,8 @@ const MidKey = struct { dim: c_int, nslots: c_int };
 const ReduceKey = struct { out_dim: c_int, rows: c_int, topk: c_int };
 var pair_prep_cfgs: CfgCache(PairPrepKey, 8) = .{};
 var pair_gemv_cfgs: CfgCache(PairGemvKey, 8) = .{};
+const FusedPairKey = struct { in_dim: c_int, out_dim: c_int, nslots: c_int, topk: c_int };
+var fused_pair_cfgs: CfgCache(FusedPairKey, 8) = .{};
 var mid_cfgs: CfgCache(MidKey, 8) = .{};
 var reduce_cfgs: CfgCache(ReduceKey, 8) = .{};
 var token_prep_cfgs: CfgCache(PairPrepKey, 8) = .{};
@@ -1288,6 +1290,254 @@ const REDUCE_SOURCE: [:0]const u8 =
     \\}
 ;
 
+const FUSED_PAIR_MID_SOURCE: [:0]const u8 =
+    \\threadgroup half xp[uint(IDIM)];
+    \\threadgroup float partial[4 * 256];
+    \\threadgroup half ig[128];
+    \\threadgroup half iu[128];
+    \\uint blk = uint(threadgroup_position_in_grid.x);
+    \\uint slot = uint(threadgroup_position_in_grid.y);
+    \\uint sg = uint(simdgroup_index_in_threadgroup);
+    \\uint lane = uint(thread_index_in_simdgroup);
+    \\constexpr uint TILE = 16u;
+    \\constexpr uint IT = uint(IDIM) / TILE;
+    \\constexpr uint OT = uint(ODIM) / TILE;
+    \\constexpr uint SGS = 4u;
+    \\const uint eid = uint(slots[slot]);
+    \\const uint row = slot / uint(TOPK);
+    \\const uint prow = (lane & 3u) * 2u;
+    \\const uint pcol = lane >> 2u;
+    \\uint pos[8];
+    \\pos[0] = prow * 16u + pcol;
+    \\pos[1] = (prow + 1u) * 16u + pcol;
+    \\pos[2] = (prow + 8u) * 16u + pcol;
+    \\pos[3] = (prow + 9u) * 16u + pcol;
+    \\pos[4] = prow * 16u + pcol + 8u;
+    \\pos[5] = (prow + 1u) * 16u + pcol + 8u;
+    \\pos[6] = (prow + 8u) * 16u + pcol + 8u;
+    \\pos[7] = (prow + 9u) * 16u + pcol + 8u;
+    \\const uint row0 = pos[0] >> 4u;
+    \\const uint row1 = pos[1] >> 4u;
+    \\const uint row2 = pos[2] >> 4u;
+    \\const uint row3 = pos[3] >> 4u;
+    \\const float sc = 0.08838834764831845f;
+    \\const size_t xb = (size_t)row * (size_t)(IDIM);
+    \\const size_t sb = (size_t)eid * (size_t)(IDIM);
+    \\const uint nblk = uint(IDIM) / 128u;
+    \\for (uint b = sg; b < nblk; b += SGS) {
+    \\  const uint base = b * 128u;
+    \\  const float x0 = float(x[xb + base + lane]);
+    \\  const float x1 = float(x[xb + base + lane + 32u]);
+    \\  const float x2 = float(x[xb + base + lane + 64u]);
+    \\  const float x3 = float(x[xb + base + lane + 96u]);
+    \\  float4 v = float4(x0 * float(suhg[sb + base + lane]), x1 * float(suhg[sb + base + lane + 32u]), x2 * float(suhg[sb + base + lane + 64u]), x3 * float(suhg[sb + base + lane + 96u]));
+    \\  for (ushort bit = 1u; bit <= 16u; bit <<= 1u) {
+    \\    const float p0 = simd_shuffle_xor(v.x, bit);
+    \\    const float p1 = simd_shuffle_xor(v.y, bit);
+    \\    const float p2 = simd_shuffle_xor(v.z, bit);
+    \\    const float p3 = simd_shuffle_xor(v.w, bit);
+    \\    const bool lower = (lane & bit) == 0u;
+    \\    v.x = lower ? v.x + p0 : p0 - v.x;
+    \\    v.y = lower ? v.y + p1 : p1 - v.y;
+    \\    v.z = lower ? v.z + p2 : p2 - v.z;
+    \\    v.w = lower ? v.w + p3 : p3 - v.w;
+    \\  }
+    \\  const float s0 = v.x + v.y;
+    \\  const float s1 = v.x - v.y;
+    \\  const float s2 = v.z + v.w;
+    \\  const float s3 = v.z - v.w;
+    \\  xp[base + lane] = half((s0 + s2) * sc);
+    \\  xp[base + lane + 32u] = half((s1 + s3) * sc);
+    \\  xp[base + lane + 64u] = half((s0 - s2) * sc);
+    \\  xp[base + lane + 96u] = half((s1 - s3) * sc);
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\const device uint *tg_e = (const device uint *)(tg + ((size_t)eid * (size_t)IT * (size_t)OT) * 64u);
+    \\for (uint t = 0u; t < 8u; t++) {
+    \\  const uint ot = blk * 8u + t;
+    \\  float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    \\  if (ot < OT) {
+    \\    for (uint tk = sg; tk < IT; tk += SGS) {
+    \\      const device uint *words = tg_e + ((size_t)tk * (size_t)OT + ot) * 32u;
+    \\      const ulong merged = ((ulong)words[(lane + 31u) & 31u] << 32) | (ulong)words[lane];
+    \\      const float in0 = float(xp[tk * TILE + row0]);
+    \\      const float in1 = float(xp[tk * TILE + row1]);
+    \\      const float in2 = float(xp[tk * TILE + row2]);
+    \\      const float in3 = float(xp[tk * TILE + row3]);
+    \\      const uint sh[8] = {28u, 24u, 20u, 16u, 12u, 8u, 4u, 0u};
+    \\      const float ins[8] = {in0, in1, in2, in3, in0, in1, in2, in3};
+    \\      for (uint p = 0u; p < 4u; p++) {
+    \\        const uint2 cw = uint2(uint(merged >> sh[p * 2u]), uint(merged >> sh[p * 2u + 1u])) & uint2(0xffffu);
+    \\        const uint2 mixed = cw * uint2(0x83DCD12Du);
+    \\        const uint2 pair_sums = (mixed & uint2(0x00FF00FFu)) + ((mixed >> uint2(8u)) & uint2(0x00FF00FFu));
+    \\        const uint2 byte_sum = uint2(0x6400u) + (pair_sums & uint2(0xFFFFu)) + (pair_sums >> uint2(16u));
+    \\        const half2 hh = as_type<half2>(ushort2(byte_sum & uint2(0xFFFFu)));
+    \\        const float2 w = float2(fma(hh, as_type<half2>(ushort2(0x1EEEu)), as_type<half2>(ushort2(0xC931u))));
+    \\        acc[p * 2u] = fma(ins[p * 2u], w.x, acc[p * 2u]);
+    \\        acc[p * 2u + 1u] = fma(ins[p * 2u + 1u], w.y, acc[p * 2u + 1u]);
+    \\      }
+    \\    }
+    \\  }
+    \\  for (uint si = 0u; si < 8u; si++) partial[sg * 256u + pos[si]] = acc[si];
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\  if (lane < 16u) {
+    \\    float sum = 0.0f;
+    \\    for (uint r = 0u; r < 16u; r++) {
+    \\      for (uint g = 0u; g < SGS; g++) sum += partial[g * 256u + r * 16u + lane];
+    \\    }
+    \\    ig[t * 16u + lane] = half(sum);
+    \\  }
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\}
+    \\for (uint b = sg; b < nblk; b += SGS) {
+    \\  const uint base = b * 128u;
+    \\  const float x0 = float(x[xb + base + lane]);
+    \\  const float x1 = float(x[xb + base + lane + 32u]);
+    \\  const float x2 = float(x[xb + base + lane + 64u]);
+    \\  const float x3 = float(x[xb + base + lane + 96u]);
+    \\  float4 v = float4(x0 * float(suhu[sb + base + lane]), x1 * float(suhu[sb + base + lane + 32u]), x2 * float(suhu[sb + base + lane + 64u]), x3 * float(suhu[sb + base + lane + 96u]));
+    \\  for (ushort bit = 1u; bit <= 16u; bit <<= 1u) {
+    \\    const float p0 = simd_shuffle_xor(v.x, bit);
+    \\    const float p1 = simd_shuffle_xor(v.y, bit);
+    \\    const float p2 = simd_shuffle_xor(v.z, bit);
+    \\    const float p3 = simd_shuffle_xor(v.w, bit);
+    \\    const bool lower = (lane & bit) == 0u;
+    \\    v.x = lower ? v.x + p0 : p0 - v.x;
+    \\    v.y = lower ? v.y + p1 : p1 - v.y;
+    \\    v.z = lower ? v.z + p2 : p2 - v.z;
+    \\    v.w = lower ? v.w + p3 : p3 - v.w;
+    \\  }
+    \\  const float s0 = v.x + v.y;
+    \\  const float s1 = v.x - v.y;
+    \\  const float s2 = v.z + v.w;
+    \\  const float s3 = v.z - v.w;
+    \\  xp[base + lane] = half((s0 + s2) * sc);
+    \\  xp[base + lane + 32u] = half((s1 + s3) * sc);
+    \\  xp[base + lane + 64u] = half((s0 - s2) * sc);
+    \\  xp[base + lane + 96u] = half((s1 - s3) * sc);
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\const device uint *tu_e = (const device uint *)(tu + ((size_t)eid * (size_t)IT * (size_t)OT) * 64u);
+    \\for (uint t = 0u; t < 8u; t++) {
+    \\  const uint ot = blk * 8u + t;
+    \\  float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    \\  if (ot < OT) {
+    \\    for (uint tk = sg; tk < IT; tk += SGS) {
+    \\      const device uint *words = tu_e + ((size_t)tk * (size_t)OT + ot) * 32u;
+    \\      const ulong merged = ((ulong)words[(lane + 31u) & 31u] << 32) | (ulong)words[lane];
+    \\      const float in0 = float(xp[tk * TILE + row0]);
+    \\      const float in1 = float(xp[tk * TILE + row1]);
+    \\      const float in2 = float(xp[tk * TILE + row2]);
+    \\      const float in3 = float(xp[tk * TILE + row3]);
+    \\      const uint sh[8] = {28u, 24u, 20u, 16u, 12u, 8u, 4u, 0u};
+    \\      const float ins[8] = {in0, in1, in2, in3, in0, in1, in2, in3};
+    \\      for (uint p = 0u; p < 4u; p++) {
+    \\        const uint2 cw = uint2(uint(merged >> sh[p * 2u]), uint(merged >> sh[p * 2u + 1u])) & uint2(0xffffu);
+    \\        const uint2 mixed = cw * uint2(0x83DCD12Du);
+    \\        const uint2 pair_sums = (mixed & uint2(0x00FF00FFu)) + ((mixed >> uint2(8u)) & uint2(0x00FF00FFu));
+    \\        const uint2 byte_sum = uint2(0x6400u) + (pair_sums & uint2(0xFFFFu)) + (pair_sums >> uint2(16u));
+    \\        const half2 hh = as_type<half2>(ushort2(byte_sum & uint2(0xFFFFu)));
+    \\        const float2 w = float2(fma(hh, as_type<half2>(ushort2(0x1EEEu)), as_type<half2>(ushort2(0xC931u))));
+    \\        acc[p * 2u] = fma(ins[p * 2u], w.x, acc[p * 2u]);
+    \\        acc[p * 2u + 1u] = fma(ins[p * 2u + 1u], w.y, acc[p * 2u + 1u]);
+    \\      }
+    \\    }
+    \\  }
+    \\  for (uint si = 0u; si < 8u; si++) partial[sg * 256u + pos[si]] = acc[si];
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\  if (lane < 16u) {
+    \\    float sum = 0.0f;
+    \\    for (uint r = 0u; r < 16u; r++) {
+    \\      for (uint g = 0u; g < SGS; g++) sum += partial[g * 256u + r * 16u + lane];
+    \\    }
+    \\    iu[t * 16u + lane] = half(sum);
+    \\  }
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\}
+    \\{
+    \\  const uint base = 0u;
+    \\  float4 v = float4(float(ig[lane]), float(ig[lane + 32u]), float(ig[lane + 64u]), float(ig[lane + 96u]));
+    \\  for (ushort bit = 1u; bit <= 16u; bit <<= 1u) {
+    \\    const float p0 = simd_shuffle_xor(v.x, bit);
+    \\    const float p1 = simd_shuffle_xor(v.y, bit);
+    \\    const float p2 = simd_shuffle_xor(v.z, bit);
+    \\    const float p3 = simd_shuffle_xor(v.w, bit);
+    \\    const bool lower = (lane & bit) == 0u;
+    \\    v.x = lower ? v.x + p0 : p0 - v.x;
+    \\    v.y = lower ? v.y + p1 : p1 - v.y;
+    \\    v.z = lower ? v.z + p2 : p2 - v.z;
+    \\    v.w = lower ? v.w + p3 : p3 - v.w;
+    \\  }
+    \\  float s0 = v.x + v.y;
+    \\  float s1 = v.x - v.y;
+    \\  float s2 = v.z + v.w;
+    \\  float s3 = v.z - v.w;
+    \\  const size_t ob = (size_t)eid * (size_t)(ODIM) + blk * 128u;
+    \\  const half g0 = half((s0 + s2) * sc * float(svhg[ob + lane]));
+    \\  const half g1 = half((s1 + s3) * sc * float(svhg[ob + lane + 32u]));
+    \\  const half g2 = half((s0 - s2) * sc * float(svhg[ob + lane + 64u]));
+    \\  const half g3 = half((s1 - s3) * sc * float(svhg[ob + lane + 96u]));
+    \\  v = float4(float(iu[lane]), float(iu[lane + 32u]), float(iu[lane + 64u]), float(iu[lane + 96u]));
+    \\  for (ushort bit = 1u; bit <= 16u; bit <<= 1u) {
+    \\    const float p0 = simd_shuffle_xor(v.x, bit);
+    \\    const float p1 = simd_shuffle_xor(v.y, bit);
+    \\    const float p2 = simd_shuffle_xor(v.z, bit);
+    \\    const float p3 = simd_shuffle_xor(v.w, bit);
+    \\    const bool lower = (lane & bit) == 0u;
+    \\    v.x = lower ? v.x + p0 : p0 - v.x;
+    \\    v.y = lower ? v.y + p1 : p1 - v.y;
+    \\    v.z = lower ? v.z + p2 : p2 - v.z;
+    \\    v.w = lower ? v.w + p3 : p3 - v.w;
+    \\  }
+    \\  s0 = v.x + v.y;
+    \\  s1 = v.x - v.y;
+    \\  s2 = v.z + v.w;
+    \\  s3 = v.z - v.w;
+    \\  const half u0 = half((s0 + s2) * sc * float(svhu[ob + lane]));
+    \\  const half u1 = half((s1 + s3) * sc * float(svhu[ob + lane + 32u]));
+    \\  const half u2 = half((s0 - s2) * sc * float(svhu[ob + lane + 64u]));
+    \\  const half u3 = half((s1 - s3) * sc * float(svhu[ob + lane + 96u]));
+    \\  const half ysig0 = 1 / (1 + exp(abs(g0)));
+    \\  const half ysig1 = 1 / (1 + exp(abs(g1)));
+    \\  const half ysig2 = 1 / (1 + exp(abs(g2)));
+    \\  const half ysig3 = 1 / (1 + exp(abs(g3)));
+    \\  const half sig0 = (g0 < 0) ? ysig0 : 1 - ysig0;
+    \\  const half sig1 = (g1 < 0) ? ysig1 : 1 - ysig1;
+    \\  const half sig2 = (g2 < 0) ? ysig2 : 1 - ysig2;
+    \\  const half sig3 = (g3 < 0) ? ysig3 : 1 - ysig3;
+    \\  const half silu0 = half(float(g0) * float(sig0));
+    \\  const half silu1 = half(float(g1) * float(sig1));
+    \\  const half silu2 = half(float(g2) * float(sig2));
+    \\  const half silu3 = half(float(g3) * float(sig3));
+    \\  const half h0 = half(float(silu0) * float(u0));
+    \\  const half h1 = half(float(silu1) * float(u1));
+    \\  const half h2 = half(float(silu2) * float(u2));
+    \\  const half h3 = half(float(silu3) * float(u3));
+    \\  v = float4(float(h0) * float(suhd[ob + lane]), float(h1) * float(suhd[ob + lane + 32u]), float(h2) * float(suhd[ob + lane + 64u]), float(h3) * float(suhd[ob + lane + 96u]));
+    \\  for (ushort bit = 1u; bit <= 16u; bit <<= 1u) {
+    \\    const float p0 = simd_shuffle_xor(v.x, bit);
+    \\    const float p1 = simd_shuffle_xor(v.y, bit);
+    \\    const float p2 = simd_shuffle_xor(v.z, bit);
+    \\    const float p3 = simd_shuffle_xor(v.w, bit);
+    \\    const bool lower = (lane & bit) == 0u;
+    \\    v.x = lower ? v.x + p0 : p0 - v.x;
+    \\    v.y = lower ? v.y + p1 : p1 - v.y;
+    \\    v.z = lower ? v.z + p2 : p2 - v.z;
+    \\    v.w = lower ? v.w + p3 : p3 - v.w;
+    \\  }
+    \\  s0 = v.x + v.y;
+    \\  s1 = v.x - v.y;
+    \\  s2 = v.z + v.w;
+    \\  s3 = v.z - v.w;
+    \\  const size_t yb = (size_t)slot * (size_t)(ODIM) + blk * 128u;
+    \\  yd[yb + lane] = half((s0 + s2) * sc);
+    \\  yd[yb + lane + 32u] = half((s1 + s3) * sc);
+    \\  yd[yb + lane + 64u] = half((s0 - s2) * sc);
+    \\  yd[yb + lane + 96u] = half((s1 - s3) * sc);
+    \\}
+;
+
+var fused_pair_mid_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var pair_prepare_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var pair_gemv_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var mid_kernel: ?mlx.mlx_fast_metal_kernel = null;
@@ -1467,6 +1717,46 @@ fn tokenReduce(s: mlx.mlx_stream, d: mlx.mlx_array, inv: mlx.mlx_array, scores: 
     return a;
 }
 
+fn pairFusedMid(
+    s: mlx.mlx_stream,
+    x: mlx.mlx_array,
+    suhg: mlx.mlx_array,
+    suhu: mlx.mlx_array,
+    tg: mlx.mlx_array,
+    tu: mlx.mlx_array,
+    svhg: mlx.mlx_array,
+    svhu: mlx.mlx_array,
+    suhd: mlx.mlx_array,
+    slots: mlx.mlx_array,
+    in_dim: c_int,
+    out_dim: c_int,
+    nslots: c_int,
+    topk: c_int,
+) !mlx.mlx_array {
+    const key = FusedPairKey{ .in_dim = in_dim, .out_dim = out_dim, .nslots = nslots, .topk = topk };
+    const cfg = fused_pair_cfgs.get(key) orelse blk: {
+        const c = mlx.mlx_fast_metal_kernel_config_new();
+        const sh = [_]c_int{ nslots, out_dim };
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &sh, 2, .float16));
+        const blocks = @divExact(out_dim, 128);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, 128 * blocks, nslots, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 128, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "IDIM", in_dim));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ODIM", out_dim));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "TOPK", topk));
+        fused_pair_cfgs.put(key, c);
+        break :blk c;
+    };
+    const ins = [_][*:0]const u8{ "x", "suhg", "suhu", "tg", "tu", "svhg", "svhu", "suhd", "slots" };
+    const outs = [_][*:0]const u8{"yd"};
+    const kernel = try getNamedKernel(&fused_pair_mid_kernel, "mlxserve_exl3_pair_fused", &ins, &outs, FUSED_PAIR_MID_SOURCE, "");
+    const ov = try applyOuts(s, kernel, &.{ x, suhg, suhu, tg, tu, svhg, svhu, suhd, slots }, cfg, 1);
+    defer _ = mlx.mlx_vector_array_free(ov);
+    var a = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&a, ov, 0));
+    return a;
+}
+
 pub fn moeSwigluFused(
     s: mlx.mlx_stream,
     x: mlx.mlx_array,
@@ -1490,19 +1780,9 @@ pub fn moeSwigluFused(
     const rows: c_int = if (xsh.len == 1) 1 else xsh[0];
     const topk = @divExact(nslots, rows);
     const inter = tsh[2] * 16;
-    const prep = try pairPrepare(s, x, gate_suh, up_suh, slots, hidden, nslots, topk);
-    defer _ = mlx.mlx_array_free(prep[0]);
-    defer _ = mlx.mlx_array_free(prep[1]);
-    try ubenchEval(prep[0], "pair_prepare");
-    if (exl3UbenchOn()) try mlx.check(mlx.mlx_array_eval(prep[1]));
-    const inners = try pairGemv(s, prep[0], prep[1], gate_t, up_t, slots, hidden, inter, nslots);
-    defer _ = mlx.mlx_array_free(inners[0]);
-    defer _ = mlx.mlx_array_free(inners[1]);
-    try ubenchEval(inners[0], "pair_gemv");
-    if (exl3UbenchOn()) try mlx.check(mlx.mlx_array_eval(inners[1]));
-    const down_x = try midSwigluPrep(s, inners[0], inners[1], gate_svh, up_svh, down_suh, slots, inter, nslots);
+    const down_x = try pairFusedMid(s, x, gate_suh, up_suh, gate_t, up_t, gate_svh, up_svh, down_suh, slots, hidden, inter, nslots, topk);
     defer _ = mlx.mlx_array_free(down_x);
-    try ubenchEval(down_x, "mid");
+    try ubenchEval(down_x, "pair_fused");
     const down_inner = try indexedGemvCoopF16(s, down_x, down_t, slots);
     defer _ = mlx.mlx_array_free(down_inner);
     try ubenchEval(down_inner, "down_gemv");
@@ -2504,7 +2784,7 @@ test "exl3 fused decode chain matches indexed SwiGLU on one row" {
         const b: u16 = @bitCast(so[i]);
         try t.expectEqual(b, a);
     }
-    try t.expectEqual(@as(u32, 5), n_disp);
+    try t.expectEqual(@as(u32, 3), n_disp);
 }
 
 test "exl3 fused decode chain rows match N solo calls" {

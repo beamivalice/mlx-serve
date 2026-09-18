@@ -227,18 +227,18 @@ Levers tried and **reverted** (ubench regression, tests stayed green but slower)
 - 8 simdgroups / 256-thread TG: pair_gemv 0.55 ms, coop GEMV 576 µs (was 150 µs).
 - 4 output tiles packed per TG, full-K per sg: pair_gemv 0.58 ms, coop 606 µs.
 
-Live `fwd_ubench` 8 decode forwards (`--no-mtp --kv-quant 8`):
+Live `fwd_ubench` 8 decode forwards (`--no-mtp --kv-quant 8`), **LAYER_UBENCH unset**:
 
 | pack | ms/forward | CPU build | GPU eval | ops |
 | --- | --- | --- | --- | --- |
-| EXL3 | **123.3** | **120.9** | 2.4 | 5007 |
-| affine 4/8 | **16.5** | 1.3 | 15.2 | 4023 |
+| EXL3 | **19.414** | 1.533 | 17.866 | 4671 |
+| affine 4/8 | **16.464** | 1.282 | 15.174 | 4023 |
 
-EXL3 custom `kernel_apply` is eager, so GPU time sits in "build". 48 layers × 1.62 ms serialized ≈ 78 ms of the 121 ms; the rest is graph walk (5007 ops). Affine's fused gate+up+SwiGLU and down+reduce are two dispatches and 1.3 ms of CPU.
+The 123.3 / 120.9 / 2.4 row was taken with `MLX_SERVE_EXL3_LAYER_UBENCH=1`; those sync evals inside `forwardWith` measured the meter. `mlx_fast_metal_kernel_apply` is lazy. Struck.
 
-That is why live decode is 54 vs 100 tok/s (18.5 vs 10 ms): not the GEMV ALU, the **five eager custom launches per layer**. Occupancy levers on the GEMV body (8-sg, 4-tile pack) cannot close that gap and measured slower; reverted.
+Per-dispatch table (serialized eval): each row includes ~0.2–0.3 ms eval round-trip (the smallest rows *are* that floor). Sum 1.62 ms × 48 = 78 ms cannot be per-token GPU time when the token is 18.5 ms. Real gap: 18.5 − 10 ≈ 8.5 ms/token ≈ **177 µs/layer** over affine's two fused dispatches.
 
-Prefill 891 vs 2109 tok/s: ubench at E=16 is 9.4 ms/layer; live E=512 is ~47 ms/layer-chunk (2 chunks × 48 layers in 4.5 s). NAX 0.43× was vs three gather_qmm on a synthetic layer, not the full 4k stack.
+Prefill restatement: live affine 4k is **~5 ms per whole layer** (2109 tok/s, 512-token chunks, 48 layers). Isolated 46 ms for three gather_qmm was eval-per-call inflation, not the production path. EXL3 GEMMs at 2.7–3.1 ms × 3 ≈ 9 ms/layer is **~1.8× the entire affine layer**, not 0.43×. NAX 0.43× vs three gather_qmm does not show in 4k prefill (891 vs 2109).
 
 ## Ports
 
