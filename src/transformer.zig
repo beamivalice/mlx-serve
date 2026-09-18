@@ -28680,6 +28680,13 @@ pub const Transformer = struct {
             errdefer _ = mlx.mlx_array_free(out);
             try mlx.check(mlx.mlx_reshape(&out, y, xsh.ptr, @intCast(xsh.len), self.s));
             _ = mlx.mlx_array_free(y);
+            const xd = mlx.mlx_array_dtype(expert_x);
+            if (mlx.mlx_array_dtype(out) != xd) {
+                var cast = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_astype(&cast, out, xd, self.s));
+                _ = mlx.mlx_array_free(out);
+                return cast;
+            }
             return out;
         }
         const y = try expert_exl3_kernels.moePrefill(
@@ -28702,6 +28709,13 @@ pub const Transformer = struct {
         errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_reshape(&out, y, xsh.ptr, @intCast(xsh.len), self.s));
         _ = mlx.mlx_array_free(y);
+        const xd = mlx.mlx_array_dtype(expert_x);
+        if (mlx.mlx_array_dtype(out) != xd) {
+            var cast = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&cast, out, xd, self.s));
+            _ = mlx.mlx_array_free(out);
+            return cast;
+        }
         return out;
     }
 
