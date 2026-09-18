@@ -56,6 +56,75 @@ pub fn envPrefillChunk() usize {
     return readEnvUsize("MLX_SERVE_PREFILL_CHUNK", 0);
 }
 
+pub fn tickUbenchN(raw: ?[*:0]const u8) u32 {
+    const v = raw orelse return 0;
+    if (v[0] == '0') return 0;
+    return std.fmt.parseInt(u32, std.mem.sliceTo(v, 0), 10) catch 0;
+}
+
+var tick_ubench_left: ?u32 = null;
+
+pub fn tickUbenchArmed() bool {
+    if (tick_ubench_left == null) {
+        tick_ubench_left = tickUbenchN(std.c.getenv("MLX_SERVE_DECODE_TICK_UBENCH"));
+    }
+    return tick_ubench_left.? > 0;
+}
+
+fn tickUbenchConsume() void {
+    if (tick_ubench_left) |*n| {
+        if (n.* > 0) n.* -= 1;
+    }
+}
+
+const TickKind = enum(u2) { fwd, sample, resolve, eval };
+
+const TickProf = struct {
+    on: bool,
+    wall: io_util.Stopwatch,
+    ns: [4]u64 = @splat(0),
+
+    fn begin() TickProf {
+        if (!tickUbenchArmed()) return .{ .on = false, .wall = undefined };
+        return .{ .on = true, .wall = io_util.Stopwatch.init(std.Io.Threaded.global_single_threaded.io()) };
+    }
+
+    fn mark(self: *const TickProf) u64 {
+        if (!self.on) return 0;
+        return self.wall.read();
+    }
+
+    fn add(self: *TickProf, kind: TickKind, t0: u64) void {
+        if (!self.on) return;
+        self.ns[@backingInt(kind)] += self.wall.read() - t0;
+    }
+
+    fn finish(self: *TickProf) void {
+        if (!self.on) return;
+        const wall = self.wall.read();
+        const fwd = self.ns[@backingInt(TickKind.fwd)];
+        const sample = self.ns[@backingInt(TickKind.sample)];
+        const resolve = self.ns[@backingInt(TickKind.resolve)];
+        const eval = self.ns[@backingInt(TickKind.eval)];
+        const accounted = fwd + sample + resolve + eval;
+        const rest = if (wall > accounted) wall - accounted else 0;
+        const ms = struct {
+            fn f(n: u64) f64 {
+                return @as(f64, @floatFromInt(n)) / 1e6;
+            }
+        }.f;
+        log.info("[tick-ubench] wall={d:.3} ms fwd={d:.3} sample={d:.3} resolve={d:.3} eval={d:.3} rest={d:.3}\n", .{
+            ms(wall),
+            ms(fwd),
+            ms(sample),
+            ms(resolve),
+            ms(eval),
+            ms(rest),
+        });
+        tickUbenchConsume();
+    }
+};
+
 /// Per-prefill state for the adaptive width; lives on `runPrefill`'s stack. The policy is
 /// `server.adaptivePrefillWidth`.
 /// The one place a chosen width becomes the running width.
@@ -632,6 +701,13 @@ pub const SchemaConstraint = struct {
         if (self.constraint.pstate.phase == .json_body) self.constraint.pending_span = .{ .token_index = 0, .byte_offset = 0 };
     }
 };
+
+test "decode tick ubench count is off unless a positive integer" {
+    try std.testing.expectEqual(@as(u32, 0), tickUbenchN(null));
+    try std.testing.expectEqual(@as(u32, 0), tickUbenchN("0"));
+    try std.testing.expectEqual(@as(u32, 1), tickUbenchN("1"));
+    try std.testing.expectEqual(@as(u32, 8), tickUbenchN("8"));
+}
 
 test "forced recovery leaves room for the whole transition and one answer token" {
     try std.testing.expect(forcedBoundaryCanContinue(0, 2, 1));
@@ -10214,6 +10290,8 @@ pub const Generator = struct {
     ///   This mirrors mlx-lm's: _step(y) → async_eval(next_y) → yield y.item()
     ///   where y.item() is instant because async_eval forced y's computation.
     pub fn next(self: *Generator, allocator: std.mem.Allocator) !?u32 {
+        var tick_prof = TickProf.begin();
+        defer tick_prof.finish();
         if (self.done) return null;
         if (self.sampling.constraint != null) return self.nextConstrained(allocator);
 
@@ -10233,7 +10311,9 @@ pub const Generator = struct {
             const tok_shape = [_]c_int{ 1, 1 };
             const tok_input = mlx.mlx_array_new_data(&tok_i32, &tok_shape, 2, .int32);
             defer _ = mlx.mlx_array_free(tok_input);
+            const t_fwd = tick_prof.mark();
             self.pending_logits = try self.xfm.forwardWith(&self.ctx, tok_input);
+            tick_prof.add(.fwd, t_fwd);
             self.has_pending_logits = true;
         }
 
@@ -10244,25 +10324,33 @@ pub const Generator = struct {
             const step_logits = self.pending_logits;
             self.has_pending_logits = false;
 
+            const t_sample = tick_prof.mark();
             const lazy_token = self.sampleLazy(step_logits);
+            tick_prof.add(.sample, t_sample);
             _ = mlx.mlx_array_free(step_logits);
 
             var adopted = false;
             defer if (!adopted) {
                 _ = mlx.mlx_array_free(lazy_token);
             };
+            const t_fwd = tick_prof.mark();
             if (lazyForward(self.xfm, &self.ctx, lazy_token)) |next_logits| {
+                tick_prof.add(.fwd, t_fwd);
                 defer if (!adopted) {
                     _ = mlx.mlx_array_free(next_logits);
                 };
                 const arr = [_]mlx.mlx_array{ lazy_token, next_logits };
                 const vec = mlx.mlx_vector_array_new_data(&arr, 2);
+                const t_eval = tick_prof.mark();
                 _ = mlx.mlx_async_eval(vec);
+                tick_prof.add(.eval, t_eval);
                 _ = mlx.mlx_vector_array_free(vec);
 
                 // NOW resolve the pending token — GPU already computed it as a
                 // dependency of the graph we just submitted. Should be instant.
+                const t_res = tick_prof.mark();
                 try self.resolvePendingToken();
+                tick_prof.add(.resolve, t_res);
 
                 // Check stop conditions on the resolved token
                 if (try self.checkStop()) return null;
@@ -10280,6 +10368,7 @@ pub const Generator = struct {
 
                 return token;
             } else |_| {
+                tick_prof.add(.fwd, t_fwd);
                 // lazyForward failed — fall through to slow path
                 try mlx.check(mlx.mlx_array_eval(lazy_token));
                 var val: i32 = 0;
@@ -10292,7 +10381,9 @@ pub const Generator = struct {
         }
 
         // ── Phase 2: Slow path (first token, last token, logprobs, or pipeline miss) ──
+        const t_res = tick_prof.mark();
         try self.resolvePendingToken();
+        tick_prof.add(.resolve, t_res);
 
         if (try self.checkStop()) return null;
 
@@ -10309,13 +10400,18 @@ pub const Generator = struct {
             const tok_shape = [_]c_int{ 1, 1 };
             const tok_input = mlx.mlx_array_new_data(&tok_i32, &tok_shape, 2, .int32);
             defer _ = mlx.mlx_array_free(tok_input);
-            break :blk try self.xfm.forwardWith(&self.ctx, tok_input);
+            const t_fwd = tick_prof.mark();
+            const out = try self.xfm.forwardWith(&self.ctx, tok_input);
+            tick_prof.add(.fwd, t_fwd);
+            break :blk out;
         };
 
         // Logprobs: fully synchronous
         if (self.logprobs_n > 0) {
             defer _ = mlx.mlx_array_free(step_logits);
+            const t_sample = tick_prof.mark();
             const result = try sampleToken(allocator, step_logits, self.sampling, self.generated_ids.items, self.logprobs_n, self.xfm.s);
+            tick_prof.add(.sample, t_sample);
             self.sampling.draw +%= 1;
             self.next_token_id = result.token_id;
             // `result` belongs to the token we just SAMPLED, which the next
@@ -10328,11 +10424,15 @@ pub const Generator = struct {
         }
 
         // Last token or pipeline bootstrap
+        const t_sample = tick_prof.mark();
         const lazy_token = self.sampleLazy(step_logits);
+        tick_prof.add(.sample, t_sample);
         _ = mlx.mlx_array_free(step_logits);
 
         if (self.step < self.max_tokens) {
+            const t_fwd = tick_prof.mark();
             const next_logits = lazyForward(self.xfm, &self.ctx, lazy_token) catch {
+                tick_prof.add(.fwd, t_fwd);
                 try mlx.check(mlx.mlx_array_eval(lazy_token));
                 var val: i32 = 0;
                 try mlx.check(mlx.mlx_array_item_int32(&val, lazy_token));
@@ -10340,10 +10440,13 @@ pub const Generator = struct {
                 self.next_token_id = @intCast(val);
                 return token;
             };
+            tick_prof.add(.fwd, t_fwd);
 
             const arr = [_]mlx.mlx_array{ lazy_token, next_logits };
             const vec = mlx.mlx_vector_array_new_data(&arr, 2);
+            const t_eval = tick_prof.mark();
             _ = mlx.mlx_async_eval(vec);
+            tick_prof.add(.eval, t_eval);
             _ = mlx.mlx_vector_array_free(vec);
 
             self.pending_token = lazy_token;

@@ -273,9 +273,30 @@ Not ported: NAX `matmul2d`, `_x2` GEMV, prefetch.
 
 Owner targets not met. Per-dispatch table at this head (5 dispatches, serialized eval floor ~0.2 ms): pair_prepare 0.26, pair_gemv 0.48, mid 0.20, down_gemv 0.40, reduce 0.29.
 
+## Meter reconciliation (the 5.6 ms)
+
+The 5.6 ms/token live gap is **not** EXL3 host work outside the forward. Serial-to-serial the 0.85× ubench ratio already holds live.
+
+`~/.mlx-serve/model-settings.json` has `"mtp": true` for the affine pack. HTTP `defaultEnableMtp` takes that as `force`; `--no-mtp` does not override a request that omits `enable_mtp`. Affine live A/B therefore ran MTP (`[spec-stats] mode=mtp`). EXL3 is not in that file, so MoE default is serial. Live 18.5 vs 10 ms/token compared EXL3 serial to affine MTP.
+
+One-boot, kv8, `enable_mtp:false`, pipelined `Generator.next` (tokens 2–8, `MLX_SERVE_DECODE_TICK_UBENCH=8`):
+
+| pack | wall ms | fwd (CPU build) | async_eval (GPU) | sample | resolve | sched rest |
+| --- | --- | --- | --- | --- | --- | --- |
+| EXL3 | **17.43** | 2.62 | 14.79 | 0.008 | 0.002 | 0.003 |
+| affine serial | **14.95** | 2.40 | 12.55 | 0.008 | 0.001 | 0.002 |
+
+EXL3 `kernel_apply` host (source copy in `mlx_fast_metal_kernel_apply`): **0.26 ms/token**, 1.4 µs/apply. Sampler, resolve, scheduler publish: <0.02 ms. lm_head (serialized ubench, affine): 0.52 ms.
+
+Live serial tok/s this boot: EXL3 **56.7** vs affine **65.8** (0.86×). Affine with MTP on the same prompt: 122.9 tok/s, `avg_per_round=1.67`. Ubench 19.4 vs 16.5 is the same 0.85×; eval-per-step is ~2 ms slower than pipelined `async_eval`.
+
+Serialized `QWEN4_PROFILE_FWD=all` (eval per block, not live): mlp 37.2 vs 23.3 ms; hcRead/gdn/attn/hcWrite match. The remaining ~2.5 ms/token (14.8 vs 12.6 eval) is inside the 5-dispatch GEMV chain, ~52 µs/layer.
+
+0.85× vs **serial** affine already holds. 0.85× vs the published 99 tok/s affine number is MTP-vs-serial; EXL3 MTP was 75 vs 100 (0.75×). Not a host-side fix.
+
 ## Open questions
 
-Coordinator: next three-auditor round on this head. Box still ours until that dispatch.
+Box still ours. Next: split-K 1/2/4/8, prepare-only 5→4, down GEMV mapping, prefill chunk table.
 
 ## Comments
 

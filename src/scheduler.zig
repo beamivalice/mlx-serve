@@ -3409,14 +3409,14 @@ test "the cold-load LoadRequest re-applies EVERY retained launch setting" {
     // Needles are ++-split so this test's own source can't satisfy the scan.
     const src = @embedFile("scheduler.zig");
     inline for (.{
-        "kv_quant_config",           "prefix_cache_capacity",     "prefix_cache_mem_bytes",
-        "prefix_cache_disk_bytes",   "ssm_checkpoint_stride",     "ssm_checkpoint_max",
-        "mtp_enabled",               "mtp_head_kv_quant",         "mtp_depth",
-        "llama_cache_entries",       "llama_kv_type_k",           "llama_kv_type_v",
-        "ds4_mtp",                   "ds4_dspark",                "ds4_ssd_streaming",
-        "no_drafter",                "draft_block_size",          "draft_block_size_explicit",
-        "ane_prefill",               "ane_chunk_resolver",        "ane_headroom_resolver",
-        "prefix_cache_mem_resolver", "expert_cache_bytes",        "expert_cache_fit_resolver",
+        "kv_quant_config",           "prefix_cache_capacity", "prefix_cache_mem_bytes",
+        "prefix_cache_disk_bytes",   "ssm_checkpoint_stride", "ssm_checkpoint_max",
+        "mtp_enabled",               "mtp_head_kv_quant",     "mtp_depth",
+        "llama_cache_entries",       "llama_kv_type_k",       "llama_kv_type_v",
+        "ds4_mtp",                   "ds4_dspark",            "ds4_ssd_streaming",
+        "no_drafter",                "draft_block_size",      "draft_block_size_explicit",
+        "ane_prefill",               "ane_chunk_resolver",    "ane_headroom_resolver",
+        "prefix_cache_mem_resolver", "expert_cache_bytes",    "expert_cache_fit_resolver",
         "ssd_budget_bytes",
     }) |field| {
         const needle = "." ++ field ++ " = self" ++ "." ++ field ++ ",";
@@ -7242,7 +7242,10 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
 
     // Regular path. A request that never armed MTP teaches the round-cost table what a plain
     // serial token costs; `observeSerialTick` owns the drop rules and `serialCellWanted`.
+    const tick_on = generate_mod.tickUbenchArmed();
+    var tick_sw = if (tick_on) io_util.Stopwatch.init(sch.io) else undefined;
     const tok_opt = try gen.next(slot.allocator);
+    const next_ns: u64 = if (tick_on) tick_sw.read() else 0;
     if (tok_opt == null) {
         finishSlot(sch, slot, gen.finish_reason);
         return;
@@ -7274,6 +7277,13 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
     slot.pushTokenWithLogprob(t, lp_take);
     if (t != 0) slot.was_pad_only = false;
     slot.completion_tokens = gen.completion_tokens;
+    if (tick_on) {
+        const rest_ns = tick_sw.read() - next_ns;
+        log.info("[tick-ubench] sched next={d:.3} ms rest={d:.3} ms\n", .{
+            @as(f64, @floatFromInt(next_ns)) / 1e6,
+            @as(f64, @floatFromInt(rest_ns)) / 1e6,
+        });
+    }
 }
 
 test "all speculative blocks publish through one per-token accounting loop" {

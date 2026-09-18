@@ -562,6 +562,18 @@ var token_reduce_cfgs: CfgCache(ReduceKey, 8) = .{};
 var token_prepare_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var token_reduce_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var fused_dispatches: u32 = 0;
+var apply_host_ns: u64 = 0;
+var apply_host_n: u32 = 0;
+var apply_host_layers: u32 = 0;
+var apply_host_dumps: u32 = 0;
+var apply_ubench_env: ?bool = null;
+
+fn applyUbenchOn() bool {
+    if (apply_ubench_env) |v| return v;
+    const v = diagEnvValueOn(std.c.getenv("MLX_SERVE_DECODE_TICK_UBENCH"));
+    apply_ubench_env = v;
+    return v;
+}
 
 pub fn resetFusedDispatchCount() void {
     fused_dispatches = 0;
@@ -1310,7 +1322,14 @@ fn applyOuts(s: mlx.mlx_stream, kernel: mlx.mlx_fast_metal_kernel, inputs: []con
     const inputs_vec = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
     var outputs_vec = mlx.mlx_vector_array_new();
+    const host_on = applyUbenchOn();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var sw = if (host_on) io_util.Stopwatch.init(io) else undefined;
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, cfg, s));
+    if (host_on) {
+        apply_host_ns += sw.read();
+        apply_host_n += 1;
+    }
     if (mlx.mlx_vector_array_size(outputs_vec) != n_out) {
         _ = mlx.mlx_vector_array_free(outputs_vec);
         return error.MetalKernelBadOutputCount;
@@ -1509,6 +1528,25 @@ pub fn moeSwigluFused(
     fused_dispatches += 1;
     const out = try downFinishReduce(s, down_inner, down_svh, slots, scores, hidden, rows, topk);
     try ubenchEval(out, "reduce");
+    if (applyUbenchOn()) {
+        apply_host_layers += 1;
+        if (apply_host_layers == 48) {
+            if (apply_host_dumps < 8) {
+                const ms = @as(f64, @floatFromInt(apply_host_ns)) / 1e6;
+                const n: f64 = @floatFromInt(@max(apply_host_n, 1));
+                log.info("[exl3-apply] host {d:.3} ms n={d} us/apply={d:.1}\n", .{
+                    ms,
+                    apply_host_n,
+                    (ms * 1e3) / n,
+                });
+                apply_host_dumps += 1;
+            }
+            apply_host_ns = 0;
+            apply_host_n = 0;
+            apply_host_layers = 0;
+            if (apply_host_dumps >= 8) apply_ubench_env = false;
+        }
+    }
     return out;
 }
 
