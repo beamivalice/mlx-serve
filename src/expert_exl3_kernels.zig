@@ -105,7 +105,13 @@ fn unionHistOn() bool {
 pub fn dumpUnionHist(slots_u: mlx.mlx_array, S: usize, K: usize) !void {
     if (!unionHistOn()) return;
     if (S < 2 or K == 0) return;
-    try mlx.check(mlx.mlx_array_eval(slots_u));
+    // The caller swallows this error, so the latch this eval may raise is ours
+    // to drop: left standing it becomes the next decode tick's `MlxFailure`.
+    const had_error = mlx.errorPending();
+    mlx.check(mlx.mlx_array_eval(slots_u)) catch |e| {
+        mlx.dropLatchedErrorUnless(had_error);
+        return e;
+    };
     const n = S * K;
     const ptr = mlx.mlx_array_data_uint32(slots_u) orelse return;
     const slice = ptr[0..n];
