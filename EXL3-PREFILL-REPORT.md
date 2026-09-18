@@ -14,7 +14,7 @@ Box: Apple M5 Max
 - Item 0: both in-tree prefill benches assert `max_e >= 400` and loop C in {512, 2048} at E=512 / top-k 10.
 - Item 1: `exl3 sorted GEMM 16-row windows match 4-row per row` (mixed runs, n=32, bit identity). NAX default and SIMD via `MLX_SERVE_FORCE_GPU_FAMILY_FALLBACK=1`.
 - Item 2: `exl3 moePrefill matches staged sorted chain` (old two-prepare / MLX SwiGLU / inv-reduce vs new path, bit identity).
-- Item 3: `exl3 decode-once transient bytes at production dims`; `exl3 decode-full K4 matches host inner`; `exl3 decode-once GEMM matches 16-row windows on long run` (20-row expert + 4-row tail, bit identity vs window path).
+- Item 3: `exl3 decode-once transient bytes at production dims`; `exl3 decode-full K4 matches host inner`; `exl3 decode-once GEMM matches 16-row windows on long run`; `exl3 decode-once stage ubench C=2048 sweep N`.
 
 ## Red-first evidence
 
@@ -28,7 +28,7 @@ Box: Apple M5 Max
 - Item 0 filtered `-Dtest-filter="exl3"`: 22 passed.
 - Item 1 filtered `-Dtest-filter="exl3"`: 23 passed, 0 failed (includes new identity test). SIMD-arm rerun of sorted GEMM tests: 4/4.
 - Item 2 filtered `-Dtest-filter="exl3"`: 24 passed, 0 failed.
-- Item 3 filtered `-Dtest-filter="exl3"`: 27 passed, 0 failed.
+- Item 3 filtered `-Dtest-filter="exl3"`: 28 passed, 0 failed.
 
 ## Commit sha
 
@@ -128,6 +128,44 @@ Status: done. Live median 1465 tok/s. Below 1580.
 
 Status: done. Live median 1454 tok/s (flat vs item 1 within boot noise). Below 1580.
 
-## Item 3 — decode-once + dense f16 GEMM
+## Item 3 — decode-once occupancy retry
 
-Status: arm implemented and tested; live 4k **215 tok/s** when wired (loadavg 2.2–3.5). Not selected for `moePrefill`. Production remains item 2 windows at **1454 tok/s**. Bar 1580 not met.
+Grid is now one simdgroup per 16x16 tile (`in_tiles * 32, out_tiles, n_exp`). Bit-exact vs host and vs 16-row windows.
+
+### Per-stage (one gate/up projection, production H=2560 I=640)
+
+C=2048 (nslots=20480), after warmup:
+
+| N (decode-once if run >= N) | window us | decode-once us | decode_full ms/group | matmul_pad ms/group | pad/live rows | host_group |
+| --- | --- | --- | --- | --- | --- | --- |
+| 16 | 5172 | 27772 | 0.83–0.87 (first 4.4) | 1.06–1.66 | 3712/2497 .. 3648/2548 (64 exp) | 0.075 ms **eval=1** |
+| 32 | 5172 | 19694 | 0.82–0.89 | 1.03–1.13 | similar | 0.063 ms eval=1 |
+| 64 | 5172 | 4553 | (no long runs) | — | — | 0.054 ms eval=1 |
+
+C=8192 (nslots=81920): window **13786 us**. N=16 decode-once **58713 us**. decode_full 0.65–3.2 ms/group, matmul_pad 2.4–2.8 ms/group (pad ~9200 vs live ~8100, ~50 experts). host_group 0.141 ms eval=1.
+
+Token-major reduce is unchanged (`downFinishReduce` after scatter). Host grouping eval inside the layer is a red flag (one `mlx_array_eval` of sorted eids per `innerGemmByRuns`).
+
+Winner of the N sweep: **N=64** (falls through to windows) at C=2048; at C=8192 even N=16 loses 4x. PROFILED arm still loses. `moePrefill` stays on 16-row windows.
+
+### Chunk sweep (16-row windows, not decode-once)
+
+8k prompt ~8085 tok, 4k ~4055 tok. One boot each. Admission width matches `--prefill-chunk`. Default sizer is 8192.
+
+| prompt | chunk | EXL3 tok/s | affine tok/s | EXL3 peak_bytes | affine peak_bytes | loadavg 1m EXL3 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 8k | 2048 | 1273 | 1741 | 69.3e9 | 74.2e9 | 2.88 |
+| 8k | 4096 | 1319 | **1860** | 69.9e9 | 74.8e9 | 4.04 |
+| 8k | 8192 | **1438** | 1712 | 71.3e9 | 76.1e9 | 4.29 |
+| 4k | 2048 | 926 | 1518 | 68.3e9 | 74.3e9 | 3.98 |
+| 4k | 4096 | 1228 | **1846** | 68.9e9 | 74.8e9 | 3.11 |
+| 4k | 8192 | **1396** | 1738 | 68.9e9 | 74.8e9 | 3.03 |
+
+3-boot 8k, EXL3 at its best (8192) vs affine at its best (4096):
+
+| arm | boot1 | boot2 | boot3 | median | loadavg 1m |
+| --- | --- | --- | --- | --- | --- |
+| EXL3 8192 | 1446.9 | 1567.0 | 1558.6 | **1558.6** | 2.96 / 2.58 / 2.92 |
+| affine 4096 | 1650.6 | 1938.6 | 1939.8 | **1938.6** | 2.76 / 3.16 / 2.86 |
+
+Default sizer picks 8192, which **is** EXL3's winner. Affine prefers 4096. The old 583 vs 891 at chunk 4096 was the 4-row path and is void; on 16-row windows, wider chunks help EXL3 (926 → 1228 → 1396 at 4k; 1273 → 1319 → 1438 at 8k).
