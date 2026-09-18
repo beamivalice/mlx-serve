@@ -28661,13 +28661,9 @@ pub const Transformer = struct {
         try mlx.check(mlx.mlx_astype(&slots_u, slots, .uint32, self.s));
         const rows: usize = @intCast(B * S);
         if (rows <= expert_exl3_kernels.DECODE_ROWS_MAX) {
-        if (B * S == 1) {
-            var x1 = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(x1);
-            try mlx.check(mlx.mlx_reshape(&x1, x2, &[_]c_int{D}, 1, self.s));
-            const y = try expert_exl3_kernels.moeSwigluIndexed(
+            const y = try expert_exl3_kernels.moeSwigluFused(
                 self.s,
-                x1,
+                x2,
                 mw.switch_gate_w,
                 mw.switch_gate_s,
                 mw.switch_gate_b,
@@ -28685,62 +28681,6 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_reshape(&out, y, xsh.ptr, @intCast(xsh.len), self.s));
             _ = mlx.mlx_array_free(y);
             return out;
-        }
-        var acc = mlx.mlx_array_new();
-        var have = false;
-        var t_i: c_int = 0;
-        while (t_i < B * S) : (t_i += 1) {
-            var xrow = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(xrow);
-            const strides2 = [_]c_int{ 1, 1 };
-            const strides1 = [_]c_int{1};
-            try mlx.check(mlx.mlx_slice(&xrow, x2, &[_]c_int{ t_i, 0 }, 2, &[_]c_int{ t_i + 1, D }, 2, &strides2, 2, self.s));
-            var x1 = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(x1);
-            try mlx.check(mlx.mlx_reshape(&x1, xrow, &[_]c_int{D}, 1, self.s));
-            var sl = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(sl);
-            try mlx.check(mlx.mlx_slice(&sl, slots_u, &[_]c_int{t_i * K}, 1, &[_]c_int{(t_i + 1) * K}, 1, &strides1, 1, self.s));
-            var scr = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(scr);
-            try mlx.check(mlx.mlx_slice(&scr, sc, &[_]c_int{t_i * K}, 1, &[_]c_int{(t_i + 1) * K}, 1, &strides1, 1, self.s));
-            const y = try expert_exl3_kernels.moeSwigluIndexed(
-                self.s,
-                x1,
-                mw.switch_gate_w,
-                mw.switch_gate_s,
-                mw.switch_gate_b,
-                mw.switch_up_w,
-                mw.switch_up_s,
-                mw.switch_up_b,
-                mw.switch_down_w,
-                mw.switch_down_s,
-                mw.switch_down_b,
-                sl,
-                scr,
-            );
-            defer _ = mlx.mlx_array_free(y);
-            var y2 = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(y2);
-            try mlx.check(mlx.mlx_reshape(&y2, y, &[_]c_int{ 1, D }, 2, self.s));
-            if (!have) {
-                try mlx.check(mlx.mlx_array_set(&acc, y2));
-                have = true;
-            } else {
-                const pair = [_]mlx.mlx_array{ acc, y2 };
-                const vec = mlx.mlx_vector_array_new_data(&pair, 2);
-                defer _ = mlx.mlx_vector_array_free(vec);
-                var cat = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_concatenate_axis(&cat, vec, 0, self.s));
-                _ = mlx.mlx_array_free(acc);
-                acc = cat;
-            }
-        }
-        var out = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(out);
-        try mlx.check(mlx.mlx_reshape(&out, acc, xsh.ptr, @intCast(xsh.len), self.s));
-        _ = mlx.mlx_array_free(acc);
-        return out;
         }
         const y = try expert_exl3_kernels.moePrefill(
             self.s,
