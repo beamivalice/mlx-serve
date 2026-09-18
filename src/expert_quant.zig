@@ -73,77 +73,6 @@ pub fn kFromPackedDim(last: u64) ?u8 {
     };
 }
 
-pub const KScan = struct {
-    modal: u8,
-    counts: [5]u32 = @splat(0),
-    n: u32 = 0,
-};
-
-fn readStHeader(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, name: []const u8) !std.json.Parsed(std.json.Value) {
-    var file = try dir.openFile(io, name, .{});
-    defer file.close(io);
-    var read_buffer: [8192]u8 = undefined;
-    var reader = file.reader(io, &read_buffer);
-    const header_len = try reader.interface.takeInt(u64, .little);
-    if (header_len == 0 or header_len > 128 * 1024 * 1024) return error.ExpertLayoutUnsupported;
-    const raw = try allocator.alloc(u8, @intCast(header_len));
-    defer allocator.free(raw);
-    try reader.interface.readSliceAll(raw);
-    return std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
-}
-
-pub fn scanExl3TrellisK(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8) !KScan {
-    var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{});
-    defer dir.close(io);
-    const index_raw = try dir.readFileAlloc(io, "model.safetensors.index.json", allocator, .limited(64 * 1024 * 1024));
-    defer allocator.free(index_raw);
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, index_raw, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.ExpertLayoutUnsupported;
-    const map_v = parsed.value.object.get("weight_map") orelse return error.ExpertLayoutUnsupported;
-    if (map_v != .object) return error.ExpertLayoutUnsupported;
-    var headers = std.StringHashMap(std.json.Parsed(std.json.Value)).init(allocator);
-    defer {
-        var it = headers.iterator();
-        while (it.next()) |e| e.value_ptr.deinit();
-        headers.deinit();
-    }
-    var scan = KScan{ .modal = 4 };
-    var mit = map_v.object.iterator();
-    while (mit.next()) |entry| {
-        const key = entry.key_ptr.*;
-        if (!std.mem.endsWith(u8, key, ".trellis")) continue;
-        if (!isRoutedExpertKey(.exl3_k4, key)) continue;
-        if (entry.value_ptr.* != .string) return error.ExpertLayoutUnsupported;
-        const fname = entry.value_ptr.string;
-        const hdr = headers.get(fname) orelse blk: {
-            const h = readStHeader(allocator, io, dir, fname) catch return error.ExpertLayoutUnsupported;
-            try headers.put(fname, h);
-            break :blk h;
-        };
-        if (hdr.value != .object) return error.ExpertLayoutUnsupported;
-        const meta = hdr.value.object.get(key) orelse return error.ExpertLayoutUnsupported;
-        if (meta != .object) return error.ExpertLayoutUnsupported;
-        const shape_v = meta.object.get("shape") orelse return error.ExpertLayoutUnsupported;
-        if (shape_v != .array or shape_v.array.items.len == 0) return error.ExpertLayoutUnsupported;
-        const last: u64 = @intCast(shape_v.array.items[shape_v.array.items.len - 1].integer);
-        const k = kFromPackedDim(last) orelse return error.ExpertLayoutUnsupported;
-        scan.counts[k] += 1;
-        scan.n += 1;
-    }
-    if (scan.n == 0) return error.ExpertLayoutUnsupported;
-    var best: u8 = 2;
-    var best_n: u32 = 0;
-    for ([_]u8{ 2, 3, 4 }) |k| {
-        if (scan.counts[k] >= best_n) {
-            best_n = scan.counts[k];
-            best = k;
-        }
-    }
-    scan.modal = best;
-    return scan;
-}
-
 /// How a qwen4_exp checkpoint stores its ROUTED experts. Both are leading-index
 /// banks: `bf16_fused` is the HF checkpoint's two dense tensors per layer,
 /// `quantized_split` the MLX pack's nine (three projections x weight/scales/biases).
@@ -601,32 +530,17 @@ test "exl3 kFromPackedDim maps last dim 16*K" {
     try t.expectEqual(@as(?u8, null), kFromPackedDim(16));
 }
 
-test "exl3 scanExl3TrellisK loads a mixed-K two-layer pack" {
+test "exl3 mixed last dims map to per-tensor K in 2,3,4" {
     const t = std.testing;
-    const io = t.io;
-    var tmp = t.tmpDir(.{});
-    defer tmp.cleanup();
-    const hdr =
-        \\{"language_model.model.layers.0.mlp.switch_mlp.gate_proj.trellis":{"dtype":"U16","shape":[2,8,8,48],"data_offsets":[0,0]},"language_model.model.layers.0.mlp.switch_mlp.up_proj.trellis":{"dtype":"U16","shape":[2,8,8,32],"data_offsets":[0,0]},"language_model.model.layers.0.mlp.switch_mlp.down_proj.trellis":{"dtype":"U16","shape":[2,8,8,64],"data_offsets":[0,0]},"language_model.model.layers.1.mlp.switch_mlp.gate_proj.trellis":{"dtype":"U16","shape":[2,8,8,48],"data_offsets":[0,0]},"language_model.model.layers.1.mlp.switch_mlp.up_proj.trellis":{"dtype":"U16","shape":[2,8,8,48],"data_offsets":[0,0]},"language_model.model.layers.1.mlp.switch_mlp.down_proj.trellis":{"dtype":"U16","shape":[2,8,8,48],"data_offsets":[0,0]}}
-    ;
-    var st: [8 + hdr.len]u8 = undefined;
-    std.mem.writeInt(u64, st[0..8], hdr.len, .little);
-    @memcpy(st[8..], hdr);
-    try tmp.dir.writeFile(io, .{ .sub_path = "model-00001.safetensors", .data = &st });
-    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = 
-        \\{"weight_map":{"language_model.model.layers.0.mlp.switch_mlp.gate_proj.trellis":"model-00001.safetensors","language_model.model.layers.0.mlp.switch_mlp.up_proj.trellis":"model-00001.safetensors","language_model.model.layers.0.mlp.switch_mlp.down_proj.trellis":"model-00001.safetensors","language_model.model.layers.1.mlp.switch_mlp.gate_proj.trellis":"model-00001.safetensors","language_model.model.layers.1.mlp.switch_mlp.up_proj.trellis":"model-00001.safetensors","language_model.model.layers.1.mlp.switch_mlp.down_proj.trellis":"model-00001.safetensors"}}
-    });
-    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
-    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
-    const dir = try std.fmt.allocPrint(t.allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd, tmp.sub_path });
-    defer t.allocator.free(dir);
-    const scan = try scanExl3TrellisK(t.allocator, io, dir);
-    try t.expectEqual(@as(u32, 6), scan.n);
-    try t.expectEqual(@as(u8, 3), scan.modal);
-    try t.expectEqual(@as(u32, 1), scan.counts[2]);
-    try t.expectEqual(@as(u32, 4), scan.counts[3]);
-    try t.expectEqual(@as(u32, 1), scan.counts[4]);
+    const last = [_]u64{ 48, 32, 64, 48, 48, 48 };
+    var counts: [5]u32 = @splat(0);
+    for (last) |d| {
+        const k = kFromPackedDim(d) orelse return error.TestUnexpectedResult;
+        counts[k] += 1;
+    }
+    try t.expectEqual(@as(u32, 1), counts[2]);
+    try t.expectEqual(@as(u32, 4), counts[3]);
+    try t.expectEqual(@as(u32, 1), counts[4]);
 }
 
 test "layout resolution is qwen4_exp only: the same index declares nothing for another arch" {
