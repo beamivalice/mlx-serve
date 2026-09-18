@@ -1,103 +1,115 @@
-# EXL3-DECODE-REPORT (round 7)
+# EXL3-DECODE-REPORT (round 8) — 64k prefill growth diagnosis
 
-Reset onto `2f876392` (`feat/qwen4-exl3`: cap-scope `a9598bd0` + B13 `00ef132a` + prefill config reuse). Shared-decode (`6e523afb`, `62520f81`) and half-product acc (`f84a794d`) dropped with the reset. Start-at-2 never on this head. Restored `lib/ds4`, `lib/mlx-src`, `lib/mlxc-src`, `lib/opencode2-mlx-serve` worktree symlinks; not git-added.
+No kernel edits. Integration base `dec5319d`. Measured sha `ce0c3f55` (prefill-trace mem line after `mlx_clear_cache`). One lease per pack. `prompt-64k.txt`, nonce, max_tokens 16, `--prefill-trace`, `QWEN4_PROFILE_QSA=1`, no `NGRAM_WARM` override. Chunk 8192. kv8. Box Apple M5 Max.
 
-Quality chain stays at f32 finish reduce (bar 0.0679 / 0.923). 0.0676 bisect closed as exhausted.
+## EXL3 prefill transients (geometry, not kv)
 
-Leases: AUTO one 20m lock, unlock; forced-d2 one 20m lock, unlock. Not a combined lease.
+C=8192, topk=10, H=2560, I=640, win=32, nslots=81920. Same every full chunk.
 
-## Shared-decode null (deleted)
+| plane | shape / dtype | bytes |
+|---|---|---:|
+| sorted slot tables | nslots u32 ×3 (order, i32, take) | 0.98 MB |
+| window starts+nlives | ~nwin u32 ×2, nwin≈2560 | 0.02 MB |
+| pair-prepare yg,yu | 2 × [nslots,H] f16 | 839 MB |
+| GEMM gate+up | 2 × [nslots,I] f16 | 210 MB |
+| GEMM down + scatter | 2 × [nslots,H] f16 | 839 MB |
 
-Whole-forward, shared ON, handbook 512-decode, round 6 (contaminated for merging, kept as the null):
+No f32 split planes on the prefill GEMM (those are decode). Overlapping defers ~1.5 GB peak, **O(chunk) not O(kv)**. Matches PROFILE_FWD mlp flat at ~2.42 s.
 
-| ctx | serial EXL3 | shared-ON MTP EXL3 | delta |
-|---|---:|---:|---:|
-| 4k | 53.682 | 45.054 | −8.6 tok/s (−16%) |
-| 16k | 54.353 | 48.016 | −6.3 tok/s (−12%) |
-| 64k | 52.521 | 49.651 | −2.9 tok/s (−5%) |
+## Allocator picture (after every chunk, after `mlx_clear_cache`)
 
-Live MTP widths on EXL3 AUTO/d2 are S≈2 (cap 2 / force 2). That is a loss vs per-row serial. S=3..5 were not a winning in-situ arm (no live EXL3 path drafts that wide under cap-2). Kernel, descriptor, buckets, and tests deleted with the reset. No width kept behind a predicate.
+Cadence: **clear every chunk**. Both packs `cache_bytes=0` after every clear. The pool is not the grower.
 
-## Half-product float acc null (deleted)
+### Affine (`diag-64k-aff`, 2025.6 tok/s)
 
-KLD to-EOS **0.068517 / top-1 0.9222** vs bar 0.0676 / 0.924 (worse than f32 finish 0.06787 / 0.9228). Dropped.
+| pos | wall ms | eval ms | active GB | cache | Δ active |
+|---:|---:|---:|---:|---:|---:|
+| 0–8192 | 4203 | 7 | 74.376 | 0 | — |
+| 8192–16384 | 3907 | 6 | 74.376 | 0 | 0 |
+| 16384–24576 | 3892 | 6 | 74.376 | 0 | 0 |
+| 24576–32768 | 3938 | 8 | 74.376 | 0 | 0 |
+| 32768–40960 | 3978 | 6 | 74.376 | 0 | 0 |
+| 40960–49152 | 4003 | 5 | 74.376 | 0 | 0 |
+| 49152–57344 | 4140 | 4 | 74.376 | 0 | 0 |
+| 57344–65536 | 4136 | 5 | 74.376 | 0 | 0 |
+| 65536–69940 | 2237 | 1 | 74.240 | 0 | −0.14 |
 
-## New-standard MTP on clean `2f876392`
+Wall ~3.9–4.2 s, flat. `/props` after: active 72.95 GB, cache 1.14 GB (decode/idle pool), peak 77.16 GB.
 
-Handbook prompts `/Users/beam/claude-tmp/exl3-bench/prompt-{4k,16k,64k}.txt`, nonce prefix, max_tokens 512. Every row **completion_tokens=512**, **finish_reason=length**. kv8, width=8192, persist 0, no `MLX_SERVE_NGRAM_WARM=0`. Affine first, interleaved, 3 boots, medians. Box Apple M5 Max.
+### EXL3 (`diag-64k-exl3`, 1672 tok/s under QSA evals)
 
-`spec-stats depth=` is the **cap** (`mtp_depth`), not the round width. AUTO EXL3 prints depth=2 (cap-2). FORCE_DEPTH=2 unclamps the cap (prints 6) but every round drafts exactly 2 (`accepts / (attempts * 2)` matches `per_draft_pct`).
+| pos | wall ms | eval ms | active GB | cache | Δ active |
+|---:|---:|---:|---:|---:|---:|
+| 0–8192 | 5007 | 2 | 69.315 | 0 | — |
+| 8192–16384 | 4675 | 10 | 71.328 | 0 | **+2.013 GB** |
+| 16384–24576 | 4715 | 8 | 73.341 | 0 | **+2.013 GB** |
+| 24576–32768 | 4750 | 1 | 75.355 | 0 | **+2.013 GB** |
+| 32768–40960 | 4814 | 8 | 77.368 | 0 | **+2.013 GB** |
+| 40960–49152 | 4858 | 7 | 79.381 | 0 | **+2.013 GB** |
+| 49152–57344 | 4899 | 9 | 81.394 | 0 | **+2.013 GB** |
+| 57344–65536 | 4960 | 8 | 83.408 | 0 | **+2.013 GB** |
+| 65536–69939 | 3049 | 2 | 84.354 | 0 | +0.946 GB |
 
-### AUTO (cap 2, persist 0) — one lease
+Δ is **exactly 1920 MiB per 8192 tokens** (245760 B/token), live `active_bytes`, not the cache pool. Tail 4403 tok × same rate ≈ 0.946 GB. `/props` after: active 83.06 GB, cache 1.14 GB, peak 86.41 GB (from 65.9 GB before the prompt).
 
-| arm | boot | loadavg | 4k tok/s avg/ms | 16k tok/s avg/ms | 64k tok/s avg/ms |
-|---|---|---|---|---|---|
-| aff | r1 | 2.11 2.00 1.86 | 76.192 1.23/33.54 | 74.470 1.28/29.40 | 70.167 1.12/27.83 |
-| exl3 | r1 | 2.78 2.21 1.95 | 60.327 0.82/37.70 | 58.204 1.43/36.48 | 60.660 1.12/35.57 |
-| aff | r2 | 2.20 2.23 1.99 | 72.474 1.35/34.53 | 74.969 1.42/29.38 | 76.721 1.37/30.63 |
-| exl3 | r2 | 1.66 2.15 1.99 | 61.754 0.94/28.73 | 63.202 0.90/34.30 | 66.498 1.20/31.87 |
-| aff | r3 | 1.95 2.33 2.09 | 72.783 1.17/34.59 | 75.264 1.59/37.74 | 78.205 1.67/35.63 |
-| exl3 | r3 | 2.35 2.47 2.17 | 61.801 1.23/38.85 | 66.629 1.27/35.96 | 63.674 0.85/27.58 |
+eval_ms stays 1–10 ms: the extra 2 GB is **already materialized**, not a growing `mlx_eval` of the KV vector.
 
-Medians: affine decode **72.783 / 74.969 / 76.721**, avg **1.23 / 1.42 / 1.37**, round_ms **34.53 / 29.40 / 30.63**, cap 6. EXL3 decode **61.754 / 63.202 / 63.674**, avg **0.94 / 1.27 / 1.12**, round_ms **37.70 / 35.96 / 31.87**, cap 2. Decode ratio **84.8% / 84.3% / 83.0%**. `[mtp] adaptive depth cap 2`. `[expert-exl3] engaged`.
+## QSA share (12 full-attn layers, `indexer_compress_ratio=4`)
 
-### Forced d2 — one lease
+Profile evals flatten wall (known). Numbers still name the kv term. 12 layers/chunk.
 
-Both packs `MLX_SERVE_MTP_FORCE_DEPTH=2` (every round drafts 2).
+| kv after chunk | affine select sum / med | affine gather sum / med | EXL3 select sum / med | EXL3 gather sum / med |
+|---:|---:|---:|---:|---:|
+| 16384 | 2762 / 228.5 | 707 / 58.8 | 619 / 51.4 | 698 / 57.9 |
+| 32768 | 2806 / 232.9 | 744 / 61.8 | 656 / 54.7 | 738 / 61.4 |
+| 49152 | 2871 / 238.5 | 776 / 64.7 | 697 / 58.1 | 776 / 64.6 |
+| 65536 | 2957 / 244.8 | 822 / 68.5 | 728 / 60.4 | 807 / 66.5 |
 
-| arm | boot | loadavg | 4k tok/s avg/ms | 16k tok/s avg/ms | 64k tok/s avg/ms |
-|---|---|---|---|---|---|
-| aff | r1 | 1.84 2.18 2.09 | 76.013 1.13/28.05 | 82.591 1.26/27.55 | 78.928 1.30/29.66 |
-| exl3 | r1 | 2.82 2.39 2.18 | 59.529 1.19/33.97 | 69.794 1.28/32.42 | 65.931 1.21/33.44 |
-| aff | r2 | 2.83 2.55 2.27 | 76.898 1.19/28.77 | 79.181 1.18/27.97 | 81.605 1.29/28.29 |
-| exl3 | r2 | 2.54 2.57 2.30 | 66.271 1.17/34.05 | 69.639 1.24/32.85 | 67.962 1.27/33.54 |
-| aff | r3 | 2.21 2.40 2.26 | 76.691 1.12/28.02 | 83.144 1.24/27.12 | 83.242 1.34/28.39 |
-| exl3 | r3 | 1.87 2.27 2.22 | 65.995 1.16/33.69 | 71.334 1.27/32.43 | 67.710 1.21/33.32 |
+EXL3 QSA total 1317 → 1535 ms/chunk (+218 ms). Wall 4675 → 4960 (+285 ms) under profile evals. Uninstrumented climb 5.3 → 7.4 s (+2.1 s) is the same graph **without** per-op eval: lazy QSA over growing `nb=kv/4`.
 
-Medians: affine decode **76.691 / 82.591 / 81.605**, avg **1.13 / 1.24 / 1.30**, round_ms **28.05 / 27.55 / 28.39**. EXL3 decode **65.995 / 69.794 / 67.710**, avg **1.17 / 1.27 / 1.21**, round_ms **33.97 / 32.43 / 33.44**. Decode ratio **86.1% / 84.5% / 83.0%**.
+Dense score sheet `[S=8192, nb]` f32: 67 MB at kv=8k → **537 MB at kv=64k**. New size every chunk.
 
-## EXL3/affine MTP ratio and cause
+## Growing term
 
-Handbook affine MTP is **73–77 AUTO / 77–83 forced-d2**, not the 95–98 short-prose band. Acceptance on this prompt is low: affine avg_per_round **1.13–1.42** (handbook) vs ~2+ on short prose.
+**Named: EXL3 keeps 1920 MiB of live tensors per 8192-token chunk (`active_bytes`, cache_bytes=0). Affine keeps 0.** That is not MoE (O(chunk) f16 planes, mlp flat). It is not `mlx_clear_cache` cadence (already every chunk; pool empty). Compute slope without profile evals is the **lazy QSA select/gather graph on `nb=kv/4`**, which PROFILE_FWD/QSA evals hide.
 
-At **matched force-d2**, acceptance is the same (EXL3 1.17/1.27/1.21 vs affine 1.13/1.24/1.30). EXL3 **round_ms is 18–21% higher** (34.0/32.4/33.4 vs 28.1/27.6/28.4). The MTP ratio **83–86%** is verify-row cost, not acceptance.
+## Proposed fix (prefill executor)
 
-AUTO ratio is the same **83–85%**: affine’s extra cap-6 width does not pay on this prompt (affine forced-d2 is *faster* than affine AUTO). EXL3 cap-2 is not the limiter here.
-
-vs serial EXL3 53.7/54.4/52.5, clean AUTO 61.8/63.2/63.7 is still a real MTP gain.
+1. **Stop the 1920 MiB/chunk retain.** Affine pre-sizes the KV/QSA slab; EXL3 is appending live tensors. Find the handle (full-attn KV, GDN history, QSA pooled keys, or a dequant view) and reuse one preallocated plane. `clear_cache` cannot fix `active_bytes`.
+2. **Bound QSA select.** Tile `nb` (already tiles `S`) and reuse one `[S, tile]` f32 score workspace instead of a new `[S, kv/4]` sheet per chunk. Or cap the sheet at `indexer_budget=2048` blocks.
+3. Do not change prefill GEMM dtype or window tables for this; they do not grow with kv.
+4. Keep the per-chunk mem line (`[prefill-trace] mem ... active_bytes= cache_bytes=`) until the retain is gone.
 
 ## Files changed
 
-- `EXL3-DECODE-REPORT.md` only (reset dropped shared-decode, half-product acc, start-at-2)
+- `src/generate.zig` — `mlxPrefillMem` / `formatPrefillMemLine` after chunk clear (diagnosis only)
+- `EXL3-DECODE-REPORT.md`
 
 ## Tests added
 
-none this turn
+- `prefill-trace mem line names active_bytes and cache_bytes`
 
 ## Red-first evidence
 
-n/a (reset; no new kernel)
+undeclared `formatPrefillMemLine`
 
 ## Suite counts
 
-not re-run this turn
+that test green. Full suite not re-run.
 
 ## Commit sha
 
-- integration reset: `2f876392`
-- cap-scope (on that head): `a9598bd0`
-- B13 (on that head): `00ef132a`
-- tables measured on `2f876392`
+- integration: `dec5319d`
+- measured: `ce0c3f55`
 
 ## Live table
 
-Box Apple M5 Max. `[admission] width=8192`. kv affine 8. `[expert-exl3] engaged`. AUTO: `[mtp] adaptive depth cap 2`. Logs `/tmp/exl3-decode-logs/clean-{auto,d2}.log`. JSON `/tmp/exl3-decode-logs/live-clean-{auto,d2}-*-std.json`.
+Box Apple M5 Max. `[admission] width=8192`. kv affine 8. `[expert-exl3] engaged`. `[exl3-gemm] win=32 aligned=1 nwin=2788 mixed=0 n=81920`. Logs `/tmp/exl3-decode-logs/diag-64k-{aff,exl3}.log` and `*-server.log`.
 
 ## Open questions
 
-- Shared-decode is a journal null; no width kept.
-- Half-product acc is a journal null; quality stays f32 finish reduce.
-- Handbook MTP is acceptance-limited for affine; EXL3 gap at matched d2 is round_ms.
+- Which live tensor is the 1920 MiB/chunk (KV append vs QSA pooled vs dequant view) — needs an allocation name, not more wall clocks.
+- Affine QSA select is ~4× EXL3 (228 vs 51 ms) but affine wall stays flat; EXL3’s problem is retain + lazy graph, not select ms under eval.
 
 ## Comments
 
