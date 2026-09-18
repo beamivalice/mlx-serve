@@ -40,6 +40,19 @@ from convert_qwen38_flash_next import read_header, read_raw, rename  # noqa: E40
 K = 4
 CODEBOOK = "mul1"
 PACKED_K4 = 256 * K // 16
+
+
+def packed_hw(k: int) -> int:
+    return 256 * k // 16
+
+
+def k_from_packed(last: int) -> int:
+    if last % 16 != 0:
+        raise RuntimeError(f"packed dim {last} not divisible by 16")
+    k = last // 16
+    if k not in (2, 3, 4):
+        raise RuntimeError(f"unsupported packed K={k} from last dim {last}")
+    return k
 HAD = 128
 MCG_MULT = 0xCBAC1FED
 
@@ -417,6 +430,7 @@ def restack_from_exl3(src_dir: str | Path, pack_dir: str | Path, dst: str | Path
         write_safetensors_raw(str(dst / fname), _copy_raw_tensors(pack_dir / fname, other_keys))
     weight_map = {key: pack_index["weight_map"][key] for key in plan["keep_keys"]}
     header_cache: dict[str, tuple] = {}
+    k_hist = {2: 0, 3: 0, 4: 0}
 
     def header_of(fname: str):
         if fname not in header_cache:
@@ -428,8 +442,7 @@ def restack_from_exl3(src_dir: str | Path, pack_dir: str | Path, dst: str | Path
         e0 = experts[0]
         h0, off0 = header_of(e0["trellis"][0])
         tshape = list(h0[e0["trellis"][1]]["shape"])
-        if tshape[-1] != PACKED_K4:
-            raise RuntimeError(f"not K4 packed dim {tshape}")
+        k_from_packed(tshape[-1])
         suh_shape = list(header_of(e0["suh"][0])[0][e0["suh"][1]]["shape"])
         svh_shape = list(header_of(e0["svh"][0])[0][e0["svh"][1]]["shape"])
         tdtype = h0[e0["trellis"][1]]["dtype"]
@@ -445,6 +458,7 @@ def restack_from_exl3(src_dir: str | Path, pack_dir: str | Path, dst: str | Path
         stacked_t = np.empty((n_exp, *tshape), dtype=np.uint16)
         stacked_suh = np.empty((n_exp, *suh_shape), dtype=np.float16)
         stacked_svh = np.empty((n_exp, *svh_shape), dtype=np.float16)
+        k_hist[k_from_packed(tshape[-1])] += n_exp
         for ei in range(n_exp):
             check("trellis", tshape, tdtype, ei)
             check("suh", suh_shape, "F16", ei)
@@ -452,6 +466,9 @@ def restack_from_exl3(src_dir: str | Path, pack_dir: str | Path, dst: str | Path
             tf, tk = experts[ei]["trellis"]
             hf, ho = header_of(tf)
             tb = _raw_bytes(src_dir / tf, hf, tk, ho)
+            sh = list(hf[tk]["shape"])
+            if sh[-1] != tshape[-1]:
+                raise RuntimeError(f"mixed K inside {prefix} L{layer} {proj} expert {ei}: {sh} vs {tshape}")
             stacked_t[ei] = np.frombuffer(tb, dtype=np.uint16).reshape(tshape)
             sf, sk = experts[ei]["suh"]
             hf, ho = header_of(sf)
@@ -474,10 +491,12 @@ def restack_from_exl3(src_dir: str | Path, pack_dir: str | Path, dst: str | Path
     (dst / "model.safetensors.index.json").write_text(json.dumps(
         {"metadata": {"total_size": total}, "weight_map": weight_map}, indent=2
     ))
+    modal = max(k_hist, key=lambda kk: (k_hist[kk], kk))
+    print(f"k histogram tensors={k_hist} modal={modal}", flush=True)
     cfg = json.loads((pack_dir / "config.json").read_text())
-    cfg["expert_quant"] = expert_quant_block("restack")
+    cfg["expert_quant"] = expert_quant_block("restack", k=int(modal))
     (dst / "config.json").write_text(json.dumps(cfg, indent=2))
-    return {"weight_map": weight_map}
+    return {"weight_map": weight_map, "k_hist": k_hist, "k": int(modal)}
 
 
 def expert_quant_block(source: str, **extra) -> dict:
@@ -648,8 +667,16 @@ def shard_is_valid(path: str | Path, n_experts: int, in_dim: int, out_dim: int) 
     trellis_keys = [k for k in header if k.endswith(".trellis")]
     if len(trellis_keys) != 1:
         return False
-    want = [n_experts, in_dim // 16, out_dim // 16, PACKED_K4]
-    return list(header[trellis_keys[0]]["shape"]) == want
+    sh = list(header[trellis_keys[0]]["shape"])
+    if len(sh) != 4:
+        return False
+    if sh[:3] != [n_experts, in_dim // 16, out_dim // 16]:
+        return False
+    try:
+        k_from_packed(sh[3])
+    except RuntimeError:
+        return False
+    return True
 
 
 def imatrix_layer_keys(layer: int) -> tuple[str, str, str]:
@@ -801,6 +828,64 @@ class RestackTests(unittest.TestCase):
                 src, pack, dst, _, _, _ = self._write_case(Path(td), odd_expert=(1, odd[0]))
                 with self.assertRaises(RuntimeError):
                     restack_from_exl3(src, pack, dst)
+
+    def test_restack_mixed_k_per_tensor_keeps_each_last_dim(self):
+        rng = np.random.default_rng(5)
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            src, pack, dst = td / "src", td / "pack", td / "out"
+            src.mkdir(); pack.mkdir()
+            e, h, i = 2, 128, 128
+            packed = {"gate": packed_hw(3), "up": packed_hw(3), "down": packed_hw(2)}
+            tensors = {}
+            for layer in range(2):
+                for ei in range(e):
+                    for proj, inn, outn in (("gate", h, i), ("up", h, i), ("down", i, h)):
+                        base = f"model.language_model.layers.{layer}.mlp.experts.{ei}.{proj}_proj"
+                        trellis = rng.integers(0, 65535, (inn // 16, outn // 16, packed[proj]), dtype=np.uint16)
+                        tensors[base + ".trellis"] = ("I16", trellis.shape, trellis.tobytes())
+                        tensors[base + ".suh"] = ("F16", (inn,), np.zeros(inn, np.float16).tobytes())
+                        tensors[base + ".svh"] = ("F16", (outn,), np.ones(outn, np.float16).tobytes())
+                        tensors[base + ".mul1"] = ("I32", (), np.int32(1).tobytes())
+            write_safetensors_raw(str(src / "model-00001-of-00001.safetensors"), tensors)
+            (src / "model.safetensors.index.json").write_text(json.dumps({
+                "weight_map": {k: "model-00001-of-00001.safetensors" for k in tensors}
+            }))
+            (src / "config.json").write_text(json.dumps({
+                "quantization_config": {"codebook": "mul1", "bits": 3.05, "out_scales": "always"},
+                "text_config": {"num_experts": e, "hidden_size": h, "moe_intermediate_size": i, "num_hidden_layers": 2},
+            }))
+            write_safetensors_raw(str(pack / "model-00001.safetensors"), {
+                "language_model.model.embed_tokens.weight": ("F32", (4,), np.zeros(4, np.float32).tobytes()),
+            })
+            dummy = np.zeros((e, 8), np.uint32)
+            pack_tensors = {}
+            wm = {"language_model.model.embed_tokens.weight": "model-00001.safetensors"}
+            for layer in range(2):
+                for proj in ("gate", "up", "down"):
+                    for part, dt, sh, arr in (
+                        ("weight", "U32", dummy.shape, dummy),
+                        ("scales", "F16", (e, 2), np.zeros((e, 2), np.float16)),
+                        ("biases", "F16", (e, 2), np.zeros((e, 2), np.float16)),
+                    ):
+                        key = f"language_model.model.layers.{layer}.mlp.switch_mlp.{proj}_proj.{part}"
+                        pack_tensors[key] = (dt, sh, arr.tobytes())
+                        wm[key] = "model-00002.safetensors"
+            write_safetensors_raw(str(pack / "model-00002.safetensors"), pack_tensors)
+            (pack / "model.safetensors.index.json").write_text(json.dumps({"metadata": {"total_size": 1}, "weight_map": wm}))
+            (pack / "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
+            (pack / "tokenizer.json").write_text("{}")
+            restack_from_exl3(src, pack, dst)
+            cfg = json.loads((dst / "config.json").read_text())
+            self.assertEqual(cfg["expert_quant"]["codebook"], "mul1")
+            self.assertEqual(cfg["expert_quant"]["k"], 3)
+            idx = json.loads((dst / "model.safetensors.index.json").read_text())
+            want = {"gate": packed["gate"], "up": packed["up"], "down": packed["down"]}
+            for layer in range(2):
+                for proj, inn, outn in (("gate", h, i), ("up", h, i), ("down", i, h)):
+                    key = f"language_model.model.layers.{layer}.mlp.switch_mlp.{proj}_proj.trellis"
+                    header, _ = read_header(dst / idx["weight_map"][key])
+                    self.assertEqual(tuple(header[key]["shape"]), (e, inn // 16, outn // 16, want[proj]))
 
 
 class ResumeTests(unittest.TestCase):
