@@ -12,7 +12,7 @@ var swiglu_maxabs_dumped: bool = false;
 
 fn diagEnvValueOn(raw: ?[*:0]const u8) bool {
     const v = raw orelse return false;
-    return v[0] != '0';
+    return v[0] != 0 and v[0] != '0';
 }
 
 fn pairSplitCount() u32 {
@@ -4671,4 +4671,12 @@ test "exl3 the decode reduce folds the scores in f32" {
         std.debug.print("exl3 reduce worst rel {d:.8}\n", .{worst});
         return error.TestExpectedEqual;
     }
+}
+
+test "exl3 a diagnostic env switch set to nothing is off" {
+    const t = std.testing;
+    try t.expect(!diagEnvValueOn(null));
+    try t.expect(!diagEnvValueOn("0"));
+    try t.expect(!diagEnvValueOn(""));
+    try t.expect(diagEnvValueOn("1"));
 }

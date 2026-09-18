@@ -32667,10 +32667,11 @@ fn envFlagCached(cache: *?bool, name: [*:0]const u8) bool {
 /// The diagnostic-switch decision, split from the `getenv` so it is testable.
 pub fn diagEnvValueOn(raw: ?[*:0]const u8) bool {
     const v = raw orelse return false;
-    return v[0] != '0';
+    return v[0] != 0 and v[0] != '0';
 }
-/// Diagnostic env switch: set and not `0`. `FOO=0` exported by a harness must
-/// never arm a sync profiler (the qwen4 MTP verify once measured 70 ms).
+/// Diagnostic env switch: set to a value that is neither empty nor `0`. A
+/// harness exporting `FOO=0` or `FOO=` must never arm a sync profiler (the
+/// qwen4 MTP verify once measured 70 ms).
 fn diagEnvOn(name: [*:0]const u8) bool {
     return diagEnvValueOn(std.c.getenv(name));
 }
@@ -60476,9 +60477,10 @@ test "qwen4PleInstalledAt accepts the MTP head's deliberate -1 and still refuses
     try testing.expect(!model_mod.qwen4PleInstalledAt(&.{true}, -1));
 }
 
-test "diagEnvValueOn: absent or 0 is off" {
+test "diagEnvValueOn: absent, empty or 0 is off" {
     try testing.expectEqual(false, diagEnvValueOn(null));
     try testing.expectEqual(false, diagEnvValueOn("0"));
+    try testing.expectEqual(false, diagEnvValueOn(""));
     try testing.expectEqual(true, diagEnvValueOn("1"));
     try testing.expectEqual(true, diagEnvValueOn("on"));
 }
