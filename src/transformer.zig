@@ -28853,7 +28853,7 @@ pub const Transformer = struct {
         if (stream_ctx) |info| return self.streamedMoeResult(info, expert_x, inds, norm_scores, mw);
         if (cfg.expert_layout == .exl3_k4) {
             const y = try self.moeExl3(expert_x, mw, inds, norm_scores);
-            if (skip_shared) return y;
+            if (skip_shared or mw.shared_expert_gate_w == null or qwen4Standin().moe_shared) return y;
             defer _ = mlx.mlx_array_free(y);
             return self.moeAddGatedShared(y, expert_x, mw);
         }
@@ -38636,6 +38636,190 @@ test "exl3 MTP fused rows match N solo calls on the same kernel" {
         }
     }
     try t.expectEqual(@as(u32, 4), n_disp);
+}
+
+const Exl3MoeHarness = struct {
+    xfm: Transformer,
+    x: mlx.mlx_array,
+    mw: MoeMlpWeights,
+    owned: [10]mlx.mlx_array,
+
+    const E: usize = 4;
+    const dim: usize = 128;
+
+    fn init(alloc: std.mem.Allocator, s: mlx.mlx_stream, rows: usize, seed: u64) !Exl3MoeHarness {
+        const exl3 = @import("expert_exl3.zig");
+        const fixture = @embedFile("fixtures/exl3_k4_linear.safetensors");
+        const header_len = std.mem.readInt(u64, fixture[0..8], .little);
+        const header = fixture[8 .. 8 + header_len];
+        const data = fixture[8 + header_len ..];
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, header, .{});
+        defer parsed.deinit();
+        const trellis_meta = parsed.value.object.get("trellis").?.object;
+        const suh_meta = parsed.value.object.get("suh").?.object;
+        const svh_meta = parsed.value.object.get("svh").?.object;
+        const t0: usize = @intCast(trellis_meta.get("data_offsets").?.array.items[0].integer);
+        const t1: usize = @intCast(trellis_meta.get("data_offsets").?.array.items[1].integer);
+        const s0: usize = @intCast(suh_meta.get("data_offsets").?.array.items[0].integer);
+        const s1: usize = @intCast(suh_meta.get("data_offsets").?.array.items[1].integer);
+        const v0: usize = @intCast(svh_meta.get("data_offsets").?.array.items[0].integer);
+        const v1: usize = @intCast(svh_meta.get("data_offsets").?.array.items[1].integer);
+        const trellis_bits = std.mem.bytesAsSlice(u16, data[t0..t1]);
+        const suh_bits = std.mem.bytesAsSlice(u16, data[s0..s1]);
+        const svh_bits = std.mem.bytesAsSlice(u16, data[v0..v1]);
+        const tile_n = 8 * 8 * 64;
+        const stacked_t = try alloc.alloc(u16, E * tile_n);
+        const stacked_suh = try alloc.alloc(u16, E * dim);
+        const stacked_svh = try alloc.alloc(u16, E * dim);
+        for (0..E) |e| {
+            @memcpy(stacked_t[e * tile_n ..][0..tile_n], trellis_bits);
+            @memcpy(stacked_suh[e * dim ..][0..dim], suh_bits);
+            @memcpy(stacked_svh[e * dim ..][0..dim], svh_bits);
+        }
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rnd = prng.random();
+        const xh = try alloc.alloc(u16, rows * dim);
+        for (xh) |*v| v.* = exl3.f32ToF16Bits(rnd.float(f32) * 2 - 1);
+        const rw = try alloc.alloc(u16, dim * E);
+        for (rw) |*v| v.* = exl3.f32ToF16Bits(rnd.float(f32) * 0.05);
+        const ident = try alloc.alloc(u16, dim * dim);
+        @memset(ident, 0);
+        for (0..dim) |i| ident[i * dim + i] = exl3.f32ToF16Bits(1.0);
+        const gbits = try alloc.alloc(u16, dim);
+        @memset(gbits, 0);
+        const tr = mlx.mlx_array_new_data(stacked_t.ptr, &[_]c_int{ @intCast(E), 8, 8, 64 }, 4, .uint16);
+        const suh = mlx.mlx_array_new_data(stacked_suh.ptr, &[_]c_int{ @intCast(E), @intCast(dim) }, 2, .float16);
+        const svh = mlx.mlx_array_new_data(stacked_svh.ptr, &[_]c_int{ @intCast(E), @intCast(dim) }, 2, .float16);
+        const router = mlx.mlx_array_new_data(rw.ptr, &[_]c_int{ @intCast(dim), @intCast(E) }, 2, .float16);
+        const sh_gate = mlx.mlx_array_new_data(ident.ptr, &[_]c_int{ @intCast(dim), @intCast(dim) }, 2, .float16);
+        const sh_up = mlx.mlx_array_new_data(ident.ptr, &[_]c_int{ @intCast(dim), @intCast(dim) }, 2, .float16);
+        const sh_down = mlx.mlx_array_new_data(ident.ptr, &[_]c_int{ @intCast(dim), @intCast(dim) }, 2, .float16);
+        const sh_eg = mlx.mlx_array_new_data(gbits.ptr, &[_]c_int{ @intCast(dim), 1 }, 2, .float16);
+        const x = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ 1, @intCast(rows), @intCast(dim) }, 3, .float16);
+        const one = mlx.mlx_array_new_float(1.0);
+        const none = mlx.mlx_array{ .ctx = null };
+        var h: Exl3MoeHarness = .{
+            .xfm = undefined,
+            .x = x,
+            .owned = .{ tr, suh, svh, router, sh_gate, sh_up, sh_down, sh_eg, x, one },
+            .mw = .{
+                .router_w = router,
+                .router_s = none,
+                .router_b = none,
+                .switch_gate_w = tr,
+                .switch_gate_s = suh,
+                .switch_gate_b = svh,
+                .switch_up_w = tr,
+                .switch_up_s = suh,
+                .switch_up_b = svh,
+                .switch_down_w = tr,
+                .switch_down_s = suh,
+                .switch_down_b = svh,
+                .shared_gate_w = sh_gate,
+                .shared_gate_s = none,
+                .shared_gate_b = none,
+                .shared_up_w = sh_up,
+                .shared_up_s = none,
+                .shared_up_b = none,
+                .shared_down_w = sh_down,
+                .shared_down_s = none,
+                .shared_down_b = none,
+                .shared_expert_gate_w = sh_eg,
+                .shared_expert_gate_s = none,
+                .shared_expert_gate_b = none,
+            },
+        };
+        h.xfm.s = s;
+        h.xfm.config = .{
+            .expert_layout = .exl3_k4,
+            .num_experts = @intCast(E),
+            .num_experts_per_tok = @intCast(E),
+            .hidden_size = @intCast(dim),
+            .moe_intermediate_size = @intCast(dim),
+            .quant_bits = 0,
+            .quant_group_size = 64,
+            .quant_mode = .affine,
+            .hidden_act = .silu,
+        };
+        h.xfm.one = one;
+        h.xfm.bits_cache = .{};
+        h.xfm.compiled_moe_routing = null;
+        h.xfm.compiled_gelu = null;
+        h.xfm.compiled_geglu = null;
+        h.xfm.cost_trace_active = false;
+        for (h.owned) |a| try mlx.check(mlx.mlx_array_eval(a));
+        return h;
+    }
+
+    fn deinit(self: *Exl3MoeHarness) void {
+        for (self.owned) |a| _ = mlx.mlx_array_free(a);
+    }
+};
+
+test "exl3 MoE prefill chunks return live mlx bytes to baseline" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    var h = try Exl3MoeHarness.init(arena.allocator(), s, expert_exl3_kernels.DECODE_ROWS_MAX * 2, 53);
+    defer h.deinit();
+    const prev_st = qwen4_standin_override;
+    qwen4_standin_override = .{};
+    defer qwen4_standin_override = prev_st;
+    const chunk = struct {
+        fn run(hh: *Exl3MoeHarness) !void {
+            const y = try hh.xfm.moeMLP(hh.x, &hh.mw);
+            defer _ = mlx.mlx_array_free(y);
+            try mlx.check(mlx.mlx_array_eval(y));
+        }
+    };
+    try chunk.run(&h);
+    try chunk.run(&h);
+    _ = mlx.mlx_clear_cache();
+    var base: usize = 0;
+    try mlx.check(mlx.mlx_get_active_memory(&base));
+    try chunk.run(&h);
+    try chunk.run(&h);
+    try chunk.run(&h);
+    _ = mlx.mlx_clear_cache();
+    var after: usize = 0;
+    try mlx.check(mlx.mlx_get_active_memory(&after));
+    try t.expectEqual(base, after);
+}
+
+test "exl3 MoE answers the shared-expert standin with the routed sum" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    var h = try Exl3MoeHarness.init(arena.allocator(), s, expert_exl3_kernels.DECODE_ROWS_MAX * 2, 59);
+    defer h.deinit();
+    const prev_st = qwen4_standin_override;
+    defer qwen4_standin_override = prev_st;
+    qwen4_standin_override = .{};
+    const routed = try h.xfm.moeMLP2WithRouter(h.x, h.x, &h.mw, null, true, null, null);
+    defer _ = mlx.mlx_array_free(routed);
+    qwen4_standin_override = .{ .moe_shared = true };
+    const got = try h.xfm.moeMLP(h.x, &h.mw);
+    defer _ = mlx.mlx_array_free(got);
+    var c_r = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(c_r);
+    var c_g = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(c_g);
+    try mlx.check(mlx.mlx_contiguous(&c_r, routed, false, s));
+    try mlx.check(mlx.mlx_contiguous(&c_g, got, false, s));
+    try mlx.check(mlx.mlx_array_eval(c_r));
+    try mlx.check(mlx.mlx_array_eval(c_g));
+    const pr = mlx.mlx_array_data_float16(c_r) orelse return error.F16Unreadable;
+    const pg = mlx.mlx_array_data_float16(c_g) orelse return error.F16Unreadable;
+    const n = Exl3MoeHarness.dim * expert_exl3_kernels.DECODE_ROWS_MAX * 2;
+    for (0..n) |i| {
+        const a: u16 = @bitCast(pr[i]);
+        const b: u16 = @bitCast(pg[i]);
+        try t.expectEqual(a, b);
+    }
 }
 
 /// `{prefix}.{base}.{suffix}` with a RUNTIME base — the embedding table's name
