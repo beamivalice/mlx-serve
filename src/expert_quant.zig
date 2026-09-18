@@ -42,10 +42,32 @@ pub fn isExpertStreamingArch(model_type: []const u8) bool {
     return std.mem.eql(u8, model_type, "qwen4_exp");
 }
 
+pub const Exl3Spec = struct {
+    k: u8,
+    codebook: []const u8,
+};
+
+pub fn parseExpertQuant(obj: std.json.ObjectMap) !Exl3Spec {
+    const block = obj.get("expert_quant") orelse return error.ExpertLayoutUnsupported;
+    if (block != .object) return error.ExpertLayoutUnsupported;
+    const format = block.object.get("format") orelse return error.ExpertLayoutUnsupported;
+    if (format != .string or !std.mem.eql(u8, format.string, "exl3")) return error.ExpertLayoutUnsupported;
+    const k_v = block.object.get("k") orelse return error.ExpertLayoutUnsupported;
+    const k: u8 = switch (k_v) {
+        .integer => |n| std.math.cast(u8, n) orelse return error.ExpertLayoutUnsupported,
+        else => return error.ExpertLayoutUnsupported,
+    };
+    const cb_v = block.object.get("codebook") orelse return error.ExpertLayoutUnsupported;
+    if (cb_v != .string) return error.ExpertLayoutUnsupported;
+    if (k != 4) return error.ExpertLayoutUnsupported;
+    if (!std.mem.eql(u8, cb_v.string, "mcg")) return error.ExpertLayoutUnsupported;
+    return .{ .k = k, .codebook = cb_v.string };
+}
+
 /// How a qwen4_exp checkpoint stores its ROUTED experts. Both are leading-index
 /// banks: `bf16_fused` is the HF checkpoint's two dense tensors per layer,
 /// `quantized_split` the MLX pack's nine (three projections x weight/scales/biases).
-pub const Layout = enum { bf16_fused, quantized_split };
+pub const Layout = enum { bf16_fused, quantized_split, exl3_k4 };
 
 pub const Component = enum(u4) {
     gate_w,
@@ -120,6 +142,9 @@ pub fn isRoutedExpertKey(layout: Layout, key: []const u8) bool {
                 std.mem.endsWith(u8, key, ".mlp.experts.down_proj")),
         .quantized_split => std.mem.startsWith(u8, key, "language_model.model.layers.") and
             std.mem.indexOf(u8, key, ".mlp.switch_mlp.") != null,
+        .exl3_k4 => (std.mem.startsWith(u8, key, "language_model.model.layers.") or
+            std.mem.startsWith(u8, key, "language_model.mtp.")) and
+            std.mem.indexOf(u8, key, ".mlp.switch_mlp.") != null,
     };
 }
 
@@ -145,6 +170,28 @@ pub fn layoutFromWeightMap(map: std.json.ObjectMap, layers: u16) ?Layout {
         }
     }
     if (fused) return .bf16_fused;
+    var exl3 = true;
+    for (0..layers) |layer| {
+        for ([_][]const u8{ "gate", "up", "down" }) |proj| {
+            const trellis = std.fmt.bufPrint(&buf, "language_model.model.layers.{d}.mlp.switch_mlp.{s}_proj.trellis", .{ layer, proj }) catch return null;
+            if (!stringAt(map, trellis)) {
+                exl3 = false;
+                break;
+            }
+            const suh = std.fmt.bufPrint(&buf, "language_model.model.layers.{d}.mlp.switch_mlp.{s}_proj.suh", .{ layer, proj }) catch return null;
+            if (!stringAt(map, suh)) {
+                exl3 = false;
+                break;
+            }
+            const svh = std.fmt.bufPrint(&buf, "language_model.model.layers.{d}.mlp.switch_mlp.{s}_proj.svh", .{ layer, proj }) catch return null;
+            if (!stringAt(map, svh)) {
+                exl3 = false;
+                break;
+            }
+        }
+        if (!exl3) break;
+    }
+    if (exl3) return .exl3_k4;
     for (0..layers) |layer| {
         for (0..component_count) |ci| {
             const key = tensorKey(&buf, @intCast(layer), @enumFromInt(ci)) catch return null;
@@ -416,6 +463,37 @@ test "routed expert layout is read off the weight map" {
     try t.expect(isRoutedExpertKey(.quantized_split, "language_model.model.layers.3.mlp.switch_mlp.down_proj.scales"));
     try t.expect(!isRoutedExpertKey(.quantized_split, "language_model.model.layers.3.mlp.shared_expert.down_proj.scales"));
     try t.expect(isRoutedExpertKey(.bf16_fused, "model.language_model.layers.3.mlp.experts.down_proj"));
+    const exl3 =
+        \\{"weight_map":{"language_model.model.layers.0.mlp.switch_mlp.gate_proj.trellis":"a","language_model.model.layers.0.mlp.switch_mlp.gate_proj.suh":"a","language_model.model.layers.0.mlp.switch_mlp.gate_proj.svh":"a","language_model.model.layers.0.mlp.switch_mlp.up_proj.trellis":"a","language_model.model.layers.0.mlp.switch_mlp.up_proj.suh":"a","language_model.model.layers.0.mlp.switch_mlp.up_proj.svh":"a","language_model.model.layers.0.mlp.switch_mlp.down_proj.trellis":"a","language_model.model.layers.0.mlp.switch_mlp.down_proj.suh":"a","language_model.model.layers.0.mlp.switch_mlp.down_proj.svh":"a"}}
+    ;
+    try t.expectEqual(Layout.exl3_k4, layoutFromIndexJson(t.allocator, "qwen4_exp", exl3, 1).?);
+    try t.expect(isRoutedExpertKey(.exl3_k4, "language_model.model.layers.3.mlp.switch_mlp.gate_proj.trellis"));
+    try t.expect(isRoutedExpertKey(.exl3_k4, "language_model.mtp.layers.0.mlp.switch_mlp.down_proj.suh"));
+    try t.expect(!isRoutedExpertKey(.exl3_k4, "language_model.model.layers.3.mlp.shared_expert.down_proj.weight"));
+}
+
+test "exl3 expert_quant admits uniform K4 mcg and refuses any other codebook or k" {
+    const t = std.testing;
+    const ok = try std.json.parseFromSlice(std.json.Value, t.allocator,
+        \\{"expert_quant":{"format":"exl3","k":4,"codebook":"mcg"}}
+    , .{});
+    defer ok.deinit();
+    const spec = try parseExpertQuant(ok.value.object);
+    try t.expectEqual(@as(u8, 4), spec.k);
+    try t.expectEqualStrings("mcg", spec.codebook);
+    const bad_k = try std.json.parseFromSlice(std.json.Value, t.allocator,
+        \\{"expert_quant":{"format":"exl3","k":6,"codebook":"mcg"}}
+    , .{});
+    defer bad_k.deinit();
+    try t.expectError(error.ExpertLayoutUnsupported, parseExpertQuant(bad_k.value.object));
+    const bad_cb = try std.json.parseFromSlice(std.json.Value, t.allocator,
+        \\{"expert_quant":{"format":"exl3","k":4,"codebook":"mul1"}}
+    , .{});
+    defer bad_cb.deinit();
+    try t.expectError(error.ExpertLayoutUnsupported, parseExpertQuant(bad_cb.value.object));
+    const missing = try std.json.parseFromSlice(std.json.Value, t.allocator, "{}", .{});
+    defer missing.deinit();
+    try t.expectError(error.ExpertLayoutUnsupported, parseExpertQuant(missing.value.object));
 }
 
 test "layout resolution is qwen4_exp only: the same index declares nothing for another arch" {

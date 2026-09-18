@@ -2071,6 +2071,13 @@ fn ownWeightOpt(w: *const Weights, key: []const u8) mlx.mlx_array {
 /// the shape the trunk's gather/qmatmul paths expect for MoE tensors.
 fn loadMoeTriple(w: *const Weights, prefix: []const u8) !struct { w: mlx.mlx_array, s: mlx.mlx_array, b: mlx.mlx_array } {
     var key_buf: [256]u8 = undefined;
+    if (w.get(try std.fmt.bufPrint(&key_buf, "{s}.trellis", .{prefix})) != null) {
+        return .{
+            .w = try ownWeight(w, try std.fmt.bufPrint(&key_buf, "{s}.trellis", .{prefix})),
+            .s = ownWeightOpt(w, try std.fmt.bufPrint(&key_buf, "{s}.suh", .{prefix})),
+            .b = ownWeightOpt(w, try std.fmt.bufPrint(&key_buf, "{s}.svh", .{prefix})),
+        };
+    }
     return .{
         .w = try ownWeight(w, try std.fmt.bufPrint(&key_buf, "{s}.weight", .{prefix})),
         .s = ownWeightOpt(w, try std.fmt.bufPrint(&key_buf, "{s}.scales", .{prefix})),
@@ -2156,7 +2163,8 @@ pub fn loadMtp(
 
     // MLP flavor: a `switch_mlp` router/expert pack marks a MoE-trunk sidecar
     // (35B-A3B); plain gate/up/down is the dense one-layer head.
-    const is_moe = weights.get(K.k(&kb, p, "layers.0.mlp.switch_mlp.gate_proj.weight")) != null;
+    const is_moe = weights.get(K.k(&kb, p, "layers.0.mlp.switch_mlp.gate_proj.weight")) != null or
+        weights.get(K.k(&kb, p, "layers.0.mlp.switch_mlp.gate_proj.trellis")) != null;
 
     // Delta-encoded norms (Qwen original layout, oMLX OptiQ) need `+1` folded
     // in at load so the runtime `rmsnorm(x) * w` matches; a natively-folded

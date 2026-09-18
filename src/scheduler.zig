@@ -3734,6 +3734,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         const geometry = streamingGeometryOf(params.config);
         const layout = expert_stream_mod.quant.layoutOfDir(sch.allocator, sch.io, params.config.model_type, params.model_dir, geometry.layers) orelse
             return error.ExpertStreamingUnsupportedLayout;
+        if (layout == .exl3_k4) return error.ExpertLayoutUnsupported;
         params.config.expert_layout = layout;
         const split = try model_mod.streamingResidentSplit(sch.io, sch.allocator, params.model_dir, layout);
         switch (expert_stream_mod.mtpUnderStreaming(params.mtp_enabled, params.config.mtp_override)) {

@@ -66,7 +66,19 @@ pub fn expertBytesFor(allocator: std.mem.Allocator, model_dir: []const u8, geome
             defer store.deinit();
             return store.expertBytes();
         },
+        .exl3_k4 => return exl3ExpertBytes(geometry),
     }
+}
+
+pub fn exl3ExpertBytes(geometry: Geometry) !u64 {
+    const h: u64 = geometry.hidden;
+    const i: u64 = geometry.intermediate;
+    if (h == 0 or i == 0 or h % 16 != 0 or i % 16 != 0) return error.InvalidExpertGeometry;
+    const tile_words: u64 = 64;
+    const gate_up = (h / 16) * (i / 16) * tile_words * 2 + h * 2 + i * 2;
+    const down = (i / 16) * (h / 16) * tile_words * 2 + i * 2 + h * 2;
+    const both = std.math.mul(u64, gate_up, 2) catch return error.InvalidExpertGeometry;
+    return std.math.add(u64, both, down) catch return error.InvalidExpertGeometry;
 }
 
 pub fn cachePlanBytes(requested_bytes: u64, layers: u16, experts: u16, expert_bytes: u64) !CachePlan {
