@@ -3203,7 +3203,7 @@ pub const Generator = struct {
                 .mtp_accept_param = accept_route.param,
                 .mtp_cache = mtp_cache,
                 .mtp_position_base = mtp_position_base,
-                .mtp_depth = resolveMtpDepthCapForProfile(options.mtp_depth, mtp_cost_profile),
+                .mtp_depth = mtp_mod.applyExl3DepthCap(ane_mod.chipBrand(), xfm.config.expert_layout, resolveMtpDepthCapForProfile(options.mtp_depth, mtp_cost_profile)),
                 .mtp_depth_free = if (xfm.mtp_depth_free != 0) xfm.mtp_depth_free else mtpDepthCapFree(options.mtp_depth),
                 .mtp_ev_costs = mtpEvCosts(mtp_cost_profile),
                 // Start at depth 1 and climb with evidence: the cheap depth

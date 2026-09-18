@@ -104,6 +104,24 @@ pub fn adaptiveDepthCapForMachine(chip: []const u8, default_cap: u32) DepthCap {
     return .{ .cap = default_cap, .label = "default" };
 }
 
+pub fn adaptiveDepthCapForExl3(chip: []const u8, default_cap: u32) DepthCap {
+    if (std.mem.indexOf(u8, chip, "M5 Max") != null)
+        return .{ .cap = 2, .label = "m5-max-exl3", .measured = true };
+    return adaptiveDepthCapForMachine(chip, default_cap);
+}
+
+var exl3_cap_logged: bool = false;
+
+pub fn applyExl3DepthCap(chip: []const u8, layout: expert_quant.Layout, cap: u32) u32 {
+    if (layout != .exl3_k4) return cap;
+    const row = adaptiveDepthCapForExl3(chip, cap);
+    if (row.measured and row.cap < cap and !exl3_cap_logged) {
+        exl3_cap_logged = true;
+        log.info("[mtp] adaptive depth cap {d} ({s} row, default {d})\n", .{ row.cap, row.label, cap });
+    }
+    return @min(cap, row.cap);
+}
+
 /// Exact full-round cost surfaces known to the adaptive MTP controller.
 /// Selection is based on runtime tensor geometry, never a model/repository
 /// name. `generic` retains the conservative M1-M4 surface and auto cap.
@@ -5603,6 +5621,16 @@ test "adaptiveDepthCapForMachine: base M5 caps at 4, Pro/Max/Ultra keep the defa
     try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M5 Pro", 6).cap);
     try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M5 Max", 6).cap);
     try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M5 Ultra", 6).cap);
+}
+
+test "adaptiveDepthCapForExl3: M5 Max cold-start cap is 2" {
+    try testing.expectEqual(@as(u32, 2), adaptiveDepthCapForExl3("Apple M5 Max", 6).cap);
+    try testing.expectEqualStrings("m5-max-exl3", adaptiveDepthCapForExl3("Apple M5 Max", 6).label);
+    try testing.expect(adaptiveDepthCapForExl3("Apple M5 Max", 6).measured);
+    try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForExl3("Apple M5 Pro", 6).cap);
+    try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M5 Max", 6).cap);
+    try testing.expectEqual(@as(u32, 2), applyExl3DepthCap("Apple M5 Max", .exl3_k4, 6));
+    try testing.expectEqual(@as(u32, 6), applyExl3DepthCap("Apple M5 Max", .quantized_split, 6));
 }
 
 test "mtpCtxWithinLimit: 0 is unlimited and the ceiling is inclusive" {

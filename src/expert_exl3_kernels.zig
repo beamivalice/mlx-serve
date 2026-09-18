@@ -68,6 +68,58 @@ pub fn usesPrefillArm(rows: usize) bool {
     return rows > DECODE_ROWS_MAX;
 }
 
+pub const UNION_EXPERTS: usize = 512;
+
+pub fn unionUnique(eids: []const u32) u32 {
+    var seen: [UNION_EXPERTS]u8 = @splat(0);
+    var n: u32 = 0;
+    for (eids) |e| {
+        if (e >= UNION_EXPERTS) continue;
+        if (seen[e] == 0) {
+            seen[e] = 1;
+            n += 1;
+        }
+    }
+    return n;
+}
+
+pub fn unionMultiplicity(eids: []const u32, counts: []u32) u32 {
+    var unique: u32 = 0;
+    for (eids) |e| {
+        if (e >= counts.len) continue;
+        if (counts[e] == 0) unique += 1;
+        counts[e] += 1;
+    }
+    return unique;
+}
+
+var union_hist_env: ?bool = null;
+
+fn unionHistOn() bool {
+    if (union_hist_env) |v| return v;
+    const v = diagEnvValueOn(std.c.getenv("MLX_SERVE_EXL3_UNION_HIST"));
+    union_hist_env = v;
+    return v;
+}
+
+pub fn dumpUnionHist(slots_u: mlx.mlx_array, S: usize, K: usize) !void {
+    if (!unionHistOn()) return;
+    if (S < 2 or K == 0) return;
+    try mlx.check(mlx.mlx_array_eval(slots_u));
+    const n = S * K;
+    const ptr = mlx.mlx_array_data_uint32(slots_u) orelse return;
+    const slice = ptr[0..n];
+    var counts: [UNION_EXPERTS]u32 = @splat(0);
+    const unique = unionMultiplicity(slice, &counts);
+    var shared: u32 = 0;
+    var max_m: u32 = 0;
+    for (counts) |c| {
+        if (c >= 2) shared += 1;
+        if (c > max_m) max_m = c;
+    }
+    log.info("[exl3-union] S={d} K={d} assignments={d} unique={d} shared={d} max_mult={d}\n", .{ S, K, n, unique, shared, max_m });
+}
+
 pub const RunTable = struct {
     start: []u32,
     len: []u32,
@@ -2276,6 +2328,29 @@ test "exl3 K4 Metal inner GEMV matches the host tile decode" {
         const bits: u16 = @bitCast(src[i]);
         try t.expectEqual(exl3.f32ToF16Bits(host[i]), bits);
     }
+}
+
+test "exl3 verify group union unique vs assignment count" {
+    const t = std.testing;
+    var eids: [20]u32 = undefined;
+    var i: usize = 0;
+    while (i < 10) : (i += 1) eids[i] = @intCast(i);
+    i = 0;
+    while (i < 10) : (i += 1) eids[10 + i] = @intCast(100 + i);
+    try t.expectEqual(@as(u32, 20), unionUnique(&eids));
+    i = 0;
+    while (i < 10) : (i += 1) eids[10 + i] = @intCast(i);
+    try t.expectEqual(@as(u32, 10), unionUnique(&eids));
+    i = 0;
+    while (i < 10) : (i += 1) eids[10 + i] = @intCast(7 + i);
+    try t.expectEqual(@as(u32, 17), unionUnique(&eids));
+    var counts: [512]u32 = @splat(0);
+    const u = unionMultiplicity(&eids, &counts);
+    try t.expectEqual(@as(u32, 17), u);
+    try t.expectEqual(@as(u32, 1), counts[0]);
+    try t.expectEqual(@as(u32, 2), counts[7]);
+    try t.expectEqual(@as(u32, 2), counts[9]);
+    try t.expectEqual(@as(u32, 1), counts[16]);
 }
 
 test "exl3 buildRuns groups sorted expert ids" {

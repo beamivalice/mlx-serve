@@ -28666,6 +28666,9 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(slots_u);
         try mlx.check(mlx.mlx_astype(&slots_u, slots, .uint32, self.s));
         const rows: usize = @intCast(B * S);
+        if (rows >= 2 and rows <= expert_exl3_kernels.DECODE_ROWS_MAX) {
+            expert_exl3_kernels.dumpUnionHist(slots_u, rows, @intCast(K)) catch {};
+        }
         if (rows <= expert_exl3_kernels.DECODE_ROWS_MAX) {
             const xd = mlx.mlx_array_dtype(expert_x);
             const y = try expert_exl3_kernels.moeSwigluFused(
