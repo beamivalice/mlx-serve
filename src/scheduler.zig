@@ -4317,7 +4317,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         const warmup_ns: u64 = @intCast(warmup_start.untilNow(sch.io, .awake).nanoseconds);
         log.info("Warmup complete ({d} ms).\n", .{warmup_ns / std.time.ns_per_ms});
         if (mtp_enabled and xfm_ptr.qwen4_mtp != null) {
-            const cap = mtp_mod.applyExl3DepthCap(ane_mod.chipBrand(), xfm_ptr.config.expert_layout, generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile));
+            const cap = mtp_mod.applyExl3DepthCap(ane_mod.chipBrand(), xfm_ptr.config.expert_layout, generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile), params.mtp_depth, generate_mod.Generator.mtpAdaptiveEnabled(), generate_mod.Generator.mtpForcedDepth() != null);
             xfm_ptr.warmupSpecVerify(cap, params.kv_quant_config) catch |err| {
                 log.warn("[spec-warmup] failed ({s}); the first round at each width pays its kernel compile inside the round.\n", .{@errorName(err)});
             };
@@ -4350,7 +4350,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         null;
     // Resolve the auto (0) cap here so every downstream reader of
     // `lm.mtp_depth` (server log lines, slot params) sees the real value.
-    entry.mtp_depth = mtp_mod.applyExl3DepthCap(ane_mod.chipBrand(), xfm_ptr.config.expert_layout, generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile));
+    entry.mtp_depth = mtp_mod.applyExl3DepthCap(ane_mod.chipBrand(), xfm_ptr.config.expert_layout, generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile), params.mtp_depth, generate_mod.Generator.mtpAdaptiveEnabled(), generate_mod.Generator.mtpForcedDepth() != null);
     xfm_ptr.mtp_depth_free = generate_mod.Generator.mtpDepthCapFree(params.mtp_depth);
     // A MERGED drafter has no `--drafter` to echo, so the reported path comes
     // from what was actually resolved — `drafter_loaded` and `drafter_path`

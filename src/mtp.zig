@@ -112,8 +112,9 @@ pub fn adaptiveDepthCapForExl3(chip: []const u8, default_cap: u32) DepthCap {
 
 var exl3_cap_logged: bool = false;
 
-pub fn applyExl3DepthCap(chip: []const u8, layout: expert_quant.Layout, cap: u32) u32 {
+pub fn applyExl3DepthCap(chip: []const u8, layout: expert_quant.Layout, cap: u32, configured: u32, adaptive: bool, force_depth: bool) u32 {
     if (layout != .exl3_k4) return cap;
+    if (configured != 0 or !adaptive or force_depth) return cap;
     const row = adaptiveDepthCapForExl3(chip, cap);
     if (row.measured and row.cap < cap and !exl3_cap_logged) {
         exl3_cap_logged = true;
@@ -5629,8 +5630,15 @@ test "adaptiveDepthCapForExl3: M5 Max cold-start cap is 2" {
     try testing.expect(adaptiveDepthCapForExl3("Apple M5 Max", 6).measured);
     try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForExl3("Apple M5 Pro", 6).cap);
     try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M5 Max", 6).cap);
-    try testing.expectEqual(@as(u32, 2), applyExl3DepthCap("Apple M5 Max", .exl3_k4, 6));
-    try testing.expectEqual(@as(u32, 6), applyExl3DepthCap("Apple M5 Max", .quantized_split, 6));
+    try testing.expectEqual(@as(u32, 2), applyExl3DepthCap("Apple M5 Max", .exl3_k4, 6, 0, true, false));
+    try testing.expectEqual(@as(u32, 6), applyExl3DepthCap("Apple M5 Max", .quantized_split, 6, 0, true, false));
+}
+
+test "applyExl3DepthCap binds only the auto path" {
+    try testing.expectEqual(@as(u32, 3), applyExl3DepthCap("Apple M5 Max", .exl3_k4, 3, 0, false, false));
+    try testing.expectEqual(@as(u32, 5), applyExl3DepthCap("Apple M5 Max", .exl3_k4, 5, 5, true, false));
+    try testing.expectEqual(@as(u32, 4), applyExl3DepthCap("Apple M5 Max", .exl3_k4, 4, 0, true, true));
+    try testing.expectEqual(@as(u32, 2), applyExl3DepthCap("Apple M5 Max", .exl3_k4, 6, 0, true, false));
 }
 
 test "mtpCtxWithinLimit: 0 is unlimited and the ceiling is inclusive" {
