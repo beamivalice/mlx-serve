@@ -1559,6 +1559,7 @@ fn downGemvFusedMid(
     const ov = try applyOuts(s, kernel, &.{ ig, iu, trellis, svhg, svhu, suhd, slots }, cfg, 1);
     defer _ = mlx.mlx_vector_array_free(ov);
     var a = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(a);
     try mlx.check(mlx.mlx_vector_array_get(&a, ov, 0));
     return a;
 }
@@ -1880,6 +1881,7 @@ fn applyOuts(s: mlx.mlx_stream, kernel: mlx.mlx_fast_metal_kernel, inputs: []con
     const inputs_vec = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
     var outputs_vec = mlx.mlx_vector_array_new();
+    errdefer _ = mlx.mlx_vector_array_free(outputs_vec);
     const host_on = applyUbenchOn();
     const io = std.Io.Threaded.global_single_threaded.io();
     var sw = if (host_on) io_util.Stopwatch.init(io) else undefined;
@@ -1888,10 +1890,7 @@ fn applyOuts(s: mlx.mlx_stream, kernel: mlx.mlx_fast_metal_kernel, inputs: []con
         apply_host_ns += sw.read();
         apply_host_n += 1;
     }
-    if (mlx.mlx_vector_array_size(outputs_vec) != n_out) {
-        _ = mlx.mlx_vector_array_free(outputs_vec);
-        return error.MetalKernelBadOutputCount;
-    }
+    if (mlx.mlx_vector_array_size(outputs_vec) != n_out) return error.MetalKernelBadOutputCount;
     return outputs_vec;
 }
 
@@ -1916,7 +1915,9 @@ fn pairPrepare(s: mlx.mlx_stream, x: mlx.mlx_array, suhg: mlx.mlx_array, suhu: m
     const ov = try applyOuts(s, kernel, &.{ x, suhg, suhu, slots }, cfg, 2);
     defer _ = mlx.mlx_vector_array_free(ov);
     var a = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(a);
     var b = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(b);
     try mlx.check(mlx.mlx_vector_array_get(&a, ov, 0));
     try mlx.check(mlx.mlx_vector_array_get(&b, ov, 1));
     return .{ a, b };
@@ -1945,7 +1946,9 @@ fn pairGemv(s: mlx.mlx_stream, xg: mlx.mlx_array, xu: mlx.mlx_array, tg: mlx.mlx
     const ov = try applyOuts(s, kernel, &.{ xg, xu, tg, tu, slots }, cfg, 2);
     defer _ = mlx.mlx_vector_array_free(ov);
     var a = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(a);
     var b = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(b);
     try mlx.check(mlx.mlx_vector_array_get(&a, ov, 0));
     try mlx.check(mlx.mlx_vector_array_get(&b, ov, 1));
     return .{ a, b };
@@ -1970,6 +1973,7 @@ fn midSwigluPrep(s: mlx.mlx_stream, ig: mlx.mlx_array, iu: mlx.mlx_array, svhg: 
     const ov = try applyOuts(s, kernel, &.{ ig, iu, svhg, svhu, suhd, slots }, cfg, 1);
     defer _ = mlx.mlx_vector_array_free(ov);
     var a = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(a);
     try mlx.check(mlx.mlx_vector_array_get(&a, ov, 0));
     return a;
 }
@@ -2001,6 +2005,7 @@ fn downFinishReduce(s: mlx.mlx_stream, inner: mlx.mlx_array, svh: mlx.mlx_array,
     const ov = try applyOuts(s, kernel, &.{ inner, svh, slots, scores }, cfg, 1);
     defer _ = mlx.mlx_vector_array_free(ov);
     var a = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(a);
     try mlx.check(mlx.mlx_vector_array_get(&a, ov, 0));
     return a;
 }
@@ -2025,6 +2030,7 @@ fn prepareFromTokens(s: mlx.mlx_stream, x: mlx.mlx_array, suh: mlx.mlx_array, sl
     const ov = try applyOuts(s, kernel, &.{ x, suh, slots, order }, cfg, 1);
     defer _ = mlx.mlx_vector_array_free(ov);
     var a = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(a);
     try mlx.check(mlx.mlx_vector_array_get(&a, ov, 0));
     return a;
 }
@@ -2048,6 +2054,7 @@ fn tokenReduce(s: mlx.mlx_stream, d: mlx.mlx_array, inv: mlx.mlx_array, scores: 
     const ov = try applyOuts(s, kernel, &.{ d, inv, scores }, cfg, 1);
     defer _ = mlx.mlx_vector_array_free(ov);
     var a = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(a);
     try mlx.check(mlx.mlx_vector_array_get(&a, ov, 0));
     return a;
 }
@@ -2073,7 +2080,9 @@ fn pairPrepareFromTokens(s: mlx.mlx_stream, x: mlx.mlx_array, suhg: mlx.mlx_arra
     const ov = try applyOuts(s, kernel, &.{ x, suhg, suhu, slots, order }, cfg, 2);
     defer _ = mlx.mlx_vector_array_free(ov);
     var a = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(a);
     var b = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(b);
     try mlx.check(mlx.mlx_vector_array_get(&a, ov, 0));
     try mlx.check(mlx.mlx_vector_array_get(&b, ov, 1));
     return .{ a, b };
@@ -2097,6 +2106,7 @@ fn scatterSorted(s: mlx.mlx_stream, x: mlx.mlx_array, order: mlx.mlx_array, dim:
     const ov = try applyOuts(s, kernel, &.{ x, order }, cfg, 1);
     defer _ = mlx.mlx_vector_array_free(ov);
     var a = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(a);
     try mlx.check(mlx.mlx_vector_array_get(&a, ov, 0));
     return a;
 }
