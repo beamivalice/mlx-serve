@@ -438,3 +438,48 @@ test "exl3 K4 packed fixture decodes to the library inner and public f16" {
     const rel = @sqrt(ss / @max(ref, 1e-20));
     try t.expect(rel < 0.02);
 }
+
+const fixture_k3_bytes = @embedFile("fixtures/exl3_k3_linear.safetensors");
+const fixture_k2_bytes = @embedFile("fixtures/exl3_k2_linear.safetensors");
+
+fn decodePackedFixture(
+    alloc: std.mem.Allocator,
+    raw: []const u8,
+    k: u32,
+    packed_hw: usize,
+) !void {
+    const t = std.testing;
+    var tensors = try parseSafetensors(alloc, raw);
+    defer tensors.deinit();
+    const trellis = tensors.get("trellis") orelse return error.MissingTrellis;
+    const suh = tensors.get("suh") orelse return error.MissingSuh;
+    const svh = tensors.get("svh") orelse return error.MissingSvh;
+    const inner = tensors.get("inner") orelse return error.MissingInner;
+    const public = tensors.get("public") orelse return error.MissingPublic;
+    try t.expectEqual(@as(usize, 3), trellis.shape.len);
+    try t.expectEqual(@as(usize, 8), trellis.shape[0]);
+    try t.expectEqual(@as(usize, 8), trellis.shape[1]);
+    try t.expectEqual(packed_hw, trellis.shape[2]);
+    const in_features: usize = 128;
+    const out_features: usize = 128;
+    const got_inner = try alloc.alloc(u16, in_features * out_features);
+    reconstructInner(asU16(trellis), in_features, out_features, k, .mul1, got_inner);
+    try t.expectEqualSlices(u16, asU16(inner), got_inner);
+    const got_public = try alloc.alloc(u16, in_features * out_features);
+    try reconstructPublic(alloc, asU16(trellis), asU16(suh), asU16(svh), in_features, out_features, k, .mul1, got_public);
+    try t.expectEqualSlices(u16, asU16(public), got_public);
+}
+
+test "exl3 K3 packed fixture decodes to the library inner and public f16" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    try decodePackedFixture(arena.allocator(), fixture_k3_bytes, 3, 48);
+}
+
+test "exl3 K2 packed fixture decodes to the library inner and public f16" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    try decodePackedFixture(arena.allocator(), fixture_k2_bytes, 2, 32);
+}
