@@ -2,11 +2,11 @@
 """Replace routed-expert affine banks in a qwen4_exp 4/8 pack with stacked EXL3 K4.
 
 Input: bf16 HF checkpoint + the existing mixed 4/8 pack. Output: a new pack dir
-where every routed gate/up/down bank is EXL3 K4 (MCG), stacked [E, ...] per
+where every routed gate/up/down bank is EXL3 K4 (MUL1), stacked [E, ...] per
 projection so gather kernels index expert e on axis 0. Every non-expert file
 from the 4/8 pack is hard-linked; mixed shards are rewritten with the expert
 tensors dropped and remaining tensors copied as raw bytes. config.json carries
-expert_quant = {format: exl3, k: 4, codebook: mcg}.
+expert_quant = {format: exl3, k: 4, codebook: mul1}.
 
 Default quantization is LDLQ with a captured Hessian; --quantizer direct is
 the synthetic-test path. Calibration rows, when captured, are the MLP input
@@ -462,15 +462,16 @@ def restack_from_exl3(src_dir: str | Path, pack_dir: str | Path, dst: str | Path
         {"metadata": {"total_size": total}, "weight_map": weight_map}, indent=2
     ))
     cfg = json.loads((pack_dir / "config.json").read_text())
-    cfg["expert_quant"] = {
-        "format": "exl3",
-        "k": 4,
-        "codebook": "mul1",
-        "out_scales": "svh",
-        "source": "restack",
-    }
+    cfg["expert_quant"] = expert_quant_block("restack")
     (dst / "config.json").write_text(json.dumps(cfg, indent=2))
     return {"weight_map": weight_map}
+
+
+def expert_quant_block(source: str, **extra) -> dict:
+    """The `expert_quant` block the server admits: exl3, K, mul1 — nothing else."""
+    block = {"format": "exl3", "k": int(K), "codebook": CODEBOOK, "out_scales": "svh", "source": source}
+    block.update(extra)
+    return block
 
 
 def load_imatrix(path: str | Path) -> dict[str, np.ndarray]:
@@ -603,14 +604,7 @@ def convert_pack(
         cal_tag = "ldlq-gaussian-256"
     else:
         cal_tag = "none-direct"
-    cfg["expert_quant"] = {
-        "format": "exl3",
-        "k": int(k),
-        "codebook": codebook,
-        "mcg_multiplier": MCG_MULT,
-        "quantizer": quantizer,
-        "calibration": cal_tag,
-    }
+    cfg["expert_quant"] = expert_quant_block("convert", k=int(k), codebook=codebook, quantizer=quantizer, calibration=cal_tag)
     (dst / "config.json").write_text(json.dumps(cfg, indent=2))
     plan["zero_routed"] = zero_routed
     plan["calibration"] = cal_tag
@@ -1005,6 +999,22 @@ class PlanTests(unittest.TestCase):
         self.assertIn("language_model.model.layers.0.mlp.switch_mlp.gate_proj.trellis", plan["exl3_keys"])
         self.assertNotIn("language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight", plan["keep_keys"])
         self.assertIn("language_model.model.layers.0.mlp.gate.weight", plan["keep_keys"])
+
+
+class ExpertQuantBlockTests(unittest.TestCase):
+    def test_both_writers_emit_the_block_the_server_admits(self):
+        for source in ("restack", "convert"):
+            block = expert_quant_block(source)
+            self.assertEqual(block["format"], "exl3")
+            self.assertEqual(block["k"], 4)
+            self.assertEqual(block["codebook"], "mul1")
+            self.assertNotIn("mcg_multiplier", block)
+
+    def test_convert_extras_ride_beside_the_admitted_keys(self):
+        block = expert_quant_block("convert", quantizer="ldlq", calibration="imatrix-diagonal")
+        self.assertEqual(block["codebook"], "mul1")
+        self.assertEqual(block["quantizer"], "ldlq")
+        self.assertNotIn("mcg_multiplier", block)
 
 
 class LayoutTests(unittest.TestCase):
