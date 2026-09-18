@@ -2361,7 +2361,7 @@ pub fn moePrefill(
     try ubenchEval(d_inner, "gemm_down");
     const d_unsorted = try scatterSorted(s, d_inner, order_i, hidden, nslots);
     defer _ = mlx.mlx_array_free(d_unsorted);
-    const out = try downFinishReduce(s, d_unsorted, down_svh, slots, scores, hidden, rows, topk, .float16);
+    const out = try downFinishReduce(s, d_unsorted, down_svh, slots, scores, hidden, rows, topk, mlx.mlx_array_dtype(x));
     try ubenchEval(out, "token_reduce");
     return out;
 }
@@ -4550,4 +4550,62 @@ test "exl3 prepareIndexed refuses a row count that is not the slot count" {
     const ok = try prepareIndexed(s, x0, suh_a, sl);
     defer _ = mlx.mlx_array_free(ok);
     try t.expectEqual(topk, mlx.getShape(ok)[0]);
+}
+
+test "exl3 prefill output carries the activation dtype" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const E: c_int = 2;
+    const dim: c_int = 128;
+    const rows: c_int = 20;
+    const topk: c_int = 1;
+    const tr = try alloc.alloc(u16, @intCast(E * 8 * 8 * 64));
+    var prng = std.Random.DefaultPrng.init(21);
+    const rnd = prng.random();
+    for (tr) |*v| v.* = @truncate(rnd.int(u32));
+    const suh = try alloc.alloc(u16, @intCast(E * dim));
+    for (suh) |*v| v.* = exl3.f32ToF16Bits(1.0);
+    const svh = try alloc.alloc(u16, @intCast(E * dim));
+    for (svh) |*v| v.* = exl3.f32ToF16Bits(1.0);
+    // A bf16 activation is what the qwen4 trunk hands the routed experts; an
+    // f16 result both double-rounds and saturates at 65504.
+    const xb = try alloc.alloc(u16, @intCast(rows * dim));
+    for (xb) |*v| v.* = @truncate(@as(u32, @bitCast(@as(f32, 0.5))) >> 16);
+    const slots_h = try alloc.alloc(u32, @intCast(rows * topk));
+    for (slots_h, 0..) |*v, i| v.* = @intCast(i % @as(usize, @intCast(E)));
+    const scores_h = try alloc.alloc(f32, @intCast(rows * topk));
+    for (scores_h) |*v| v.* = 1e8;
+    const x_arr = mlx.mlx_array_new_data(xb.ptr, &[_]c_int{ rows, dim }, 2, .bfloat16);
+    defer _ = mlx.mlx_array_free(x_arr);
+    const tr_a = mlx.mlx_array_new_data(tr.ptr, &[_]c_int{ E, 8, 8, 64 }, 4, .uint16);
+    defer _ = mlx.mlx_array_free(tr_a);
+    const suh_a = mlx.mlx_array_new_data(suh.ptr, &[_]c_int{ E, dim }, 2, .float16);
+    defer _ = mlx.mlx_array_free(suh_a);
+    const svh_a = mlx.mlx_array_new_data(svh.ptr, &[_]c_int{ E, dim }, 2, .float16);
+    defer _ = mlx.mlx_array_free(svh_a);
+    const sl = mlx.mlx_array_new_data(slots_h.ptr, &[_]c_int{rows * topk}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(sl);
+    const sc = mlx.mlx_array_new_data(scores_h.ptr, &[_]c_int{rows * topk}, 1, .float32);
+    defer _ = mlx.mlx_array_free(sc);
+    const out = try moePrefill(s, x_arr, tr_a, suh_a, svh_a, tr_a, suh_a, svh_a, tr_a, suh_a, svh_a, sl, sc, topk);
+    defer _ = mlx.mlx_array_free(out);
+    try t.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(out));
+    var c = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(c);
+    try mlx.check(mlx.mlx_contiguous(&c, out, false, s));
+    try mlx.check(mlx.mlx_array_eval(c));
+    var f32c = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f32c);
+    try mlx.check(mlx.mlx_astype(&f32c, c, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(f32c));
+    const p = mlx.mlx_array_data_float32(f32c) orelse return error.F16Unreadable;
+    var finite: usize = 0;
+    for (0..@intCast(rows * dim)) |j| {
+        if (std.math.isFinite(p[j])) finite += 1;
+    }
+    try t.expectEqual(@as(usize, @intCast(rows * dim)), finite);
 }
