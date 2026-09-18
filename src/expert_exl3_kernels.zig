@@ -1022,6 +1022,10 @@ fn innerGemmSortedWinAlign(
     if (nwin <= 0) return error.BadExl3Shape;
     const key = GemmSortedKey{ .in_dim = in_dim, .out_dim = out_dim, .rows = n, .win = win, .nwin = nwin };
     if (gemmNaxOn() and @rem(out_dim, 128) == 0) {
+        // The fallback below answers a NAX build or dispatch that failed, so the
+        // failure's latch is ours to drop: left standing it becomes the next
+        // decode tick's `MlxFailure`.
+        const had_error = mlx.errorPending();
         if (getGemmNaxKernel()) |nk| {
             const ncfg = gemm_nax_cfgs.get(key) orelse blk: {
                 const c = mlx.mlx_fast_metal_kernel_config_new();
@@ -1050,6 +1054,7 @@ fn innerGemmSortedWinAlign(
         } else |_| {
             gemm_nax_failed = true;
         }
+        mlx.dropLatchedErrorUnless(had_error);
     }
     const cfg = gemm_sorted_cfgs.get(key) orelse blk: {
         const c = mlx.mlx_fast_metal_kernel_config_new();
