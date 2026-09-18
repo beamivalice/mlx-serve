@@ -38326,7 +38326,7 @@ test "a missing weight is a load ERROR, not a process exit (issue #217)" {
     try std.testing.expectError(error.MissingWeight, getWeightFmt(&w, &buf, "{s}.norm.weight", "model"));
 }
 
-test "MTP EXL3 switch_mlp binds restacked trellis/suh/svh under the head prefix" {
+test "exl3 MTP switch_mlp binds restacked trellis/suh/svh under the head prefix" {
     const t = std.testing;
     const s = mlx.gpuStream();
     const put = struct {
@@ -38361,7 +38361,7 @@ test "MTP EXL3 switch_mlp binds restacked trellis/suh/svh under the head prefix"
     try t.expectEqualSlices(c_int, mlx.getShape(bank.down_s), mlx.getShape(bank.gate_s));
 }
 
-test "MTP EXL3 switch_mlp refuses a missing restacked tensor by MissingWeight" {
+test "exl3 MTP switch_mlp refuses a missing restacked tensor by MissingWeight" {
     const t = std.testing;
     const s = mlx.gpuStream();
     const put = struct {
@@ -38386,7 +38386,7 @@ test "MTP EXL3 switch_mlp refuses a missing restacked tensor by MissingWeight" {
     try t.expectError(error.MissingWeight, loadSwitchMlpBank(&w, &buf, "language_model.mtp", 0, true));
 }
 
-test "MTP EXL3 mtpMoeRows refuses a verify wider than 16 by MtpExl3RowsTooWide" {
+test "exl3 MTP rows wider than the decode arm refuse by Exl3MtpRowsExceedDecode" {
     const t = std.testing;
     const s = mlx.gpuStream();
     var xfm: Transformer = undefined;
@@ -38448,7 +38448,7 @@ test "MTP EXL3 mtpMoeRows refuses a verify wider than 16 by MtpExl3RowsTooWide" 
     try t.expectError(error.Exl3MtpRowsExceedDecode, xfm.mtpMoeRows(x, &mw));
 }
 
-test "MTP EXL3 mtpMoeRows fused rows match N solo calls on the same kernel" {
+test "exl3 MTP fused rows match N solo calls on the same kernel" {
     const t = std.testing;
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
