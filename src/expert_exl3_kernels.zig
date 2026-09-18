@@ -2,6 +2,25 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
 const exl3 = @import("expert_exl3.zig");
+const io_util = @import("io_util.zig");
+
+var ubench_force: bool = false;
+
+fn exl3UbenchOn() bool {
+    if (ubench_force) return true;
+    const p = std.c.getenv("MLX_SERVE_EXL3_LAYER_UBENCH") orelse return false;
+    return p[0] == '1';
+}
+
+fn ubenchEval(a: mlx.mlx_array, name: []const u8) !void {
+    if (!exl3UbenchOn()) return;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var sw = io_util.Stopwatch.init(io);
+    try mlx.check(mlx.mlx_array_eval(a));
+    const ns = sw.read();
+    std.debug.print("[exl3-ubench] {s} {d:.3} ms\n", .{ name, @as(f64, @floatFromInt(ns)) / 1e6 });
+    log.info("[exl3-ubench] {s} {d:.3} ms\n", .{ name, @as(f64, @floatFromInt(ns)) / 1e6 });
+}
 
 pub const DECODE_ROWS_MAX: usize = 16;
 
@@ -1466,15 +1485,23 @@ pub fn moeSwigluFused(
     const prep = try pairPrepare(s, x, gate_suh, up_suh, slots, hidden, nslots, topk);
     defer _ = mlx.mlx_array_free(prep[0]);
     defer _ = mlx.mlx_array_free(prep[1]);
+    try ubenchEval( prep[0], "pair_prepare");
+    if (exl3UbenchOn()) try mlx.check(mlx.mlx_array_eval(prep[1]));
     const inners = try pairGemv(s, prep[0], prep[1], gate_t, up_t, slots, hidden, inter, nslots);
     defer _ = mlx.mlx_array_free(inners[0]);
     defer _ = mlx.mlx_array_free(inners[1]);
+    try ubenchEval( inners[0], "pair_gemv");
+    if (exl3UbenchOn()) try mlx.check(mlx.mlx_array_eval(inners[1]));
     const down_x = try midSwigluPrep(s, inners[0], inners[1], gate_svh, up_svh, down_suh, slots, inter, nslots);
     defer _ = mlx.mlx_array_free(down_x);
+    try ubenchEval( down_x, "mid");
     const down_inner = try indexedGemvCoopF16(s, down_x, down_t, slots);
     defer _ = mlx.mlx_array_free(down_inner);
+    try ubenchEval( down_inner, "down_gemv");
     fused_dispatches += 1;
-    return downFinishReduce(s, down_inner, down_svh, slots, scores, hidden, rows, topk);
+    const out = try downFinishReduce(s, down_inner, down_svh, slots, scores, hidden, rows, topk);
+    try ubenchEval( out, "reduce");
+    return out;
 }
 
 pub fn moeSwigluIndexed(
@@ -1611,18 +1638,27 @@ pub fn moePrefill(
     var sorted_slots = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(sorted_slots);
     try mlx.check(mlx.mlx_take_axis(&sorted_slots, slots, order, 0, s));
+    try ubenchEval( sorted_slots, "sort");
     const g_prep = try prepareFromTokens(s, x, gate_suh, sorted_slots, order_u, hidden, nslots, topk);
     defer _ = mlx.mlx_array_free(g_prep);
     const u_prep = try prepareFromTokens(s, x, up_suh, sorted_slots, order_u, hidden, nslots, topk);
     defer _ = mlx.mlx_array_free(u_prep);
+    try ubenchEval( g_prep, "token_prepare");
+    if (exl3UbenchOn()) try mlx.check(mlx.mlx_array_eval(u_prep));
     const g_inner = try innerGemmSorted(s, g_prep, gate_t, sorted_slots);
     defer _ = mlx.mlx_array_free(g_inner);
+    try ubenchEval( g_inner, "gemm_gate");
     const u_inner = try innerGemmSorted(s, u_prep, up_t, sorted_slots);
     defer _ = mlx.mlx_array_free(u_inner);
+    try ubenchEval( u_inner, "gemm_up");
     const g = try finishIndexed(s, g_inner, gate_svh, sorted_slots);
     defer _ = mlx.mlx_array_free(g);
     const u = try finishIndexed(s, u_inner, up_svh, sorted_slots);
     defer _ = mlx.mlx_array_free(u);
+    if (exl3UbenchOn()) {
+        try mlx.check(mlx.mlx_array_eval(g));
+        try mlx.check(mlx.mlx_array_eval(u));
+    }
     var sig = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(sig);
     try mlx.check(mlx.mlx_sigmoid(&sig, g, s));
@@ -1634,13 +1670,16 @@ pub fn moePrefill(
     try mlx.check(mlx.mlx_multiply(&h, silu, u, s));
     const d_sorted = try projectSortedWithRuns(s, h, down_t, down_suh, down_svh, sorted_slots);
     defer _ = mlx.mlx_array_free(d_sorted);
+    try ubenchEval( d_sorted, "gemm_down");
     var inv = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(inv);
     try mlx.check(mlx.mlx_argsort_axis(&inv, order, 0, s));
     var inv_u = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(inv_u);
     try mlx.check(mlx.mlx_astype(&inv_u, inv, .uint32, s));
-    return tokenReduce(s, d_sorted, inv_u, scores, hidden, rows, topk);
+    const out = try tokenReduce(s, d_sorted, inv_u, scores, hidden, rows, topk);
+    try ubenchEval( out, "token_reduce");
+    return out;
 }
 
 pub fn prefillDecodeGatherMm(
@@ -1934,7 +1973,6 @@ test "exl3 512-row prefill: decode-to-f16 gather_mm vs rows kernel" {
     defer _ = mlx.mlx_array_free(svh);
     const pub_a = mlx.mlx_array_new_data(stacked_pub.ptr, &[_]c_int{ E, dim, dim }, 3, .float16);
     defer _ = mlx.mlx_array_free(pub_a);
-    const io_util = @import("io_util.zig");
     const warm = try moePrefill(s, x_arr, tr, suh, svh, tr, suh, svh, tr, suh, svh, slots, scores, topk);
     try mlx.check(mlx.mlx_array_eval(warm));
     _ = mlx.mlx_array_free(warm);
@@ -2056,7 +2094,6 @@ test "exl3 512-row production-shape sorted gemm vs affine gather_qmm" {
     const warm = try moePrefill(s, x_arr, trg, sugh, svgi, trg, sugh, svgi, trd, sudi, svdh, slots, scores, topk);
     try mlx.check(mlx.mlx_array_eval(warm));
     _ = mlx.mlx_array_free(warm);
-    const io_util = @import("io_util.zig");
     var t_g = io_util.Stopwatch.init(t.io);
     var it: usize = 0;
     while (it < 5) : (it += 1) {
@@ -2275,7 +2312,6 @@ test "exl3 K4 cooperative indexed GEMV runs at production shape" {
     const warm_new = try indexedGemvCoopF16(s, x_arr, tr_arr, slots);
     try mlx.check(mlx.mlx_array_eval(warm_new));
     _ = mlx.mlx_array_free(warm_new);
-    const io_util = @import("io_util.zig");
     var new_ns: u64 = 0;
     var it: usize = 0;
     while (it < 10) : (it += 1) {
@@ -2290,6 +2326,96 @@ test "exl3 K4 cooperative indexed GEMV runs at production shape" {
         new_ns / 1000,
     });
     try t.expect(new_ns > 0);
+}
+
+test "exl3 layer ubench production shape rows=1 and 512" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    ubench_force = true;
+    defer {
+        ubench_force = false;
+    }
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const E: usize = 16;
+    const topk: usize = 10;
+    const in_dim: usize = 2560;
+    const out_dim: usize = 640;
+    const in_tiles = in_dim / 16;
+    const out_tiles = out_dim / 16;
+    const g_n = in_tiles * out_tiles * 64;
+    const d_n = out_tiles * in_tiles * 64;
+    const tr_g = try alloc.alloc(u16, E * g_n);
+    const tr_d = try alloc.alloc(u16, E * d_n);
+    const suh_g = try alloc.alloc(u16, E * in_dim);
+    const svh_g = try alloc.alloc(u16, E * out_dim);
+    const suh_d = try alloc.alloc(u16, E * out_dim);
+    const svh_d = try alloc.alloc(u16, E * in_dim);
+    var prng = std.Random.DefaultPrng.init(71);
+    const rnd = prng.random();
+    for (tr_g) |*v| v.* = @truncate(rnd.int(u32));
+    for (tr_d) |*v| v.* = @truncate(rnd.int(u32));
+    for (suh_g) |*v| v.* = exl3.f32ToF16Bits(1.0);
+    for (svh_g) |*v| v.* = exl3.f32ToF16Bits(1.0);
+    for (suh_d) |*v| v.* = exl3.f32ToF16Bits(1.0);
+    for (svh_d) |*v| v.* = exl3.f32ToF16Bits(1.0);
+    const trg = mlx.mlx_array_new_data(tr_g.ptr, &[_]c_int{ @intCast(E), @intCast(in_tiles), @intCast(out_tiles), 64 }, 4, .uint16);
+    defer _ = mlx.mlx_array_free(trg);
+    const trd = mlx.mlx_array_new_data(tr_d.ptr, &[_]c_int{ @intCast(E), @intCast(out_tiles), @intCast(in_tiles), 64 }, 4, .uint16);
+    defer _ = mlx.mlx_array_free(trd);
+    const sugh = mlx.mlx_array_new_data(suh_g.ptr, &[_]c_int{ @intCast(E), @intCast(in_dim) }, 2, .float16);
+    defer _ = mlx.mlx_array_free(sugh);
+    const svgi = mlx.mlx_array_new_data(svh_g.ptr, &[_]c_int{ @intCast(E), @intCast(out_dim) }, 2, .float16);
+    defer _ = mlx.mlx_array_free(svgi);
+    const sudi = mlx.mlx_array_new_data(suh_d.ptr, &[_]c_int{ @intCast(E), @intCast(out_dim) }, 2, .float16);
+    defer _ = mlx.mlx_array_free(sudi);
+    const svdh = mlx.mlx_array_new_data(svh_d.ptr, &[_]c_int{ @intCast(E), @intCast(in_dim) }, 2, .float16);
+    defer _ = mlx.mlx_array_free(svdh);
+    const x1h = try alloc.alloc(u16, in_dim);
+    for (x1h) |*v| v.* = exl3.f32ToF16Bits(rnd.float(f32) * 0.1);
+    const sl1 = try alloc.alloc(u32, topk);
+    const sc1 = try alloc.alloc(f32, topk);
+    for (sl1, 0..) |*v, i| v.* = @intCast(i % E);
+    for (sc1) |*v| v.* = 0.1;
+    const x1 = mlx.mlx_array_new_data(x1h.ptr, &[_]c_int{@intCast(in_dim)}, 1, .float16);
+    defer _ = mlx.mlx_array_free(x1);
+    const slots1 = mlx.mlx_array_new_data(sl1.ptr, &[_]c_int{@intCast(topk)}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(slots1);
+    const scores1 = mlx.mlx_array_new_data(sc1.ptr, &[_]c_int{@intCast(topk)}, 1, .float32);
+    defer _ = mlx.mlx_array_free(scores1);
+    ubench_force = false;
+    const warm1 = try moeSwigluFused(s, x1, trg, sugh, svgi, trg, sugh, svgi, trd, sudi, svdh, slots1, scores1);
+    try mlx.check(mlx.mlx_array_eval(warm1));
+    _ = mlx.mlx_array_free(warm1);
+    ubench_force = true;
+    std.debug.print("exl3-ubench rows=1\n", .{});
+    const y1 = try moeSwigluFused(s, x1, trg, sugh, svgi, trg, sugh, svgi, trd, sudi, svdh, slots1, scores1);
+    try mlx.check(mlx.mlx_array_eval(y1));
+    _ = mlx.mlx_array_free(y1);
+    const R: usize = 512;
+    const xnh = try alloc.alloc(u16, R * in_dim);
+    for (xnh) |*v| v.* = exl3.f32ToF16Bits(rnd.float(f32) * 0.1);
+    const sln = try alloc.alloc(u32, R * topk);
+    const scn = try alloc.alloc(f32, R * topk);
+    for (sln, 0..) |*v, i| v.* = @intCast(i % E);
+    for (scn) |*v| v.* = 0.1;
+    const xn = mlx.mlx_array_new_data(xnh.ptr, &[_]c_int{ @intCast(R), @intCast(in_dim) }, 2, .float16);
+    defer _ = mlx.mlx_array_free(xn);
+    const slotsn = mlx.mlx_array_new_data(sln.ptr, &[_]c_int{@intCast(R * topk)}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(slotsn);
+    const scoresn = mlx.mlx_array_new_data(scn.ptr, &[_]c_int{@intCast(R * topk)}, 1, .float32);
+    defer _ = mlx.mlx_array_free(scoresn);
+    ubench_force = false;
+    const warmn = try moePrefill(s, xn, trg, sugh, svgi, trg, sugh, svgi, trd, sudi, svdh, slotsn, scoresn, @intCast(topk));
+    try mlx.check(mlx.mlx_array_eval(warmn));
+    _ = mlx.mlx_array_free(warmn);
+    ubench_force = true;
+    std.debug.print("exl3-ubench rows=512\n", .{});
+    const yn = try moePrefill(s, xn, trg, sugh, svgi, trg, sugh, svgi, trd, sudi, svdh, slotsn, scoresn, @intCast(topk));
+    try mlx.check(mlx.mlx_array_eval(yn));
+    _ = mlx.mlx_array_free(yn);
 }
 
 test "exl3 fused decode chain matches indexed SwiGLU on one row" {
@@ -2580,7 +2706,6 @@ test "exl3 512-row E=512 topk=10 layer within 2x affine" {
     const warm = try moePrefill(s, x_arr, trg, sugh, svgi, trg, sugh, svgi, trd, sudi, svdh, slots, scores, topk);
     try mlx.check(mlx.mlx_array_eval(warm));
     _ = mlx.mlx_array_free(warm);
-    const io_util = @import("io_util.zig");
     var t_g = io_util.Stopwatch.init(t.io);
     var it: usize = 0;
     while (it < 3) : (it += 1) {

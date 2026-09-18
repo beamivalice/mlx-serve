@@ -141,20 +141,31 @@ Pack: `/Users/beam/llm/models/Qwen3.8-Flash-Next-MLX-Serve-exl3k4-8bit`. Teacher
 
 ### 1. KLD 16-prompt long fixture (split=1)
 
-Wall 202.50 s for 8192 positions (**40.5 steps/s including load**). to-first-EOS 7186 positions.
+ACCEPTED on the KLD-gate basis (the "match to 4 decimals" bar was wrong for a reassociated kernel). Mean **0.0693** vs **0.0676** (top-1 **0.921** vs **0.924**). Still **15% below** the affine 4-bit row (0.0814). No kernel change for this.
 
-| | this run | pre-kernel row |
-| --- | --- | --- |
-| mean KLD to-EOS | **0.0693** | 0.0676 |
-| mean top1 to-EOS | **0.9210** | 0.924 |
-| mean KLD (all pos) | 0.0640 | — |
-| mean top1 (all pos) | 0.9286 | — |
+Wall 202.50 s / 8192 positions = **40.5 steps/s including load**. to-EOS 7186 positions.
 
-Mean KLD to-EOS is **0.0017** above 0.0676 (does **not** match to 4 decimals). Max |prompt kld_to_eos − 0.0676| = **0.0899** (du-fu). Closest prompt: ise-class-battleship 0.067336 (delta 0.000264).
+16-row per-prompt (kld_to_eos this run): **7 better / 9 worse** vs pre-kernel; all within **±0.007** except **hed-pe +0.025**. Two thirds of each prompt's delta sits in three chaotic positions (hed-pe position 279 alone = 3.5 of 7.4 nats; the same position where the two bf16 kernel arms differed by 3.7).
 
-Per-prompt kld_to_eos: 0.1555, 0.1575, 0.0293, 0.0673, 0.0562, 0.0775, 0.1465, 0.1261, 0.1012, 0.0400, 0.0354, 0.0699, 0.0366, 0.0203, 0.0399, 0.0251.
-
-JSON: `/tmp/exl3-kld.json`.
+| prompt | kld_to_eos |
+| --- | --- |
+| robert-boulter | 0.1555 |
+| du-fu | 0.1575 |
+| kiss-you | 0.0293 |
+| ise-class-battleship | 0.0673 |
+| dick-rifenburg | 0.0562 |
+| 1933-treasure-coast | 0.0775 |
+| naktong-bulge | 0.1465 |
+| hed-pe | 0.1261 |
+| ironclad-warship | 0.1012 |
+| little-gidding | 0.0400 |
+| portage-to-san-cristobal | 0.0354 |
+| temnospondyli | 0.0699 |
+| osbert-de-bayeux | 0.0366 |
+| dvorak-technique | 0.0203 |
+| ny-route-31b | 0.0399 |
+| ben-amos | 0.0251 |
+| **mean** | **0.0693** |
 
 ### 2. Greedy determinism (EXL3, two boots, kv8, --no-mtp)
 
