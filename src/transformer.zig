@@ -3,6 +3,7 @@ const dsv4_mod = @import("deepseek_v4.zig");
 const qwen4_mod = @import("qwen4_exp.zig");
 const expert_stream_mod = @import("expert_stream.zig");
 const expert_bf16 = @import("expert_bf16_kernels.zig");
+const expert_exl3_kernels = @import("expert_exl3_kernels.zig");
 const expert_quant_mod = @import("expert_quant.zig");
 // The qwen4_exp MTP head shares the sidecar head's draft-rerank scheme
 // (`mtp.rerankSelect` + `QLinear`), which reads only the TARGET's lm_head and
@@ -28639,6 +28640,107 @@ pub const Transformer = struct {
     /// MoE MLP with separate router and expert inputs.
     /// router_x: input for routing (raw hidden states).
     /// expert_x: input for expert computation (possibly normalized).
+    fn moeExl3(self: *Transformer, expert_x: mlx.mlx_array, mw: *const MoeMlpWeights, inds: mlx.mlx_array, scores: mlx.mlx_array) !mlx.mlx_array {
+        const xsh = mlx.getShape(expert_x);
+        const B = xsh[0];
+        const S = xsh[1];
+        const D = xsh[xsh.len - 1];
+        var x2 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x2);
+        try mlx.check(mlx.mlx_reshape(&x2, expert_x, &[_]c_int{ B * S, D }, 2, self.s));
+        const ish = mlx.getShape(inds);
+        const K = ish[ish.len - 1];
+        var slots = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(slots);
+        try mlx.check(mlx.mlx_reshape(&slots, inds, &[_]c_int{ B * S * K }, 1, self.s));
+        var sc = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sc);
+        try mlx.check(mlx.mlx_reshape(&sc, scores, &[_]c_int{ B * S * K }, 1, self.s));
+        var slots_u = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(slots_u);
+        try mlx.check(mlx.mlx_astype(&slots_u, slots, .uint32, self.s));
+        if (B * S == 1) {
+            var x1 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(x1);
+            try mlx.check(mlx.mlx_reshape(&x1, x2, &[_]c_int{D}, 1, self.s));
+            const y = try expert_exl3_kernels.moeSwigluIndexed(
+                self.s,
+                x1,
+                mw.switch_gate_w,
+                mw.switch_gate_s,
+                mw.switch_gate_b,
+                mw.switch_up_w,
+                mw.switch_up_s,
+                mw.switch_up_b,
+                mw.switch_down_w,
+                mw.switch_down_s,
+                mw.switch_down_b,
+                slots_u,
+                sc,
+            );
+            var out = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(out);
+            try mlx.check(mlx.mlx_reshape(&out, y, xsh.ptr, @intCast(xsh.len), self.s));
+            _ = mlx.mlx_array_free(y);
+            return out;
+        }
+        var acc = mlx.mlx_array_new();
+        var have = false;
+        var t_i: c_int = 0;
+        while (t_i < B * S) : (t_i += 1) {
+            var xrow = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(xrow);
+            const strides2 = [_]c_int{ 1, 1 };
+            const strides1 = [_]c_int{1};
+            try mlx.check(mlx.mlx_slice(&xrow, x2, &[_]c_int{ t_i, 0 }, 2, &[_]c_int{ t_i + 1, D }, 2, &strides2, 2, self.s));
+            var x1 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(x1);
+            try mlx.check(mlx.mlx_reshape(&x1, xrow, &[_]c_int{D}, 1, self.s));
+            var sl = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(sl);
+            try mlx.check(mlx.mlx_slice(&sl, slots_u, &[_]c_int{t_i * K}, 1, &[_]c_int{(t_i + 1) * K}, 1, &strides1, 1, self.s));
+            var scr = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(scr);
+            try mlx.check(mlx.mlx_slice(&scr, sc, &[_]c_int{t_i * K}, 1, &[_]c_int{(t_i + 1) * K}, 1, &strides1, 1, self.s));
+            const y = try expert_exl3_kernels.moeSwigluIndexed(
+                self.s,
+                x1,
+                mw.switch_gate_w,
+                mw.switch_gate_s,
+                mw.switch_gate_b,
+                mw.switch_up_w,
+                mw.switch_up_s,
+                mw.switch_up_b,
+                mw.switch_down_w,
+                mw.switch_down_s,
+                mw.switch_down_b,
+                sl,
+                scr,
+            );
+            defer _ = mlx.mlx_array_free(y);
+            var y2 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(y2);
+            try mlx.check(mlx.mlx_reshape(&y2, y, &[_]c_int{ 1, D }, 2, self.s));
+            if (!have) {
+                try mlx.check(mlx.mlx_array_set(&acc, y2));
+                have = true;
+            } else {
+                const pair = [_]mlx.mlx_array{ acc, y2 };
+                const vec = mlx.mlx_vector_array_new_data(&pair, 2);
+                defer _ = mlx.mlx_vector_array_free(vec);
+                var cat = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_concatenate_axis(&cat, vec, 0, self.s));
+                _ = mlx.mlx_array_free(acc);
+                acc = cat;
+            }
+        }
+        var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_reshape(&out, acc, xsh.ptr, @intCast(xsh.len), self.s));
+        _ = mlx.mlx_array_free(acc);
+        return out;
+    }
+
     fn moeMLP2(self: *Transformer, router_x: mlx.mlx_array, expert_x_in: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
         return self.moeMLP2WithRouter(router_x, expert_x_in, mw, null, false, null, null);
     }
@@ -28766,6 +28868,11 @@ pub const Transformer = struct {
         }
 
         if (stream_ctx) |info| return self.streamedMoeResult(info, expert_x, inds, norm_scores, mw);
+        if (cfg.expert_layout == .exl3_k4) {
+            const y = try self.moeExl3(expert_x, mw, inds, norm_scores);
+            if (skip_shared) return y;
+            return self.moeAddGatedShared(y, expert_x, mw);
+        }
 
         // Expert computation. Two paths:
         //
