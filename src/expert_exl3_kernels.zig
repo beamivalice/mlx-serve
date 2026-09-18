@@ -698,6 +698,11 @@ const GemmSortedKey = struct { in_dim: c_int, out_dim: c_int, rows: c_int, win: 
 
 const GEMM_WINDOW_ROWS: c_int = 32;
 
+/// Rows one run-window may carry. `GEMM_SORTED_SOURCE` accumulates `acc[8][4]`
+/// and the NAX body has two 16-row destinations, so past this the kernels'
+/// own `n > WIN` guard still admits the window and the extra rows go unwritten.
+const GEMM_WINDOW_MAX_ROWS: c_int = 32;
+
 fn gemmWindowRows() c_int {
     if (std.c.getenv("MLX_SERVE_EXL3_GEMM_WIN")) |p| {
         const v = std.mem.span(p);
@@ -1007,7 +1012,7 @@ fn innerGemmSortedWinAlign(
     const xsh = mlx.getShape(x);
     const tsh = mlx.getShape(trellis);
     if (xsh.len != 2 or tsh.len != 4) return error.BadExl3Shape;
-    if (win <= 0) return error.BadExl3Shape;
+    if (win <= 0 or win > GEMM_WINDOW_MAX_ROWS) return error.BadExl3Shape;
     const n = xsh[0];
     const in_dim = xsh[1];
     const out_dim = tsh[2] * 16;
@@ -4452,4 +4457,34 @@ test "exl3 decode and prefill arms agree with the indexed chain at production ge
     const ad = mlx.mlx_array_data_float16(cd) orelse return error.F16Unreadable;
     const ap = mlx.mlx_array_data_float16(cp) orelse return error.F16Unreadable;
     try expectRelRms(ad[0 .. rows * H], ap[0 .. rows * H], 0.01);
+}
+
+test "exl3 a window wider than the kernel row capacity refuses" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    const n: c_int = 40;
+    const dim: c_int = 128;
+    const E: c_int = 2;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const xh = try alloc.alloc(u16, @intCast(n * dim));
+    @memset(xh, 0);
+    const tr = try alloc.alloc(u16, @intCast(E * 8 * 8 * 64));
+    @memset(tr, 0);
+    var eids: [40]u32 = @splat(0);
+    const x_arr = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ n, dim }, 2, .float16);
+    defer _ = mlx.mlx_array_free(x_arr);
+    const tr_arr = mlx.mlx_array_new_data(tr.ptr, &[_]c_int{ E, 8, 8, 64 }, 4, .uint16);
+    defer _ = mlx.mlx_array_free(tr_arr);
+    const eid_a = mlx.mlx_array_new_data(&eids, &[_]c_int{n}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(eid_a);
+    // 32 rows is what both kernel bodies accumulate; past it their own
+    // `n > WIN` guard still admits the window and the extra rows go unwritten.
+    try t.expectError(error.BadExl3Shape, innerGemmSortedWin(s, x_arr, tr_arr, eid_a, 33));
+    try t.expectError(error.BadExl3Shape, innerGemmSortedWin(s, x_arr, tr_arr, eid_a, 64));
+    const ok = try innerGemmSortedWin(s, x_arr, tr_arr, eid_a, 32);
+    defer _ = mlx.mlx_array_free(ok);
+    try t.expectEqual(@as(c_int, n), mlx.getShape(ok)[0]);
 }
