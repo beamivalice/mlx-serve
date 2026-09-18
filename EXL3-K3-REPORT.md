@@ -92,7 +92,7 @@ Rebased onto 728af897:
 - 457bbc3c `--from-exl3` restack K2/K3/K4
 - 059074b3 config parse does not open trellis shards
 - af6d2680 live KLD/greedy/speed report
-- this kernel port: filled after commit
+- 0bf5827d K-generic cooperative readers on the integration bodies
 
 ## Live table
 
