@@ -246,6 +246,101 @@ const GEMM_SORTED_SOURCE: [:0]const u8 =
     \\}
 ;
 
+const GEMM_NAX_HEADER: [:0]const u8 =
+    \\#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+    \\using namespace metal;
+    \\using namespace mpp::tensor_ops;
+    \\static inline half2 mul1_pair(uint2 cw) {
+    \\  const uint2 mixed = cw * uint2(0x83DCD12Du);
+    \\  const uint2 pair_sums = (mixed & uint2(0x00FF00FFu)) + ((mixed >> uint2(8u)) & uint2(0x00FF00FFu));
+    \\  const uint2 byte_sum = uint2(0x6400u) + (pair_sums & uint2(0xFFFFu)) + (pair_sums >> uint2(16u));
+    \\  const half2 h = as_type<half2>(ushort2(byte_sum & uint2(0xFFFFu)));
+    \\  return fma(h, as_type<half2>(ushort2(0x1EEEu)), as_type<half2>(ushort2(0xC931u)));
+    \\}
+    \\using nfrag = vec<half, 8>;
+    \\static inline nfrag nax_wfrag(const device uint *words, uint lane) {
+    \\  const uint source0 = (lane & 16u) + ((lane & 7u) << 1u);
+    \\  const uint2 current = *(const device uint2 *)(words + source0);
+    \\  const uint previous = words[(source0 + 31u) & 31u];
+    \\  const uint slot = ((lane >> 3u) & 1u) * 2u;
+    \\  const ulong w0 = ((ulong)previous << 32) | (ulong)current.x;
+    \\  const ulong w1 = ((ulong)current.x << 32) | (ulong)current.y;
+    \\  const uint s0 = 28u - slot * 4u;
+    \\  const uint s1 = 28u - (slot + 4u) * 4u;
+    \\  const half2 p00 = mul1_pair(uint2(uint(w0 >> s0) & 0xffffu, uint(w0 >> (s0 - 4u)) & 0xffffu));
+    \\  const half2 p01 = mul1_pair(uint2(uint(w1 >> s0) & 0xffffu, uint(w1 >> (s0 - 4u)) & 0xffffu));
+    \\  const half2 p10 = mul1_pair(uint2(uint(w0 >> s1) & 0xffffu, uint(w0 >> (s1 - 4u)) & 0xffffu));
+    \\  const half2 p11 = mul1_pair(uint2(uint(w1 >> s1) & 0xffffu, uint(w1 >> (s1 - 4u)) & 0xffffu));
+    \\  return nfrag(p00.x, p00.y, p01.x, p01.y, p10.x, p10.y, p11.x, p11.y);
+    \\}
+    \\static inline short2 nax_origin(uint lane) {
+    \\  const short qid = short(lane >> 2u);
+    \\  return short2(short(((qid & 2) | short(lane & 1u)) * 4), short((qid & 4) | short((lane >> 1u) & 3u)));
+    \\}
+;
+
+const GEMM_NAX_SOURCE: [:0]const u8 =
+    \\uint win = uint(threadgroup_position_in_grid.y);
+    \\uint sg = uint(simdgroup_index_in_threadgroup);
+    \\uint lane = uint(thread_index_in_simdgroup);
+    \\constexpr uint TILE = 16u;
+    \\constexpr uint IT = uint(IDIM) / TILE;
+    \\constexpr uint OT = uint(ODIM) / TILE;
+    \\const uint start = win * 4u;
+    \\const uint ntot = uint(NROWS);
+    \\const uint n = (start >= ntot) ? 0u : min(4u, ntot - start);
+    \\if (n == 0u) return;
+    \\uint eid0 = uint(eids[start]);
+    \\uint same = 1u;
+    \\for (uint r = 1u; r < n; r++) {
+    \\  if (uint(eids[start + r]) != eid0) same = 0u;
+    \\}
+    \\constexpr auto desc = matmul2d_descriptor(16, 32, 16, false, true, true, matmul2d_descriptor::mode::multiply_accumulate);
+    \\matmul2d<desc, execution_simdgroup> op;
+    \\auto left = op.get_left_input_cooperative_tensor<half, half, float>();
+    \\auto right = op.get_right_input_cooperative_tensor<half, half, float>();
+    \\auto destination = op.get_destination_cooperative_tensor<decltype(left), decltype(right), float>();
+    \\const short2 origin = nax_origin(lane);
+    \\const uint output_base = uint(threadgroup_position_in_grid.x) * 128u + sg * 32u;
+    \\const uint npass = same ? 1u : n;
+    \\for (uint pass = 0u; pass < npass; pass++) {
+    \\  const uint row0 = same ? start : (start + pass);
+    \\  const uint nlive = same ? n : 1u;
+    \\  const uint eid = same ? eid0 : uint(eids[row0]);
+    \\  const bool active = origin.y < short(nlive);
+    \\  for (uint s = 0u; s < destination.get_capacity(); s++) destination[s] = 0.0f;
+    \\  const device uint *trellis_e = (const device uint *)(trellis + ((size_t)eid * (size_t)IT * (size_t)OT) * 64u);
+    \\  for (uint tk = 0u; tk < IT; tk++) {
+    \\    const uint input_base = tk * TILE;
+    \\    nfrag act;
+    \\    for (short c = 0; c < 4; c++) {
+    \\      const uint ic = input_base + uint(origin.x + c);
+    \\      act[c] = active ? x[(size_t)(row0 + uint(origin.y)) * (size_t)(IDIM) + ic] : half(0.0h);
+    \\      act[4 + c] = half(0.0h);
+    \\    }
+    \\    const device uint *words0 = trellis_e + ((size_t)tk * (size_t)OT + output_base / 16u) * 32u;
+    \\    const nfrag w0 = nax_wfrag(words0, lane);
+    \\    const nfrag w1 = nax_wfrag(words0 + 32u, lane);
+    \\    for (short s = 0; s < 8; s++) {
+    \\      left[s] = act[s];
+    \\      right[s] = w0[s];
+    \\      right[8 + s] = w1[s];
+    \\    }
+    \\    op.run(left, right, destination);
+    \\  }
+    \\  if (active) {
+    \\    for (short ct = 0; ct < 2; ct++) {
+    \\      for (short c = 0; c < 4; c++) {
+    \\        const uint col = output_base + uint(ct) * 16u + uint(origin.x + c);
+    \\        if (col < uint(ODIM)) {
+    \\          y[(size_t)(row0 + uint(origin.y)) * (size_t)(ODIM) + col] = half(destination[uint(ct) * 8u + uint(c)]);
+    \\        }
+    \\      }
+    \\    }
+    \\  }
+    \\}
+;
+
 const TOKEN_PREPARE_SOURCE: [:0]const u8 =
     \\uint block = uint(threadgroup_position_in_grid.x);
     \\uint slot = uint(threadgroup_position_in_grid.y);
@@ -424,6 +519,9 @@ var indexed_coop_cfgs: CfgCache(IndexedKey, 8) = .{};
 var prepare_cfgs: CfgCache(UnaryKey, 8) = .{};
 var finish_cfgs: CfgCache(UnaryKey, 8) = .{};
 var gemm_sorted_cfgs: CfgCache(GemmSortedKey, 8) = .{};
+var gemm_nax_cfgs: CfgCache(GemmSortedKey, 8) = .{};
+var gemm_nax_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var gemm_nax_failed: bool = false;
 const PairPrepKey = struct { in_dim: c_int, nslots: c_int, topk: c_int };
 const PairGemvKey = struct { in_dim: c_int, out_dim: c_int, nslots: c_int };
 const MidKey = struct { dim: c_int, nslots: c_int };
@@ -444,6 +542,62 @@ pub fn resetFusedDispatchCount() void {
 
 pub fn fusedDispatchCount() u32 {
     return fused_dispatches;
+}
+
+fn gpuArch(buf: []u8) ?[]const u8 {
+    var dev = mlx.mlx_device{ .ctx = null };
+    if (mlx.mlx_get_default_device(&dev) != 0) return null;
+    var info = mlx.mlx_device_info_new();
+    defer _ = mlx.mlx_device_info_free(info);
+    if (mlx.mlx_device_info_get(&info, dev) != 0) return null;
+    var cstr: [*:0]const u8 = undefined;
+    if (mlx.mlx_device_info_get_string(&cstr, info, "architecture") != 0) return null;
+    const arch = std.mem.span(cstr);
+    if (arch.len == 0 or arch.len > buf.len) return null;
+    @memcpy(buf[0..arch.len], arch);
+    return buf[0..arch.len];
+}
+
+fn gemmNaxOn() bool {
+    if (gemm_nax_failed) return false;
+    if (std.c.getenv("MLX_SERVE_FORCE_GPU_FAMILY_FALLBACK")) |p| {
+        const v = std.mem.span(p);
+        if (v.len > 0 and v[0] == '1') return false;
+    }
+    var buf: [128]u8 = undefined;
+    const arch = gpuArch(&buf) orelse return false;
+    var i: usize = 0;
+    while (i + 2 < arch.len) : (i += 1) {
+        const a = arch[i] | 32;
+        const b = arch[i + 1] | 32;
+        if (a == 'g' and b == '1' and arch[i + 2] >= '7' and arch[i + 2] <= '9') return true;
+    }
+    return false;
+}
+
+fn getGemmNaxKernel() !mlx.mlx_fast_metal_kernel {
+    if (gemm_nax_kernel) |k| return k;
+    const input_names = [_][*:0]const u8{ "x", "trellis", "eids" };
+    const output_names = [_][*:0]const u8{"y"};
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new(
+        "mlxserve_exl3_k4_gemm_nax",
+        in_vec,
+        out_vec,
+        GEMM_NAX_SOURCE,
+        GEMM_NAX_HEADER,
+        true,
+        false,
+    );
+    if (kernel.ctx == null) {
+        gemm_nax_failed = true;
+        return error.MetalKernelCompileFailed;
+    }
+    gemm_nax_kernel = kernel;
+    return kernel;
 }
 
 fn getGemmSortedKernel() !mlx.mlx_fast_metal_kernel {
@@ -483,6 +637,35 @@ pub fn innerGemmSorted(
     const out_tiles = tsh[2];
     const nwin = @divFloor(n + 3, 4);
     const key = GemmSortedKey{ .in_dim = in_dim, .out_dim = out_dim, .rows = n };
+    if (gemmNaxOn() and @rem(out_dim, 128) == 0) {
+        if (getGemmNaxKernel()) |nk| {
+            const ncfg = gemm_nax_cfgs.get(key) orelse blk: {
+                const c = mlx.mlx_fast_metal_kernel_config_new();
+                try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &[_]c_int{ n, out_dim }, 2, .float16));
+                try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, out_dim, nwin, 1));
+                try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 128, 1, 1));
+                try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "IDIM", in_dim));
+                try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ODIM", out_dim));
+                try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "NROWS", n));
+                gemm_nax_cfgs.put(key, c);
+                break :blk c;
+            };
+            const ninputs = [_]mlx.mlx_array{ x, trellis, eids };
+            const ninputs_vec = mlx.mlx_vector_array_new_data(&ninputs, ninputs.len);
+            defer _ = mlx.mlx_vector_array_free(ninputs_vec);
+            var noutputs = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(noutputs);
+            if (mlx.mlx_fast_metal_kernel_apply(&noutputs, nk, ninputs_vec, ncfg, s) == 0 and mlx.mlx_vector_array_size(noutputs) == 1) {
+                var nout = mlx.mlx_array_new();
+                errdefer _ = mlx.mlx_array_free(nout);
+                try mlx.check(mlx.mlx_vector_array_get(&nout, noutputs, 0));
+                return nout;
+            }
+            gemm_nax_failed = true;
+        } else |_| {
+            gemm_nax_failed = true;
+        }
+    }
     const cfg = gemm_sorted_cfgs.get(key) orelse blk: {
         const c = mlx.mlx_fast_metal_kernel_config_new();
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &[_]c_int{ n, out_dim }, 2, .float16));
@@ -2328,14 +2511,16 @@ test "exl3 sorted GEMM matches host MUL1 on small shape" {
     try mlx.check(mlx.mlx_array_eval(contig));
     const src = mlx.mlx_array_data_float16(contig) orelse return error.F16Unreadable;
     const xf = try alloc.alloc(f32, dim);
-    const host = try alloc.alloc(f32, dim);
+    const host16 = try alloc.alloc(f32, dim);
+    const host32 = try alloc.alloc(f32, dim);
     for (0..n) |r| {
         for (0..dim) |i| xf[i] = exl3.f16BitsToF32(xh[r * dim + i]);
         const e: usize = eids[r];
-        exl3.innerGemv(stacked[e * tile_n ..][0..tile_n], xf, dim, dim, 4, .mul1, host);
+        exl3.innerGemv(stacked[e * tile_n ..][0..tile_n], xf, dim, dim, 4, .mul1, host16);
+        exl3.innerGemvF32(stacked[e * tile_n ..][0..tile_n], xf, dim, dim, 4, .mul1, host32);
         for (0..dim) |o| {
-            const bits: u16 = @bitCast(src[r * dim + o]);
-            try t.expectEqual(exl3.f32ToF16Bits(host[o]), bits);
+            const gpu = @as(f32, @floatCast(src[r * dim + o]));
+            try expectGemvEnvelope(gpu, host16[o], host32[o]);
         }
     }
 }
