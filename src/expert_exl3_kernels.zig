@@ -928,7 +928,9 @@ fn buildWindowTableHost(s: mlx.mlx_stream, eids: mlx.mlx_array, n: c_int, win: c
     const nlives_raw = mlx.mlx_array_new_data(lh.ptr, &[_]c_int{@intCast(nwin_u)}, 1, .uint32);
     defer _ = mlx.mlx_array_free(nlives_raw);
     var starts = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(starts);
     var nlives = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(nlives);
     try mlx.check(mlx.mlx_contiguous(&starts, starts_raw, false, s));
     try mlx.check(mlx.mlx_contiguous(&nlives, nlives_raw, false, s));
     try mlx.check(mlx.mlx_array_eval(starts));
@@ -958,7 +960,9 @@ fn buildStrideTable(s: mlx.mlx_stream, n: c_int, win: c_int) !WindowTable {
     const nlives_raw = mlx.mlx_array_new_data(lh.ptr, &[_]c_int{@intCast(nwin_u)}, 1, .uint32);
     defer _ = mlx.mlx_array_free(nlives_raw);
     var starts = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(starts);
     var nlives = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(nlives);
     try mlx.check(mlx.mlx_contiguous(&starts, starts_raw, false, s));
     try mlx.check(mlx.mlx_contiguous(&nlives, nlives_raw, false, s));
     try mlx.check(mlx.mlx_array_eval(starts));
