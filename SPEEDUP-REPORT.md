@@ -260,9 +260,22 @@ Not ported: NAX `matmul2d`, `_x2` GEMV, prefetch.
 
 `-Dtest-filter="exl3"`: **21/21 passed**.
 
+## Levers (measured)
+
+| lever | result |
+| --- | --- |
+| 8-sg / 256-thread GEMV | reverted; coop 576 µs vs 150 |
+| 4-tile packed GEMV | reverted; coop 606 µs |
+| 5→3 fuse prepare+mid into pair GEMV (one TG owns 128 out cols, redundant H128) | **live decode 37 vs 54 tok/s**; reverted `2a94fea9`. 4-prompt KLD after revert matches 16-prompt first four rows |
+| `--prefill-chunk 4096` (one boot) | 4k prefill **583** vs 891 at default 2048 |
+
+**Out of occupancy/fusion/chunk-width levers short of targets.** Decode 54 vs ≥85 tok/s short-warm, 52 vs ≥80 at 4k. Prefill 891 vs ≥1580. Remaining work a new auditor round should name: occupancy-preserving 5→3 (cannot serialize 40 output tiles onto 10 TGs), or a compiled fused graph that keeps the 400-TG GEMV grid while folding prepare/mid without a cross-TG barrier.
+
+Owner targets not met. Per-dispatch table at this head (5 dispatches, serialized eval floor ~0.2 ms): pair_prepare 0.26, pair_gemv 0.48, mid 0.20, down_gemv 0.40, reduce 0.29.
+
 ## Open questions
 
-Split-K 2/4/8 on decode GEMV still needs the KLD gate. Prefill 2048/8192 rungs unmeasured. Live decode/prefill A/B and MTP spec-stats need the box.
+Coordinator: next three-auditor round on this head. Box still ours until that dispatch.
 
 ## Comments
 
