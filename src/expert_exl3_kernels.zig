@@ -1150,7 +1150,6 @@ fn innerGemmSortedWinAlign(
                 try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 128, 1, 1));
                 try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "IDIM", in_dim));
                 try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ODIM", out_dim));
-                try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "NROWS", n));
                 try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "WIN", win));
                 try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "KBITS", @intCast(k)));
                 gemm_nax_cfgs.put(key, c);
@@ -1180,7 +1179,6 @@ fn innerGemmSortedWinAlign(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 128, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "IDIM", in_dim));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ODIM", out_dim));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "NROWS", n));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "WIN", win));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "KBITS", @intCast(k)));
         gemm_sorted_cfgs.put(key, c);
@@ -5400,4 +5398,51 @@ test "exl3 the host SwiGLU oracle decodes at the K its packed dim names" {
         for (0..dim) |i| want[i] += w * down_y[i];
     }
     try t.expectEqualSlices(f32, want, got);
+}
+
+test "exl3 a novel row count does not compile another sorted GEMM" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const dim: usize = 256;
+    const E: usize = 2;
+    const tiles = dim / 16;
+    const packed_n = exl3.packedHalfwords(4);
+    const tile_n = tiles * tiles * packed_n;
+    const stacked = try alloc.alloc(u16, E * tile_n);
+    var prng = std.Random.DefaultPrng.init(5);
+    const rnd = prng.random();
+    for (stacked) |*v| v.* = @truncate(rnd.int(u32));
+    const tr = mlx.mlx_array_new_data(stacked.ptr, &[_]c_int{ @intCast(E), @intCast(tiles), @intCast(tiles), @intCast(packed_n) }, 4, .uint16);
+    defer _ = mlx.mlx_array_free(tr);
+    // Row counts the prefill really sees vary per chunk; only the first shape
+    // may pay a kernel compile.
+    const counts = [_]usize{ 32, 64, 96 };
+    var warm_ns: u64 = 0;
+    for (counts, 0..) |n, ci| {
+        const xh = try alloc.alloc(u16, n * dim);
+        for (xh) |*v| v.* = exl3.f32ToF16Bits(rnd.float(f32) * 0.5);
+        const eids = try alloc.alloc(u32, n);
+        for (eids, 0..) |*v, i| v.* = @intCast((i / 16) % E);
+        const x_arr = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ @intCast(n), @intCast(dim) }, 2, .float16);
+        defer _ = mlx.mlx_array_free(x_arr);
+        const eid_a = mlx.mlx_array_new_data(eids.ptr, &[_]c_int{@intCast(n)}, 1, .uint32);
+        defer _ = mlx.mlx_array_free(eid_a);
+        var first_ns: u64 = 0;
+        for (0..3) |rep| {
+            var sw = io_util.Stopwatch.init(t.io);
+            const y = try innerGemmSorted(s, x_arr, tr, eid_a);
+            try mlx.check(mlx.mlx_array_eval(y));
+            const dt = sw.read();
+            _ = mlx.mlx_array_free(y);
+            if (rep == 0) first_ns = dt else warm_ns = @max(warm_ns, dt);
+        }
+        if (ci == 0) continue;
+        std.debug.print("[exl3] novel n={d} first={d} us warm={d} us\n", .{ n, first_ns / 1000, warm_ns / 1000 });
+        try t.expect(warm_ns > 0);
+        try t.expect(first_ns < warm_ns * 10);
+    }
 }
