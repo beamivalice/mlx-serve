@@ -1,8 +1,8 @@
 # EXL3-K3 report
 
-Status: rebased onto 2f876392. K3 prefill uses the NAX rows GEMM (`GEMM_NAX_SOURCE`) with K-generic tile decode; K4 keeps the aligned nax_wfrag body. Live six-number rows on e5e47e83.
+Status: reset onto 5b1eaae6. Diagnosis only (no kernel edits). The 64k prefill dip is a K4-specific **48k resident-bandwidth cliff**. K3 MTP forced-d2 and AUTO 4k are on record.
 
-Start sha 238fb8d7, branch agent/exl3-k3b. KLD/greedy on 6b3c5671. Speed on e5e47e83. HEAD e5e47e83. Routed-expert trellis in the K3 pack is uniform K3.
+Measurement sha 467b630 (mem-line diagnostic on 5b1eaae6).
 
 ## Files changed
 
@@ -12,6 +12,7 @@ Start sha 238fb8d7, branch agent/exl3-k3b. KLD/greedy on 6b3c5671. Speed on e5e4
 - `src/expert_quant.zig`: `parseExpertQuant` admits k in {2,3,4} mul1; `kFromPackedDim`. No config-parse shard scan.
 - `src/model.zig`: `expert_quant_k` on config from the expert_quant block. Enum stays `.exl3_k4`.
 - `tests/convert_qwen38_flash_next_exl3.py`: `--from-exl3` accepts K2/K3/K4 per stacked bank, prints a per-K histogram, writes modal `expert_quant.k`.
+- `src/generate.zig`: per-chunk `[prefill-trace] mem ... active_bytes= cache_bytes=` after eval, before `mlx_clear_cache` (diagnosis; not a kernel).
 - `EXL3-K3-REPORT.md`.
 
 ## Tests added
@@ -33,6 +34,7 @@ Start sha 238fb8d7, branch agent/exl3-k3b. KLD/greedy on 6b3c5671. Speed on e5e4
 - `test_restack_mixed_k_per_tensor_keeps_each_last_dim` — `tests/convert_qwen38_flash_next_exl3.py`
 - Production-shape cooperative GEMV uses `expectGemvEnvelope` (K4 f32-reference bar) for K3 and K2. The E=16 run test prints K3 vs K4 and asserts K3 * 100 < K4 * 115.
 - `exl3 NAX K3 GEMM within 1.15x of K4 at C=2048 and 8192` — `src/expert_exl3_kernels.zig`
+- `prefill-trace mem line names active_bytes and cache_bytes` — `src/generate.zig`
 
 ## Red-first evidence
 
@@ -82,19 +84,7 @@ KLD-era envelope on 6b3c5671: `K4 157 us K3 159 us`. Previous session 351/352 µ
 
 ## Commit sha
 
-KLD/greedy binary: 6b3c5671.
-
-Rebased onto 2f876392:
-
-- 61d45cf4 host K2/K3 decode fixtures
-- 4936ea49 kFromPackedDim
-- b5a6e2a1 loader admits K in {2,3,4} MUL1
-- 0f10d085 `--from-exl3` restack
-- 48c82bea config parse does not open shards
-- cfe14ea1 live KLD/greedy/speed report (6b3c5671 numbers)
-- fb37abe6 K-generic cooperative readers (GEMM key keeps k, drops nwin)
-- b1831e07 record kernel-port sha
-- e5e47e83 K-generic NAX tile decode (HEAD, live speed binary)
+Integration 5b1eaae6 (e5e47e83 + 801cbfac merged). Diagnostic + live 467b630.
 
 ## Live table
 
@@ -134,12 +124,47 @@ K4 per-boot prefill 4k: 1466.7 / 1520.1 / 1551.9. Decode-512 4k: 51.6 / 51.8 / 5
 
 On 6b3c5671 (SIMD GEMM, no NAX for K3) the same protocol was K3 4k 233.4 / 49.2 vs K4 762.6 / 51.4 (K3/K4 prefill 0.306). NAX port is a 6.3x K3 prefill lift at 4k.
 
+### 64k pack-differential (467b630)
+
+One 64k boot per pack, one lease each, `--prefill-trace`, chunk 8192, kv8, no MTP. Both: `[exl3-gemm] win=32 aligned=1 mixed=0` NAX, n=81920. nwin K4 2794 / K3 2788. Overall: K4 1470.4 tok/s / K3 1506.5 tok/s (this boot; e5e47e83 3-boot medians were K4 1336 / K3 1523).
+
+Per 8192-token chunk, ms and mem after eval before `mlx_clear_cache`. `eval_ms=0` (KV eval <1 ms). Active grows **+2013265920 B (+1.875 GiB) per 8k chunk on BOTH packs** (KV, not trellis). cache_bytes trajectory is **identical** (~6.02 → 4.76 → 5.28 GB).
+
+| pos | K4 ms | K3 ms | K4/K3 | K4 active GB | K3 active GB | K4 cache GB | K3 cache GB |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 0–8k | 5000 | 5343 | 0.936 | 64.60 | 50.53 | 5.61 | 5.61 |
+| 8–16k | 4724 | 5242 | 0.901 | 66.47 | 52.40 | 4.44 | 4.44 |
+| 16–24k | 4846 | 5370 | 0.902 | 68.35 | 54.27 | 4.52 | 4.52 |
+| 24–32k | 5053 | 5354 | 0.944 | 70.22 | 56.15 | 4.55 | 4.55 |
+| 32–40k | 5138 | 5409 | 0.950 | 72.10 | 58.02 | 4.64 | 4.64 |
+| 40–48k | 5207 | 5418 | 0.961 | 73.97 | 59.90 | 4.80 | 4.80 |
+| 48–56k | 6050 | 5452 | **1.110** | 75.85 | 61.77 | 4.89 | 4.89 |
+| 56–64k | 6454 | 5507 | **1.172** | 77.72 | 63.65 | 4.92 | 4.92 |
+| 64–70k | 5001 | 3242 | 1.542 | 78.60 | 64.53 | 3.18 | 3.17 |
+
+K3 is flat (5343→5507 = 1.03×). K4 is faster until 48k, then a cliff 5207→6050→6454. Not nwin, not cache_bytes, not KV growth (same +1.875 GiB/chunk). Tile bytes **128 vs 96** (64 vs 48 u16). Weight delta **14.07 GB** (first-chunk active 64.60 vs 50.53).
+
+**Term: 48k resident-bandwidth cliff (K4-only).** At pos 49152 K4 active is 75.85 GB vs K3 61.77. The K4 aligned 32-word NAX tile (128 B) plus 14 GB extra weights share the unified-memory bus with growing KV. Early chunks are compute-bound (aligned `nax_wfrag` wins). After ~48k the extra 33% trellis bytes become a DRAM tax on the same bus as attention KV, and K4 8k-chunk time jumps 21% while K3 stays flat.
+
+**Fix (prefill executor):** (1) split the 8k-chunk timer into attention vs expert GEMM at pos 8k vs 56k on both packs — if GEMM inflates, cap NAX occupancy or use the K3 funnel occupancy when `kv_len>48k`; if attention inflates, the 14 GB K4 weights + 128 B tiles are starving KV, so stage expert tiles through a K-independent scratch or pipeline KV away from GEMM. (2) Do not chase cache_bytes (identical). (3) Do not chase nwin (2794 vs 2788).
+
+### K3 MTP 4k (467b630)
+
+One lease each, persist 0, kv8, handbook 4k, 512 tokens, finish=length. K4 numbers from decode report on 2f876392 (EXL3-DECODE-REPORT).
+
+| row | K3 tok/s | K3 avg/round | K3 depth | K3 round_ms | K4 tok/s (decode rpt) | K3/K4 |
+|---|---:|---:|---:|---:|---:|---:|
+| forced-d2 (`MLX_SERVE_MTP_FORCE_DEPTH=2`) | 64.782 | 1.21 | 6 (unclamped) | 35.03 | 65.995 | **0.982** |
+| AUTO (cap 2, no FORCE_DEPTH) | 50.233 | 1.09 | 2 | 44.75 | 61.754 | **0.813** |
+
+Forced-d2 is K4-parity. AUTO lost the MTP gain (50.2 ≈ serial 50.1 on e5e47e83); log shows `[mtp] adaptive depth cap 2` and a two-chunk regime gate. One boot.
+
 ## Open questions
 
-- K3 KLD 0.0982 / top-1 0.907 (6b3c5671) is worse than K4 0.0676 / 0.924 and worse than affine 4/8 0.0814. Expected of 3-bit routed experts. No K3 MTP claim until this is accepted.
-- K3 64k prefill 1.140x of same-binary K4 (e5e47e83): K4 64k prefill dipped to 1336 vs K3 1523. Decode stays ~0.93x.
-- Affine ratios use the 20260918-2318 affine-ab row, not a same-session affine boot.
-- Shared-expert and attention in the 305bpw checkpoint are K5. Out of scope.
+- K3 KLD 0.0982 / top-1 0.907 (6b3c5671) vs K4 0.0676 / affine 0.0814.
+- Prefill executor: confirm whether the 48k cliff is attention or GEMM (layer ubench at 8k vs 56k).
+- K3 AUTO MTP 0.813 vs K4 is one boot; forced-d2 is 0.982. Cap-2 climb vs two-chunk gate.
+- Shared-expert/attention K5 out of scope.
 
 ## Comments
 
