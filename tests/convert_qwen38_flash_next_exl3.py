@@ -572,7 +572,7 @@ def convert_pack(
         e, out_dim, in_dim = bank.shape
         shard = layer_proj_shard(layer, proj)
         dest = dst / shard
-        if shard_is_valid(dest, e, in_dim, out_dim):
+        if shard_is_valid(dest, e, in_dim, out_dim, k):
             skipped += 1
             print(f"skip {shard}", flush=True)
             for suffix in (".trellis", ".suh", ".svh"):
@@ -656,7 +656,7 @@ def parse_layer_from_hf_key(hf_key: str) -> int:
     return int(m.group(1))
 
 
-def shard_is_valid(path: str | Path, n_experts: int, in_dim: int, out_dim: int) -> bool:
+def shard_is_valid(path: str | Path, n_experts: int, in_dim: int, out_dim: int, k: int) -> bool:
     p = Path(path)
     if not p.is_file():
         return False
@@ -672,11 +672,7 @@ def shard_is_valid(path: str | Path, n_experts: int, in_dim: int, out_dim: int) 
         return False
     if sh[:3] != [n_experts, in_dim // 16, out_dim // 16]:
         return False
-    try:
-        k_from_packed(sh[3])
-    except RuntimeError:
-        return False
-    return True
+    return sh[3] == packed_hw(k)
 
 
 def imatrix_layer_keys(layer: int) -> tuple[str, str, str]:
@@ -888,6 +884,61 @@ class RestackTests(unittest.TestCase):
                     self.assertEqual(tuple(header[key]["shape"]), (e, inn // 16, outn // 16, want[proj]))
 
 
+def _write_resume_fixture(hf: Path, pack: Path, rng) -> None:
+    hf.mkdir(); pack.mkdir()
+    e, hidden, inter = 2, 128, 128
+    write_safetensors_raw(str(hf / "model.safetensors"), {
+        "model.language_model.layers.0.mlp.experts.gate_up_proj": (
+            "F32", (e, 2 * inter, hidden), rng.standard_normal((e, 2 * inter, hidden), dtype=np.float32).tobytes()),
+        "model.language_model.layers.0.mlp.experts.down_proj": (
+            "F32", (e, hidden, inter), rng.standard_normal((e, hidden, inter), dtype=np.float32).tobytes()),
+    })
+    (hf / "config.json").write_text("{}")
+    (hf / "model.safetensors.index.json").write_text(json.dumps({
+        "weight_map": {
+            "model.language_model.layers.0.mlp.experts.gate_up_proj": "model.safetensors",
+            "model.language_model.layers.0.mlp.experts.down_proj": "model.safetensors",
+        }
+    }))
+    write_safetensors_raw(str(pack / "model-00001.safetensors"), {
+        "language_model.model.embed_tokens.weight": ("F32", (4,), np.zeros(4, np.float32).tobytes()),
+    })
+    dummy = np.zeros((e, 8), dtype=np.uint32)
+    zeros_e2 = np.zeros((e, 2), np.float16)
+    write_safetensors_raw(str(pack / "model-00002.safetensors"), {
+        "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight": ("U32", dummy.shape, dummy.tobytes()),
+        "language_model.model.layers.0.mlp.switch_mlp.gate_proj.scales": ("F16", (e, 2), zeros_e2.tobytes()),
+        "language_model.model.layers.0.mlp.switch_mlp.gate_proj.biases": ("F16", (e, 2), zeros_e2.tobytes()),
+        "language_model.model.layers.0.mlp.switch_mlp.up_proj.weight": ("U32", dummy.shape, dummy.tobytes()),
+        "language_model.model.layers.0.mlp.switch_mlp.up_proj.scales": ("F16", (e, 2), zeros_e2.tobytes()),
+        "language_model.model.layers.0.mlp.switch_mlp.up_proj.biases": ("F16", (e, 2), zeros_e2.tobytes()),
+    })
+    write_safetensors_raw(str(pack / "model-00003.safetensors"), {
+        "language_model.model.layers.0.mlp.switch_mlp.down_proj.weight": ("U32", dummy.shape, dummy.tobytes()),
+        "language_model.model.layers.0.mlp.switch_mlp.down_proj.scales": ("F16", (e, 2), zeros_e2.tobytes()),
+        "language_model.model.layers.0.mlp.switch_mlp.down_proj.biases": ("F16", (e, 2), zeros_e2.tobytes()),
+        "language_model.model.layers.0.mlp.gate.weight": ("F32", (e, hidden), np.zeros((e, hidden), np.float32).tobytes()),
+    })
+    (pack / "model.safetensors.index.json").write_text(json.dumps({
+        "metadata": {"total_size": 1},
+        "weight_map": {
+            "language_model.model.embed_tokens.weight": "model-00001.safetensors",
+            "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight": "model-00002.safetensors",
+            "language_model.model.layers.0.mlp.switch_mlp.gate_proj.scales": "model-00002.safetensors",
+            "language_model.model.layers.0.mlp.switch_mlp.gate_proj.biases": "model-00002.safetensors",
+            "language_model.model.layers.0.mlp.switch_mlp.up_proj.weight": "model-00002.safetensors",
+            "language_model.model.layers.0.mlp.switch_mlp.up_proj.scales": "model-00002.safetensors",
+            "language_model.model.layers.0.mlp.switch_mlp.up_proj.biases": "model-00002.safetensors",
+            "language_model.model.layers.0.mlp.switch_mlp.down_proj.weight": "model-00003.safetensors",
+            "language_model.model.layers.0.mlp.switch_mlp.down_proj.scales": "model-00003.safetensors",
+            "language_model.model.layers.0.mlp.switch_mlp.down_proj.biases": "model-00003.safetensors",
+            "language_model.model.layers.0.mlp.gate.weight": "model-00003.safetensors",
+        },
+    }))
+    (pack / "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
+    (pack / "tokenizer.json").write_text("{}")
+
+
 class ResumeTests(unittest.TestCase):
     def test_layer_projection_shard_names_are_stable(self):
         self.assertEqual(layer_proj_shard(0, "gate"), "model-exl3-L00-gate.safetensors")
@@ -906,67 +957,17 @@ class ResumeTests(unittest.TestCase):
                 "language_model.model.layers.3.mlp.switch_mlp.up_proj.svh": (
                     "F16", (e, i), np.zeros((e, i), np.float16).tobytes()),
             })
-            self.assertTrue(shard_is_valid(p, e, h, i))
-            self.assertFalse(shard_is_valid(p, e, 256, i))
-            self.assertFalse(shard_is_valid(Path(td) / "missing.safetensors", e, h, i))
+            self.assertTrue(shard_is_valid(p, e, h, i, 4))
+            self.assertFalse(shard_is_valid(p, e, 256, i, 4))
+            self.assertFalse(shard_is_valid(p, e, h, i, 3))
+            self.assertFalse(shard_is_valid(Path(td) / "missing.safetensors", e, h, i, 4))
 
     def test_second_convert_skips_existing_shards(self):
         rng = np.random.default_rng(3)
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             hf, pack, dst = td / "hf", td / "pack", td / "out"
-            hf.mkdir(); pack.mkdir()
-            e, hidden, inter = 2, 128, 128
-            write_safetensors_raw(str(hf / "model.safetensors"), {
-                "model.language_model.layers.0.mlp.experts.gate_up_proj": (
-                    "F32", (e, 2 * inter, hidden), rng.standard_normal((e, 2 * inter, hidden), dtype=np.float32).tobytes()),
-                "model.language_model.layers.0.mlp.experts.down_proj": (
-                    "F32", (e, hidden, inter), rng.standard_normal((e, hidden, inter), dtype=np.float32).tobytes()),
-            })
-            (hf / "config.json").write_text("{}")
-            (hf / "model.safetensors.index.json").write_text(json.dumps({
-                "weight_map": {
-                    "model.language_model.layers.0.mlp.experts.gate_up_proj": "model.safetensors",
-                    "model.language_model.layers.0.mlp.experts.down_proj": "model.safetensors",
-                }
-            }))
-            write_safetensors_raw(str(pack / "model-00001.safetensors"), {
-                "language_model.model.embed_tokens.weight": ("F32", (4,), np.zeros(4, np.float32).tobytes()),
-            })
-            dummy = np.zeros((e, 8), dtype=np.uint32)
-            zeros_e2 = np.zeros((e, 2), np.float16)
-            write_safetensors_raw(str(pack / "model-00002.safetensors"), {
-                "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight": ("U32", dummy.shape, dummy.tobytes()),
-                "language_model.model.layers.0.mlp.switch_mlp.gate_proj.scales": ("F16", (e, 2), zeros_e2.tobytes()),
-                "language_model.model.layers.0.mlp.switch_mlp.gate_proj.biases": ("F16", (e, 2), zeros_e2.tobytes()),
-                "language_model.model.layers.0.mlp.switch_mlp.up_proj.weight": ("U32", dummy.shape, dummy.tobytes()),
-                "language_model.model.layers.0.mlp.switch_mlp.up_proj.scales": ("F16", (e, 2), zeros_e2.tobytes()),
-                "language_model.model.layers.0.mlp.switch_mlp.up_proj.biases": ("F16", (e, 2), zeros_e2.tobytes()),
-            })
-            write_safetensors_raw(str(pack / "model-00003.safetensors"), {
-                "language_model.model.layers.0.mlp.switch_mlp.down_proj.weight": ("U32", dummy.shape, dummy.tobytes()),
-                "language_model.model.layers.0.mlp.switch_mlp.down_proj.scales": ("F16", (e, 2), zeros_e2.tobytes()),
-                "language_model.model.layers.0.mlp.switch_mlp.down_proj.biases": ("F16", (e, 2), zeros_e2.tobytes()),
-                "language_model.model.layers.0.mlp.gate.weight": ("F32", (e, hidden), np.zeros((e, hidden), np.float32).tobytes()),
-            })
-            (pack / "model.safetensors.index.json").write_text(json.dumps({
-                "metadata": {"total_size": 1},
-                "weight_map": {
-                    "language_model.model.embed_tokens.weight": "model-00001.safetensors",
-                    "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight": "model-00002.safetensors",
-                    "language_model.model.layers.0.mlp.switch_mlp.gate_proj.scales": "model-00002.safetensors",
-                    "language_model.model.layers.0.mlp.switch_mlp.gate_proj.biases": "model-00002.safetensors",
-                    "language_model.model.layers.0.mlp.switch_mlp.up_proj.weight": "model-00002.safetensors",
-                    "language_model.model.layers.0.mlp.switch_mlp.up_proj.scales": "model-00002.safetensors",
-                    "language_model.model.layers.0.mlp.switch_mlp.up_proj.biases": "model-00002.safetensors",
-                    "language_model.model.layers.0.mlp.switch_mlp.down_proj.weight": "model-00003.safetensors",
-                    "language_model.model.layers.0.mlp.switch_mlp.down_proj.scales": "model-00003.safetensors",
-                    "language_model.model.layers.0.mlp.switch_mlp.down_proj.biases": "model-00003.safetensors",
-                    "language_model.model.layers.0.mlp.gate.weight": "model-00003.safetensors",
-                },
-            }))
-            (pack / "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
-            (pack / "tokenizer.json").write_text("{}")
+            _write_resume_fixture(hf, pack, rng)
             convert_pack(hf, pack, dst, quantizer="direct")
             mtimes = {p.name: p.stat().st_mtime_ns for p in dst.glob("model-exl3-L00-*.safetensors")}
             self.assertEqual(len(mtimes), 3)
@@ -974,6 +975,21 @@ class ResumeTests(unittest.TestCase):
             self.assertEqual(plan["skipped"], 3)
             for p in dst.glob("model-exl3-L00-*.safetensors"):
                 self.assertEqual(p.stat().st_mtime_ns, mtimes[p.name])
+
+    def test_resume_at_another_k_rewrites_the_shards(self):
+        rng = np.random.default_rng(11)
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            hf, pack, dst = td / "hf", td / "pack", td / "out"
+            _write_resume_fixture(hf, pack, rng)
+            convert_pack(hf, pack, dst, quantizer="direct", k=4)
+            plan = convert_pack(hf, pack, dst, quantizer="direct", k=3)
+            self.assertEqual(plan["skipped"], 0)
+            for proj in ("gate", "up", "down"):
+                p = dst / layer_proj_shard(0, proj)
+                header, _ = read_header(p)
+                key = f"language_model.model.layers.0.mlp.switch_mlp.{proj}_proj.trellis"
+                self.assertEqual(header[key]["shape"][-1], packed_hw(3))
 
     def test_imatrix_layer_complete_is_the_three_expert_keys(self):
         store = {
