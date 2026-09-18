@@ -2409,6 +2409,14 @@ test "exl3 fused decode chain rows match N solo calls" {
     }
 }
 
+test "exl3 MTP MoE rows stay on the fused decode arm" {
+    const t = std.testing;
+    try t.expect(!usesPrefillArm(1));
+    try t.expect(!usesPrefillArm(4));
+    try t.expect(!usesPrefillArm(16));
+    try t.expect(usesPrefillArm(17));
+}
+
 test "exl3 sorted GEMM matches host MUL1 on small shape" {
     const t = std.testing;
     const s = mlx.gpuStream();
