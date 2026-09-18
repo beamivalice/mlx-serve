@@ -64,6 +64,13 @@ fn dumpAbsMax(s: mlx.mlx_stream, a: mlx.mlx_array, name: []const u8) !void {
 
 pub const DECODE_ROWS_MAX: usize = 16;
 
+fn packedK(last: c_int) !u32 {
+    if (@rem(last, 16) != 0) return error.BadExl3Shape;
+    const k: u32 = @intCast(@divExact(last, 16));
+    if (k < 2 or k > 4) return error.BadExl3Shape;
+    return k;
+}
+
 pub fn usesPrefillArm(rows: usize) bool {
     return rows > DECODE_ROWS_MAX;
 }
@@ -172,18 +179,20 @@ const GEMV_SOURCE: [:0]const u8 =
     \\uint gid = uint(thread_position_in_grid.x);
     \\if (gid >= uint(ODIM)) return;
     \\constexpr uint TILE = 16u;
+    \\constexpr uint K = uint(KBITS);
+    \\constexpr uint PACKED_HW = 16u * K;
+    \\constexpr uint word_count = 256u * K / 32u;
     \\constexpr uint IN_TILES = uint(IDIM) / TILE;
     \\constexpr uint OUT_TILES = uint(ODIM) / TILE;
     \\const uint tn = gid / TILE;
     \\const uint local = gid % TILE;
     \\float acc = 0.0f;
     \\for (uint tk = 0u; tk < IN_TILES; tk++) {
-    \\  const device ushort* tile = trellis + (tk * OUT_TILES + tn) * 64u;
+    \\  const device ushort* tile = trellis + (tk * OUT_TILES + tn) * PACKED_HW;
     \\  ushort cw[256];
-    \\  const uint word_count = 32u;
     \\  for (uint th = 0u; th < 128u; th++) {
-    \\    const int bit0 = int(th) * 8 + 4 + 1024 - 16;
-    \\    const int bit2 = bit0 + 4 + 16;
+    \\    const int bit0 = int(th) * 2 * int(K) + int(K) + 256 * int(K) - 16;
+    \\    const int bit2 = bit0 + int(K) + 16;
     \\    const int index0 = bit0 / 32;
     \\    const int index1 = (bit2 - 1) / 32;
     \\    const uint shift = uint((index1 + 1) * 32 - bit2);
@@ -191,7 +200,7 @@ const GEMV_SOURCE: [:0]const u8 =
     \\    const uint b = uint(tile[(uint(index1) % word_count) * 2u]) | (uint(tile[(uint(index1) % word_count) * 2u + 1u]) << 16u);
     \\    const ulong merged = (ulong(a) << 32) | ulong(b);
     \\    const uint funnel = uint(merged >> shift);
-    \\    cw[th * 2u] = ushort((funnel >> 4u) & 0xffffu);
+    \\    cw[th * 2u] = ushort((funnel >> K) & 0xffffu);
     \\    cw[th * 2u + 1u] = ushort(funnel & 0xffffu);
     \\  }
     \\  for (uint slot = 0u; slot < 256u; slot++) {
@@ -232,6 +241,9 @@ const GEMM_SORTED_SOURCE: [:0]const u8 =
     \\uint lane = uint(thread_index_in_simdgroup);
     \\uint lid = uint(thread_index_in_threadgroup);
     \\constexpr uint TILE = 16u;
+    \\constexpr uint K = uint(KBITS);
+    \\constexpr uint PACKED_HW = 16u * K;
+    \\constexpr uint PACKED_W = 8u * K;
     \\constexpr uint IT = uint(IDIM) / TILE;
     \\constexpr uint OT = uint(ODIM) / TILE;
     \\const uint start = wstarts[win];
@@ -278,24 +290,24 @@ const GEMM_SORTED_SOURCE: [:0]const u8 =
     \\  acc[g][3] = float4(0.0f);
     \\}
     \\  for (uint tk = pg; tk < IT; tk += 2u) {
-    \\    const device uint* words = (const device uint*)(trellis + ((((size_t)eid * (size_t)IT + tk) * (size_t)OT + ot) * 64u));
-    \\    const int bits = 4;
-    \\    const int b0 = int(first) * bits + bits + 1024 - 16;
+    \\    const device uint* words = (const device uint*)(trellis + ((((size_t)eid * (size_t)IT + tk) * (size_t)OT + ot) * PACKED_HW));
+    \\    const int bits = int(K);
+    \\    const int b0 = int(first) * bits + bits + 256 * bits - 16;
     \\    const int b2 = b0 + bits + 16;
     \\    const int i0 = b0 / 32;
     \\    const int i1 = (b2 - 1) / 32;
     \\    const uint sh0 = uint((i1 + 1) * 32 - b2);
-    \\    const ulong m0 = ((ulong)words[uint(i0) % 32u] << 32) | (ulong)words[uint(i1) % 32u];
+    \\    const ulong m0 = ((ulong)words[uint(i0) % PACKED_W] << 32) | (ulong)words[uint(i1) % PACKED_W];
     \\    const uint f0 = uint(m0 >> sh0);
-    \\    const int b3 = int(first + 2u) * bits + bits + 1024 - 16;
+    \\    const int b3 = int(first + 2u) * bits + bits + 256 * bits - 16;
     \\    const int b5 = b3 + bits + 16;
     \\    const int i2 = b3 / 32;
     \\    const int i3 = (b5 - 1) / 32;
     \\    const uint sh1 = uint((i3 + 1) * 32 - b5);
-    \\    const ulong m1 = ((ulong)words[uint(i2) % 32u] << 32) | (ulong)words[uint(i3) % 32u];
+    \\    const ulong m1 = ((ulong)words[uint(i2) % PACKED_W] << 32) | (ulong)words[uint(i3) % PACKED_W];
     \\    const uint f1 = uint(m1 >> sh1);
-    \\    const uint2 lo = uint2((f0 >> 4u) & 0xffffu, f0 & 0xffffu);
-    \\    const uint2 hi = uint2((f1 >> 4u) & 0xffffu, f1 & 0xffffu);
+    \\    const uint2 lo = uint2((f0 >> K) & 0xffffu, f0 & 0xffffu);
+    \\    const uint2 hi = uint2((f1 >> K) & 0xffffu, f1 & 0xffffu);
     \\    const uint2 mlo = lo * uint2(0x83DCD12Du);
     \\    const uint2 mhi = hi * uint2(0x83DCD12Du);
     \\    const uint2 pslo = (mlo & uint2(0x00FF00FFu)) + ((mlo >> uint2(8u)) & uint2(0x00FF00FFu));
@@ -655,7 +667,7 @@ var finish_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var gemv_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var gemv_engaged: bool = false;
 
-const GemvKey = struct { in_dim: c_int, out_dim: c_int };
+const GemvKey = struct { in_dim: c_int, out_dim: c_int, k: u32 };
 
 fn CfgCache(comptime Key: type, comptime CAP: usize) type {
     return struct {
@@ -698,9 +710,9 @@ fn CfgCache(comptime Key: type, comptime CAP: usize) type {
     };
 }
 
-const IndexedKey = struct { in_dim: c_int, out_dim: c_int, topk: c_int };
+const IndexedKey = struct { in_dim: c_int, out_dim: c_int, topk: c_int, k: u32 };
 const UnaryKey = struct { dim: c_int, topk: c_int };
-const GemmSortedKey = struct { in_dim: c_int, out_dim: c_int, rows: c_int, win: c_int };
+const GemmSortedKey = struct { in_dim: c_int, out_dim: c_int, rows: c_int, win: c_int, k: u32 };
 
 const GEMM_WINDOW_ROWS: c_int = 32;
 
@@ -752,8 +764,8 @@ var gemm_nax_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var gemm_nax_failed: bool = false;
 var gemm_nax_cached: ?bool = null;
 const PairPrepKey = struct { in_dim: c_int, nslots: c_int, topk: c_int };
-const PairGemvKey = struct { in_dim: c_int, out_dim: c_int, nslots: c_int, nsplit: c_int };
-const DownFusedKey = struct { in_dim: c_int, out_dim: c_int, nslots: c_int, nsplit: c_int };
+const PairGemvKey = struct { in_dim: c_int, out_dim: c_int, nslots: c_int, nsplit: c_int, k: u32 };
+const DownFusedKey = struct { in_dim: c_int, out_dim: c_int, nslots: c_int, nsplit: c_int, k: u32 };
 const MidKey = struct { dim: c_int, nslots: c_int };
 const ReduceKey = struct { out_dim: c_int, rows: c_int, topk: c_int };
 const DecodeReduceKey = struct { out_dim: c_int, rows: c_int, topk: c_int, dtype: mlx.mlx_dtype };
@@ -1060,6 +1072,8 @@ fn innerGemmSortedWinAlign(
     const in_dim = xsh[1];
     const out_dim = tsh[2] * 16;
     const out_tiles = tsh[2];
+    const k = try packedK(tsh[3]);
+    if (tsh[1] * 16 != in_dim) return error.BadExl3Shape;
     const tab = if (aligned)
         try buildWindowTable(s, eids, n, win)
     else
@@ -1069,8 +1083,8 @@ fn innerGemmSortedWinAlign(
     const nwin = tab.nwin;
     if (nwin <= 0) return error.BadExl3Shape;
     logGemmSelector(win, aligned, nwin, n);
-    const key = GemmSortedKey{ .in_dim = in_dim, .out_dim = out_dim, .rows = n, .win = win };
-    if (gemmNaxOn() and @rem(out_dim, 128) == 0) {
+    const key = GemmSortedKey{ .in_dim = in_dim, .out_dim = out_dim, .rows = n, .win = win, .k = k };
+    if (k == 4 and gemmNaxOn() and @rem(out_dim, 128) == 0) {
         // The fallback below answers a NAX build or dispatch that failed, so the
         // failure's latch is ours to drop: left standing it becomes the next
         // decode tick's `MlxFailure`.
@@ -1113,6 +1127,7 @@ fn innerGemmSortedWinAlign(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ODIM", out_dim));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "NROWS", n));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "WIN", win));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "KBITS", @intCast(k)));
         gemm_sorted_cfgs.put(key, c);
         break :blk c;
     };
@@ -1268,8 +1283,8 @@ fn getGemvKernel() !mlx.mlx_fast_metal_kernel {
 
 var inner_gemv_cfgs: CfgCache(GemvKey, 8) = .{};
 
-fn gemvConfig(in_dim: c_int, out_dim: c_int) !mlx.mlx_fast_metal_kernel_config {
-    const key = GemvKey{ .in_dim = in_dim, .out_dim = out_dim };
+fn gemvConfig(in_dim: c_int, out_dim: c_int, k: u32) !mlx.mlx_fast_metal_kernel_config {
+    const key = GemvKey{ .in_dim = in_dim, .out_dim = out_dim, .k = k };
     if (inner_gemv_cfgs.get(key)) |c| return c;
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     const out_shape = [_]c_int{out_dim};
@@ -1278,6 +1293,7 @@ fn gemvConfig(in_dim: c_int, out_dim: c_int) !mlx.mlx_fast_metal_kernel_config {
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "IDIM", in_dim));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "ODIM", out_dim));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "KBITS", @intCast(k)));
     inner_gemv_cfgs.put(key, cfg);
     return cfg;
 }
@@ -1291,6 +1307,9 @@ const INDEXED_COOP_SOURCE: [:0]const u8 =
     \\uint lane = uint(thread_index_in_simdgroup);
     \\uint lid = uint(thread_index_in_threadgroup);
     \\constexpr uint TILE = 16u;
+    \\constexpr uint K = uint(KBITS);
+    \\constexpr uint PACKED_HW = 16u * K;
+    \\constexpr uint PACKED_W = 8u * K;
     \\constexpr uint IT = uint(IDIM) / TILE;
     \\constexpr uint OT = uint(ODIM) / TILE;
     \\constexpr uint SGS = 4u;
@@ -1315,8 +1334,10 @@ const INDEXED_COOP_SOURCE: [:0]const u8 =
     \\const uint row2 = pos[2] >> 4u;
     \\const uint row3 = pos[3] >> 4u;
     \\float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-    \\const device uint* trellis_e = (const device uint*)(trellis + ((size_t)eid * (size_t)IT * (size_t)OT) * 64u);
     \\const size_t xb = (size_t)slot * (size_t)(IDIM);
+    \\const size_t expert_stride = (size_t)IT * (size_t)OT * (size_t)PACKED_HW;
+    \\const device uint* trellis_e = (const device uint*)(trellis + (size_t)eid * expert_stride);
+    \\if (K == 4u) {
     \\for (uint tk = tk0 + sg; tk < tk1; tk += SGS) {
     \\  const device uint* words = trellis_e + ((size_t)tk * (size_t)OT + ot) * 32u;
     \\  const ulong merged = ((ulong)words[(lane + 31u) & 31u] << 32) | (ulong)words[lane];
@@ -1337,6 +1358,44 @@ const INDEXED_COOP_SOURCE: [:0]const u8 =
     \\    const float2 w = float2(fma(hh, inv, bias));
     \\    acc[p * 2u] = fma(ins[p * 2u], w.x, acc[p * 2u]);
     \\    acc[p * 2u + 1u] = fma(ins[p * 2u + 1u], w.y, acc[p * 2u + 1u]);
+    \\  }
+    \\}
+    \\} else {
+    \\  uint w0[4];
+    \\  uint w1[4];
+    \\  uint shv[4];
+    \\  for (uint p = 0u; p < 4u; p++) {
+    \\    const uint first = lane * 8u + p * 2u;
+    \\    const int bits = int(K);
+    \\    const int b0 = int(first) * bits + bits + 256 * bits - 16;
+    \\    const int b2 = b0 + bits + 16;
+    \\    const int i0 = b0 / 32;
+    \\    const int i1 = (b2 - 1) / 32;
+    \\    w0[p] = uint(i0) % PACKED_W;
+    \\    w1[p] = uint(i1) % PACKED_W;
+    \\    shv[p] = uint((i1 + 1) * 32 - b2);
+    \\  }
+    \\  for (uint tk = tk0 + sg; tk < tk1; tk += SGS) {
+    \\    const device uint* words = trellis_e + ((size_t)tk * (size_t)OT + ot) * PACKED_W;
+    \\    const float in0 = float(x[xb + tk * TILE + row0]);
+    \\    const float in1 = float(x[xb + tk * TILE + row1]);
+    \\    const float in2 = float(x[xb + tk * TILE + row2]);
+    \\    const float in3 = float(x[xb + tk * TILE + row3]);
+    \\    const float ins[8] = {in0, in1, in2, in3, in0, in1, in2, in3};
+    \\    for (uint p = 0u; p < 4u; p++) {
+    \\      const ulong merged = ((ulong)words[w0[p]] << 32) | (ulong)words[w1[p]];
+    \\      const uint funnel = uint(merged >> shv[p]);
+    \\      const uint2 cw = uint2((funnel >> K) & 0xffffu, funnel & 0xffffu);
+    \\      const uint2 mixed = cw * uint2(0x83DCD12Du);
+    \\      const uint2 pair_sums = (mixed & uint2(0x00FF00FFu)) + ((mixed >> uint2(8u)) & uint2(0x00FF00FFu));
+    \\      const uint2 byte_sum = uint2(0x6400u) + (pair_sums & uint2(0xFFFFu)) + (pair_sums >> uint2(16u));
+    \\      const half2 hh = as_type<half2>(ushort2(byte_sum & uint2(0xFFFFu)));
+    \\      const half2 inv = as_type<half2>(ushort2(0x1EEEu));
+    \\      const half2 bias = as_type<half2>(ushort2(0xC931u));
+    \\      const float2 w = float2(fma(hh, inv, bias));
+    \\      acc[p * 2u] = fma(ins[p * 2u], w.x, acc[p * 2u]);
+    \\      acc[p * 2u + 1u] = fma(ins[p * 2u + 1u], w.y, acc[p * 2u + 1u]);
+    \\    }
     \\  }
     \\}
     \\for (uint si = 0u; si < 8u; si++) {
@@ -1389,8 +1448,9 @@ pub fn indexedGemvCoopF16(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_
     const out_dim = tsh[2] * 16;
     const out_tiles = tsh[2];
     const topk = ssh[0];
-    if (tsh[1] * 16 != in_dim or tsh[3] != 64) return error.BadExl3Shape;
-    const key = IndexedKey{ .in_dim = in_dim, .out_dim = out_dim, .topk = topk };
+    const k = try packedK(tsh[3]);
+    if (tsh[1] * 16 != in_dim) return error.BadExl3Shape;
+    const key = IndexedKey{ .in_dim = in_dim, .out_dim = out_dim, .topk = topk, .k = k };
     const cfg = indexed_coop_cfgs.get(key) orelse blk: {
         const c = mlx.mlx_fast_metal_kernel_config_new();
         const out_shape = [_]c_int{ topk, out_dim };
@@ -1399,6 +1459,7 @@ pub fn indexedGemvCoopF16(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 128, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "IDIM", in_dim));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ODIM", out_dim));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "KBITS", @intCast(k)));
         indexed_coop_cfgs.put(key, c);
         break :blk c;
     };
@@ -1426,6 +1487,9 @@ const DOWN_FUSED_SOURCE: [:0]const u8 =
     \\uint lane = uint(thread_index_in_simdgroup);
     \\uint lid = uint(thread_index_in_threadgroup);
     \\constexpr uint TILE = 16u;
+    \\constexpr uint K = uint(KBITS);
+    \\constexpr uint PACKED_HW = 16u * K;
+    \\constexpr uint PACKED_W = 8u * K;
     \\constexpr uint IT = uint(IDIM) / TILE;
     \\constexpr uint OT = uint(ODIM) / TILE;
     \\constexpr uint SGS = 4u;
@@ -1541,7 +1605,8 @@ const DOWN_FUSED_SOURCE: [:0]const u8 =
     \\const uint row2 = pos[2] >> 4u;
     \\const uint row3 = pos[3] >> 4u;
     \\float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-    \\const device uint* trellis_e = (const device uint*)(trellis + ((size_t)eid * (size_t)IT * (size_t)OT) * 64u);
+    \\const device uint* trellis_e = (const device uint*)(trellis + ((size_t)eid * (size_t)IT * (size_t)OT) * PACKED_HW);
+    \\if (K == 4u) {
     \\for (uint tk = tk0 + sg; tk < tk1; tk += SGS) {
     \\  const device uint* words = trellis_e + ((size_t)tk * (size_t)OT + ot) * 32u;
     \\  const ulong merged = ((ulong)words[(lane + 31u) & 31u] << 32) | (ulong)words[lane];
@@ -1562,6 +1627,44 @@ const DOWN_FUSED_SOURCE: [:0]const u8 =
     \\    const float2 w = float2(fma(hh, inv, bias));
     \\    acc[p * 2u] = fma(ins[p * 2u], w.x, acc[p * 2u]);
     \\    acc[p * 2u + 1u] = fma(ins[p * 2u + 1u], w.y, acc[p * 2u + 1u]);
+    \\  }
+    \\}
+    \\} else {
+    \\  uint w0[4];
+    \\  uint w1[4];
+    \\  uint shv[4];
+    \\  for (uint p = 0u; p < 4u; p++) {
+    \\    const uint first = lane * 8u + p * 2u;
+    \\    const int bits = int(K);
+    \\    const int b0 = int(first) * bits + bits + 256 * bits - 16;
+    \\    const int b2 = b0 + bits + 16;
+    \\    const int i0 = b0 / 32;
+    \\    const int i1 = (b2 - 1) / 32;
+    \\    w0[p] = uint(i0) % PACKED_W;
+    \\    w1[p] = uint(i1) % PACKED_W;
+    \\    shv[p] = uint((i1 + 1) * 32 - b2);
+    \\  }
+    \\  for (uint tk = tk0 + sg; tk < tk1; tk += SGS) {
+    \\    const device uint* words = trellis_e + ((size_t)tk * (size_t)OT + ot) * PACKED_W;
+    \\    const float in0 = float(prepared[tk * TILE + row0]);
+    \\    const float in1 = float(prepared[tk * TILE + row1]);
+    \\    const float in2 = float(prepared[tk * TILE + row2]);
+    \\    const float in3 = float(prepared[tk * TILE + row3]);
+    \\    const float ins[8] = {in0, in1, in2, in3, in0, in1, in2, in3};
+    \\    for (uint p = 0u; p < 4u; p++) {
+    \\      const ulong merged = ((ulong)words[w0[p]] << 32) | (ulong)words[w1[p]];
+    \\      const uint funnel = uint(merged >> shv[p]);
+    \\      const uint2 cw = uint2((funnel >> K) & 0xffffu, funnel & 0xffffu);
+    \\      const uint2 mixed = cw * uint2(0x83DCD12Du);
+    \\      const uint2 pair_sums = (mixed & uint2(0x00FF00FFu)) + ((mixed >> uint2(8u)) & uint2(0x00FF00FFu));
+    \\      const uint2 byte_sum = uint2(0x6400u) + (pair_sums & uint2(0xFFFFu)) + (pair_sums >> uint2(16u));
+    \\      const half2 hh = as_type<half2>(ushort2(byte_sum & uint2(0xFFFFu)));
+    \\      const half2 inv = as_type<half2>(ushort2(0x1EEEu));
+    \\      const half2 bias = as_type<half2>(ushort2(0xC931u));
+    \\      const float2 w = float2(fma(hh, inv, bias));
+    \\      acc[p * 2u] = fma(ins[p * 2u], w.x, acc[p * 2u]);
+    \\      acc[p * 2u + 1u] = fma(ins[p * 2u + 1u], w.y, acc[p * 2u + 1u]);
+    \\    }
     \\  }
     \\}
     \\for (uint si = 0u; si < 8u; si++) {
@@ -1594,9 +1697,11 @@ fn downGemvFusedMid(
     out_dim: c_int,
     nslots: c_int,
 ) !mlx.mlx_array {
+    const tsh = mlx.getShape(trellis);
+    const k = try packedK(tsh[tsh.len - 1]);
     const out_tiles = @divExact(out_dim, 16);
     const nsplit: c_int = @intCast(pairSplitCount());
-    const key = DownFusedKey{ .in_dim = in_dim, .out_dim = out_dim, .nslots = nslots, .nsplit = nsplit };
+    const key = DownFusedKey{ .in_dim = in_dim, .out_dim = out_dim, .nslots = nslots, .nsplit = nsplit, .k = k };
     const cfg = down_fused_cfgs.get(key) orelse blk: {
         const c = mlx.mlx_fast_metal_kernel_config_new();
         const sh = [_]c_int{ nslots, out_dim };
@@ -1606,6 +1711,7 @@ fn downGemvFusedMid(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "IDIM", in_dim));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ODIM", out_dim));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "NSPLIT", nsplit));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "KBITS", @intCast(k)));
         down_fused_cfgs.put(key, c);
         break :blk c;
     };
@@ -1705,6 +1811,9 @@ const PAIR_GEMV_SOURCE: [:0]const u8 =
     \\uint lane = uint(thread_index_in_simdgroup);
     \\uint lid = uint(thread_index_in_threadgroup);
     \\constexpr uint TILE = 16u;
+    \\constexpr uint K = uint(KBITS);
+    \\constexpr uint PACKED_HW = 16u * K;
+    \\constexpr uint PACKED_W = 8u * K;
     \\constexpr uint IT = uint(IDIM) / TILE;
     \\constexpr uint OT = uint(ODIM) / TILE;
     \\constexpr uint SGS = 4u;
@@ -1733,7 +1842,8 @@ const PAIR_GEMV_SOURCE: [:0]const u8 =
     \\  const device ushort *trellis = (proj == 0u) ? tg : tu;
     \\  device float *y = (proj == 0u) ? yg : yu;
     \\  float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-    \\  const device uint *trellis_e = (const device uint *)(trellis + ((size_t)eid * (size_t)IT * (size_t)OT) * 64u);
+    \\  const device uint *trellis_e = (const device uint *)(trellis + ((size_t)eid * (size_t)IT * (size_t)OT) * PACKED_HW);
+    \\  if (K == 4u) {
     \\  for (uint tk = tk0 + sg; tk < tk1; tk += SGS) {
     \\    const device uint *words = trellis_e + ((size_t)tk * (size_t)OT + ot) * 32u;
     \\    const ulong merged = ((ulong)words[(lane + 31u) & 31u] << 32) | (ulong)words[lane];
@@ -1754,6 +1864,44 @@ const PAIR_GEMV_SOURCE: [:0]const u8 =
     \\      const float2 w = float2(fma(hh, inv, bias));
     \\      acc[p * 2u] = fma(ins[p * 2u], w.x, acc[p * 2u]);
     \\      acc[p * 2u + 1u] = fma(ins[p * 2u + 1u], w.y, acc[p * 2u + 1u]);
+    \\    }
+    \\  }
+    \\  } else {
+    \\    uint w0[4];
+    \\    uint w1[4];
+    \\    uint shv[4];
+    \\    for (uint p = 0u; p < 4u; p++) {
+    \\      const uint first = lane * 8u + p * 2u;
+    \\      const int bits = int(K);
+    \\      const int b0 = int(first) * bits + bits + 256 * bits - 16;
+    \\      const int b2 = b0 + bits + 16;
+    \\      const int i0 = b0 / 32;
+    \\      const int i1 = (b2 - 1) / 32;
+    \\      w0[p] = uint(i0) % PACKED_W;
+    \\      w1[p] = uint(i1) % PACKED_W;
+    \\      shv[p] = uint((i1 + 1) * 32 - b2);
+    \\    }
+    \\    for (uint tk = tk0 + sg; tk < tk1; tk += SGS) {
+    \\      const device uint *words = trellis_e + ((size_t)tk * (size_t)OT + ot) * PACKED_W;
+    \\      const float in0 = float(x[xb + tk * TILE + row0]);
+    \\      const float in1 = float(x[xb + tk * TILE + row1]);
+    \\      const float in2 = float(x[xb + tk * TILE + row2]);
+    \\      const float in3 = float(x[xb + tk * TILE + row3]);
+    \\      const float ins[8] = {in0, in1, in2, in3, in0, in1, in2, in3};
+    \\      for (uint p = 0u; p < 4u; p++) {
+    \\        const ulong merged = ((ulong)words[w0[p]] << 32) | (ulong)words[w1[p]];
+    \\        const uint funnel = uint(merged >> shv[p]);
+    \\        const uint2 cw = uint2((funnel >> K) & 0xffffu, funnel & 0xffffu);
+    \\        const uint2 mixed = cw * uint2(0x83DCD12Du);
+    \\        const uint2 pair_sums = (mixed & uint2(0x00FF00FFu)) + ((mixed >> uint2(8u)) & uint2(0x00FF00FFu));
+    \\        const uint2 byte_sum = uint2(0x6400u) + (pair_sums & uint2(0xFFFFu)) + (pair_sums >> uint2(16u));
+    \\        const half2 hh = as_type<half2>(ushort2(byte_sum & uint2(0xFFFFu)));
+    \\        const half2 inv = as_type<half2>(ushort2(0x1EEEu));
+    \\        const half2 bias = as_type<half2>(ushort2(0xC931u));
+    \\        const float2 w = float2(fma(hh, inv, bias));
+    \\        acc[p * 2u] = fma(ins[p * 2u], w.x, acc[p * 2u]);
+    \\        acc[p * 2u + 1u] = fma(ins[p * 2u + 1u], w.y, acc[p * 2u + 1u]);
+    \\      }
     \\    }
     \\  }
     \\  for (uint si = 0u; si < 8u; si++) {
@@ -1980,9 +2128,13 @@ fn pairPrepare(s: mlx.mlx_stream, x: mlx.mlx_array, suhg: mlx.mlx_array, suhu: m
 }
 
 fn pairGemv(s: mlx.mlx_stream, xg: mlx.mlx_array, xu: mlx.mlx_array, tg: mlx.mlx_array, tu: mlx.mlx_array, slots: mlx.mlx_array, in_dim: c_int, out_dim: c_int, nslots: c_int) !struct { mlx.mlx_array, mlx.mlx_array } {
+    const tsh = mlx.getShape(tg);
+    const ush = mlx.getShape(tu);
+    const k = try packedK(tsh[tsh.len - 1]);
+    if (ush[ush.len - 1] != tsh[tsh.len - 1]) return error.BadExl3Shape;
     const out_tiles = @divExact(out_dim, 16);
     const nsplit: c_int = @intCast(pairSplitCount());
-    const key = PairGemvKey{ .in_dim = in_dim, .out_dim = out_dim, .nslots = nslots, .nsplit = nsplit };
+    const key = PairGemvKey{ .in_dim = in_dim, .out_dim = out_dim, .nslots = nslots, .nsplit = nsplit, .k = k };
     const cfg = pair_gemv_cfgs.get(key) orelse blk: {
         const c = mlx.mlx_fast_metal_kernel_config_new();
         const sh = [_]c_int{ nslots * nsplit, out_dim };
@@ -1993,6 +2145,7 @@ fn pairGemv(s: mlx.mlx_stream, xg: mlx.mlx_array, xu: mlx.mlx_array, tg: mlx.mlx
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "IDIM", in_dim));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ODIM", out_dim));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "NSPLIT", nsplit));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "KBITS", @intCast(k)));
         pair_gemv_cfgs.put(key, c);
         break :blk c;
     };
@@ -2460,8 +2613,9 @@ pub fn innerGemvF16(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array)
     if (xsh.len != 1 or tsh.len != 3) return error.BadExl3Shape;
     const in_dim = xsh[0];
     const out_dim = tsh[1] * 16;
-    if (tsh[0] * 16 != in_dim or tsh[2] != 64) return error.BadExl3Shape;
-    const cfg = try gemvConfig(in_dim, out_dim);
+    const k = try packedK(tsh[2]);
+    if (tsh[0] * 16 != in_dim) return error.BadExl3Shape;
+    const cfg = try gemvConfig(in_dim, out_dim, k);
     const inputs_arr = [_]mlx.mlx_array{ x, trellis };
     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
@@ -2533,6 +2687,196 @@ pub fn moeSwigluHost(
         for (0..hidden) |i| y[i] += w * down_y[i];
     }
     return y;
+}
+
+test "exl3 packedK accepts last dim 16 times 2,3,4" {
+    const t = std.testing;
+    try t.expectEqual(@as(u32, 2), try packedK(32));
+    try t.expectEqual(@as(u32, 3), try packedK(48));
+    try t.expectEqual(@as(u32, 4), try packedK(64));
+    try t.expectError(error.BadExl3Shape, packedK(16));
+    try t.expectError(error.BadExl3Shape, packedK(80));
+}
+
+fn metalInnerGemvFixture(fixture: []const u8, packed_hw: c_int, k: u32) !void {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const header_len = std.mem.readInt(u64, fixture[0..8], .little);
+    const header = fixture[8 .. 8 + header_len];
+    const data = fixture[8 + header_len ..];
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, header, .{});
+    defer parsed.deinit();
+    const trellis_meta = parsed.value.object.get("trellis").?.object;
+    const t_off: usize = @intCast(trellis_meta.get("data_offsets").?.array.items[0].integer);
+    const t_end: usize = @intCast(trellis_meta.get("data_offsets").?.array.items[1].integer);
+    const trellis_bits: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, data[t_off..t_end]));
+    var x: [128]f32 = undefined;
+    var prng = std.Random.DefaultPrng.init(11);
+    const rnd = prng.random();
+    for (&x) |*v| v.* = rnd.float(f32) * 2 - 1;
+    const xf16 = try alloc.alloc(u16, 128);
+    for (x, xf16) |v, *b| b.* = exl3.f32ToF16Bits(v);
+    const xf = try alloc.alloc(f32, 128);
+    for (xf16, xf) |b, *v| v.* = exl3.f16BitsToF32(b);
+    const x_arr = mlx.mlx_array_new_data(xf16.ptr, &[_]c_int{128}, 1, .float16);
+    defer _ = mlx.mlx_array_free(x_arr);
+    const tr_arr = mlx.mlx_array_new_data(trellis_bits.ptr, &[_]c_int{ 8, 8, packed_hw }, 3, .uint16);
+    defer _ = mlx.mlx_array_free(tr_arr);
+    const got = try innerGemvF16(s, x_arr, tr_arr);
+    defer _ = mlx.mlx_array_free(got);
+    var contig = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(contig);
+    try mlx.check(mlx.mlx_contiguous(&contig, got, false, s));
+    try mlx.check(mlx.mlx_array_eval(contig));
+    const src = mlx.mlx_array_data_float16(contig) orelse return error.F16Unreadable;
+    var host: [128]f32 = undefined;
+    exl3.innerGemv(trellis_bits, xf, 128, 128, k, .mul1, &host);
+    for (0..128) |i| {
+        const bits: u16 = @bitCast(src[i]);
+        try t.expectEqual(exl3.f32ToF16Bits(host[i]), bits);
+    }
+}
+
+test "exl3 K3 Metal inner GEMV matches the host tile decode" {
+    try metalInnerGemvFixture(@embedFile("fixtures/exl3_k3_linear.safetensors"), 48, 3);
+}
+
+test "exl3 K2 Metal inner GEMV matches the host tile decode" {
+    try metalInnerGemvFixture(@embedFile("fixtures/exl3_k2_linear.safetensors"), 32, 2);
+}
+
+fn indexedParity(k: u32, in_dim: usize, out_dim: usize, e: usize, topk: usize, seed: u64) !void {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const packed_n = exl3.packedHalfwords(k);
+    const in_tiles = in_dim / 16;
+    const out_tiles = out_dim / 16;
+    const tile_n = in_tiles * out_tiles * packed_n;
+    const stacked = try alloc.alloc(u16, e * tile_n);
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rnd = prng.random();
+    for (stacked) |*v| v.* = @truncate(rnd.int(u32));
+    const xh = try alloc.alloc(u16, topk * in_dim);
+    for (xh) |*v| v.* = exl3.f32ToF16Bits(rnd.float(f32) * 2 - 1);
+    const slots_h = try alloc.alloc(u32, topk);
+    for (slots_h, 0..) |*v, i| v.* = @intCast(i % e);
+    const x_arr = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ @intCast(topk), @intCast(in_dim) }, 2, .float16);
+    defer _ = mlx.mlx_array_free(x_arr);
+    const tr_arr = mlx.mlx_array_new_data(stacked.ptr, &[_]c_int{ @intCast(e), @intCast(in_tiles), @intCast(out_tiles), @intCast(packed_n) }, 4, .uint16);
+    defer _ = mlx.mlx_array_free(tr_arr);
+    const slots = mlx.mlx_array_new_data(slots_h.ptr, &[_]c_int{@intCast(topk)}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(slots);
+    const got = try indexedGemvCoopF16(s, x_arr, tr_arr, slots);
+    defer _ = mlx.mlx_array_free(got);
+    var contig = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(contig);
+    try mlx.check(mlx.mlx_contiguous(&contig, got, false, s));
+    try mlx.check(mlx.mlx_array_eval(contig));
+    const src = mlx.mlx_array_data_float16(contig) orelse return error.F16Unreadable;
+    const xf = try alloc.alloc(f32, in_dim);
+    const host16 = try alloc.alloc(f32, out_dim);
+    const host32 = try alloc.alloc(f32, out_dim);
+    const pos_acc = try alloc.alloc(f32, out_dim * 16);
+    const host_pos = try alloc.alloc(f32, out_dim);
+    for (0..topk) |row| {
+        for (0..in_dim) |i| xf[i] = exl3.f16BitsToF32(xh[row * in_dim + i]);
+        const eid: usize = slots_h[row];
+        const trellis = stacked[eid * tile_n ..][0..tile_n];
+        exl3.innerGemv(trellis, xf, in_dim, out_dim, k, .mul1, host16);
+        exl3.innerGemvF32(trellis, xf, in_dim, out_dim, k, .mul1, host32);
+        @memset(pos_acc, 0);
+        var tile_w: [exl3.TILE_VALUES]u16 = undefined;
+        for (0..in_tiles) |tk| {
+            for (0..out_tiles) |tn| {
+                const off = (tk * out_tiles + tn) * packed_n;
+                exl3.decodeTile(trellis[off..][0..packed_n], k, .mul1, &tile_w);
+                for (0..16) |r| {
+                    const xv = xf[tk * 16 + r];
+                    for (0..16) |c| {
+                        pos_acc[(tn * 16 + c) * 16 + r] += xv * exl3.f16BitsToF32(tile_w[r * 16 + c]);
+                    }
+                }
+            }
+        }
+        for (0..out_dim) |o| {
+            var psum: f32 = 0;
+            for (0..16) |r| psum += pos_acc[o * 16 + r];
+            host_pos[o] = psum;
+        }
+        for (0..out_dim) |o| {
+            const gpu = @as(f32, @floatCast(src[row * out_dim + o]));
+            expectGemvEnvelope(gpu, host16[o], host32[o]) catch {
+                const hp16 = exl3.f16BitsToF32(exl3.f32ToF16Bits(host_pos[o]));
+                try expectGemvEnvelope(gpu, hp16, host_pos[o]);
+            };
+        }
+    }
+}
+
+test "exl3 K3 cooperative indexed GEMV matches host MUL1 tile decode" {
+    try indexedParity(3, 128, 128, 4, 10, 17);
+}
+
+test "exl3 K2 cooperative indexed GEMV matches host MUL1 tile decode" {
+    try indexedParity(2, 128, 128, 4, 10, 19);
+}
+
+test "exl3 K3 Metal inner GEMV matches host on production shape" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const in_dim: usize = 2560;
+    const out_dim: usize = 640;
+    const k: u32 = 3;
+    const packed_n = exl3.packedHalfwords(k);
+    const in_tiles = in_dim / 16;
+    const out_tiles = out_dim / 16;
+    const trellis = try alloc.alloc(u16, in_tiles * out_tiles * packed_n);
+    var prng = std.Random.DefaultPrng.init(23);
+    const rnd = prng.random();
+    for (trellis) |*v| v.* = @truncate(rnd.int(u32));
+    const xf16 = try alloc.alloc(u16, in_dim);
+    for (xf16) |*v| v.* = exl3.f32ToF16Bits(rnd.float(f32) * 2 - 1);
+    const xf = try alloc.alloc(f32, in_dim);
+    for (xf16, xf) |b, *v| v.* = exl3.f16BitsToF32(b);
+    const x_arr = mlx.mlx_array_new_data(xf16.ptr, &[_]c_int{@intCast(in_dim)}, 1, .float16);
+    defer _ = mlx.mlx_array_free(x_arr);
+    const tr_arr = mlx.mlx_array_new_data(trellis.ptr, &[_]c_int{ @intCast(in_tiles), @intCast(out_tiles), @intCast(packed_n) }, 3, .uint16);
+    defer _ = mlx.mlx_array_free(tr_arr);
+    const got = try innerGemvF16(s, x_arr, tr_arr);
+    defer _ = mlx.mlx_array_free(got);
+    var contig = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(contig);
+    try mlx.check(mlx.mlx_contiguous(&contig, got, false, s));
+    try mlx.check(mlx.mlx_array_eval(contig));
+    const src = mlx.mlx_array_data_float16(contig) orelse return error.F16Unreadable;
+    const host16 = try alloc.alloc(f32, out_dim);
+    const host32 = try alloc.alloc(f32, out_dim);
+    exl3.innerGemv(trellis, xf, in_dim, out_dim, k, .mul1, host16);
+    exl3.innerGemvF32(trellis, xf, in_dim, out_dim, k, .mul1, host32);
+    for (0..out_dim) |o| {
+        const gpu = @as(f32, @floatCast(src[o]));
+        try expectGemvEnvelope(gpu, host16[o], host32[o]);
+    }
+}
+
+test "exl3 K3 cooperative indexed GEMV matches host MUL1 on production shape" {
+    try indexedParity(3, 2560, 640, 4, 10, 23);
+}
+
+test "exl3 K2 cooperative indexed GEMV matches host MUL1 on production shape" {
+    try indexedParity(2, 2560, 640, 4, 10, 29);
 }
 
 test "exl3 K4 Metal inner GEMV matches the host tile decode" {
@@ -3095,10 +3439,39 @@ test "exl3 K4 cooperative indexed GEMV runs at production shape" {
         _ = mlx.mlx_array_free(b);
     }
     new_ns /= 10;
-    std.debug.print("exl3 indexed GEMV H=2560 I=640 topk=10: coop {d} us\n", .{
-        new_ns / 1000,
+    const packed3 = exl3.packedHalfwords(3);
+    const tile3 = in_tiles * out_tiles * packed3;
+    const stacked3 = try alloc.alloc(u16, E * tile3);
+    for (stacked3) |*v| v.* = @truncate(rnd.int(u32));
+    const tr3 = mlx.mlx_array_new_data(stacked3.ptr, &[_]c_int{ @intCast(E), @intCast(in_tiles), @intCast(out_tiles), @intCast(packed3) }, 4, .uint16);
+    defer _ = mlx.mlx_array_free(tr3);
+    const warm3 = try indexedGemvCoopF16(s, x_arr, tr3, slots);
+    try mlx.check(mlx.mlx_array_eval(warm3));
+    _ = mlx.mlx_array_free(warm3);
+    var k3_ns: u64 = 0;
+    var k4_ns: u64 = 0;
+    it = 0;
+    while (it < 10) : (it += 1) {
+        var sw4 = io_util.Stopwatch.init(t.io);
+        const b4 = try indexedGemvCoopF16(s, x_arr, tr_arr, slots);
+        try mlx.check(mlx.mlx_array_eval(b4));
+        k4_ns += sw4.read();
+        _ = mlx.mlx_array_free(b4);
+        var sw3 = io_util.Stopwatch.init(t.io);
+        const b3 = try indexedGemvCoopF16(s, x_arr, tr3, slots);
+        try mlx.check(mlx.mlx_array_eval(b3));
+        k3_ns += sw3.read();
+        _ = mlx.mlx_array_free(b3);
+    }
+    k3_ns /= 10;
+    k4_ns /= 10;
+    std.debug.print("exl3 indexed GEMV H=2560 I=640 topk=10: K4 {d} us K3 {d} us\n", .{
+        k4_ns / 1000,
+        k3_ns / 1000,
     });
     try t.expect(new_ns > 0);
+    try t.expect(k4_ns > 0);
+    try t.expect(k3_ns * 100 < k4_ns * 115);
 }
 
 test "exl3 layer ubench production shape rows=1 and 512" {
@@ -3581,6 +3954,62 @@ test "exl3 sorted GEMM matches host MUL1 on small shape" {
         const e: usize = eids[r];
         exl3.innerGemv(stacked[e * tile_n ..][0..tile_n], xf, dim, dim, 4, .mul1, host16);
         exl3.innerGemvF32(stacked[e * tile_n ..][0..tile_n], xf, dim, dim, 4, .mul1, host32);
+        for (0..dim) |o| {
+            const gpu = @as(f32, @floatCast(src[r * dim + o]));
+            try expectGemvEnvelope(gpu, host16[o], host32[o]);
+        }
+    }
+}
+
+test "exl3 K3 sorted GEMM matches host MUL1 on small shape" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    const fixture = @embedFile("fixtures/exl3_k3_linear.safetensors");
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const header_len = std.mem.readInt(u64, fixture[0..8], .little);
+    const header = fixture[8 .. 8 + header_len];
+    const data = fixture[8 + header_len ..];
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, header, .{});
+    defer parsed.deinit();
+    const trellis_meta = parsed.value.object.get("trellis").?.object;
+    const t0: usize = @intCast(trellis_meta.get("data_offsets").?.array.items[0].integer);
+    const t1: usize = @intCast(trellis_meta.get("data_offsets").?.array.items[1].integer);
+    const trellis_bits = std.mem.bytesAsSlice(u16, data[t0..t1]);
+    const E: usize = 4;
+    const dim: usize = 128;
+    const n: usize = 8;
+    const tile_n = 8 * 8 * 48;
+    const stacked = try alloc.alloc(u16, E * tile_n);
+    for (0..E) |e| @memcpy(stacked[e * tile_n ..][0..tile_n], trellis_bits);
+    var prng = std.Random.DefaultPrng.init(47);
+    const rnd = prng.random();
+    const xh = try alloc.alloc(u16, n * dim);
+    for (xh) |*v| v.* = exl3.f32ToF16Bits(rnd.float(f32) * 2 - 1);
+    const eids = [_]u32{ 0, 0, 0, 0, 2, 2, 1, 1 };
+    const x_arr = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ @intCast(n), @intCast(dim) }, 2, .float16);
+    defer _ = mlx.mlx_array_free(x_arr);
+    const tr_arr = mlx.mlx_array_new_data(stacked.ptr, &[_]c_int{ @intCast(E), 8, 8, 48 }, 4, .uint16);
+    defer _ = mlx.mlx_array_free(tr_arr);
+    const eid_a = mlx.mlx_array_new_data(&eids, &[_]c_int{@intCast(n)}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(eid_a);
+    const got = try innerGemmSorted(s, x_arr, tr_arr, eid_a);
+    defer _ = mlx.mlx_array_free(got);
+    var contig = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(contig);
+    try mlx.check(mlx.mlx_contiguous(&contig, got, false, s));
+    try mlx.check(mlx.mlx_array_eval(contig));
+    const src = mlx.mlx_array_data_float16(contig) orelse return error.F16Unreadable;
+    const xf = try alloc.alloc(f32, dim);
+    const host16 = try alloc.alloc(f32, dim);
+    const host32 = try alloc.alloc(f32, dim);
+    for (0..n) |r| {
+        for (0..dim) |i| xf[i] = exl3.f16BitsToF32(xh[r * dim + i]);
+        const e: usize = eids[r];
+        exl3.innerGemv(stacked[e * tile_n ..][0..tile_n], xf, dim, dim, 3, .mul1, host16);
+        exl3.innerGemvF32(stacked[e * tile_n ..][0..tile_n], xf, dim, dim, 3, .mul1, host32);
         for (0..dim) |o| {
             const gpu = @as(f32, @floatCast(src[r * dim + o]));
             try expectGemvEnvelope(gpu, host16[o], host32[o]);

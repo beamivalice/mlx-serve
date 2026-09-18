@@ -1,8 +1,8 @@
 # EXL3-K3 report
 
-Status: kernels, loader, converter, restack, live KLD, greedy determinism, and new-standard speed rows done on 6b3c5671. Rebase onto integration 728af897 is the next commit on this branch.
+Status: kernels, loader, converter, restack, live KLD, greedy determinism, and new-standard speed rows done on 6b3c5671; rebased onto integration 728af897 with K-generic cooperative readers on the new bodies.
 
-Start sha 238fb8d7, branch agent/exl3-k3b, clone head at measurement 6b3c5671. Routed-expert trellis in the K3 pack is uniform K3. Non-expert trellis stays in the 4/8 trunk (shared-expert/attn K5, MTP fc K4, indexer K3).
+Start sha 238fb8d7, branch agent/exl3-k3b. Measurement binary 6b3c5671. Rebase parent 728af897. Routed-expert trellis in the K3 pack is uniform K3. Non-expert trellis stays in the 4/8 trunk (shared-expert/attn K5, MTP fc K4, indexer K3).
 
 ## Files changed
 
@@ -59,7 +59,7 @@ Production-shape K3 cooperative GEMV (before the PACKED_W funnel): `expectGemvEn
 
 ## Suite counts
 
-This session, head 6b3c5671:
+Measurement head 6b3c5671:
 
 ```
 .zig-toolchain/zig build -Doptimize=ReleaseFast
@@ -67,19 +67,32 @@ This session, head 6b3c5671:
 36/36 passed.
 ```
 
-Envelope print from that run: `exl3 indexed GEMV H=2560 I=640 topk=10: K4 157 us K3 159 us` (K3/K4 = 1.013, bar 1.15). Previous session on the same test printed K3 351 µs vs K4 352 µs (parity under the K4 envelope). Ratio holds; absolute µs tracks box load.
+Envelope print: `exl3 indexed GEMV H=2560 I=640 topk=10: K4 157 us K3 159 us` (K3/K4 = 1.013, bar 1.15). Previous session on the same test printed K3 351 µs vs K4 352 µs.
 
-Converter `--self-test`: 15 tests OK.
+Rebased head (this commit):
+
+```
+.zig-toolchain/zig build test-build -Doptimize=ReleaseFast -Dtest-filter="exl3" && ./zig-out/tests/test
+59/59 passed.
+.zig-toolchain/zig build test-build -Doptimize=ReleaseFast -Dtest-filter="mtp" && ./zig-out/tests/test
+123 passed; 1 skipped; 0 failed.
+```
+
+Isolated envelope on the rebased bodies: `K4 173 us K3 164 us` (K3/K4 = 0.948, bar 1.15). K4 production envelope and fused/split-2/window tests passed (K4 timings unchanged in the test bodies). Converter `--self-test`: 18 tests OK.
 
 ## Commit sha
 
-- 32f2bf55 host K2/K3 decode fixtures
-- bcf0800f Metal tile decode parameterized on K
-- 5e134f18 loader admits K in {2,3,4} MUL1
-- 46983e81 `--from-exl3` restack K2/K3/K4
-- fa2bab27 config parse does not open trellis shards
-- 6b3c5671 K3 cooperative GEMV uses PACKED_W funnel (measurement binary)
-- this report: filled after commit
+Measurement (pre-rebase): 6b3c5671 PACKED_W funnel; report 37230894.
+
+Rebased onto 728af897:
+
+- f18cacb3 host K2/K3 decode fixtures
+- 886b80a2 kFromPackedDim on host
+- 64f0e1e9 loader admits K in {2,3,4} MUL1
+- 457bbc3c `--from-exl3` restack K2/K3/K4
+- 059074b3 config parse does not open trellis shards
+- af6d2680 live KLD/greedy/speed report
+- this kernel port: filled after commit
 
 ## Live table
 
@@ -124,7 +137,7 @@ Decode matches the envelope test (K3 ≈ K4). Prefill on this branch is 0.31x of
 ## Open questions
 
 - K3 KLD 0.0982 / top-1 0.907 is worse than K4 0.0676 / 0.924 and worse than affine 4/8 0.0814. Expected of 3-bit vs 4-bit routed experts; not a kernel-parity failure (envelope holds). No K3 MTP claim until this is accepted.
-- K3 prefill 0.31x of K4 on 6b3c5671. After rebase the K-generic funnel must land on the run-aligned 32-row window GEMM; remeasure at the new standard before quoting a K3 prefill ratio against integration K4.
+- K3 prefill 0.31x of K4 on 6b3c5671 (no aligned-32 windows). The rebased GEMM now takes K on the run-aligned 32-row windows; live K3 prefill was not re-run on 728af897. Remeasure at the new standard before quoting a K3 prefill ratio against integration K4.
 - Shared-expert and attention in the 305bpw checkpoint are K5. Out of scope (K in {2,3,4} for routed experts).
 
 ## Comments
