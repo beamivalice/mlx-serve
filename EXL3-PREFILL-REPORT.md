@@ -6,27 +6,31 @@ Box: Apple M5 Max
 
 ## Files changed
 
-- `src/expert_exl3_kernels.zig` (item 0 benches; item 1 16-row windows + run walk)
+- `src/expert_exl3_kernels.zig` (item 0 benches; item 1 16-row windows + run walk; item 2 paired prepare, int32 order, scatter, mid/finish fuse, gemmNaxOn cache)
 
 ## Tests added
 
 - Item 0: both in-tree prefill benches assert `max_e >= 400` and loop C in {512, 2048} at E=512 / top-k 10.
 - Item 1: `exl3 sorted GEMM 16-row windows match 4-row per row` (mixed runs, n=32, bit identity). NAX default and SIMD via `MLX_SERVE_FORCE_GPU_FAMILY_FALLBACK=1`.
+- Item 2: `exl3 moePrefill matches staged sorted chain` (old two-prepare / MLX SwiGLU / inv-reduce vs new path, bit identity).
 
 ## Red-first evidence
 
 - Item 0: `max_e >= 400` on E=4 benches: `FAIL (TestUnexpectedResult)`. Green after E=512 / top-k 10.
 - Item 1: 16-row grid with kernel still `win * 4u`: `expected 17898, found 0` (`FAIL TestExpectedEqual`). Green after `start = win * WIN` and in-kernel run walk.
+- Item 2: characterization `exl3 moePrefill matches staged sorted chain` green on the old body, still green after pair-prepare / int32 / scatter / mid+downFinishReduce.
 
 ## Suite counts
 
 - Item 0 filtered `-Dtest-filter="exl3"`: 22 passed.
 - Item 1 filtered `-Dtest-filter="exl3"`: 23 passed, 0 failed (includes new identity test). SIMD-arm rerun of sorted GEMM tests: 4/4.
+- Item 2 filtered `-Dtest-filter="exl3"`: 24 passed, 0 failed.
 
 ## Commit sha
 
 - item 0: `26332d0a37ba48c6a65dfdd86dbbc5da93aea253`
-- item 1: (pending)
+- item 1: `ccb4916c5f8feb9abbb79deee39b4bf1cc6e8180`
+- item 2: `f158aec058838d253787158d931c547d173f21e3`
 
 ## Live table (every row with box, chunk, engagement lines)
 
@@ -47,6 +51,15 @@ Protocol: 100 s idle, kv8, `--no-mtp`, affine through `/Users/beam/llm/models/Qw
 | affine-ab | 2074.7 | 2100.6 | 2110.5 | **2100.6** | 8192 (1 chunk) | same kv8 / serial / MTP-head-loaded-not-armed; `[prefill-trace] tokens=4084 chunks=1 chunk_size=8192` |
 
 Ratio 1464.5 / 2100.6 = **0.697x**. Bar 1580 tok/s (0.75x of 2109, or 0.75x of 2100.6 = 1575). Still short.
+
+### After item 2 (paired prepare, int32 order, scatter, mid/finish fuse)
+
+| arm | boot1 | boot2 | boot3 | median tok/s | chunk | engagement |
+| --- | --- | --- | --- | --- | --- | --- |
+| EXL3 | 1186.7 | 1454.4 | 1470.3 | **1454.4** | 8192 (1 chunk) | `[args] kv-quant: affine 8-bit (group=64)`; `[expert-exl3] engaged`; `[qwen4] MTP head loaded ... drafts armed by --mtp`; `[short-gen] ... path=serial`; `[prefill-trace] tokens=4088 chunks=1 chunk_size=8192`; `[model-settings]` absent; `[spec-stats] mode=` absent |
+| affine-ab | 2070.7 | 2097.4 | 2108.4 | **2097.4** | 8192 (1 chunk) | same kv8 / serial / MTP-head-loaded-not-armed; `[prefill-trace] tokens=4083 chunks=1 chunk_size=8192` |
+
+Ratio 1454.4 / 2097.4 = **0.693x**. Still short of 1580. Item 3 is required.
 
 Hermetic serialized 512-row prefill dispatch (E=16 / top-k 10 / H=2560 / I=640):
 
@@ -81,6 +94,7 @@ none added
 ## Ports (reference ideas taken, for NOTICE)
 
 - 16-row NAX fill of the existing 16x32x16 `matmul2d` tile (`act[4+c]` = row `origin.y+8`); run walk one pass per distinct expert in the window.
+- Prefill mid/finish fused onto the existing decode mid + down-finish-reduce leaves (no new arithmetic).
 
 ## Item 0 — Measurement
 
@@ -92,8 +106,8 @@ Status: done. Live median 1465 tok/s. Below 1580.
 
 ## Item 2 — Fixed costs, bit-identical
 
-Status: in progress
+Status: done. Live median 1454 tok/s (flat vs item 1 within boot noise). Below 1580.
 
 ## Item 3 — decode-once + dense f16 GEMM
 
-Status: pending (only if still < 1580 after 1+2)
+Status: required (still < 1580 after 1+2).

@@ -379,6 +379,80 @@ const TOKEN_PREPARE_SOURCE: [:0]const u8 =
     \\y[yb + lane + 96u] = half((s1 - s3) * sc);
 ;
 
+const TOKEN_PAIR_PREPARE_SOURCE: [:0]const u8 =
+    \\uint block = uint(threadgroup_position_in_grid.x);
+    \\uint slot = uint(threadgroup_position_in_grid.y);
+    \\ushort lane = thread_index_in_simdgroup;
+    \\const uint eid = uint(slots[slot]);
+    \\const uint orig = uint(order[slot]);
+    \\const uint row = orig / uint(TOPK);
+    \\const uint base = block * 128u;
+    \\const size_t xb = (size_t)row * (size_t)(IDIM) + base;
+    \\const size_t yb = (size_t)slot * (size_t)(IDIM) + base;
+    \\const size_t sb = (size_t)eid * (size_t)(IDIM) + base;
+    \\const float x0 = float(x[xb + lane]);
+    \\const float x1 = float(x[xb + lane + 32u]);
+    \\const float x2 = float(x[xb + lane + 64u]);
+    \\const float x3 = float(x[xb + lane + 96u]);
+    \\float4 v = float4(
+    \\  x0 * float(suhg[sb + lane]),
+    \\  x1 * float(suhg[sb + lane + 32u]),
+    \\  x2 * float(suhg[sb + lane + 64u]),
+    \\  x3 * float(suhg[sb + lane + 96u]));
+    \\for (ushort bit = 1u; bit <= 16u; bit <<= 1u) {
+    \\  const float p0 = simd_shuffle_xor(v.x, bit);
+    \\  const float p1 = simd_shuffle_xor(v.y, bit);
+    \\  const float p2 = simd_shuffle_xor(v.z, bit);
+    \\  const float p3 = simd_shuffle_xor(v.w, bit);
+    \\  const bool lower = (lane & bit) == 0u;
+    \\  v.x = lower ? v.x + p0 : p0 - v.x;
+    \\  v.y = lower ? v.y + p1 : p1 - v.y;
+    \\  v.z = lower ? v.z + p2 : p2 - v.z;
+    \\  v.w = lower ? v.w + p3 : p3 - v.w;
+    \\}
+    \\const float sc = 0.08838834764831845f;
+    \\float s0 = v.x + v.y;
+    \\float s1 = v.x - v.y;
+    \\float s2 = v.z + v.w;
+    \\float s3 = v.z - v.w;
+    \\yg[yb + lane] = half((s0 + s2) * sc);
+    \\yg[yb + lane + 32u] = half((s1 + s3) * sc);
+    \\yg[yb + lane + 64u] = half((s0 - s2) * sc);
+    \\yg[yb + lane + 96u] = half((s1 - s3) * sc);
+    \\v = float4(
+    \\  x0 * float(suhu[sb + lane]),
+    \\  x1 * float(suhu[sb + lane + 32u]),
+    \\  x2 * float(suhu[sb + lane + 64u]),
+    \\  x3 * float(suhu[sb + lane + 96u]));
+    \\for (ushort bit = 1u; bit <= 16u; bit <<= 1u) {
+    \\  const float p0 = simd_shuffle_xor(v.x, bit);
+    \\  const float p1 = simd_shuffle_xor(v.y, bit);
+    \\  const float p2 = simd_shuffle_xor(v.z, bit);
+    \\  const float p3 = simd_shuffle_xor(v.w, bit);
+    \\  const bool lower = (lane & bit) == 0u;
+    \\  v.x = lower ? v.x + p0 : p0 - v.x;
+    \\  v.y = lower ? v.y + p1 : p1 - v.y;
+    \\  v.z = lower ? v.z + p2 : p2 - v.z;
+    \\  v.w = lower ? v.w + p3 : p3 - v.w;
+    \\}
+    \\s0 = v.x + v.y;
+    \\s1 = v.x - v.y;
+    \\s2 = v.z + v.w;
+    \\s3 = v.z - v.w;
+    \\yu[yb + lane] = half((s0 + s2) * sc);
+    \\yu[yb + lane + 32u] = half((s1 + s3) * sc);
+    \\yu[yb + lane + 64u] = half((s0 - s2) * sc);
+    \\yu[yb + lane + 96u] = half((s1 - s3) * sc);
+;
+
+const TOKEN_SCATTER_SOURCE: [:0]const u8 =
+    \\uint col = uint(thread_position_in_grid.x);
+    \\uint slot = uint(thread_position_in_grid.y);
+    \\if (col >= uint(DIM)) return;
+    \\const uint orig = uint(order[slot]);
+    \\y[(size_t)orig * (size_t)(DIM) + col] = x[(size_t)slot * (size_t)(DIM) + col];
+;
+
 const TOKEN_REDUCE_SOURCE: [:0]const u8 =
     \\uint col = uint(thread_position_in_grid.x);
     \\uint row = uint(thread_position_in_grid.y);
@@ -523,6 +597,7 @@ var gemm_sorted_cfgs: CfgCache(GemmSortedKey, 8) = .{};
 var gemm_nax_cfgs: CfgCache(GemmSortedKey, 8) = .{};
 var gemm_nax_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var gemm_nax_failed: bool = false;
+var gemm_nax_cached: ?bool = null;
 const PairPrepKey = struct { in_dim: c_int, nslots: c_int, topk: c_int };
 const PairGemvKey = struct { in_dim: c_int, out_dim: c_int, nslots: c_int };
 const MidKey = struct { dim: c_int, nslots: c_int };
@@ -532,8 +607,13 @@ var pair_gemv_cfgs: CfgCache(PairGemvKey, 8) = .{};
 var mid_cfgs: CfgCache(MidKey, 8) = .{};
 var reduce_cfgs: CfgCache(ReduceKey, 8) = .{};
 var token_prep_cfgs: CfgCache(PairPrepKey, 8) = .{};
+var token_pair_prep_cfgs: CfgCache(PairPrepKey, 8) = .{};
 var token_reduce_cfgs: CfgCache(ReduceKey, 8) = .{};
+const ScatterKey = struct { dim: c_int, nslots: c_int };
+var token_scatter_cfgs: CfgCache(ScatterKey, 8) = .{};
 var token_prepare_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var token_pair_prepare_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var token_scatter_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var token_reduce_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var fused_dispatches: u32 = 0;
 var apply_host_ns: u64 = 0;
@@ -577,14 +657,22 @@ fn gemmNaxOn() bool {
         const v = std.mem.span(p);
         if (v.len > 0 and v[0] == '1') return false;
     }
+    if (gemm_nax_cached) |v| return v;
     var buf: [128]u8 = undefined;
-    const arch = gpuArch(&buf) orelse return false;
+    const arch = gpuArch(&buf) orelse {
+        gemm_nax_cached = false;
+        return false;
+    };
     var i: usize = 0;
     while (i + 2 < arch.len) : (i += 1) {
         const a = arch[i] | 32;
         const b = arch[i + 1] | 32;
-        if (a == 'g' and b == '1' and arch[i + 2] >= '7' and arch[i + 2] <= '9') return true;
+        if (a == 'g' and b == '1' and arch[i + 2] >= '7' and arch[i + 2] <= '9') {
+            gemm_nax_cached = true;
+            return true;
+        }
     }
+    gemm_nax_cached = false;
     return false;
 }
 
@@ -1473,6 +1561,55 @@ fn tokenReduce(s: mlx.mlx_stream, d: mlx.mlx_array, inv: mlx.mlx_array, scores: 
     return a;
 }
 
+fn pairPrepareFromTokens(s: mlx.mlx_stream, x: mlx.mlx_array, suhg: mlx.mlx_array, suhu: mlx.mlx_array, slots: mlx.mlx_array, order: mlx.mlx_array, in_dim: c_int, nslots: c_int, topk: c_int) !struct { mlx.mlx_array, mlx.mlx_array } {
+    const key = PairPrepKey{ .in_dim = in_dim, .nslots = nslots, .topk = topk };
+    const cfg = token_pair_prep_cfgs.get(key) orelse blk: {
+        const c = mlx.mlx_fast_metal_kernel_config_new();
+        const sh = [_]c_int{ nslots, in_dim };
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &sh, 2, .float16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &sh, 2, .float16));
+        const blocks = @divExact(in_dim, 128);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, 32 * blocks, nslots, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 32, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "IDIM", in_dim));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "TOPK", topk));
+        token_pair_prep_cfgs.put(key, c);
+        break :blk c;
+    };
+    const ins = [_][*:0]const u8{ "x", "suhg", "suhu", "slots", "order" };
+    const outs = [_][*:0]const u8{ "yg", "yu" };
+    const kernel = try getNamedKernel(&token_pair_prepare_kernel, "mlxserve_exl3_token_pair_prepare", &ins, &outs, TOKEN_PAIR_PREPARE_SOURCE, "");
+    const ov = try applyOuts(s, kernel, &.{ x, suhg, suhu, slots, order }, cfg, 2);
+    defer _ = mlx.mlx_vector_array_free(ov);
+    var a = mlx.mlx_array_new();
+    var b = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&a, ov, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&b, ov, 1));
+    return .{ a, b };
+}
+
+fn scatterSorted(s: mlx.mlx_stream, x: mlx.mlx_array, order: mlx.mlx_array, dim: c_int, nslots: c_int) !mlx.mlx_array {
+    const key = ScatterKey{ .dim = dim, .nslots = nslots };
+    const cfg = token_scatter_cfgs.get(key) orelse blk: {
+        const c = mlx.mlx_fast_metal_kernel_config_new();
+        const sh = [_]c_int{ nslots, dim };
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &sh, 2, .float16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, dim, nslots, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 32, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "DIM", dim));
+        token_scatter_cfgs.put(key, c);
+        break :blk c;
+    };
+    const ins = [_][*:0]const u8{ "x", "order" };
+    const outs = [_][*:0]const u8{"y"};
+    const kernel = try getNamedKernel(&token_scatter_kernel, "mlxserve_exl3_token_scatter", &ins, &outs, TOKEN_SCATTER_SOURCE, "");
+    const ov = try applyOuts(s, kernel, &.{ x, order }, cfg, 1);
+    defer _ = mlx.mlx_vector_array_free(ov);
+    var a = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&a, ov, 0));
+    return a;
+}
+
 pub fn moeSwigluFused(
     s: mlx.mlx_stream,
     x: mlx.mlx_array,
@@ -1665,52 +1802,33 @@ pub fn moePrefill(
     var order = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(order);
     try mlx.check(mlx.mlx_argsort_axis(&order, slots, 0, s));
-    var order_u = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(order_u);
-    try mlx.check(mlx.mlx_astype(&order_u, order, .uint32, s));
+    var order_i = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(order_i);
+    try mlx.check(mlx.mlx_astype(&order_i, order, .int32, s));
     var sorted_slots = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(sorted_slots);
     try mlx.check(mlx.mlx_take_axis(&sorted_slots, slots, order, 0, s));
     try ubenchEval(sorted_slots, "sort");
-    const g_prep = try prepareFromTokens(s, x, gate_suh, sorted_slots, order_u, hidden, nslots, topk);
-    defer _ = mlx.mlx_array_free(g_prep);
-    const u_prep = try prepareFromTokens(s, x, up_suh, sorted_slots, order_u, hidden, nslots, topk);
-    defer _ = mlx.mlx_array_free(u_prep);
-    try ubenchEval(g_prep, "token_prepare");
-    if (exl3UbenchOn()) try mlx.check(mlx.mlx_array_eval(u_prep));
-    const g_inner = try innerGemmSorted(s, g_prep, gate_t, sorted_slots);
+    const prep = try pairPrepareFromTokens(s, x, gate_suh, up_suh, sorted_slots, order_i, hidden, nslots, topk);
+    defer _ = mlx.mlx_array_free(prep[0]);
+    defer _ = mlx.mlx_array_free(prep[1]);
+    try ubenchEval(prep[0], "token_prepare");
+    if (exl3UbenchOn()) try mlx.check(mlx.mlx_array_eval(prep[1]));
+    const g_inner = try innerGemmSorted(s, prep[0], gate_t, sorted_slots);
     defer _ = mlx.mlx_array_free(g_inner);
     try ubenchEval(g_inner, "gemm_gate");
-    const u_inner = try innerGemmSorted(s, u_prep, up_t, sorted_slots);
+    const u_inner = try innerGemmSorted(s, prep[1], up_t, sorted_slots);
     defer _ = mlx.mlx_array_free(u_inner);
     try ubenchEval(u_inner, "gemm_up");
-    const g = try finishIndexed(s, g_inner, gate_svh, sorted_slots);
-    defer _ = mlx.mlx_array_free(g);
-    const u = try finishIndexed(s, u_inner, up_svh, sorted_slots);
-    defer _ = mlx.mlx_array_free(u);
-    if (exl3UbenchOn()) {
-        try mlx.check(mlx.mlx_array_eval(g));
-        try mlx.check(mlx.mlx_array_eval(u));
-    }
-    var sig = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sig);
-    try mlx.check(mlx.mlx_sigmoid(&sig, g, s));
-    var silu = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(silu);
-    try mlx.check(mlx.mlx_multiply(&silu, g, sig, s));
-    var h = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(h);
-    try mlx.check(mlx.mlx_multiply(&h, silu, u, s));
-    const d_sorted = try projectSortedWithRuns(s, h, down_t, down_suh, down_svh, sorted_slots);
-    defer _ = mlx.mlx_array_free(d_sorted);
-    try ubenchEval(d_sorted, "gemm_down");
-    var inv = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(inv);
-    try mlx.check(mlx.mlx_argsort_axis(&inv, order, 0, s));
-    var inv_u = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(inv_u);
-    try mlx.check(mlx.mlx_astype(&inv_u, inv, .uint32, s));
-    const out = try tokenReduce(s, d_sorted, inv_u, scores, hidden, rows, topk);
+    const down_x = try midSwigluPrep(s, g_inner, u_inner, gate_svh, up_svh, down_suh, sorted_slots, mlx.getShape(g_inner)[1], nslots);
+    defer _ = mlx.mlx_array_free(down_x);
+    try ubenchEval(down_x, "mid");
+    const d_inner = try innerGemmSorted(s, down_x, down_t, sorted_slots);
+    defer _ = mlx.mlx_array_free(d_inner);
+    try ubenchEval(d_inner, "gemm_down");
+    const d_unsorted = try scatterSorted(s, d_inner, order_i, hidden, nslots);
+    defer _ = mlx.mlx_array_free(d_unsorted);
+    const out = try downFinishReduce(s, d_unsorted, down_svh, slots, scores, hidden, rows, topk);
     try ubenchEval(out, "token_reduce");
     return out;
 }
@@ -2753,6 +2871,125 @@ test "exl3 sorted GEMM 16-row windows match 4-row per row" {
         const b4: u16 = @bitCast(a4[j]);
         const b16: u16 = @bitCast(a16[j]);
         try t.expectEqual(b4, b16);
+    }
+}
+
+test "exl3 moePrefill matches staged sorted chain" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    const fixture = @embedFile("fixtures/exl3_k4_linear.safetensors");
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const header_len = std.mem.readInt(u64, fixture[0..8], .little);
+    const header = fixture[8 .. 8 + header_len];
+    const data = fixture[8 + header_len ..];
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, header, .{});
+    defer parsed.deinit();
+    const trellis_meta = parsed.value.object.get("trellis").?.object;
+    const t0: usize = @intCast(trellis_meta.get("data_offsets").?.array.items[0].integer);
+    const t1: usize = @intCast(trellis_meta.get("data_offsets").?.array.items[1].integer);
+    const suh_meta = parsed.value.object.get("suh").?.object;
+    const s0: usize = @intCast(suh_meta.get("data_offsets").?.array.items[0].integer);
+    const s1: usize = @intCast(suh_meta.get("data_offsets").?.array.items[1].integer);
+    const svh_meta = parsed.value.object.get("svh").?.object;
+    const v0: usize = @intCast(svh_meta.get("data_offsets").?.array.items[0].integer);
+    const v1: usize = @intCast(svh_meta.get("data_offsets").?.array.items[1].integer);
+    const trellis_bits = std.mem.bytesAsSlice(u16, data[t0..t1]);
+    const suh_bits = std.mem.bytesAsSlice(u16, data[s0..s1]);
+    const svh_bits = std.mem.bytesAsSlice(u16, data[v0..v1]);
+    const E: c_int = 4;
+    const R: c_int = 8;
+    const topk: c_int = 2;
+    const dim: c_int = 128;
+    const stacked_t = try alloc.alloc(u16, @intCast(E * 8 * 8 * 64));
+    const stacked_suh = try alloc.alloc(u16, @intCast(E * dim));
+    const stacked_svh = try alloc.alloc(u16, @intCast(E * dim));
+    var e_i: c_int = 0;
+    while (e_i < E) : (e_i += 1) {
+        const tb: usize = @intCast(e_i);
+        @memcpy(stacked_t[tb * trellis_bits.len ..][0..trellis_bits.len], trellis_bits);
+        @memcpy(stacked_suh[tb * suh_bits.len ..][0..suh_bits.len], suh_bits);
+        @memcpy(stacked_svh[tb * svh_bits.len ..][0..svh_bits.len], svh_bits);
+    }
+    var prng = std.Random.DefaultPrng.init(71);
+    const rnd = prng.random();
+    const xh = try alloc.alloc(u16, @intCast(R * dim));
+    for (xh) |*v| v.* = exl3.f32ToF16Bits(rnd.float(f32) * 2 - 1);
+    const slots_h = try alloc.alloc(u32, @intCast(R * topk));
+    for (slots_h) |*v| v.* = rnd.uintLessThan(u32, @intCast(E));
+    const scores_h = try alloc.alloc(f32, @intCast(R * topk));
+    for (scores_h) |*v| v.* = 0.25 + rnd.float(f32) * 0.5;
+    const x_arr = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ R, dim }, 2, .float16);
+    defer _ = mlx.mlx_array_free(x_arr);
+    const slots = mlx.mlx_array_new_data(slots_h.ptr, &[_]c_int{R * topk}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(slots);
+    const scores = mlx.mlx_array_new_data(scores_h.ptr, &[_]c_int{R * topk}, 1, .float32);
+    defer _ = mlx.mlx_array_free(scores);
+    const tr = mlx.mlx_array_new_data(stacked_t.ptr, &[_]c_int{ E, 8, 8, 64 }, 4, .uint16);
+    defer _ = mlx.mlx_array_free(tr);
+    const suh = mlx.mlx_array_new_data(stacked_suh.ptr, &[_]c_int{ E, dim }, 2, .float16);
+    defer _ = mlx.mlx_array_free(suh);
+    const svh = mlx.mlx_array_new_data(stacked_svh.ptr, &[_]c_int{ E, dim }, 2, .float16);
+    defer _ = mlx.mlx_array_free(svh);
+    const got = try moePrefill(s, x_arr, tr, suh, svh, tr, suh, svh, tr, suh, svh, slots, scores, topk);
+    defer _ = mlx.mlx_array_free(got);
+    var order = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(order);
+    try mlx.check(mlx.mlx_argsort_axis(&order, slots, 0, s));
+    var order_u = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(order_u);
+    try mlx.check(mlx.mlx_astype(&order_u, order, .uint32, s));
+    var sorted_slots = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sorted_slots);
+    try mlx.check(mlx.mlx_take_axis(&sorted_slots, slots, order, 0, s));
+    const g_prep = try prepareFromTokens(s, x_arr, suh, sorted_slots, order_u, dim, R * topk, topk);
+    defer _ = mlx.mlx_array_free(g_prep);
+    const u_prep = try prepareFromTokens(s, x_arr, suh, sorted_slots, order_u, dim, R * topk, topk);
+    defer _ = mlx.mlx_array_free(u_prep);
+    const g_inner = try innerGemmSorted(s, g_prep, tr, sorted_slots);
+    defer _ = mlx.mlx_array_free(g_inner);
+    const u_inner = try innerGemmSorted(s, u_prep, tr, sorted_slots);
+    defer _ = mlx.mlx_array_free(u_inner);
+    const g = try finishIndexed(s, g_inner, svh, sorted_slots);
+    defer _ = mlx.mlx_array_free(g);
+    const u = try finishIndexed(s, u_inner, svh, sorted_slots);
+    defer _ = mlx.mlx_array_free(u);
+    var sig = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sig);
+    try mlx.check(mlx.mlx_sigmoid(&sig, g, s));
+    var silu = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(silu);
+    try mlx.check(mlx.mlx_multiply(&silu, g, sig, s));
+    var h = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(h);
+    try mlx.check(mlx.mlx_multiply(&h, silu, u, s));
+    const d_sorted = try projectSortedWithRuns(s, h, tr, suh, svh, sorted_slots);
+    defer _ = mlx.mlx_array_free(d_sorted);
+    var inv = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(inv);
+    try mlx.check(mlx.mlx_argsort_axis(&inv, order, 0, s));
+    var inv_u = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(inv_u);
+    try mlx.check(mlx.mlx_astype(&inv_u, inv, .uint32, s));
+    const ref = try tokenReduce(s, d_sorted, inv_u, scores, dim, R, topk);
+    defer _ = mlx.mlx_array_free(ref);
+    var cg = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cg);
+    var cr = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cr);
+    try mlx.check(mlx.mlx_contiguous(&cg, got, false, s));
+    try mlx.check(mlx.mlx_contiguous(&cr, ref, false, s));
+    try mlx.check(mlx.mlx_array_eval(cg));
+    try mlx.check(mlx.mlx_array_eval(cr));
+    const ag = mlx.mlx_array_data_float16(cg) orelse return error.F16Unreadable;
+    const ar = mlx.mlx_array_data_float16(cr) orelse return error.F16Unreadable;
+    const n: usize = @intCast(R * dim);
+    for (0..n) |j| {
+        const bg: u16 = @bitCast(ag[j]);
+        const br: u16 = @bitCast(ar[j]);
+        try t.expectEqual(br, bg);
     }
 }
 
