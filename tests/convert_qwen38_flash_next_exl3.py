@@ -103,6 +103,23 @@ def plan_pack(pack_index: dict) -> dict:
     }
 
 
+def diag_hessian(v: np.ndarray) -> np.ndarray:
+    vec = np.asarray(v, dtype=np.float32).reshape(-1)
+    return np.diag(vec)
+
+
+def imatrix_expert_vector(flat: np.ndarray, expert: int, dim: int) -> np.ndarray:
+    arr = np.asarray(flat, dtype=np.float32).reshape(-1)
+    start = expert * dim
+    return arr[start : start + dim].copy()
+
+
+def calib_for_expert(routed_tokens: int, moments: np.ndarray) -> tuple[str, np.ndarray | None]:
+    if routed_tokens <= 0:
+        return "ldlq-gaussian-256", None
+    return "imatrix-diagonal", np.asarray(moments, dtype=np.float32).reshape(-1)
+
+
 def _ensure_lib() -> None:
     lib = os.environ.get("EXL3_CONVERT_LIB", "/Users/beam/llm/ponyexl3")
     if lib not in sys.path:
@@ -137,11 +154,17 @@ def _quantize_public(
     if calibration is None:
         rng = np.random.default_rng(seed + 17)
         acts = rng.standard_normal((256, rows), dtype=np.float32)
+        hessian = capture_hessian(acts)
+    elif calibration.ndim == 1:
+        if calibration.shape[0] != rows:
+            raise ValueError(f"calibration features {calibration.shape[0]} != {rows}")
+        hessian = diag_hessian(calibration)
     else:
         acts = np.asarray(calibration, dtype=np.float32)
         if acts.shape[1] != rows:
             raise ValueError(f"calibration features {acts.shape[1]} != {rows}")
-    prepared = prepare_hessian_for_ldl(capture_hessian(acts))
+        hessian = capture_hessian(acts)
+    prepared = prepare_hessian_for_ldl(hessian)
     ldl = block_ldl(prepared.hessian)
     result = ldlq_inner_matrix(
         reg.inner,
@@ -164,13 +187,28 @@ def _stack_experts(
     quantizer: str,
     calibration: np.ndarray | None,
     seed: int,
+    routed_rows: np.ndarray | None = None,
+    imatrix_flat: np.ndarray | None = None,
+    zero_routed: list | None = None,
+    layer_key: str = "",
 ) -> dict[str, tuple[str, tuple[int, ...], bytes]]:
     e, out_dim, in_dim = bank.shape
     trellis_list, suh_list, svh_list = [], [], []
     for ei in range(e):
         public = np.ascontiguousarray(bank[ei].T)
+        cal = calibration
+        if imatrix_flat is not None:
+            moments = imatrix_expert_vector(imatrix_flat, ei, in_dim)
+            ntok = int(routed_rows[ei]) if routed_rows is not None else 1
+            mode, vec = calib_for_expert(ntok, moments)
+            if mode != "imatrix-diagonal":
+                if zero_routed is not None:
+                    zero_routed.append(f"{layer_key}#{ei}")
+                cal = None
+            else:
+                cal = vec
         packed, suh, svh = _quantize_public(
-            public, k=k, codebook=codebook, quantizer=quantizer, calibration=calibration, seed=seed + ei
+            public, k=k, codebook=codebook, quantizer=quantizer, calibration=cal, seed=seed + ei
         )
         trellis_list.append(packed)
         suh_list.append(suh)
@@ -195,6 +233,11 @@ def _copy_raw_tensors(src_file: Path, keys: list[str]) -> dict:
     return out
 
 
+def load_imatrix(path: str | Path) -> dict[str, np.ndarray]:
+    from safetensors.numpy import load_file
+    return load_file(str(path))
+
+
 def convert_pack(
     hf_dir: str | Path,
     pack_dir: str | Path,
@@ -204,6 +247,7 @@ def convert_pack(
     k: int = K,
     codebook: str = CODEBOOK,
     calibration: np.ndarray | None = None,
+    imatrix: dict[str, np.ndarray] | None = None,
 ) -> dict:
     hf_dir = Path(hf_dir)
     pack_dir = Path(pack_dir)
@@ -247,6 +291,7 @@ def convert_pack(
             raise RuntimeError(f"keep key {key} pointed at dropped shard {pack_name}")
     expert_out: dict[str, tuple] = {}
     seed = 0
+    zero_routed: list[str] = []
     for hf_key, hf_file in hf_map.items():
         if hf_key.endswith("experts.gate_up_proj"):
             header, data_off = read_header(hf_dir / hf_file)
@@ -258,10 +303,13 @@ def convert_pack(
             half = arr.shape[1] // 2
             gate = np.ascontiguousarray(arr[:, :half])
             up = np.ascontiguousarray(arr[:, half:])
+            gu_flat = None if imatrix is None else imatrix.get(hf_key)
+            gu_rows = None if imatrix is None else imatrix.get(hf_key + ".rows")
             for proj, bank in (("gate", gate), ("up", up)):
                 base = mlx_switch_base(hf_key, proj)
                 stacked = _stack_experts(
-                    bank, k=k, codebook=codebook, quantizer=quantizer, calibration=calibration, seed=seed
+                    bank, k=k, codebook=codebook, quantizer=quantizer, calibration=calibration, seed=seed,
+                    routed_rows=gu_rows, imatrix_flat=gu_flat, zero_routed=zero_routed, layer_key=hf_key + "." + proj,
                 )
                 seed += bank.shape[0]
                 for suffix, triple in stacked.items():
@@ -274,8 +322,12 @@ def convert_pack(
                 arr = bf16_to_f32(arr)
             arr = np.asarray(arr, dtype=np.float32)
             base = mlx_switch_base(hf_key, "down")
+            parent = hf_key.replace("experts.down_proj", "experts.gate_up_proj")
+            dn_flat = None if imatrix is None else imatrix.get(hf_key)
+            gu_rows = None if imatrix is None else imatrix.get(parent + ".rows")
             stacked = _stack_experts(
-                arr, k=k, codebook=codebook, quantizer=quantizer, calibration=calibration, seed=seed
+                arr, k=k, codebook=codebook, quantizer=quantizer, calibration=calibration, seed=seed,
+                routed_rows=gu_rows, imatrix_flat=dn_flat, zero_routed=zero_routed, layer_key=hf_key,
             )
             seed += arr.shape[0]
             for suffix, triple in stacked.items():
@@ -291,19 +343,117 @@ def convert_pack(
         {"metadata": {"total_size": total}, "weight_map": weight_map}, indent=2
     ))
     cfg = json.loads((pack_dir / "config.json").read_text())
+    if imatrix is not None:
+        cal_tag = "imatrix-diagonal"
+    elif calibration is not None:
+        cal_tag = "captured-rows"
+    elif quantizer == "ldlq":
+        cal_tag = "ldlq-gaussian-256"
+    else:
+        cal_tag = "none-direct"
     cfg["expert_quant"] = {
         "format": "exl3",
         "k": int(k),
         "codebook": codebook,
         "mcg_multiplier": MCG_MULT,
         "quantizer": quantizer,
-        "calibration": (
-            "captured-rows" if calibration is not None
-            else ("ldlq-gaussian-256" if quantizer == "ldlq" else "none-direct")
-        ),
+        "calibration": cal_tag,
     }
     (dst / "config.json").write_text(json.dumps(cfg, indent=2))
+    plan["zero_routed"] = zero_routed
+    plan["calibration"] = cal_tag
     return plan
+
+
+class CalibTests(unittest.TestCase):
+    def test_channel_moments_become_a_diagonal_hessian(self):
+        v = np.array([0.5, 2.0, 0.0, 1.25], dtype=np.float32)
+        h = diag_hessian(v)
+        self.assertEqual(h.shape, (4, 4))
+        np.testing.assert_array_equal(np.diag(h), v)
+        self.assertEqual(float(h[0, 1]), 0.0)
+
+    def test_zero_routed_tokens_fall_back_to_gaussian(self):
+        mode, vec = calib_for_expert(0, np.ones(4, dtype=np.float32))
+        self.assertEqual(mode, "ldlq-gaussian-256")
+        self.assertIsNone(vec)
+        mode, vec = calib_for_expert(3, np.array([1.0, 2.0], dtype=np.float32))
+        self.assertEqual(mode, "imatrix-diagonal")
+        np.testing.assert_array_equal(vec, np.array([1.0, 2.0], dtype=np.float32))
+
+    def test_convert_records_imatrix_diagonal_and_zero_routed(self):
+        rng = np.random.default_rng(2)
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            hf, pack, dst = td / "hf", td / "pack", td / "out"
+            hf.mkdir(); pack.mkdir()
+            e, hidden, inter = 2, 128, 128
+            write_safetensors_raw(str(hf / "model.safetensors"), {
+                "model.language_model.layers.0.mlp.experts.gate_up_proj": (
+                    "F32", (e, 2 * inter, hidden), rng.standard_normal((e, 2 * inter, hidden), dtype=np.float32).tobytes()),
+                "model.language_model.layers.0.mlp.experts.down_proj": (
+                    "F32", (e, hidden, inter), rng.standard_normal((e, hidden, inter), dtype=np.float32).tobytes()),
+            })
+            (hf / "config.json").write_text("{}")
+            (hf / "model.safetensors.index.json").write_text(json.dumps({
+                "weight_map": {
+                    "model.language_model.layers.0.mlp.experts.gate_up_proj": "model.safetensors",
+                    "model.language_model.layers.0.mlp.experts.down_proj": "model.safetensors",
+                }
+            }))
+            write_safetensors_raw(str(pack / "model-00001.safetensors"), {
+                "language_model.model.embed_tokens.weight": ("F32", (4,), np.zeros(4, np.float32).tobytes()),
+            })
+            dummy = np.zeros((e, 8), dtype=np.uint32)
+            write_safetensors_raw(str(pack / "model-00002.safetensors"), {
+                "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight": ("U32", dummy.shape, dummy.tobytes()),
+                "language_model.model.layers.0.mlp.switch_mlp.gate_proj.scales": ("F16", (e, 2), np.zeros((e, 2), np.float16).tobytes()),
+                "language_model.model.layers.0.mlp.switch_mlp.gate_proj.biases": ("F16", (e, 2), np.zeros((e, 2), np.float16).tobytes()),
+                "language_model.model.layers.0.mlp.switch_mlp.up_proj.weight": ("U32", dummy.shape, dummy.tobytes()),
+                "language_model.model.layers.0.mlp.switch_mlp.up_proj.scales": ("F16", (e, 2), np.zeros((e, 2), np.float16).tobytes()),
+                "language_model.model.layers.0.mlp.switch_mlp.up_proj.biases": ("F16", (e, 2), np.zeros((e, 2), np.float16).tobytes()),
+            })
+            write_safetensors_raw(str(pack / "model-00003.safetensors"), {
+                "language_model.model.layers.0.mlp.switch_mlp.down_proj.weight": ("U32", dummy.shape, dummy.tobytes()),
+                "language_model.model.layers.0.mlp.switch_mlp.down_proj.scales": ("F16", (e, 2), np.zeros((e, 2), np.float16).tobytes()),
+                "language_model.model.layers.0.mlp.switch_mlp.down_proj.biases": ("F16", (e, 2), np.zeros((e, 2), np.float16).tobytes()),
+                "language_model.model.layers.0.mlp.gate.weight": ("F32", (e, hidden), np.zeros((e, hidden), np.float32).tobytes()),
+            })
+            (pack / "model.safetensors.index.json").write_text(json.dumps({
+                "metadata": {"total_size": 1},
+                "weight_map": {
+                    "language_model.model.embed_tokens.weight": "model-00001.safetensors",
+                    "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight": "model-00002.safetensors",
+                    "language_model.model.layers.0.mlp.switch_mlp.gate_proj.scales": "model-00002.safetensors",
+                    "language_model.model.layers.0.mlp.switch_mlp.gate_proj.biases": "model-00002.safetensors",
+                    "language_model.model.layers.0.mlp.switch_mlp.up_proj.weight": "model-00002.safetensors",
+                    "language_model.model.layers.0.mlp.switch_mlp.up_proj.scales": "model-00002.safetensors",
+                    "language_model.model.layers.0.mlp.switch_mlp.up_proj.biases": "model-00002.safetensors",
+                    "language_model.model.layers.0.mlp.switch_mlp.down_proj.weight": "model-00003.safetensors",
+                    "language_model.model.layers.0.mlp.switch_mlp.down_proj.scales": "model-00003.safetensors",
+                    "language_model.model.layers.0.mlp.switch_mlp.down_proj.biases": "model-00003.safetensors",
+                    "language_model.model.layers.0.mlp.gate.weight": "model-00003.safetensors",
+                },
+            }))
+            (pack / "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
+            (pack / "tokenizer.json").write_text("{}")
+            imat = {
+                "model.language_model.layers.0.mlp.experts.gate_up_proj": np.ones(e * hidden, dtype=np.float32),
+                "model.language_model.layers.0.mlp.experts.down_proj": np.ones(e * inter, dtype=np.float32),
+                "model.language_model.layers.0.mlp.experts.gate_up_proj.rows": np.array([4.0, 0.0], dtype=np.float32),
+            }
+            plan = convert_pack(hf, pack, dst, quantizer="direct", imatrix=imat)
+            cfg = json.loads((dst / "config.json").read_text())
+            self.assertEqual(cfg["expert_quant"]["calibration"], "imatrix-diagonal")
+            self.assertEqual(plan["calibration"], "imatrix-diagonal")
+            self.assertTrue(any("#1" in z for z in plan["zero_routed"]))
+
+    def test_gate_up_and_down_split_the_concatenated_imatrix(self):
+        e, h, i = 2, 4, 8
+        gu = np.arange(e * h, dtype=np.float32)
+        dn = np.arange(e * i, dtype=np.float32) + 10
+        self.assertEqual(tuple(imatrix_expert_vector(gu, 1, h)), (4.0, 5.0, 6.0, 7.0))
+        self.assertEqual(tuple(imatrix_expert_vector(dn, 0, i)), tuple(np.arange(8, dtype=np.float32) + 10))
 
 
 class PlanTests(unittest.TestCase):
@@ -477,6 +627,7 @@ def main():
     ap.add_argument("--dst", default=None)
     ap.add_argument("--quantizer", default="ldlq", choices=("ldlq", "direct"))
     ap.add_argument("--calibration", default=None)
+    ap.add_argument("--imatrix", default=None)
     args = ap.parse_args()
     if args.self_test:
         suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
@@ -487,7 +638,10 @@ def main():
     cal = None
     if args.calibration:
         cal = np.load(os.path.expanduser(args.calibration))
-    convert_pack(args.hf, args.pack, args.dst, quantizer=args.quantizer, calibration=cal)
+    imat = None
+    if args.imatrix:
+        imat = load_imatrix(os.path.expanduser(args.imatrix))
+    convert_pack(args.hf, args.pack, args.dst, quantizer=args.quantizer, calibration=cal, imatrix=imat)
     return 0
 
 

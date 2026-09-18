@@ -1498,6 +1498,17 @@ test "expert stream cache plan uses decimal gigabytes and reserves full workspac
     try t.expectEqual(@as(u64, 8 * 64 * 1024 * 1024), p.bounce_bytes);
 }
 
+test "exl3 expert bytes at production geometry" {
+    const t = std.testing;
+    const b = try exl3ExpertBytes(.{ .layers = 48, .experts = 512, .hidden = 2560, .intermediate = 640 });
+    const h: u64 = 2560;
+    const i: u64 = 640;
+    const tile: u64 = 64;
+    const gate_up = (h / 16) * (i / 16) * tile * 2 + h * 2 + i * 2;
+    const down = (i / 16) * (h / 16) * tile * 2 + i * 2 + h * 2;
+    try t.expectEqual(gate_up * 2 + down, b);
+}
+
 test "expert stream refuses MTP by name, at load and at request parse" {
     const t = std.testing;
     try t.expect(mtpRefusal(false, true) == null);

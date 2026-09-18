@@ -3,6 +3,12 @@ const mlx = @import("mlx.zig");
 const log = @import("log.zig");
 const exl3 = @import("expert_exl3.zig");
 
+pub const DECODE_ROWS_MAX: usize = 16;
+
+pub fn usesPrefillArm(rows: usize) bool {
+    return rows > DECODE_ROWS_MAX;
+}
+
 const GEMV_SOURCE: [:0]const u8 =
     \\uint gid = uint(thread_position_in_grid.x);
     \\if (gid >= uint(ODIM)) return;
@@ -409,6 +415,142 @@ pub fn moeSwigluIndexed(
     return out;
 }
 
+fn repeatRows(s: mlx.mlx_stream, x: mlx.mlx_array, rows: c_int, topk: c_int) !mlx.mlx_array {
+    var ar = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ar);
+    try mlx.check(mlx.mlx_arange(&ar, 0, @floatFromInt(rows), 1, .int32, s));
+    var col = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(col);
+    try mlx.check(mlx.mlx_reshape(&col, ar, &[_]c_int{ rows, 1 }, 2, s));
+    var wide = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wide);
+    const shape = [_]c_int{ rows, topk };
+    try mlx.check(mlx.mlx_broadcast_to(&wide, col, &shape, 2, s));
+    var idx = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(idx);
+    try mlx.check(mlx.mlx_reshape(&idx, wide, &[_]c_int{ rows * topk }, 1, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_take_axis(&out, x, idx, 0, s));
+    return out;
+}
+
+pub fn moePrefill(
+    s: mlx.mlx_stream,
+    x: mlx.mlx_array,
+    gate_t: mlx.mlx_array,
+    gate_suh: mlx.mlx_array,
+    gate_svh: mlx.mlx_array,
+    up_t: mlx.mlx_array,
+    up_suh: mlx.mlx_array,
+    up_svh: mlx.mlx_array,
+    down_t: mlx.mlx_array,
+    down_suh: mlx.mlx_array,
+    down_svh: mlx.mlx_array,
+    slots: mlx.mlx_array,
+    scores: mlx.mlx_array,
+    topk: c_int,
+) !mlx.mlx_array {
+    const xsh = mlx.getShape(x);
+    const rows = xsh[0];
+    const hidden = xsh[1];
+    const xrep = try repeatRows(s, x, rows, topk);
+    defer _ = mlx.mlx_array_free(xrep);
+    const g = try projectIndexed(s, xrep, gate_t, gate_suh, gate_svh, slots);
+    defer _ = mlx.mlx_array_free(g);
+    const u = try projectIndexed(s, xrep, up_t, up_suh, up_svh, slots);
+    defer _ = mlx.mlx_array_free(u);
+    var sig = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sig);
+    try mlx.check(mlx.mlx_sigmoid(&sig, g, s));
+    var silu = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(silu);
+    try mlx.check(mlx.mlx_multiply(&silu, g, sig, s));
+    var h = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(h);
+    try mlx.check(mlx.mlx_multiply(&h, silu, u, s));
+    const d = try projectIndexed(s, h, down_t, down_suh, down_svh, slots);
+    defer _ = mlx.mlx_array_free(d);
+    var sc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc);
+    try mlx.check(mlx.mlx_astype(&sc, scores, .float16, s));
+    var sc3 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc3);
+    try mlx.check(mlx.mlx_reshape(&sc3, sc, &[_]c_int{ rows, topk, 1 }, 3, s));
+    var d3 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(d3);
+    try mlx.check(mlx.mlx_reshape(&d3, d, &[_]c_int{ rows, topk, hidden }, 3, s));
+    var weighted = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(weighted);
+    try mlx.check(mlx.mlx_multiply(&weighted, d3, sc3, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_sum_axis(&out, weighted, 1, false, s));
+    return out;
+}
+
+pub fn prefillDecodeGatherMm(
+    s: mlx.mlx_stream,
+    x: mlx.mlx_array,
+    gate_pub: mlx.mlx_array,
+    up_pub: mlx.mlx_array,
+    down_pub: mlx.mlx_array,
+    slots: mlx.mlx_array,
+    scores: mlx.mlx_array,
+    rows: c_int,
+    hidden: c_int,
+    inter: c_int,
+    topk: c_int,
+) !mlx.mlx_array {
+    const no_idx = mlx.mlx_array{ .ctx = null };
+    var x4 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x4);
+    try mlx.check(mlx.mlx_reshape(&x4, x, &[_]c_int{ rows, 1, 1, hidden }, 4, s));
+    var g4 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(g4);
+    try mlx.check(mlx.mlx_gather_mm(&g4, x4, gate_pub, no_idx, slots, false, s));
+    var up4 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(up4);
+    try mlx.check(mlx.mlx_gather_mm(&up4, x4, up_pub, no_idx, slots, false, s));
+    var g = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(g);
+    try mlx.check(mlx.mlx_squeeze(&g, g4, s));
+    var u = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(u);
+    try mlx.check(mlx.mlx_squeeze(&u, up4, s));
+    var sig = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sig);
+    try mlx.check(mlx.mlx_sigmoid(&sig, g, s));
+    var silu = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(silu);
+    try mlx.check(mlx.mlx_multiply(&silu, g, sig, s));
+    var h = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(h);
+    try mlx.check(mlx.mlx_multiply(&h, silu, u, s));
+    var h4 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(h4);
+    try mlx.check(mlx.mlx_reshape(&h4, h, &[_]c_int{ rows, topk, 1, inter }, 4, s));
+    var d4 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(d4);
+    try mlx.check(mlx.mlx_gather_mm(&d4, h4, down_pub, no_idx, slots, false, s));
+    var d = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(d);
+    try mlx.check(mlx.mlx_squeeze(&d, d4, s));
+    var sc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc);
+    try mlx.check(mlx.mlx_astype(&sc, scores, mlx.mlx_array_dtype(d), s));
+    var sc3 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc3);
+    try mlx.check(mlx.mlx_reshape(&sc3, sc, &[_]c_int{ rows, topk, 1 }, 3, s));
+    var weighted = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(weighted);
+    try mlx.check(mlx.mlx_multiply(&weighted, d, sc3, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_sum_axis(&out, weighted, 1, false, s));
+    return out;
+}
+
 pub fn innerGemvF16(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array) !mlx.mlx_array {
     const xsh = mlx.getShape(x);
     const tsh = mlx.getShape(trellis);
@@ -539,4 +681,101 @@ test "exl3 K4 Metal inner GEMV matches the host tile decode" {
         const bits: u16 = @bitCast(src[i]);
         try t.expectEqual(exl3.f32ToF16Bits(host[i]), bits);
     }
+}
+
+test "exl3 prefill arm is used only above 16 rows" {
+    const t = std.testing;
+    try t.expect(!usesPrefillArm(1));
+    try t.expect(!usesPrefillArm(2));
+    try t.expect(!usesPrefillArm(16));
+    try t.expect(usesPrefillArm(17));
+    try t.expect(usesPrefillArm(512));
+}
+
+test "exl3 512-row prefill: decode-to-f16 gather_mm vs rows kernel" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    const fixture = @embedFile("fixtures/exl3_k4_linear.safetensors");
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const header_len = std.mem.readInt(u64, fixture[0..8], .little);
+    const header = fixture[8 .. 8 + header_len];
+    const data = fixture[8 + header_len ..];
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, header, .{});
+    defer parsed.deinit();
+    const trellis_meta = parsed.value.object.get("trellis").?.object;
+    const suh_meta = parsed.value.object.get("suh").?.object;
+    const svh_meta = parsed.value.object.get("svh").?.object;
+    const pub_meta = parsed.value.object.get("public").?.object;
+    const t0: usize = @intCast(trellis_meta.get("data_offsets").?.array.items[0].integer);
+    const t1: usize = @intCast(trellis_meta.get("data_offsets").?.array.items[1].integer);
+    const s0: usize = @intCast(suh_meta.get("data_offsets").?.array.items[0].integer);
+    const s1: usize = @intCast(suh_meta.get("data_offsets").?.array.items[1].integer);
+    const v0: usize = @intCast(svh_meta.get("data_offsets").?.array.items[0].integer);
+    const v1: usize = @intCast(svh_meta.get("data_offsets").?.array.items[1].integer);
+    const p0: usize = @intCast(pub_meta.get("data_offsets").?.array.items[0].integer);
+    const p1: usize = @intCast(pub_meta.get("data_offsets").?.array.items[1].integer);
+    const trellis_bits = std.mem.bytesAsSlice(u16, data[t0..t1]);
+    const suh_bits = std.mem.bytesAsSlice(u16, data[s0..s1]);
+    const svh_bits = std.mem.bytesAsSlice(u16, data[v0..v1]);
+    const pub_bits = std.mem.bytesAsSlice(u16, data[p0..p1]);
+    const E: c_int = 4;
+    const R: c_int = 512;
+    const topk: c_int = 2;
+    const dim: c_int = 128;
+    const stacked_t = try alloc.alloc(u16, @intCast(E * 8 * 8 * 64));
+    const stacked_suh = try alloc.alloc(u16, @intCast(E * dim));
+    const stacked_svh = try alloc.alloc(u16, @intCast(E * dim));
+    const stacked_pub = try alloc.alloc(u16, @intCast(E * dim * dim));
+    var e_i: c_int = 0;
+    while (e_i < E) : (e_i += 1) {
+        const tb: usize = @intCast(e_i);
+        @memcpy(stacked_t[tb * trellis_bits.len ..][0..trellis_bits.len], trellis_bits);
+        @memcpy(stacked_suh[tb * suh_bits.len ..][0..suh_bits.len], suh_bits);
+        @memcpy(stacked_svh[tb * svh_bits.len ..][0..svh_bits.len], svh_bits);
+        @memcpy(stacked_pub[tb * pub_bits.len ..][0..pub_bits.len], pub_bits);
+    }
+    var prng = std.Random.DefaultPrng.init(3);
+    const rnd = prng.random();
+    const xh = try alloc.alloc(u16, @intCast(R * dim));
+    for (xh) |*v| v.* = exl3.f32ToF16Bits(rnd.float(f32) * 2 - 1);
+    const slots_h = try alloc.alloc(u32, @intCast(R * topk));
+    for (slots_h) |*v| v.* = rnd.uintLessThan(u32, @intCast(E));
+    const scores_h = try alloc.alloc(f32, @intCast(R * topk));
+    for (scores_h) |*v| v.* = 0.5;
+    const x_arr = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ R, dim }, 2, .float16);
+    defer _ = mlx.mlx_array_free(x_arr);
+    const slots = mlx.mlx_array_new_data(slots_h.ptr, &[_]c_int{ R * topk }, 1, .uint32);
+    defer _ = mlx.mlx_array_free(slots);
+    const slots2 = mlx.mlx_array_new_data(slots_h.ptr, &[_]c_int{ R, topk }, 2, .uint32);
+    defer _ = mlx.mlx_array_free(slots2);
+    const scores = mlx.mlx_array_new_data(scores_h.ptr, &[_]c_int{ R * topk }, 1, .float32);
+    defer _ = mlx.mlx_array_free(scores);
+    const tr = mlx.mlx_array_new_data(stacked_t.ptr, &[_]c_int{ E, 8, 8, 64 }, 4, .uint16);
+    defer _ = mlx.mlx_array_free(tr);
+    const suh = mlx.mlx_array_new_data(stacked_suh.ptr, &[_]c_int{ E, dim }, 2, .float16);
+    defer _ = mlx.mlx_array_free(suh);
+    const svh = mlx.mlx_array_new_data(stacked_svh.ptr, &[_]c_int{ E, dim }, 2, .float16);
+    defer _ = mlx.mlx_array_free(svh);
+    const pub_a = mlx.mlx_array_new_data(stacked_pub.ptr, &[_]c_int{ E, dim, dim }, 3, .float16);
+    defer _ = mlx.mlx_array_free(pub_a);
+    const io_util = @import("io_util.zig");
+    var t_rows = io_util.Stopwatch.init(t.io);
+    const rows_out = try moePrefill(s, x_arr, tr, suh, svh, tr, suh, svh, tr, suh, svh, slots, scores, topk);
+    try mlx.check(mlx.mlx_array_eval(rows_out));
+    const rows_ns = t_rows.read();
+    _ = mlx.mlx_array_free(rows_out);
+    var t_mm = io_util.Stopwatch.init(t.io);
+    const mm_out = try prefillDecodeGatherMm(s, x_arr, pub_a, pub_a, pub_a, slots2, scores, R, dim, dim, topk);
+    try mlx.check(mlx.mlx_array_eval(mm_out));
+    const mm_ns = t_mm.read();
+    _ = mlx.mlx_array_free(mm_out);
+    std.debug.print("exl3 512-row synthetic E=4 H=128 topk=2: rows-kernel {d} ms  decode+gather_mm {d} ms\n", .{
+        rows_ns / 1_000_000,
+        mm_ns / 1_000_000,
+    });
+    try t.expect(rows_ns > 0);
+    try t.expect(mm_ns > 0);
 }

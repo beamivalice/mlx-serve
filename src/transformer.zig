@@ -28659,6 +28659,8 @@ pub const Transformer = struct {
         var slots_u = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(slots_u);
         try mlx.check(mlx.mlx_astype(&slots_u, slots, .uint32, self.s));
+        const rows: usize = @intCast(B * S);
+        if (rows <= expert_exl3_kernels.DECODE_ROWS_MAX) {
         if (B * S == 1) {
             var x1 = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(x1);
@@ -28738,6 +28740,28 @@ pub const Transformer = struct {
         errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_reshape(&out, acc, xsh.ptr, @intCast(xsh.len), self.s));
         _ = mlx.mlx_array_free(acc);
+        return out;
+        }
+        const y = try expert_exl3_kernels.moePrefill(
+            self.s,
+            x2,
+            mw.switch_gate_w,
+            mw.switch_gate_s,
+            mw.switch_gate_b,
+            mw.switch_up_w,
+            mw.switch_up_s,
+            mw.switch_up_b,
+            mw.switch_down_w,
+            mw.switch_down_s,
+            mw.switch_down_b,
+            slots_u,
+            sc,
+            K,
+        );
+        var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_reshape(&out, y, xsh.ptr, @intCast(xsh.len), self.s));
+        _ = mlx.mlx_array_free(y);
         return out;
     }
 

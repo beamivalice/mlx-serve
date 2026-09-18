@@ -4,41 +4,39 @@ Status: converter, loader, host decoder, and Metal inner/indexed GEMV are in tre
 
 ## Format (phase 0)
 
-K=4 trellis: each 16×16 tile stores 256 weights at 4 bits each = 1024 bits = 64 uint16 = 32 uint32. Packing writes K fresh bits per weight into 16 spans of 16 values, then SWAP16 per uint32. Unpack recovers 16-bit sliding windows (`bitshift` trellis): for thread t in 0..127 a (K+16)-bit funnel from two u32 words yields codewords `cw[2t]`, `cw[2t+1]`. Packed last dim is `256*K/16 = 64`.
+Trellis packing at K=4: a tile is 16×16 = 256 weights. Each weight contributes **4 bits**, so the tile is 1024 bits = **64 uint16** = **32 uint32**. Pack walks 16 spans of 16 values, stuffing the low-K bits of each codeword from the top of a 32-bit buffer; whenever fewer than 16 bits remain it emits the high halfword. After the spans, the uint32 view is SWAP16 (`(w<<16)|(w>>16)`). Unpack is the inverse bitshift trellis: for thread t in 0..127 a (K+16)-bit funnel from two u32 words (wrapped mod 32) yields 16-bit sliding windows `cw[2t]`, `cw[2t+1]`. Last dim is always `256*K/16 = 64`.
 
-Codebook: MCG. `mixed = codeword * 0xCBAC1FED`; `pair = 0x3B603B60 ^ (mixed & 0x8FFF8FFF)`; the two packed f16 lanes add in f32 and round back to f16. MUL1 is implemented on the host (`0x83DCD12D` + byte-sum + `0x1EEE`/`0xC931` fma) but this pack does not use it. MCG is the codebook the Metal kernels and the 4.00bpw expert conversions actually ship.
+Codebook: **MCG**, not MUL1. `mixed = (codeword & 0xFFFF) * 0xCBAC1FED`; `pair = 0x3B603B60 ^ (mixed & 0x8FFF8FFF)`; the two packed f16 lanes are added in f32 and rounded back to f16. Why MCG: it is the codebook every 4.00bpw expert conversion of this family ships (`mcg_multiplier = 3417055213`); MUL1 (`* 0x83DCD12D`, byte-sum, then `0x1EEE`/`0xC931`) is a different reconstruction and is not required. The host implements MUL1 only as a decoder twin.
 
-suh/svh: f16 vectors of length in_features / out_features. Encode folds the codebook scale (~1.2437) and per-row/col RMS into these vectors, plus random signs. Decode applies:
+suh / svh: f16 vectors, length `in_features` and `out_features`. There is **no separate per-tensor scalar**; the encode-time codebook scale `1.24371088` is folded into suh by `regularize_public_weight`. Decode:
 
-1. `x' = H128(suh ⊙ round16(x))` (round16 after the transform)
-2. inner GEMV against the decoded 16×16 tiles in row-major (tensor-core perm inverted)
-3. `y = round16(svh ⊙ H128(inner))`
+1. `x' = round16( H128( suh ⊙ round16(x) ) )`  — left / input axis
+2. inner GEMV against 16×16 tiles in **row-major** (tensor-core perm inverted)
+3. `y = round16( svh ⊙ H128(inner) )`  — right / output axis
 
-H128 is the Sylvester Hadamard of order 128, scaled by `1/sqrt(128) = 0.08838834764831845`. Host public reconstruct left-multiplies inner by H then suh, then right-multiplies by H then svh. GEMV applies the same transforms to activations.
+H128 is the **Sylvester** matrix `H[i,j] = (-1)^{popcount(i∧j)} / sqrt(128)` with `1/sqrt(128) = 0.08838834764831845`, applied with left-to-right f32 accumulation (not BLAS association). Host public reconstruct left-multiplies inner by that H then suh, then right-multiplies by H then svh. The first public-reconstruct pass used an in-place FWHT; it missed the fixture by 1 ULP, so the host switched to the popcount Sylvester matvec. Activation-side GEMV applies the same H to activations.
 
-Per expert projection tensors:
+Per expert projection (one linear):
 
-- `trellis` U16 `[in_tiles, out_tiles, 64]`
-- `suh` F16 `[in_features]`
-- `svh` F16 `[out_features]`
+| tensor | dtype | shape |
+|---|---|---|
+| `trellis` | U16 | `[in/16, out/16, 64]` |
+| `suh` | F16 | `[in]` |
+| `svh` | F16 | `[out]` |
 
-Stacked per-layer dialect, one bank per projection:
+Stacked per-layer dialect, E on axis 0 so gather is `bank[eid]`. Production geometry **E=512, hidden=2560, inter=640**:
 
-```
-language_model.model.layers.{L}.mlp.switch_mlp.{gate,up,down}_proj.trellis  [E, in_tiles, out_tiles, 64]
-language_model.model.layers.{L}.mlp.switch_mlp.{gate,up,down}_proj.suh      [E, in]
-language_model.model.layers.{L}.mlp.switch_mlp.{gate,up,down}_proj.svh      [E, out]
-```
+| projection | in | out | trellis | suh | svh |
+|---|---|---|---|---|---|
+| gate | 2560 | 640 | `[512, 160, 40, 64]` U16 | `[512, 2560]` F16 | `[512, 640]` F16 |
+| up | 2560 | 640 | `[512, 160, 40, 64]` U16 | `[512, 2560]` F16 | `[512, 640]` F16 |
+| down | 640 | 2560 | `[512, 40, 160, 64]` U16 | `[512, 640]` F16 | `[512, 2560]` F16 |
 
-Same prefix as the affine pack (`switch_mlp`, `language_model.model.`). Gather kernels index expert `e` on axis 0 without assembling per-expert modules. MTP uses the same names under `language_model.mtp.layers.0.mlp.switch_mlp.*`.
+Names: `language_model.model.layers.{L}.mlp.switch_mlp.{gate,up,down}_proj.{trellis,suh,svh}`. MTP: `language_model.mtp.layers.0.mlp.switch_mlp.*`. Same `switch_mlp` / `language_model.model.` prefix as the affine pack. Bytes: each trellis bank is 512×160×40×64×2 = 400 MiB, so three projections ≈ 1.2 GiB trellis + ~6.5 MiB suh/svh per layer; 48 layers ≈ 57.6 GiB experts.
 
-`config.json` block:
+`config.json`: `"expert_quant": {"format":"exl3","k":4,"codebook":"mcg","mcg_multiplier":3417055213,"calibration":"imatrix-diagonal"}`.
 
-```
-"expert_quant": {"format":"exl3","k":4,"codebook":"mcg","mcg_multiplier":3417055213, ...}
-```
-
-Hermetic host decoder: `src/expert_exl3.zig`. Fixture `src/fixtures/exl3_k4_linear.safetensors` (copy also under `tests/fixtures/`, gitignored there): 128×128 public matrix regularized and quantized K4 MCG, plus inner and public f16 truth.
+Host decoder: `src/expert_exl3.zig`. Fixture: `src/fixtures/exl3_k4_linear.safetensors`.
 
 ## Converter
 
@@ -47,9 +45,28 @@ Hermetic host decoder: `src/expert_exl3.zig`. Fixture `src/fixtures/exl3_k4_line
 - Input: bf16 HF dir + the mixed 4/8 pack.
 - Plan: files with only expert affine banks are dropped; files with no expert keys are hard-linked; mixed shards are rewritten with remaining tensors copied as raw bytes.
 - Experts: HF `mlp.experts.gate_up_proj` `[E,2I,H]` split and transposed to public `[H,I]`; `down_proj` `[E,H,I]` transposed to `[I,H]`; stacked on axis 0.
-- Default quantizer: LDLQ (Hessian from 256 Gaussian rows in the inner dim when no capture file is passed). `--quantizer direct` is the synthetic-test path (Metal tile search, no Hessian).
-- Calibration: synthetic tests used `none-direct`. Production default without `--calibration` is `ldlq-gaussian-256`. A captured row file (`--calibration *.npy`, shape `[N, in]`) is recorded as `captured-rows`. Wikidata/wikitext capture of the real MLP inputs is the live-conversion job (box grant).
-- Unit tests: plan classification + tiny 1-layer/2-expert/128-d pack layout, hardlink inodes, `expert_quant` block, trellis shape `[2,8,8,64]`. `python3 tests/convert_qwen38_flash_next_exl3.py --self-test` → 4/4.
+
+ponyexl3 entry points the real conversion calls, per expert linear:
+
+1. `ponyexl3.convert.regularize.regularize_public_weight` — suh/svh + inner-domain target (codebook scale folded into suh).
+2. Hessian: `diag_hessian(v)` = `np.diag(v)` from the imatrix channel vector, then `ponyexl3.convert.hessian.prepare_hessian_for_ldl` + `block_ldl`. (LDLQ has no diagonal-H shortcut; we build `H = diag(v)` ourselves.)
+3. `ponyexl3.convert.hessian.ldlq_inner_matrix(..., search_backend="metal")` — reverse 16-row LDLQ, Metal tile search, MCG K=4.
+4. Fallback if that expert’s routed-token count is 0: `capture_hessian` on 256 Gaussian rows (isotropic H ≈ direct), listed in `plan["zero_routed"]`.
+
+`--quantizer direct` is the synthetic-test path (`quantize_inner_matrix_direct` only).
+
+Calibration data for routed experts (after box-grant collect):
+
+- File: `/Users/beam/llm/models/calib/qwen38-flash-next-imatrix.safetensors` from `tests/qwen38_flash_next_imatrix_collect.py` on `/Users/beam/llm/models/Qwen/Qwen3.8-Flash-Next`.
+- `model.language_model.layers.{L}.mlp.experts.gate_up_proj` `[E*2560]` — per-expert, per-input-channel mean-squared MLP inputs (`sum(x^2)/corpus_tokens`). **gate and up share this vector.**
+- `...mlp.experts.down_proj` `[E*640]` — same for the SwiGLU intermediate (down’s input).
+- `...mlp.experts.gate_up_proj.rows` `[E]` — tokens routed to each expert. Zero → Gaussian fallback.
+- Tag in config: `"calibration": "imatrix-diagonal"`.
+- Collect is **not run yet** (loads the 360 GB bf16 checkpoint; waits for BOX-GRANT). Wall time TBD from the collector’s per-layer print; expect ~1–3 min/layer × 48 ≈ **1–2.5 h** plus embed.
+
+Wall-clock estimate for the **full pack conversion** (measured): one 2560×640 K4 Metal LDLQ is **1.272 s** (regularize 7 ms, block-LDL 132 ms, search 1.133 s). 48 layers × 512 experts × 3 projections = 73,728 linears × 1.272 s ≈ **26.0 h** serial, plus ~0.5 h MTP experts, plus rewrite/hardlink. Grant size: **imatrix collect 1–2.5 h + convert ~26 h + KLD/bench ~1 h ≈ 29 h**. Do not start until BOX-GRANT.
+
+Unit tests: plan + layout/hardlinks + imatrix-diagonal Hessian/zero-routed tag. `python3 tests/convert_qwen38_flash_next_exl3.py --self-test` → 8/8.
 
 ## Loader
 
@@ -70,13 +87,22 @@ Metal (`mlx_fast_metal_kernel`, shape-keyed config cache for the single-expert G
 
 Shapes tested: inner GEMV `in=128, out=128`, 1 row. Host project vs dense `x @ W_public` rel RMS < 0.02 on that fixture.
 
-MoE decode: `moeSwigluIndexed` = prepare+indexed GEMV+finish on gate and up, SiLU(gate)*up, same on down, score-weighted sum. Hooked in `moeMLP2WithRouter` when `expert_layout == .exl3_k4`. Decode (B*S=1) is one shot; prefill loops tokens (correctness arm, not the speed arm).
+MoE decode: `moeSwigluIndexed` = prepare+indexed GEMV+finish on gate and up, SiLU(gate)*up, same on down, score-weighted sum. Hooked in `moeMLP2WithRouter` when `expert_layout == .exl3_k4`. **rows ≤ 16** (decode + verify): one-shot or per-row loop. **rows > 16**: `moePrefill` (rows kernel).
 
 The naive inner GEMV unpacks 256 codewords per output lane per tile; it is the parity kernel, not the 66 tok/s kernel. A polar-style simdgroup K4 body (32-word tile, 8 accumulators/lane) is the speed port still owed.
 
 ## Prefill arm chosen
 
-Not measured on a 512-row synthetic layer yet (would load real expert banks or a large synthetic). Current arm: per-token `moeSwigluIndexed` (decode kernel). Alternative still open: decode selected experts to f16 then `gather_mm`. The rows4-indexed port is not in tree. Prefill numbers: n/a.
+Per-row indexed GEMV is used only for **rows ≤ 16** (decode + verify widths). Above that, `moePrefill` (expand rows × topk, one indexed GEMV family — the rows kernel).
+
+Measured on a synthetic layer, 512 rows, E=4, H=I=128, topk=2, GPU:
+
+| arm | time |
+|---|---|
+| (b) rows kernel (`moePrefill`) | **197 ms** |
+| (a) decode-to-f16 once + `gather_mm` (public banks already on GPU) | **13 ms** |
+
+**Pick (a)** by the number: 15× faster when public W is materialized. Production still runs (b) until a Metal full-matrix decode writes those banks per chunk (host reconstruct of 2560×640 × hundreds of experts is not a prefill). Next grant work: Metal decode-full of unique experts, then `gather_mm`.
 
 ## Live results
 
@@ -141,13 +167,13 @@ Every algorithm taken from another tree (do not copy these names into mlx-serve 
 
 ## Commit sha
 
-HEAD `84a25c08`. Stack: `b578cb05` host decoder, `5b9c48fb` converter, `b3e3e219` loader, `259f3b16` GEMV kernel, `84a25c08` indexed MoE hook. Clone base `7264fe15`.
+See git HEAD after this round. Prior stack: `b578cb05` host decoder, `5b9c48fb` converter, `b3e3e219` loader, `259f3b16` GEMV, `84a25c08` indexed MoE, `43c5c1d1` report. Clone base `7264fe15`.
 
 ## Open questions
 
 - Naive GEMV will not hit the 15% speed bar; need the simdgroup K4 indexed-pair port and a rows4 prefill kernel.
-- LDLQ default uses Gaussian Hessian unless `--calibration` is passed; live conversion should capture MLP-input rows from the bf16 teacher (wikitext2 / the pack's own prompt file).
-- Prefill token loop is a correctness arm only; measure vs decode-to-f16+`gather_mm` on a synthetic layer when the box is granted.
+- Imatrix collect + 26 h conversion wait on BOX-GRANT (speed executor A/B ~1 h).
+- Production prefill should switch to decode-to-bf16 + gather_mm once Metal weight decode exists (synthetic pick is 13 ms vs 197 ms).
 - suh/svh Hadamard Metal path is a naive matvec; F16 rounding vs host FWHT/Sylvester association needs a dedicated parity test at 2560-d.
 - MTP EXL3 experts load via trellis triples; the MTP forward reuses the trunk MoE hook.
 
