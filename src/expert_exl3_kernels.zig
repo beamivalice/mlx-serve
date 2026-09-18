@@ -384,6 +384,27 @@ const GEMM_NAX_HEADER: [:0]const u8 =
     \\  const half2 p11 = mul1_pair(uint2(uint(w1 >> s1) & 0xffffu, uint(w1 >> (s1 - 4u)) & 0xffffu));
     \\  return nfrag(p00.x, p00.y, p01.x, p01.y, p10.x, p10.y, p11.x, p11.y);
     \\}
+    \\template<uint K>
+    \\static inline half2 nax_funnel_pair(const device uint *words, uint oracle_thread) {
+    \\  constexpr uint tile_words = 8u * K;
+    \\  const uint bit_0 = (2u * oracle_thread + 257u) * K - 16u;
+    \\  const uint bit_2 = bit_0 + K + 16u;
+    \\  const uint index_0 = bit_0 >> 5u;
+    \\  const uint index_1 = (bit_2 - 1u) >> 5u;
+    \\  const uint shift_1 = ((index_1 + 1u) << 5u) - bit_2;
+    \\  const ulong concat = ((ulong)words[index_0 % tile_words] << 32) | (ulong)words[index_1 % tile_words];
+    \\  const uint funnel = uint(concat >> shift_1);
+    \\  return mul1_pair(uint2((funnel >> K) & 0xffffu, funnel & 0xffffu));
+    \\}
+    \\template<uint K>
+    \\static inline nfrag nax_wfrag_k(const device uint *words, uint lane) {
+    \\  const uint tau_0 = 64u * (lane >> 4u) + ((lane & 7u) << 3u) + ((lane >> 3u) & 1u);
+    \\  const half2 p0 = nax_funnel_pair<K>(words, tau_0);
+    \\  const half2 p1 = nax_funnel_pair<K>(words, tau_0 + 2u);
+    \\  const half2 p2 = nax_funnel_pair<K>(words, tau_0 + 4u);
+    \\  const half2 p3 = nax_funnel_pair<K>(words, tau_0 + 6u);
+    \\  return nfrag(p0.x, p0.y, p2.x, p2.y, p1.x, p1.y, p3.x, p3.y);
+    \\}
     \\static inline short2 nax_origin(uint lane) {
     \\  const short qid = short(lane >> 2u);
     \\  return short2(short(((qid & 2) | short(lane & 1u)) * 4), short((qid & 4) | short((lane >> 1u) & 3u)));
@@ -395,6 +416,9 @@ const GEMM_NAX_SOURCE: [:0]const u8 =
     \\uint sg = uint(simdgroup_index_in_threadgroup);
     \\uint lane = uint(thread_index_in_simdgroup);
     \\constexpr uint TILE = 16u;
+    \\constexpr uint K = uint(KBITS);
+    \\constexpr uint PACKED_HW = 16u * K;
+    \\constexpr uint PACKED_W = 8u * K;
     \\constexpr uint IT = uint(IDIM) / TILE;
     \\constexpr uint OT = uint(ODIM) / TILE;
     \\const uint start = wstarts[win];
@@ -423,7 +447,8 @@ const GEMM_NAX_SOURCE: [:0]const u8 =
     \\const bool hi1 = (origin.y + 8) < short(n_hi);
     \\for (uint s = 0u; s < destination.get_capacity(); s++) destination[s] = 0.0f;
     \\for (uint s = 0u; s < dest_hi.get_capacity(); s++) dest_hi[s] = 0.0f;
-    \\const device uint *trellis_e = (const device uint *)(trellis + ((size_t)eid * (size_t)IT * (size_t)OT) * 64u);
+    \\const device uint *trellis_e = (const device uint *)(trellis + ((size_t)eid * (size_t)IT * (size_t)OT) * PACKED_HW);
+    \\if (K == 4u) {
     \\for (uint tk = 0u; tk < IT; tk++) {
     \\  const uint input_base = tk * TILE;
     \\  nfrag act;
@@ -450,6 +475,35 @@ const GEMM_NAX_SOURCE: [:0]const u8 =
     \\    for (short s = 0; s < 8; s++) left[s] = act[s];
     \\    op.run(left, right, dest_hi);
     \\  }
+    \\}
+    \\} else {
+    \\for (uint tk = 0u; tk < IT; tk++) {
+    \\  const uint input_base = tk * TILE;
+    \\  nfrag act;
+    \\  for (short c = 0; c < 4; c++) {
+    \\    const uint ic = input_base + uint(origin.x + c);
+    \\    act[c] = active0 ? x[(size_t)(run0 + uint(origin.y)) * (size_t)(IDIM) + ic] : half(0.0h);
+    \\    act[4 + c] = active1 ? x[(size_t)(run0 + uint(origin.y) + 8u) * (size_t)(IDIM) + ic] : half(0.0h);
+    \\  }
+    \\  const device uint *words0 = trellis_e + ((size_t)tk * (size_t)OT + output_base / 16u) * PACKED_W;
+    \\  const nfrag w0 = nax_wfrag_k<K>(words0, lane);
+    \\  const nfrag w1 = nax_wfrag_k<K>(words0 + PACKED_W, lane);
+    \\  for (short s = 0; s < 8; s++) {
+    \\    left[s] = act[s];
+    \\    right[s] = w0[s];
+    \\    right[8 + s] = w1[s];
+    \\  }
+    \\  op.run(left, right, destination);
+    \\  if (n_hi > 0u) {
+    \\    for (short c = 0; c < 4; c++) {
+    \\      const uint ic = input_base + uint(origin.x + c);
+    \\      act[c] = hi0 ? x[(size_t)(run0 + 16u + uint(origin.y)) * (size_t)(IDIM) + ic] : half(0.0h);
+    \\      act[4 + c] = hi1 ? x[(size_t)(run0 + 16u + uint(origin.y) + 8u) * (size_t)(IDIM) + ic] : half(0.0h);
+    \\    }
+    \\    for (short s = 0; s < 8; s++) left[s] = act[s];
+    \\    op.run(left, right, dest_hi);
+    \\  }
+    \\}
     \\}
     \\for (short ct = 0; ct < 2; ct++) {
     \\  for (short c = 0; c < 4; c++) {
@@ -1084,7 +1138,7 @@ fn innerGemmSortedWinAlign(
     if (nwin <= 0) return error.BadExl3Shape;
     logGemmSelector(win, aligned, nwin, n);
     const key = GemmSortedKey{ .in_dim = in_dim, .out_dim = out_dim, .rows = n, .win = win, .k = k };
-    if (k == 4 and gemmNaxOn() and @rem(out_dim, 128) == 0) {
+    if (gemmNaxOn() and @rem(out_dim, 128) == 0) {
         // The fallback below answers a NAX build or dispatch that failed, so the
         // failure's latch is ours to drop: left standing it becomes the next
         // decode tick's `MlxFailure`.
@@ -1098,6 +1152,7 @@ fn innerGemmSortedWinAlign(
                 try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ODIM", out_dim));
                 try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "NROWS", n));
                 try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "WIN", win));
+                try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "KBITS", @intCast(k)));
                 gemm_nax_cfgs.put(key, c);
                 break :blk c;
             };
@@ -4014,6 +4069,80 @@ test "exl3 K3 sorted GEMM matches host MUL1 on small shape" {
             const gpu = @as(f32, @floatCast(src[r * dim + o]));
             try expectGemvEnvelope(gpu, host16[o], host32[o]);
         }
+    }
+}
+
+test "exl3 NAX K3 GEMM within 1.15x of K4 at C=2048 and 8192" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!gemmNaxOn()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const E: usize = 4;
+    const in_dim: usize = 2560;
+    const out_dim: usize = 640;
+    const in_tiles = in_dim / 16;
+    const out_tiles = out_dim / 16;
+    var prng = std.Random.DefaultPrng.init(71);
+    const rnd = prng.random();
+    const contexts = [_]c_int{ 2048, 8192 };
+    for (contexts) |C| {
+        const n: usize = @intCast(C);
+        const xh = try alloc.alloc(u16, n * in_dim);
+        for (xh) |*v| v.* = exl3.f32ToF16Bits(rnd.float(f32) * 0.1);
+        const eids = try alloc.alloc(u32, n);
+        const run = n / E;
+        for (eids, 0..) |*v, i| v.* = @intCast(@min(i / run, E - 1));
+        const x_arr = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ C, @intCast(in_dim) }, 2, .float16);
+        defer _ = mlx.mlx_array_free(x_arr);
+        const eid_a = mlx.mlx_array_new_data(eids.ptr, &[_]c_int{C}, 1, .uint32);
+        defer _ = mlx.mlx_array_free(eid_a);
+        var k4_ns: u64 = 0;
+        var k3_ns: u64 = 0;
+        const packed4 = exl3.packedHalfwords(4);
+        const packed3 = exl3.packedHalfwords(3);
+        const tile4 = in_tiles * out_tiles * packed4;
+        const tile3 = in_tiles * out_tiles * packed3;
+        const stacked4 = try alloc.alloc(u16, E * tile4);
+        const stacked3 = try alloc.alloc(u16, E * tile3);
+        for (stacked4) |*v| v.* = @truncate(rnd.int(u32));
+        for (stacked3) |*v| v.* = @truncate(rnd.int(u32));
+        const tr4 = mlx.mlx_array_new_data(stacked4.ptr, &[_]c_int{ @intCast(E), @intCast(in_tiles), @intCast(out_tiles), @intCast(packed4) }, 4, .uint16);
+        defer _ = mlx.mlx_array_free(tr4);
+        const tr3 = mlx.mlx_array_new_data(stacked3.ptr, &[_]c_int{ @intCast(E), @intCast(in_tiles), @intCast(out_tiles), @intCast(packed3) }, 4, .uint16);
+        defer _ = mlx.mlx_array_free(tr3);
+        var warm_i: usize = 0;
+        while (warm_i < 3) : (warm_i += 1) {
+            inline for (.{ tr4, tr3 }) |tr| {
+                const warm = try innerGemmSorted(s, x_arr, tr, eid_a);
+                try mlx.check(mlx.mlx_array_eval(warm));
+                _ = mlx.mlx_array_free(warm);
+            }
+        }
+        var it: usize = 0;
+        while (it < 8) : (it += 1) {
+            var sw4 = io_util.Stopwatch.init(t.io);
+            const b4 = try innerGemmSorted(s, x_arr, tr4, eid_a);
+            try mlx.check(mlx.mlx_array_eval(b4));
+            k4_ns += sw4.read();
+            _ = mlx.mlx_array_free(b4);
+            var sw3 = io_util.Stopwatch.init(t.io);
+            const b3 = try innerGemmSorted(s, x_arr, tr3, eid_a);
+            try mlx.check(mlx.mlx_array_eval(b3));
+            k3_ns += sw3.read();
+            _ = mlx.mlx_array_free(b3);
+        }
+        k4_ns /= 8;
+        k3_ns /= 8;
+        std.debug.print("exl3 NAX one-proj C={d} H=2560 I=640: K4 {d} us K3 {d} us\n", .{
+            C,
+            k4_ns / 1000,
+            k3_ns / 1000,
+        });
+        try t.expect(k4_ns > 0);
+        try t.expect(k3_ns * 100 < k4_ns * 115);
     }
 }
 
