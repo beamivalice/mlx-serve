@@ -196,6 +196,50 @@ Note: affine `--no-mtp` still emitted `[spec-stats] mode=mtp` (MTP engaged). EXL
 
 Hermetic suite after test fix: **2710 passed, 174 skipped, 0 failed**. MTP fused-rows test OK.
 
+## Per-dispatch profile (production H=2560 I=640 top-k=10, warmup then eval)
+
+rows=1 fused decode layer (serialized eval; live graph overlaps, so these overstate GPU time but rank the kernels):
+
+| dispatch | ms |
+| --- | --- |
+| pair_prepare | 0.256 |
+| pair_gemv | **0.479** |
+| mid | 0.202 |
+| down_gemv | 0.397 |
+| reduce | 0.285 |
+| **sum** | **1.62** |
+
+rows=512 prefill layer:
+
+| dispatch | ms |
+| --- | --- |
+| sort | 0.269 |
+| token_prepare | 0.266 |
+| gemm_gate | 2.725 |
+| gemm_up | 2.752 |
+| gemm_down | **3.134** |
+| token_reduce | 0.286 |
+| **sum** | **9.43** |
+
+Largest decode kernel: pair GEMV (2560-wide K). Largest prefill: the three GEMMs (NAX already on).
+
+Levers tried and **reverted** (ubench regression, tests stayed green but slower):
+- 8 simdgroups / 256-thread TG: pair_gemv 0.55 ms, coop GEMV 576 µs (was 150 µs).
+- 4 output tiles packed per TG, full-K per sg: pair_gemv 0.58 ms, coop 606 µs.
+
+Live `fwd_ubench` 8 decode forwards (`--no-mtp --kv-quant 8`):
+
+| pack | ms/forward | CPU build | GPU eval | ops |
+| --- | --- | --- | --- | --- |
+| EXL3 | **123.3** | **120.9** | 2.4 | 5007 |
+| affine 4/8 | **16.5** | 1.3 | 15.2 | 4023 |
+
+EXL3 custom `kernel_apply` is eager, so GPU time sits in "build". 48 layers × 1.62 ms serialized ≈ 78 ms of the 121 ms; the rest is graph walk (5007 ops). Affine's fused gate+up+SwiGLU and down+reduce are two dispatches and 1.3 ms of CPU.
+
+That is why live decode is 54 vs 100 tok/s (18.5 vs 10 ms): not the GEMV ALU, the **five eager custom launches per layer**. Occupancy levers on the GEMV body (8-sg, 4-tile pack) cannot close that gap and measured slower; reverted.
+
+Prefill 891 vs 2109 tok/s: ubench at E=16 is 9.4 ms/layer; live E=512 is ~47 ms/layer-chunk (2 chunks × 48 layers in 4.5 s). NAX 0.43× was vs three gather_qmm on a synthetic layer, not the full 4k stack.
+
 ## Ports
 
 1. K4 cooperative tile decode + 8 register accs + 16-row TG reduce — `exl3.metal` K4 GEMV body.  
