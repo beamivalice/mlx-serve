@@ -6,66 +6,73 @@ Box: Apple M5 Max
 
 ## Files changed
 
-- `src/expert_exl3_kernels.zig` (item 0 benches only)
+- `src/expert_exl3_kernels.zig` (item 0 benches; item 1 16-row windows + run walk)
 
 ## Tests added
 
-- Both in-tree prefill benches now assert `max_e >= 400` and loop C in {512, 2048} at E=512 / top-k 10.
+- Item 0: both in-tree prefill benches assert `max_e >= 400` and loop C in {512, 2048} at E=512 / top-k 10.
+- Item 1: `exl3 sorted GEMM 16-row windows match 4-row per row` (mixed runs, n=32, bit identity). NAX default and SIMD via `MLX_SERVE_FORCE_GPU_FAMILY_FALLBACK=1`.
 
 ## Red-first evidence
 
-- `max_e >= 400` on the old E=4 / top-k 2 benches: `FAIL (TestUnexpectedResult)` for
-  `exl3 512-row prefill: decode-to-f16 gather_mm vs rows kernel` and
-  `exl3 512-row production-shape sorted gemm vs affine gather_qmm`.
-- After re-parameterization: both green at C=512 and C=2048.
+- Item 0: `max_e >= 400` on E=4 benches: `FAIL (TestUnexpectedResult)`. Green after E=512 / top-k 10.
+- Item 1: 16-row grid with kernel still `win * 4u`: `expected 17898, found 0` (`FAIL TestExpectedEqual`). Green after `start = win * WIN` and in-kernel run walk.
 
 ## Suite counts
 
-- Filtered `-Dtest-filter="exl3"`: 22 passed, 0 skipped, 0 failed.
-- Full unfiltered suite: pending (gpu held by `exl3-decode` after item 0 live A/B).
+- Item 0 filtered `-Dtest-filter="exl3"`: 22 passed.
+- Item 1 filtered `-Dtest-filter="exl3"`: 23 passed, 0 failed (includes new identity test). SIMD-arm rerun of sorted GEMM tests: 4/4.
 
 ## Commit sha
 
-(pending item 0 commit)
+- item 0: `26332d0a37ba48c6a65dfdd86dbbc5da93aea253`
+- item 1: (pending)
 
 ## Live table (every row with box, chunk, engagement lines)
 
-Box: Apple M5 Max. Protocol: 100 s idle, kv8, `--no-mtp`, affine through `/Users/beam/llm/models/Qwen3.8-Flash-Next-MLX-Serve-affine-ab`, EXL3 `/Users/beam/llm/models/Qwen3.8-Flash-Next-MLX-Serve-exl3k4-8bit`, interleaved 3 boots, medians of `timings.prompt_per_second`. `MLX_SERVE_NGRAM_WARM=0`. ~4085 prompt tokens.
+Protocol: 100 s idle, kv8, `--no-mtp`, affine through `/Users/beam/llm/models/Qwen3.8-Flash-Next-MLX-Serve-affine-ab`, EXL3 `/Users/beam/llm/models/Qwen3.8-Flash-Next-MLX-Serve-exl3k4-8bit`, interleaved 3 boots, medians of `timings.prompt_per_second`. `MLX_SERVE_NGRAM_WARM=0`. Box: Apple M5 Max. ~4085 prompt tokens. Chunk 8192, one chunk.
+
+### Baseline (4-row windows)
 
 | arm | boot1 | boot2 | boot3 | median tok/s | chunk | engagement |
 | --- | --- | --- | --- | --- | --- | --- |
 | EXL3 | 755.8 | 853.7 | 885.8 | **853.7** | 8192 (1 chunk) | `[args] kv-quant: affine 8-bit (group=64)`; `[expert-exl3] engaged`; `[qwen4] MTP head loaded ... drafts armed by --mtp`; `[short-gen] ... path=serial`; `[prefill-trace] tokens=4088 chunks=1 chunk_size=8192`; `[model-settings]` absent; `[spec-stats] mode=` absent |
-| affine-ab | 2077.4 | 1871.2 | 2065.5 | **2065.5** | 8192 (1 chunk) | `[args] kv-quant: affine 8-bit (group=64)`; `[qwen4] MTP head loaded ... drafts armed by --mtp`; `[short-gen] ... path=serial`; `[prefill-trace] tokens=4082 chunks=1 chunk_size=8192`; `[model-settings]` absent; `[spec-stats] mode=` absent; no `[expert-exl3]` |
+| affine-ab | 2077.4 | 1871.2 | 2065.5 | **2065.5** | 8192 (1 chunk) | same kv8 / serial / MTP-head-loaded-not-armed; no `[expert-exl3]` |
 
-Ratio 853.7 / 2065.5 = **0.413x**. Bar 0.75x of this affine median is **1549 tok/s** (brief 1580 used 2109).
+### After item 1 (16-row windows + run walk)
 
-Supporting 2k (2225 tok, same protocol, one-chunk): EXL3 632.3 / 770.0 / 840.4 median 770; affine 1769.4 / 1825.3 / 1814.4 median 1814.
+| arm | boot1 | boot2 | boot3 | median tok/s | chunk | engagement |
+| --- | --- | --- | --- | --- | --- | --- |
+| EXL3 | 1157.7 | 1466.0 | 1464.5 | **1464.5** | 8192 (1 chunk) | `[args] kv-quant: affine 8-bit (group=64)`; `[expert-exl3] engaged`; `[qwen4] MTP head loaded ... drafts armed by --mtp`; `[short-gen] ... path=serial`; `[prefill-trace] tokens=4083 chunks=1 chunk_size=8192`; `[model-settings]` absent; `[spec-stats] mode=` absent |
+| affine-ab | 2074.7 | 2100.6 | 2110.5 | **2100.6** | 8192 (1 chunk) | same kv8 / serial / MTP-head-loaded-not-armed; `[prefill-trace] tokens=4084 chunks=1 chunk_size=8192` |
 
-Hermetic serialized 512-row prefill dispatch (E=16 / top-k 10 / H=2560 / I=640, `ubench_force`):
+Ratio 1464.5 / 2100.6 = **0.697x**. Bar 1580 tok/s (0.75x of 2109, or 0.75x of 2100.6 = 1575). Still short.
 
-| dispatch | ms |
-| --- | --- |
-| sort | 0.251 |
-| token_prepare | 0.237 |
-| gemm_gate | 2.740 |
-| gemm_up | 2.726 |
-| gemm_down | 3.071 |
-| token_reduce | 0.311 |
-| **sum** | **9.336** |
+Hermetic serialized 512-row prefill dispatch (E=16 / top-k 10 / H=2560 / I=640):
 
-In-tree production-shape (E=512 / top-k 10, isolated eval):
+| dispatch | 4-row ms | 16-row ms |
+| --- | --- | --- |
+| sort | 0.251 | 0.236 |
+| token_prepare | 0.237 | 0.237 |
+| gemm_gate | 2.740 | 1.021 |
+| gemm_up | 2.726 | 1.058 |
+| gemm_down | 3.071 | 1.381 |
+| token_reduce | 0.311 | 0.235 |
+| **sum** | **9.336** | **4.168** |
 
-| C | EXL3 layer us | affine one-proj us | vs 3x-qmm |
-| --- | --- | --- | --- |
-| 512 | 15714 | 2168 | 2.41x |
-| 2048 | 38806 | 3244 | 3.98x |
+In-tree production-shape (E=512 / top-k 10):
 
-`exl3 512-row E=512 topk=10 layer within 2x affine`: 15476 us vs 41403 us full 3x gather_qmm (0.37x).
+| C | 4-row layer us | 16-row layer us |
+| --- | --- | --- |
+| 512 | 15714 | 6954 |
+| 2048 | 38806 | 15121 |
+
+`exl3 512-row E=512 topk=10 layer within 2x affine` after item 1: 6648 us vs 41507 us (0.16x).
 
 ## Open questions
 
-- Auto chunk is 8192 on both arms once the affine settings row is neutralized (old 512-row affine chunk was the ctx=524288 bar). Live 4k is one 4088-row GEMM window count, not 512-row chunks.
-- Per-layer live table at `--prefill-chunk 512` not yet taken (gpu granted to `exl3-decode` on unlock).
+- Auto chunk is 8192 on both arms once the affine settings row is neutralized.
+- Item 1 landed 1465 tok/s vs 1580 bar. Item 2 (scatter, int32 slots, paired prepare, cache gemmNaxOn, fuse planes) is required.
 
 ## Comments
 
@@ -73,19 +80,19 @@ none added
 
 ## Ports (reference ideas taken, for NOTICE)
 
-(none yet)
+- 16-row NAX fill of the existing 16x32x16 `matmul2d` tile (`act[4+c]` = row `origin.y+8`); run walk one pass per distinct expert in the window.
 
 ## Item 0 — Measurement
 
-Status: done (live 4k A/B + bench re-param). Full suite and 512-row live ubench still pending GPU.
+Status: done.
 
 ## Item 1 — 16-row windows + in-kernel run walk
 
-Status: pending
+Status: done. Live median 1465 tok/s. Below 1580.
 
 ## Item 2 — Fixed costs, bit-identical
 
-Status: pending
+Status: in progress
 
 ## Item 3 — decode-once + dense f16 GEMM
 
