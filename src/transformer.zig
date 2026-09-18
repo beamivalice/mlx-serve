@@ -28653,10 +28653,10 @@ pub const Transformer = struct {
         const K = ish[ish.len - 1];
         var slots = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(slots);
-        try mlx.check(mlx.mlx_reshape(&slots, inds, &[_]c_int{ B * S * K }, 1, self.s));
+        try mlx.check(mlx.mlx_reshape(&slots, inds, &[_]c_int{B * S * K}, 1, self.s));
         var sc = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(sc);
-        try mlx.check(mlx.mlx_reshape(&sc, scores, &[_]c_int{ B * S * K }, 1, self.s));
+        try mlx.check(mlx.mlx_reshape(&sc, scores, &[_]c_int{B * S * K}, 1, self.s));
         var slots_u = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(slots_u);
         try mlx.check(mlx.mlx_astype(&slots_u, slots, .uint32, self.s));
@@ -28854,6 +28854,7 @@ pub const Transformer = struct {
         if (cfg.expert_layout == .exl3_k4) {
             const y = try self.moeExl3(expert_x, mw, inds, norm_scores);
             if (skip_shared) return y;
+            defer _ = mlx.mlx_array_free(y);
             return self.moeAddGatedShared(y, expert_x, mw);
         }
 
@@ -38636,7 +38637,6 @@ test "exl3 MTP fused rows match N solo calls on the same kernel" {
     }
     try t.expectEqual(@as(u32, 4), n_disp);
 }
-
 
 /// `{prefix}.{base}.{suffix}` with a RUNTIME base — the embedding table's name
 /// is the checkpoint's (embed_tokens / word_embeddings / embed / embeddings)
@@ -62488,62 +62488,62 @@ test "streamed expert kernel arm is no worse than the composite arm against fp32
 
         for ([_]c_int{ 1, 2, 4 }) |rows| {
             for (0..SE_DRAWS) |draw| {
-            var dkey = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(dkey);
-            try mlx.check(mlx.mlx_random_key(&dkey, 0xa5a50000 + @as(u64, draw) * 7919 + @as(u64, @intCast(u))));
-            var x = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(x);
-            try mlx.check(mlx.mlx_random_normal(&x, &[_]c_int{ rows, hidden }, 2, .bfloat16, 0.0, 1.0, dkey, s));
-            try mlx.check(mlx.mlx_array_eval(x));
-            var w = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(w);
-            try mlx.check(mlx.mlx_random_normal(&w, &[_]c_int{ rows, topk }, 2, .bfloat16, 0.0, 1.0, dkey, s));
-            try mlx.check(mlx.mlx_array_eval(w));
-            const slots_host = try seSlots(alloc, @intCast(rows), @intCast(topk), @intCast(u));
-            defer alloc.free(slots_host);
-            const slots = mlx.mlx_array_new_data(slots_host.ptr, &[_]c_int{ rows, topk }, 2, .int32);
-            defer _ = mlx.mlx_array_free(slots);
+                var dkey = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(dkey);
+                try mlx.check(mlx.mlx_random_key(&dkey, 0xa5a50000 + @as(u64, draw) * 7919 + @as(u64, @intCast(u))));
+                var x = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(x);
+                try mlx.check(mlx.mlx_random_normal(&x, &[_]c_int{ rows, hidden }, 2, .bfloat16, 0.0, 1.0, dkey, s));
+                try mlx.check(mlx.mlx_array_eval(x));
+                var w = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(w);
+                try mlx.check(mlx.mlx_random_normal(&w, &[_]c_int{ rows, topk }, 2, .bfloat16, 0.0, 1.0, dkey, s));
+                try mlx.check(mlx.mlx_array_eval(w));
+                const slots_host = try seSlots(alloc, @intCast(rows), @intCast(topk), @intCast(u));
+                defer alloc.free(slots_host);
+                const slots = mlx.mlx_array_new_data(slots_host.ptr, &[_]c_int{ rows, topk }, 2, .int32);
+                defer _ = mlx.mlx_array_free(slots);
 
-            const op = StreamedExpertOperands{
-                .x_rows = x,
-                .gate = views.gate,
-                .up = views.up,
-                .down = views.down,
-                .slab_gate_up = gu,
-                .slab_down = dn,
-                .slots = slots,
-                .weights = w,
-            };
-            const truth = try seTruth(
-                alloc,
-                mlx.mlx_array_data_bfloat16(x).?,
-                mlx.mlx_array_data_bfloat16(gu).?,
-                mlx.mlx_array_data_bfloat16(dn).?,
-                slots_host,
-                mlx.mlx_array_data_bfloat16(w).?,
-                @intCast(rows),
-                @intCast(topk),
-                @intCast(hidden),
-                @intCast(inter),
-            );
-            defer alloc.free(truth);
+                const op = StreamedExpertOperands{
+                    .x_rows = x,
+                    .gate = views.gate,
+                    .up = views.up,
+                    .down = views.down,
+                    .slab_gate_up = gu,
+                    .slab_down = dn,
+                    .slots = slots,
+                    .weights = w,
+                };
+                const truth = try seTruth(
+                    alloc,
+                    mlx.mlx_array_data_bfloat16(x).?,
+                    mlx.mlx_array_data_bfloat16(gu).?,
+                    mlx.mlx_array_data_bfloat16(dn).?,
+                    slots_host,
+                    mlx.mlx_array_data_bfloat16(w).?,
+                    @intCast(rows),
+                    @intCast(topk),
+                    @intCast(hidden),
+                    @intCast(inter),
+                );
+                defer alloc.free(truth);
 
-            const composite = try streamedExpertCompute(s, op, rows, false);
-            defer _ = mlx.mlx_array_free(composite);
-            const kernel = try streamedExpertCompute(s, op, rows, true);
-            defer _ = mlx.mlx_array_free(kernel);
-            try std.testing.expectEqualSlices(c_int, &[_]c_int{ rows, hidden }, mlx.getShape(composite));
-            try std.testing.expectEqualSlices(c_int, &[_]c_int{ rows, hidden }, mlx.getShape(kernel));
-            const ce = try seErrStats(alloc, composite, truth);
-            const ke = try seErrStats(alloc, kernel, truth);
-            var tmax: f32 = 0;
-            for (truth) |v| {
-                if (@abs(v) > tmax) tmax = @abs(v);
-            }
-            const allow: f32 = if (expert_bf16.downKernelPreferred(@intCast(rows))) 0 else seUlpBf16(tmax);
-            const bad = ke.max > ce.max + allow or ke.rms > ce.rms;
-            std.debug.print("streamed-expert U={d:>4} R={d} draw={d}: kernel max={e:.3} rms={e:.3} | composite max={e:.3} rms={e:.3} | tmax={e:.3} allow={e:.3} [{s}]\n", .{ u, rows, draw, ke.max, ke.rms, ce.max, ce.rms, tmax, allow, if (bad) "WORSE" else "ok" });
-            if (bad) worse += 1;
+                const composite = try streamedExpertCompute(s, op, rows, false);
+                defer _ = mlx.mlx_array_free(composite);
+                const kernel = try streamedExpertCompute(s, op, rows, true);
+                defer _ = mlx.mlx_array_free(kernel);
+                try std.testing.expectEqualSlices(c_int, &[_]c_int{ rows, hidden }, mlx.getShape(composite));
+                try std.testing.expectEqualSlices(c_int, &[_]c_int{ rows, hidden }, mlx.getShape(kernel));
+                const ce = try seErrStats(alloc, composite, truth);
+                const ke = try seErrStats(alloc, kernel, truth);
+                var tmax: f32 = 0;
+                for (truth) |v| {
+                    if (@abs(v) > tmax) tmax = @abs(v);
+                }
+                const allow: f32 = if (expert_bf16.downKernelPreferred(@intCast(rows))) 0 else seUlpBf16(tmax);
+                const bad = ke.max > ce.max + allow or ke.rms > ce.rms;
+                std.debug.print("streamed-expert U={d:>4} R={d} draw={d}: kernel max={e:.3} rms={e:.3} | composite max={e:.3} rms={e:.3} | tmax={e:.3} allow={e:.3} [{s}]\n", .{ u, rows, draw, ke.max, ke.rms, ce.max, ce.rms, tmax, allow, if (bad) "WORSE" else "ok" });
+                if (bad) worse += 1;
             }
         }
         _ = mlx.mlx_clear_cache();
@@ -62866,7 +62866,7 @@ test "a streamed quantized slab matches the resident bank through the same kerne
         defer prepared.deinit();
         try std.testing.expect(prepared.quantized);
         var slab: [expert_stream_mod.quant.component_count]mlx.mlx_array = undefined;
-        for (&slab, 0..) |*value, ci| value.* = prepared.quantOperand(@enumFromInt(ci));
+        for (&slab, 0..) |*value, ci| value.* = prepared.quantOperand(@fromBackingInt(@intCast(ci)));
 
         const arms = [_]SqArm{
             .{ .gate_w = bank[0], .gate_s = bank[1], .gate_b = bank[2], .up_w = bank[3], .up_s = bank[4], .up_b = bank[5], .down_w = bank[6], .down_s = bank[7], .down_b = bank[8] },
@@ -62947,4 +62947,68 @@ test "a streamed quantized slab matches the resident bank through the same kerne
             try std.testing.expectEqual(down_hashes[0], down_hashes[1]);
         }
     }
+}
+
+test "exl3 shared add releases routed output study3" {
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    var xfm: Transformer = undefined;
+    xfm.config = .{};
+    xfm.bits_cache = .{};
+    xfm.compiled_geglu = null;
+    xfm.allocator = testing.allocator;
+    xfm.s = s;
+    xfm.config.expert_layout = .exl3_k4;
+    xfm.config.hidden_act = .silu;
+    xfm.config.quant_bits = 4;
+    xfm.config.quant_group_size = 64;
+    xfm.config.moe_intermediate_size = 128;
+    var rng = std.Random.DefaultPrng.init(1103);
+    const x = try attn256RandBf16(rng.random(), &.{ 1, 64, 128 }, s);
+    defer _ = mlx.mlx_array_free(x);
+    const shared = try attn256RandBf16(rng.random(), &.{ 128, 128 }, s);
+    defer _ = mlx.mlx_array_free(shared);
+    const gate = try attn256RandBf16(rng.random(), &.{ 128, 1 }, s);
+    defer _ = mlx.mlx_array_free(gate);
+    const trh: [8 * 8 * 64]u16 = @splat(1234);
+    const tr = mlx.mlx_array_new_data(&trh, &.{ 1, 8, 8, 64 }, 4, .uint16);
+    defer _ = mlx.mlx_array_free(tr);
+    const sh: [128]u16 = @splat(0x3c00);
+    const scale = mlx.mlx_array_new_data(&sh, &.{ 1, 128 }, 2, .float16);
+    defer _ = mlx.mlx_array_free(scale);
+    const ih: [64]u32 = @splat(0);
+    const inds = mlx.mlx_array_new_data(&ih, &.{ 1, 64, 1 }, 3, .uint32);
+    defer _ = mlx.mlx_array_free(inds);
+    const sc: [64]u16 = @splat(0x3f80);
+    const scores = mlx.mlx_array_new_data(&sc, &.{ 1, 64, 1 }, 3, .bfloat16);
+    defer _ = mlx.mlx_array_free(scores);
+    var mw = std.mem.zeroes(MoeMlpWeights);
+    mw.switch_gate_w = tr;
+    mw.switch_up_w = tr;
+    mw.switch_down_w = tr;
+    mw.switch_gate_s = scale;
+    mw.switch_up_s = scale;
+    mw.switch_down_s = scale;
+    mw.switch_gate_b = scale;
+    mw.switch_up_b = scale;
+    mw.switch_down_b = scale;
+    mw.shared_gate_w = shared;
+    mw.shared_up_w = shared;
+    mw.shared_down_w = shared;
+    mw.shared_expert_gate_w = gate;
+    mw.shared_expert_gate_s = .{ .ctx = null };
+    mw.shared_expert_gate_b = .{ .ctx = null };
+    var before: usize = 0;
+    var after: usize = 0;
+    for (0..5) |rep| {
+        const out = try xfm.moeMLP2WithRouter(x, x, &mw, null, false, null, .{ .inds = inds, .norm_scores = scores });
+        try mlx.check(mlx.mlx_array_eval(out));
+        _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_synchronize(s));
+        _ = mlx.mlx_clear_cache();
+        if (rep == 0) try mlx.check(mlx.mlx_get_active_memory(&before));
+    }
+    try mlx.check(mlx.mlx_get_active_memory(&after));
+    std.debug.print("[study3 ownership] before={d} after={d} retained={d} expected_leak={d}\n", .{ before, after, after -| before, 4 * 64 * 128 * 2 });
+    try testing.expect(after <= before + 4096);
 }
