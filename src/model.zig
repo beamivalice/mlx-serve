@@ -165,6 +165,7 @@ pub const ModelConfig = struct {
     quant_mode: QuantMode = .affine,
     expert_streaming: bool = false,
     expert_layout: expert_quant.Layout = .bf16_fused,
+    expert_quant_k: u8 = 4,
     expert_source_dir: ?[]u8 = null,
     /// `MLX_SERVE_NGRAM_BF16_DIR`: serve the PLE n-gram table from the ORIGINAL bf16
     /// shards in this HF checkpoint dir instead of the pack's quantized `ngram_table.bin`
@@ -1376,8 +1377,9 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
                 const parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return error.ExpertLayoutUnsupported;
                 defer parsed.deinit();
                 if (parsed.value != .object) return error.ExpertLayoutUnsupported;
-                _ = try expert_quant.parseExpertQuant(parsed.value.object);
+                const spec = try expert_quant.parseExpertQuant(parsed.value.object);
                 try expert_quant.admitExl3TopK(config.num_experts_per_tok);
+                config.expert_quant_k = spec.k;
                 log.info("[expert-exl3] engaged\n", .{});
             }
         }
