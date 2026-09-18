@@ -1796,7 +1796,7 @@ const MID_SOURCE: [:0]const u8 =
 ;
 
 const REDUCE_SOURCE: [:0]const u8 =
-    \\threadgroup half vals[16 * 128];
+    \\threadgroup float vals[16 * 128];
     \\uint block = uint(threadgroup_position_in_grid.x);
     \\uint row = uint(threadgroup_position_in_grid.y);
     \\uint sg = uint(simdgroup_index_in_threadgroup);
@@ -1823,22 +1823,22 @@ const REDUCE_SOURCE: [:0]const u8 =
     \\const float s1 = v.x - v.y;
     \\const float s2 = v.z + v.w;
     \\const float s3 = v.z - v.w;
-    \\vals[sg * 128u + lane] = half((s0 + s2) * scv * float(svh[sb + lane]));
-    \\vals[sg * 128u + lane + 32u] = half((s1 + s3) * scv * float(svh[sb + lane + 32u]));
-    \\vals[sg * 128u + lane + 64u] = half((s0 - s2) * scv * float(svh[sb + lane + 64u]));
-    \\vals[sg * 128u + lane + 96u] = half((s1 - s3) * scv * float(svh[sb + lane + 96u]));
+    \\vals[sg * 128u + lane] = (s0 + s2) * scv * float(svh[sb + lane]);
+    \\vals[sg * 128u + lane + 32u] = (s1 + s3) * scv * float(svh[sb + lane + 32u]);
+    \\vals[sg * 128u + lane + 64u] = (s0 - s2) * scv * float(svh[sb + lane + 64u]);
+    \\vals[sg * 128u + lane + 96u] = (s1 - s3) * scv * float(svh[sb + lane + 96u]);
     \\threadgroup_barrier(mem_flags::mem_threadgroup);
     \\if (sg == 0u) {
-    \\  half a0 = half(0.0f);
-    \\  half a1 = half(0.0f);
-    \\  half a2 = half(0.0f);
-    \\  half a3 = half(0.0f);
+    \\  float a0 = 0.0f;
+    \\  float a1 = 0.0f;
+    \\  float a2 = 0.0f;
+    \\  float a3 = 0.0f;
     \\  for (uint k = 0u; k < uint(TOPK); k++) {
-    \\    const float w = float(half(sc[row * uint(TOPK) + k]));
-    \\    a0 += half(float(vals[k * 128u + lane]) * w);
-    \\    a1 += half(float(vals[k * 128u + lane + 32u]) * w);
-    \\    a2 += half(float(vals[k * 128u + lane + 64u]) * w);
-    \\    a3 += half(float(vals[k * 128u + lane + 96u]) * w);
+    \\    const float w = float(sc[row * uint(TOPK) + k]);
+    \\    a0 += vals[k * 128u + lane] * w;
+    \\    a1 += vals[k * 128u + lane + 32u] * w;
+    \\    a2 += vals[k * 128u + lane + 64u] * w;
+    \\    a3 += vals[k * 128u + lane + 96u] * w;
     \\  }
     \\  const size_t yb = (size_t)row * (size_t)(ODIM) + base;
     \\  y[yb + lane] = T(a0);
@@ -2504,6 +2504,13 @@ test "exl3 K4 Metal inner GEMV matches the host tile decode" {
         const bits: u16 = @bitCast(src[i]);
         try t.expectEqual(exl3.f32ToF16Bits(host[i]), bits);
     }
+}
+
+test "exl3 down finish reduce keeps f32 through score fold" {
+    const t = std.testing;
+    try t.expect(std.mem.indexOf(u8, REDUCE_SOURCE, "threadgroup float vals") != null);
+    try t.expect(std.mem.indexOf(u8, REDUCE_SOURCE, "half a0") == null);
+    try t.expect(std.mem.indexOf(u8, REDUCE_SOURCE, "float a0") != null);
 }
 
 test "exl3 verify group union unique vs assignment count" {
@@ -3903,11 +3910,14 @@ test "exl3 moePrefill matches staged sorted chain" {
     const ag = mlx.mlx_array_data_float16(cg) orelse return error.F16Unreadable;
     const ar = mlx.mlx_array_data_float16(cr) orelse return error.F16Unreadable;
     const n: usize = @intCast(R * dim);
+    var max_d: u16 = 0;
     for (0..n) |j| {
         const bg: u16 = @bitCast(ag[j]);
         const br: u16 = @bitCast(ar[j]);
-        try t.expectEqual(br, bg);
+        const d: u16 = if (bg >= br) bg - br else br - bg;
+        if (d > max_d) max_d = d;
     }
+    try t.expect(max_d <= 8);
 }
 
 test "exl3 512-row E=512 topk=10 layer within 2x affine" {
