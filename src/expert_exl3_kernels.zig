@@ -2900,6 +2900,24 @@ fn f16Ulp(v: f32) f32 {
     return @abs(@as(f32, @floatCast(hu)) - @as(f32, @floatCast(h)));
 }
 
+/// Two renderings of the same chain agree to `bar` in relative RMS. The chains
+/// differ in where they round to f16, so the bar is an envelope, never bytes.
+fn expectRelRms(got: []const f16, want: []const f16, bar: f64) !void {
+    var ss: f64 = 0;
+    var ref: f64 = 0;
+    for (got, want) |g, w| {
+        const a: f64 = @floatCast(g);
+        const b: f64 = @floatCast(w);
+        if (!std.math.isFinite(a) or !std.math.isFinite(b)) return error.TestExpectedEqual;
+        ss += (a - b) * (a - b);
+        ref += b * b;
+    }
+    const rel = @sqrt(ss / @max(ref, 1e-20));
+    if (rel < bar) return;
+    std.debug.print("exl3 rel_rms {d:.6} over bar {d:.6}\n", .{ rel, bar });
+    return error.TestExpectedEqual;
+}
+
 fn expectGemvEnvelope(gpu: f32, host_f16: f32, ref: f32) !void {
     const eg = @abs(gpu - ref);
     const eh = @abs(host_f16 - ref);
@@ -3169,13 +3187,7 @@ test "exl3 fused decode chain matches indexed SwiGLU on one row" {
     try mlx.check(mlx.mlx_array_eval(c_o));
     const sf = mlx.mlx_array_data_float16(c_f) orelse return error.F16Unreadable;
     const so = mlx.mlx_array_data_float16(c_o) orelse return error.F16Unreadable;
-    var maxabs: f32 = 0;
-    for (0..dim) |i| {
-        const a: u16 = @bitCast(sf[i]);
-        const b: u16 = @bitCast(so[i]);
-        maxabs = @max(maxabs, @abs(exl3.f16BitsToF32(a) - exl3.f16BitsToF32(b)));
-    }
-    try t.expect(std.math.isFinite(maxabs));
+    try expectRelRms(sf[0..dim], so[0..dim], 0.01);
     try t.expectEqual(@as(u32, 4), n_disp);
     const fused_bf = try moeSwigluFused(s, x_arr, tr, suh, svh, tr, suh, svh, tr, suh, svh, slots, scores, .bfloat16);
     defer _ = mlx.mlx_array_free(fused_bf);
@@ -3191,13 +3203,7 @@ test "exl3 fused decode chain matches indexed SwiGLU on one row" {
     try mlx.check(mlx.mlx_contiguous(&c2, fused2, false, s));
     try mlx.check(mlx.mlx_array_eval(c2));
     const s2 = mlx.mlx_array_data_float16(c2) orelse return error.F16Unreadable;
-    var split_maxabs: f32 = 0;
-    for (0..dim) |i| {
-        const a: u16 = @bitCast(sf[i]);
-        const b: u16 = @bitCast(s2[i]);
-        split_maxabs = @max(split_maxabs, @abs(exl3.f16BitsToF32(a) - exl3.f16BitsToF32(b)));
-    }
-    if (!std.math.isFinite(split_maxabs)) return error.Split2NonFinite;
+    try expectRelRms(s2[0..dim], sf[0..dim], 0.01);
 }
 
 test "exl3 fused decode chain rows match N solo calls" {
@@ -3284,13 +3290,7 @@ test "exl3 fused decode chain rows match N solo calls" {
         try mlx.check(mlx.mlx_contiguous(&c_s, solo, false, s));
         try mlx.check(mlx.mlx_array_eval(c_s));
         const ss = mlx.mlx_array_data_float16(c_s) orelse return error.F16Unreadable;
-        var row_max: f32 = 0;
-        for (0..dim) |i| {
-            const a: u16 = @bitCast(sf[r * dim + i]);
-            const b: u16 = @bitCast(ss[i]);
-            row_max = @max(row_max, @abs(exl3.f16BitsToF32(a) - exl3.f16BitsToF32(b)));
-        }
-        try t.expect(std.math.isFinite(row_max));
+        try expectRelRms(sf[r * dim ..][0..dim], ss[0..dim], 0.01);
     }
 }
 
@@ -4158,5 +4158,84 @@ test "exl3 fused decode chain matches the indexed chain across the top-k range" 
             std.debug.print("exl3 topk={d} rel_rms={d:.6}\n", .{ topk, rel });
             return error.TestExpectedEqual;
         }
+    }
+}
+
+test "exl3 prefill arm matches the fused decode arm across row counts and top-k" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    const fixture = @embedFile("fixtures/exl3_k4_linear.safetensors");
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const header_len = std.mem.readInt(u64, fixture[0..8], .little);
+    const header = fixture[8 .. 8 + header_len];
+    const data = fixture[8 + header_len ..];
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, header, .{});
+    defer parsed.deinit();
+    const tm = parsed.value.object.get("trellis").?.object;
+    const sm = parsed.value.object.get("suh").?.object;
+    const vm = parsed.value.object.get("svh").?.object;
+    const t0: usize = @intCast(tm.get("data_offsets").?.array.items[0].integer);
+    const t1: usize = @intCast(tm.get("data_offsets").?.array.items[1].integer);
+    const s0: usize = @intCast(sm.get("data_offsets").?.array.items[0].integer);
+    const s1: usize = @intCast(sm.get("data_offsets").?.array.items[1].integer);
+    const v0: usize = @intCast(vm.get("data_offsets").?.array.items[0].integer);
+    const v1: usize = @intCast(vm.get("data_offsets").?.array.items[1].integer);
+    const trellis_bits = std.mem.bytesAsSlice(u16, data[t0..t1]);
+    const suh_bits = std.mem.bytesAsSlice(u16, data[s0..s1]);
+    const svh_bits = std.mem.bytesAsSlice(u16, data[v0..v1]);
+    const E: usize = 7;
+    const dim: usize = 128;
+    const tile_n = 8 * 8 * 64;
+    const st = try alloc.alloc(u16, E * tile_n);
+    const su = try alloc.alloc(u16, E * dim);
+    const sv = try alloc.alloc(u16, E * dim);
+    for (0..E) |e| {
+        @memcpy(st[e * tile_n ..][0..tile_n], trellis_bits);
+        @memcpy(su[e * dim ..][0..dim], suh_bits);
+        @memcpy(sv[e * dim ..][0..dim], svh_bits);
+    }
+    const tr = mlx.mlx_array_new_data(st.ptr, &[_]c_int{ @intCast(E), 8, 8, 64 }, 4, .uint16);
+    defer _ = mlx.mlx_array_free(tr);
+    const suh = mlx.mlx_array_new_data(su.ptr, &[_]c_int{ @intCast(E), @intCast(dim) }, 2, .float16);
+    defer _ = mlx.mlx_array_free(suh);
+    const svh = mlx.mlx_array_new_data(sv.ptr, &[_]c_int{ @intCast(E), @intCast(dim) }, 2, .float16);
+    defer _ = mlx.mlx_array_free(svh);
+    var prng = std.Random.DefaultPrng.init(179);
+    const rnd = prng.random();
+    // Row counts either side of the 16-row window, a tail that does not fill a
+    // window, and a run that spans one: the two arms must answer the same rows.
+    for ([_][2]usize{ .{ 1, 1 }, .{ 3, 2 }, .{ 5, 7 }, .{ 16, 10 }, .{ 17, 3 }, .{ 31, 5 }, .{ 33, 1 }, .{ 64, 6 } }) |c| {
+        const rows = c[0];
+        const topk = c[1];
+        const xh = try alloc.alloc(u16, rows * dim);
+        for (xh) |*v| v.* = exl3.f32ToF16Bits(rnd.float(f32) * 2 - 1);
+        const sl = try alloc.alloc(u32, rows * topk);
+        const sc = try alloc.alloc(f32, rows * topk);
+        for (sl) |*v| v.* = rnd.uintLessThan(u32, @intCast(E));
+        for (sc) |*v| v.* = rnd.float(f32);
+        const xa = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ @intCast(rows), @intCast(dim) }, 2, .float16);
+        defer _ = mlx.mlx_array_free(xa);
+        const sa = mlx.mlx_array_new_data(sl.ptr, &[_]c_int{@intCast(rows * topk)}, 1, .uint32);
+        defer _ = mlx.mlx_array_free(sa);
+        const ca = mlx.mlx_array_new_data(sc.ptr, &[_]c_int{@intCast(rows * topk)}, 1, .float32);
+        defer _ = mlx.mlx_array_free(ca);
+        const dec = try moeSwigluFused(s, xa, tr, suh, svh, tr, suh, svh, tr, suh, svh, sa, ca, .float16);
+        defer _ = mlx.mlx_array_free(dec);
+        const pre = try moePrefill(s, xa, tr, suh, svh, tr, suh, svh, tr, suh, svh, sa, ca, @intCast(topk));
+        defer _ = mlx.mlx_array_free(pre);
+        var cd = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(cd);
+        var cp = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(cp);
+        try mlx.check(mlx.mlx_contiguous(&cd, dec, false, s));
+        try mlx.check(mlx.mlx_contiguous(&cp, pre, false, s));
+        try mlx.check(mlx.mlx_array_eval(cd));
+        try mlx.check(mlx.mlx_array_eval(cp));
+        const ad = mlx.mlx_array_data_float16(cd) orelse return error.F16Unreadable;
+        const ap = mlx.mlx_array_data_float16(cp) orelse return error.F16Unreadable;
+        try expectRelRms(ad[0 .. rows * dim], ap[0 .. rows * dim], 0.01);
     }
 }
