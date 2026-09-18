@@ -1170,6 +1170,8 @@ pub fn prepareIndexed(s: mlx.mlx_stream, x_in: mlx.mlx_array, suh: mlx.mlx_array
     const topk = mlx.getShape(slots)[0];
     const xsh = mlx.getShape(x_in);
     const in_dim = xsh[xsh.len - 1];
+    // The kernel reads `topk` rows of x, so a rank-2 x must already carry them.
+    if (xsh.len > 2 or (xsh.len == 2 and xsh[0] != topk)) return error.BadExl3Shape;
     var x = x_in;
     var owned = false;
     if (xsh.len == 1) {
@@ -4518,4 +4520,34 @@ test "exl3 the GEMM window selector answers the window it was asked for" {
     try t.expectEqual(@as(?c_int, null), resolveGemmWindowRows("0"));
     try t.expectEqual(@as(?c_int, null), resolveGemmWindowRows("64"));
     try t.expectEqual(@as(?c_int, null), resolveGemmWindowRows("16x"));
+}
+
+test "exl3 prepareIndexed refuses a row count that is not the slot count" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    const dim: c_int = 128;
+    const topk: c_int = 4;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const xh = try alloc.alloc(u16, @intCast(dim));
+    @memset(xh, 0);
+    const suh = try alloc.alloc(u16, @intCast(2 * dim));
+    @memset(suh, 0);
+    var slots: [4]u32 = @splat(0);
+    // One row spelled [1, dim] is the natural shape for a single activation and
+    // the kernel reads `topk` rows of it.
+    const x1 = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ 1, dim }, 2, .float16);
+    defer _ = mlx.mlx_array_free(x1);
+    const suh_a = mlx.mlx_array_new_data(suh.ptr, &[_]c_int{ 2, dim }, 2, .float16);
+    defer _ = mlx.mlx_array_free(suh_a);
+    const sl = mlx.mlx_array_new_data(&slots, &[_]c_int{topk}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(sl);
+    try t.expectError(error.BadExl3Shape, prepareIndexed(s, x1, suh_a, sl));
+    const x0 = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{dim}, 1, .float16);
+    defer _ = mlx.mlx_array_free(x0);
+    const ok = try prepareIndexed(s, x0, suh_a, sl);
+    defer _ = mlx.mlx_array_free(ok);
+    try t.expectEqual(topk, mlx.getShape(ok)[0]);
 }
