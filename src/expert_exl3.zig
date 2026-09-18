@@ -28,6 +28,15 @@ pub fn packedHalfwords(k: u32) usize {
     return TILE_VALUES * @as(usize, k) / 16;
 }
 
+pub fn kFromPackedDim(packed_hw: usize) ?u32 {
+    if (packed_hw % TILE != 0) return null;
+    const k = packed_hw / TILE;
+    return switch (k) {
+        2, 3, 4 => @intCast(k),
+        else => null,
+    };
+}
+
 pub fn f16BitsToF32(bits: u16) f32 {
     return @floatCast(@as(f16, @bitCast(bits)));
 }
@@ -352,6 +361,18 @@ fn parseSafetensors(allocator: std.mem.Allocator, raw: []const u8) !std.StringHa
 
 fn asU16(view: TensorView) []const u16 {
     return @alignCast(std.mem.bytesAsSlice(u16, view.bytes));
+}
+
+test "exl3 packed dim 16 times K is K in 2,3,4" {
+    const t = std.testing;
+    try t.expectEqual(@as(?u32, 2), kFromPackedDim(32));
+    try t.expectEqual(@as(?u32, 3), kFromPackedDim(48));
+    try t.expectEqual(@as(?u32, 4), kFromPackedDim(64));
+    try t.expectEqual(@as(?u32, null), kFromPackedDim(16));
+    try t.expectEqual(@as(?u32, null), kFromPackedDim(80));
+    try t.expectEqual(@as(usize, 32), packedHalfwords(2));
+    try t.expectEqual(@as(usize, 48), packedHalfwords(3));
+    try t.expectEqual(@as(usize, 64), packedHalfwords(4));
 }
 
 test "exl3 MUL1 codebook pins known codewords" {
