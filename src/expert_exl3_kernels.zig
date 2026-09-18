@@ -6,12 +6,28 @@ const io_util = @import("io_util.zig");
 
 var ubench_force: bool = false;
 var ubench_env: ?bool = null;
+var pair_splits_force: ?u32 = null;
+var pair_splits_env: ?u32 = null;
 var swiglu_maxabs_env: ?bool = null;
 var swiglu_maxabs_dumped: bool = false;
 
 fn diagEnvValueOn(raw: ?[*:0]const u8) bool {
     const v = raw orelse return false;
     return v[0] != '0';
+}
+
+fn pairSplitCount() u32 {
+    if (pair_splits_force) |v| return v;
+    if (pair_splits_env) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_EXL3_PAIR_SPLITS");
+    const n: u32 = if (raw) |r| std.fmt.parseInt(u32, std.mem.sliceTo(r, 0), 10) catch 2 else 2;
+    const v: u32 = if (n == 1 or n == 2 or n == 4) n else 2;
+    pair_splits_env = v;
+    return v;
+}
+
+pub fn setPairSplitsForTest(n: ?u32) void {
+    pair_splits_force = n;
 }
 
 fn exl3UbenchOn() bool {
@@ -621,7 +637,8 @@ var gemm_nax_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var gemm_nax_failed: bool = false;
 var gemm_nax_cached: ?bool = null;
 const PairPrepKey = struct { in_dim: c_int, nslots: c_int, topk: c_int };
-const PairGemvKey = struct { in_dim: c_int, out_dim: c_int, nslots: c_int };
+const PairGemvKey = struct { in_dim: c_int, out_dim: c_int, nslots: c_int, nsplit: c_int };
+const DownFusedKey = struct { in_dim: c_int, out_dim: c_int, nslots: c_int, nsplit: c_int };
 const MidKey = struct { dim: c_int, nslots: c_int };
 const ReduceKey = struct { out_dim: c_int, rows: c_int, topk: c_int };
 const DecodeReduceKey = struct { out_dim: c_int, rows: c_int, topk: c_int, dtype: mlx.mlx_dtype };
@@ -629,7 +646,7 @@ var pair_prep_cfgs: CfgCache(PairPrepKey, 8) = .{};
 var pair_gemv_cfgs: CfgCache(PairGemvKey, 8) = .{};
 var mid_cfgs: CfgCache(MidKey, 8) = .{};
 var reduce_cfgs: CfgCache(DecodeReduceKey, 8) = .{};
-var down_fused_cfgs: CfgCache(IndexedKey, 8) = .{};
+var down_fused_cfgs: CfgCache(DownFusedKey, 8) = .{};
 var token_prep_cfgs: CfgCache(PairPrepKey, 8) = .{};
 var token_pair_prep_cfgs: CfgCache(PairPrepKey, 8) = .{};
 var token_reduce_cfgs: CfgCache(ReduceKey, 8) = .{};
@@ -1131,9 +1148,12 @@ const DOWN_FUSED_SOURCE: [:0]const u8 =
     \\const uint nblocks = uint(IDIM) / 128u;
     \\for (uint block = sg; block < nblocks; block += SGS) {
     \\  const uint base = block * 128u;
-    \\  const size_t xb = (size_t)slot * (size_t)(IDIM) + base;
     \\  const size_t sb = (size_t)eid * (size_t)(IDIM) + base;
-    \\  float4 v = float4(float(ig[xb + lane]), float(ig[xb + lane + 32u]), float(ig[xb + lane + 64u]), float(ig[xb + lane + 96u]));
+    \\  float4 v = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    \\  for (uint sp = 0u; sp < uint(NSPLIT); sp++) {
+    \\    const size_t xb = ((size_t)slot * uint(NSPLIT) + sp) * (size_t)(IDIM) + base;
+    \\    v += float4(float(ig[xb + lane]), float(ig[xb + lane + 32u]), float(ig[xb + lane + 64u]), float(ig[xb + lane + 96u]));
+    \\  }
     \\  for (ushort bit = 1u; bit <= 16u; bit <<= 1u) {
     \\    const float p0 = simd_shuffle_xor(v.x, bit);
     \\    const float p1 = simd_shuffle_xor(v.y, bit);
@@ -1153,7 +1173,11 @@ const DOWN_FUSED_SOURCE: [:0]const u8 =
     \\  const half g1 = half((s1 + s3) * sc * float(svhg[sb + lane + 32u]));
     \\  const half g2 = half((s0 - s2) * sc * float(svhg[sb + lane + 64u]));
     \\  const half g3 = half((s1 - s3) * sc * float(svhg[sb + lane + 96u]));
-    \\  v = float4(float(iu[xb + lane]), float(iu[xb + lane + 32u]), float(iu[xb + lane + 64u]), float(iu[xb + lane + 96u]));
+    \\  v = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    \\  for (uint sp = 0u; sp < uint(NSPLIT); sp++) {
+    \\    const size_t xbu = ((size_t)slot * uint(NSPLIT) + sp) * (size_t)(IDIM) + base;
+    \\    v += float4(float(iu[xbu + lane]), float(iu[xbu + lane + 32u]), float(iu[xbu + lane + 64u]), float(iu[xbu + lane + 96u]));
+    \\  }
     \\  for (ushort bit = 1u; bit <= 16u; bit <<= 1u) {
     \\    const float p0 = simd_shuffle_xor(v.x, bit);
     \\    const float p1 = simd_shuffle_xor(v.y, bit);
@@ -1284,7 +1308,8 @@ fn downGemvFusedMid(
     nslots: c_int,
 ) !mlx.mlx_array {
     const out_tiles = @divExact(out_dim, 16);
-    const key = IndexedKey{ .in_dim = in_dim, .out_dim = out_dim, .topk = nslots };
+    const nsplit: c_int = @intCast(pairSplitCount());
+    const key = DownFusedKey{ .in_dim = in_dim, .out_dim = out_dim, .nslots = nslots, .nsplit = nsplit };
     const cfg = down_fused_cfgs.get(key) orelse blk: {
         const c = mlx.mlx_fast_metal_kernel_config_new();
         const sh = [_]c_int{ nslots, out_dim };
@@ -1293,6 +1318,7 @@ fn downGemvFusedMid(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 128, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "IDIM", in_dim));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ODIM", out_dim));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "NSPLIT", nsplit));
         down_fused_cfgs.put(key, c);
         break :blk c;
     };
@@ -1386,6 +1412,7 @@ const PAIR_GEMV_SOURCE: [:0]const u8 =
     \\threadgroup float partial[4 * 256];
     \\uint ot = uint(threadgroup_position_in_grid.x);
     \\uint slot = uint(threadgroup_position_in_grid.y);
+    \\uint split = uint(threadgroup_position_in_grid.z);
     \\uint sg = uint(simdgroup_index_in_threadgroup);
     \\uint lane = uint(thread_index_in_simdgroup);
     \\uint lid = uint(thread_index_in_threadgroup);
@@ -1393,6 +1420,9 @@ const PAIR_GEMV_SOURCE: [:0]const u8 =
     \\constexpr uint IT = uint(IDIM) / TILE;
     \\constexpr uint OT = uint(ODIM) / TILE;
     \\constexpr uint SGS = 4u;
+    \\const uint tiles_per_split = (IT + uint(NSPLIT) - 1u) / uint(NSPLIT);
+    \\const uint tk0 = split * tiles_per_split;
+    \\const uint tk1 = min(tk0 + tiles_per_split, IT);
     \\const uint eid = uint(slots[slot]);
     \\const uint prow = (lane & 3u) * 2u;
     \\const uint pcol = lane >> 2u;
@@ -1416,7 +1446,7 @@ const PAIR_GEMV_SOURCE: [:0]const u8 =
     \\  device half *y = (proj == 0u) ? yg : yu;
     \\  float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     \\  const device uint *trellis_e = (const device uint *)(trellis + ((size_t)eid * (size_t)IT * (size_t)OT) * 64u);
-    \\  for (uint tk = sg; tk < IT; tk += SGS) {
+    \\  for (uint tk = tk0 + sg; tk < tk1; tk += SGS) {
     \\    const device uint *words = trellis_e + ((size_t)tk * (size_t)OT + ot) * 32u;
     \\    const ulong merged = ((ulong)words[(lane + 31u) & 31u] << 32) | (ulong)words[lane];
     \\    const float in0 = float(x[xb + tk * TILE + row0]);
@@ -1450,7 +1480,7 @@ const PAIR_GEMV_SOURCE: [:0]const u8 =
     \\        sum += partial[g * 256u + p];
     \\      }
     \\    }
-    \\    y[(size_t)slot * (size_t)(ODIM) + ot * TILE + lid] = half(sum);
+    \\    y[(size_t)(slot * uint(NSPLIT) + split) * (size_t)(ODIM) + ot * TILE + lid] = half(sum);
     \\  }
     \\  threadgroup_barrier(mem_flags::mem_threadgroup);
     \\}
@@ -1663,16 +1693,18 @@ fn pairPrepare(s: mlx.mlx_stream, x: mlx.mlx_array, suhg: mlx.mlx_array, suhu: m
 
 fn pairGemv(s: mlx.mlx_stream, xg: mlx.mlx_array, xu: mlx.mlx_array, tg: mlx.mlx_array, tu: mlx.mlx_array, slots: mlx.mlx_array, in_dim: c_int, out_dim: c_int, nslots: c_int) !struct { mlx.mlx_array, mlx.mlx_array } {
     const out_tiles = @divExact(out_dim, 16);
-    const key = PairGemvKey{ .in_dim = in_dim, .out_dim = out_dim, .nslots = nslots };
+    const nsplit: c_int = @intCast(pairSplitCount());
+    const key = PairGemvKey{ .in_dim = in_dim, .out_dim = out_dim, .nslots = nslots, .nsplit = nsplit };
     const cfg = pair_gemv_cfgs.get(key) orelse blk: {
         const c = mlx.mlx_fast_metal_kernel_config_new();
-        const sh = [_]c_int{ nslots, out_dim };
+        const sh = [_]c_int{ nslots * nsplit, out_dim };
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &sh, 2, .float16));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &sh, 2, .float16));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, out_tiles * 128, nslots, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, out_tiles * 128, nslots, nsplit));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 128, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "IDIM", in_dim));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ODIM", out_dim));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "NSPLIT", nsplit));
         pair_gemv_cfgs.put(key, c);
         break :blk c;
     };
@@ -2864,6 +2896,7 @@ test "exl3 fused decode chain matches indexed SwiGLU on one row" {
     const scores = mlx.mlx_array_new_data(scores_h.ptr, &[_]c_int{@intCast(topk)}, 1, .float32);
     defer _ = mlx.mlx_array_free(scores);
     resetFusedDispatchCount();
+    pair_splits_force = 1;
     const fused = try moeSwigluFused(s, x_arr, tr, suh, svh, tr, suh, svh, tr, suh, svh, slots, scores, .float16);
     defer _ = mlx.mlx_array_free(fused);
     const n_disp = fusedDispatchCount();
@@ -2888,6 +2921,27 @@ test "exl3 fused decode chain matches indexed SwiGLU on one row" {
     const fused_bf = try moeSwigluFused(s, x_arr, tr, suh, svh, tr, suh, svh, tr, suh, svh, slots, scores, .bfloat16);
     defer _ = mlx.mlx_array_free(fused_bf);
     try t.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(fused_bf));
+    pair_splits_force = 2;
+    defer {
+        pair_splits_force = null;
+    }
+    const fused2 = try moeSwigluFused(s, x_arr, tr, suh, svh, tr, suh, svh, tr, suh, svh, slots, scores, .float16);
+    defer _ = mlx.mlx_array_free(fused2);
+    var c2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(c2);
+    try mlx.check(mlx.mlx_contiguous(&c2, fused2, false, s));
+    try mlx.check(mlx.mlx_array_eval(c2));
+    const s2 = mlx.mlx_array_data_float16(c2) orelse return error.F16Unreadable;
+    var ndiff: usize = 0;
+    var maxabs: f32 = 0;
+    for (0..dim) |i| {
+        const a: u16 = @bitCast(sf[i]);
+        const b: u16 = @bitCast(s2[i]);
+        if (a != b) ndiff += 1;
+        maxabs = @max(maxabs, @abs(exl3.f16BitsToF32(a) - exl3.f16BitsToF32(b)));
+    }
+    if (ndiff == 0) return error.Split2BitIdentical;
+    if (!std.math.isFinite(maxabs)) return error.Split2NonFinite;
 }
 
 test "exl3 fused decode chain rows match N solo calls" {
@@ -2948,6 +3002,10 @@ test "exl3 fused decode chain rows match N solo calls" {
     defer _ = mlx.mlx_array_free(slots);
     const scores = mlx.mlx_array_new_data(scores_h.ptr, &[_]c_int{@intCast(rows * topk)}, 1, .float32);
     defer _ = mlx.mlx_array_free(scores);
+    pair_splits_force = 1;
+    defer {
+        pair_splits_force = null;
+    }
     const fused = try moeSwigluFused(s, x_arr, tr, suh, svh, tr, suh, svh, tr, suh, svh, slots, scores, .float16);
     defer _ = mlx.mlx_array_free(fused);
     var c_f = mlx.mlx_array_new();

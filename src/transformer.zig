@@ -38574,6 +38574,8 @@ test "MTP EXL3 mtpMoeRows fused rows match N solo calls on the same kernel" {
     try mlx.check(mlx.mlx_array_eval(sh_eg));
     try mlx.check(mlx.mlx_array_eval(x_arr));
     expert_exl3_kernels.resetFusedDispatchCount();
+    expert_exl3_kernels.setPairSplitsForTest(1);
+    defer expert_exl3_kernels.setPairSplitsForTest(null);
     const fused = try xfm.mtpMoeRows(x_arr, &mw);
     defer _ = mlx.mlx_array_free(fused);
     const n_disp = expert_exl3_kernels.fusedDispatchCount();
