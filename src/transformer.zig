@@ -38501,12 +38501,18 @@ test "MTP EXL3 mtpMoeRows fused rows match N solo calls on the same kernel" {
         .quant_bits = 0,
         .quant_group_size = 64,
         .quant_mode = .affine,
+        .hidden_act = .silu,
     };
     xfm.one = mlx.mlx_array_new_float(1.0);
     defer _ = mlx.mlx_array_free(xfm.one);
     xfm.bits_cache = .{};
     xfm.compiled_moe_routing = null;
+    xfm.compiled_gelu = null;
+    xfm.compiled_geglu = null;
     xfm.cost_trace_active = false;
+    const prev_st = qwen4_standin_override;
+    qwen4_standin_override = .{ .moe_shared = true };
+    defer qwen4_standin_override = prev_st;
     const tr = mlx.mlx_array_new_data(stacked_t.ptr, &[_]c_int{ @intCast(E), 8, 8, 64 }, 4, .uint16);
     defer _ = mlx.mlx_array_free(tr);
     const suh = mlx.mlx_array_new_data(stacked_suh.ptr, &[_]c_int{ @intCast(E), @intCast(dim) }, 2, .float16);
@@ -38515,12 +38521,24 @@ test "MTP EXL3 mtpMoeRows fused rows match N solo calls on the same kernel" {
     defer _ = mlx.mlx_array_free(svh);
     const router = mlx.mlx_array_new_data(rw.ptr, &[_]c_int{ @intCast(dim), @intCast(E) }, 2, .float16);
     defer _ = mlx.mlx_array_free(router);
-    const empty = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(empty);
+    const none = mlx.mlx_array{ .ctx = null };
+    const ident = try alloc.alloc(u16, dim * dim);
+    @memset(ident, 0);
+    for (0..dim) |i| ident[i * dim + i] = exl3.f32ToF16Bits(1.0);
+    const sh_gate = mlx.mlx_array_new_data(ident.ptr, &[_]c_int{ @intCast(dim), @intCast(dim) }, 2, .float16);
+    defer _ = mlx.mlx_array_free(sh_gate);
+    const sh_up = mlx.mlx_array_new_data(ident.ptr, &[_]c_int{ @intCast(dim), @intCast(dim) }, 2, .float16);
+    defer _ = mlx.mlx_array_free(sh_up);
+    const sh_down = mlx.mlx_array_new_data(ident.ptr, &[_]c_int{ @intCast(dim), @intCast(dim) }, 2, .float16);
+    defer _ = mlx.mlx_array_free(sh_down);
+    const gbits = try alloc.alloc(u16, dim);
+    @memset(gbits, 0);
+    const sh_eg = mlx.mlx_array_new_data(gbits.ptr, &[_]c_int{ @intCast(dim), 1 }, 2, .float16);
+    defer _ = mlx.mlx_array_free(sh_eg);
     var mw: MoeMlpWeights = .{
         .router_w = router,
-        .router_s = empty,
-        .router_b = empty,
+        .router_s = none,
+        .router_b = none,
         .switch_gate_w = tr,
         .switch_gate_s = suh,
         .switch_gate_b = svh,
@@ -38530,15 +38548,18 @@ test "MTP EXL3 mtpMoeRows fused rows match N solo calls on the same kernel" {
         .switch_down_w = tr,
         .switch_down_s = suh,
         .switch_down_b = svh,
-        .shared_gate_w = empty,
-        .shared_gate_s = empty,
-        .shared_gate_b = empty,
-        .shared_up_w = empty,
-        .shared_up_s = empty,
-        .shared_up_b = empty,
-        .shared_down_w = empty,
-        .shared_down_s = empty,
-        .shared_down_b = empty,
+        .shared_gate_w = sh_gate,
+        .shared_gate_s = none,
+        .shared_gate_b = none,
+        .shared_up_w = sh_up,
+        .shared_up_s = none,
+        .shared_up_b = none,
+        .shared_down_w = sh_down,
+        .shared_down_s = none,
+        .shared_down_b = none,
+        .shared_expert_gate_w = sh_eg,
+        .shared_expert_gate_s = none,
+        .shared_expert_gate_b = none,
     };
     const x_arr = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ @intCast(rows), 1, @intCast(dim) }, 3, .float16);
     defer _ = mlx.mlx_array_free(x_arr);
@@ -38546,6 +38567,10 @@ test "MTP EXL3 mtpMoeRows fused rows match N solo calls on the same kernel" {
     try mlx.check(mlx.mlx_array_eval(suh));
     try mlx.check(mlx.mlx_array_eval(svh));
     try mlx.check(mlx.mlx_array_eval(router));
+    try mlx.check(mlx.mlx_array_eval(sh_gate));
+    try mlx.check(mlx.mlx_array_eval(sh_up));
+    try mlx.check(mlx.mlx_array_eval(sh_down));
+    try mlx.check(mlx.mlx_array_eval(sh_eg));
     try mlx.check(mlx.mlx_array_eval(x_arr));
     expert_exl3_kernels.resetFusedDispatchCount();
     const fused = try xfm.mtpMoeRows(x_arr, &mw);
