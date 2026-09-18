@@ -204,6 +204,80 @@ pub fn reconstructPublic(
     for (w, 0..) |v, i| out[i] = f32ToF16Bits(v);
 }
 
+pub fn prepareInput(x: []const f32, suh: []const u16, out: []f32) void {
+    for (x, suh, out) |xv, s, *d| {
+        d.* = f16BitsToF32(f32ToF16Bits(xv)) * f16BitsToF32(s);
+    }
+    var block: usize = 0;
+    while (block < out.len) : (block += HAD_DIM) {
+        var vec: [HAD_DIM]f32 = undefined;
+        @memcpy(&vec, out[block..][0..HAD_DIM]);
+        hadamard128(&vec);
+        for (0..HAD_DIM) |i| out[block + i] = f16BitsToF32(f32ToF16Bits(vec[i]));
+    }
+}
+
+pub fn innerGemv(
+    trellis: []const u16,
+    transformed: []const f32,
+    in_features: usize,
+    out_features: usize,
+    k: u32,
+    codebook: Codebook,
+    out: []f32,
+) void {
+    const in_tiles = in_features / TILE;
+    const out_tiles = out_features / TILE;
+    const packed_n = packedHalfwords(k);
+    @memset(out, 0);
+    var tile_w: [TILE_VALUES]u16 = undefined;
+    for (0..in_tiles) |tk| {
+        for (0..out_tiles) |tn| {
+            const off = (tk * out_tiles + tn) * packed_n;
+            decodeTile(trellis[off..][0..packed_n], k, codebook, &tile_w);
+            const xbase = tk * TILE;
+            const ybase = tn * TILE;
+            for (0..TILE) |r| {
+                const xv = transformed[xbase + r];
+                for (0..TILE) |c| {
+                    out[ybase + c] += xv * f16BitsToF32(tile_w[r * TILE + c]);
+                }
+            }
+        }
+    }
+    for (out) |*v| v.* = f16BitsToF32(f32ToF16Bits(v.*));
+}
+
+pub fn finishOutput(inner: []const f32, svh: []const u16, out: []f32) void {
+    @memcpy(out, inner);
+    var block: usize = 0;
+    while (block < out.len) : (block += HAD_DIM) {
+        var vec: [HAD_DIM]f32 = undefined;
+        @memcpy(&vec, out[block..][0..HAD_DIM]);
+        hadamard128(&vec);
+        @memcpy(out[block..][0..HAD_DIM], &vec);
+    }
+    for (out, svh) |*v, s| v.* = f16BitsToF32(f32ToF16Bits(v.* * f16BitsToF32(s)));
+}
+
+pub fn project(
+    x: []const f32,
+    trellis: []const u16,
+    suh: []const u16,
+    svh: []const u16,
+    in_features: usize,
+    out_features: usize,
+    k: u32,
+    codebook: Codebook,
+    transformed: []f32,
+    inner: []f32,
+    out: []f32,
+) void {
+    prepareInput(x, suh, transformed);
+    innerGemv(trellis, transformed, in_features, out_features, k, codebook, inner);
+    finishOutput(inner, svh, out);
+}
+
 const fixture_bytes = @embedFile("fixtures/exl3_k4_linear.safetensors");
 
 const TensorView = struct {
@@ -286,4 +360,30 @@ test "exl3 K4 packed fixture decodes to the library inner and public f16" {
     const got_public = try alloc.alloc(u16, in_features * out_features);
     try reconstructPublic(alloc, asU16(trellis), asU16(suh), asU16(svh), in_features, out_features, K4, .mcg, got_public);
     try t.expectEqualSlices(u16, asU16(public), got_public);
+
+    var x: [128]f32 = undefined;
+    var prng = std.Random.DefaultPrng.init(7);
+    const rnd = prng.random();
+    for (&x) |*v| v.* = rnd.float(f32) * 2 - 1;
+    const transformed = try alloc.alloc(f32, 128);
+    const inner_y = try alloc.alloc(f32, 128);
+    const y = try alloc.alloc(f32, 128);
+    project(&x, asU16(trellis), asU16(suh), asU16(svh), 128, 128, K4, .mcg, transformed, inner_y, y);
+    const dense = try alloc.alloc(f32, 128);
+    @memset(dense, 0);
+    const pub_w = asU16(public);
+    for (0..128) |o| {
+        var acc: f32 = 0;
+        for (0..128) |i| acc += x[i] * f16BitsToF32(pub_w[i * 128 + o]);
+        dense[o] = acc;
+    }
+    var ss: f64 = 0;
+    var ref: f64 = 0;
+    for (y, dense) |g, d| {
+        const diff = g - d;
+        ss += @as(f64, diff) * @as(f64, diff);
+        ref += @as(f64, d) * @as(f64, d);
+    }
+    const rel = @sqrt(ss / @max(ref, 1e-20));
+    try t.expect(rel < 0.02);
 }
