@@ -38387,6 +38387,40 @@ test "exl3 MTP switch_mlp refuses a missing restacked tensor by MissingWeight" {
     try t.expectError(error.MissingWeight, loadSwitchMlpBank(&w, &buf, "language_model.mtp", 0, true));
 }
 
+test "exl3 a trellis the kernels cannot decode refuses at load" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    const put = struct {
+        fn add(w: *Weights, name: []const u8, dtype: mlx.mlx_dtype, shape: []const c_int, st: mlx.mlx_stream) !void {
+            var arr = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_zeros(&arr, shape.ptr, @intCast(shape.len), dtype, st));
+            try w.map.put(try w.allocator.dupe(u8, name), arr);
+        }
+    }.add;
+    const bind = struct {
+        fn run(st: mlx.mlx_stream, trellis: []const c_int) !SwitchMlpBank {
+            var w = Weights.init(std.testing.allocator);
+            defer w.deinit();
+            const suh = [_]c_int{ 4, 128 };
+            for ([_][]const u8{ "gate", "up", "down" }) |proj| {
+                var tbuf: [96]u8 = undefined;
+                const tk = try std.fmt.bufPrint(&tbuf, "language_model.mtp.layers.0.mlp.switch_mlp.{s}_proj.trellis", .{proj});
+                try put(&w, tk, .uint16, trellis, st);
+                const sk = try std.fmt.bufPrint(&tbuf, "language_model.mtp.layers.0.mlp.switch_mlp.{s}_proj.suh", .{proj});
+                try put(&w, sk, .float16, &suh, st);
+                const vk = try std.fmt.bufPrint(&tbuf, "language_model.mtp.layers.0.mlp.switch_mlp.{s}_proj.svh", .{proj});
+                try put(&w, vk, .float16, &suh, st);
+            }
+            var buf: [256]u8 = undefined;
+            return loadSwitchMlpBank(&w, &buf, "language_model.mtp", 0, true);
+        }
+    }.run;
+    _ = try bind(s, &[_]c_int{ 4, 8, 8, 48 });
+    try t.expectError(error.Exl3TrellisGeometry, bind(s, &[_]c_int{ 4, 8, 8, 80 }));
+    try t.expectError(error.Exl3TrellisGeometry, bind(s, &[_]c_int{ 4, 8, 8, 16 }));
+    try t.expectError(error.Exl3TrellisGeometry, bind(s, &[_]c_int{ 4, 8, 64 }));
+}
+
 test "exl3 MTP rows wider than the decode arm refuse by Exl3MtpRowsExceedDecode" {
     const t = std.testing;
     const s = mlx.gpuStream();
@@ -38652,9 +38686,18 @@ const SwitchMlpBank = struct {
     down_b: mlx.mlx_array,
 };
 
-fn loadSwitchMlpBank(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, exl3: bool) error{MissingWeight}!SwitchMlpBank {
+/// A trellis the EXL3 kernels can decode: `[E, in/16, out/16, 16*K]`, K in 2..4.
+/// Anything else is a load refusal, not a per-request 500 from `packedK`.
+fn exl3TrellisAdmitted(shape: []const c_int) bool {
+    if (shape.len != 4) return false;
+    if (@rem(shape[3], 16) != 0) return false;
+    const k = @divExact(shape[3], 16);
+    return k >= 2 and k <= 4;
+}
+
+fn loadSwitchMlpBank(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, exl3: bool) error{ MissingWeight, Exl3TrellisGeometry }!SwitchMlpBank {
     if (exl3) {
-        return .{
+        const bank: SwitchMlpBank = .{
             .gate_w = try getLayerWeight(weights, buf, prefix, layer, "mlp.switch_mlp.gate_proj.trellis"),
             .gate_s = try getLayerWeight(weights, buf, prefix, layer, "mlp.switch_mlp.gate_proj.suh"),
             .gate_b = try getLayerWeight(weights, buf, prefix, layer, "mlp.switch_mlp.gate_proj.svh"),
@@ -38665,6 +38708,10 @@ fn loadSwitchMlpBank(weights: *const Weights, buf: *[256]u8, prefix: []const u8,
             .down_s = try getLayerWeight(weights, buf, prefix, layer, "mlp.switch_mlp.down_proj.suh"),
             .down_b = try getLayerWeight(weights, buf, prefix, layer, "mlp.switch_mlp.down_proj.svh"),
         };
+        for ([_]mlx.mlx_array{ bank.gate_w, bank.up_w, bank.down_w }) |trellis| {
+            if (!exl3TrellisAdmitted(mlx.getShape(trellis))) return error.Exl3TrellisGeometry;
+        }
+        return bank;
     }
     return .{
         .gate_w = try getLayerWeight(weights, buf, prefix, layer, "mlp.switch_mlp.gate_proj.weight"),

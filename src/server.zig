@@ -12864,6 +12864,7 @@ test "every load refusal the registry preserves answers under its own name" {
         "ExpertSlabImportCopied",
         "ExpertLayoutUnsupported",
         "Exl3TopKExceedsReduceBank",
+        "Exl3TrellisGeometry",
     };
     for (names) |name| {
         const refusal = loadRefusalFor(model_registry_mod.ModelRegistry.loadErrorFromName(name)) orelse {
@@ -12877,6 +12878,7 @@ test "every load refusal the registry preserves answers under its own name" {
     try t.expectEqualStrings("expert_slab_import_copied", loadRefusalFor(error.ExpertSlabImportCopied).?.type);
     try t.expectEqualStrings("expert_layout_unsupported", loadRefusalFor(error.ExpertLayoutUnsupported).?.type);
     try t.expectEqualStrings("exl3_topk_exceeds_reduce_bank", loadRefusalFor(error.Exl3TopKExceedsReduceBank).?.type);
+    try t.expectEqualStrings("exl3_trellis_geometry", loadRefusalFor(error.Exl3TrellisGeometry).?.type);
     try t.expect(loadRefusalFor(error.LoadFailed) == null);
     try t.expect(loadRefusalFor(error.UnknownModelId) == null);
 }
@@ -12894,6 +12896,7 @@ pub fn loadRefusalFor(err: anyerror) ?LoadRefusal {
         error.ExpertSlabImportCopied => .{ .type = "expert_slab_import_copied", .message = "MLX copied the expert slab instead of aliasing it, so this machine cannot stream experts zero-copy. Report the Mac model and macOS version." },
         error.ExpertLayoutUnsupported => .{ .type = "expert_layout_unsupported", .message = "This qwen4_exp checkpoint's routed experts are not a uniform EXL3 K4 MUL1 pack this build can load. Re-convert with k=4 and codebook mul1, or serve an affine pack." },
         error.Exl3TopKExceedsReduceBank => .{ .type = "exl3_topk_exceeds_reduce_bank", .message = "This EXL3 pack's num_experts_per_tok exceeds the decode reduce-bank (32). Re-convert with top-k <= 32." },
+        error.Exl3TrellisGeometry => .{ .type = "exl3_trellis_geometry", .message = "This EXL3 pack has a routed-expert trellis this build cannot decode: the packed dim must be 16*K with K in 2, 3 or 4. Re-convert with k=2, 3 or 4." },
         error.SsdBudgetBelowResident => .{ .type = "ssd_budget_below_resident", .message = "--ssd-budget-gb leaves no room for an expert cache after the resident trunk, the prefill union and the fill buffers. Raise the budget." },
         error.SsdBudgetExceedsWiredLimit => .{ .type = "ssd_budget_exceeds_wired_limit", .message = "--ssd-budget-gb plus the planned KV cache exceeds the machine's residency limit. Raise iogpu.wired_limit_mb (the server log names the value) or lower the budget." },
         else => null,
