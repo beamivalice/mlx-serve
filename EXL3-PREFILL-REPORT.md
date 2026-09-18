@@ -6,25 +6,29 @@ Box: Apple M5 Max
 
 ## Files changed
 
-- `src/expert_exl3_kernels.zig` (item 0 benches; item 1 16-row windows + run walk; item 2 paired prepare, int32 order, scatter, mid/finish fuse, gemmNaxOn cache)
+- `src/expert_exl3_kernels.zig` (items 0–2 as merged; item 3 decode-full + decode-once GEMM arm)
+- `NOTICE` (ExLlamaV3 full-trellis decode port)
 
 ## Tests added
 
 - Item 0: both in-tree prefill benches assert `max_e >= 400` and loop C in {512, 2048} at E=512 / top-k 10.
 - Item 1: `exl3 sorted GEMM 16-row windows match 4-row per row` (mixed runs, n=32, bit identity). NAX default and SIMD via `MLX_SERVE_FORCE_GPU_FAMILY_FALLBACK=1`.
 - Item 2: `exl3 moePrefill matches staged sorted chain` (old two-prepare / MLX SwiGLU / inv-reduce vs new path, bit identity).
+- Item 3: `exl3 decode-once transient bytes at production dims`; `exl3 decode-full K4 matches host inner`; `exl3 decode-once GEMM matches 16-row windows on long run` (20-row expert + 4-row tail, bit identity vs window path).
 
 ## Red-first evidence
 
 - Item 0: `max_e >= 400` on E=4 benches: `FAIL (TestUnexpectedResult)`. Green after E=512 / top-k 10.
 - Item 1: 16-row grid with kernel still `win * 4u`: `expected 17898, found 0` (`FAIL TestExpectedEqual`). Green after `start = win * WIN` and in-kernel run walk.
 - Item 2: characterization `exl3 moePrefill matches staged sorted chain` green on the old body, still green after pair-prepare / int32 / scatter / mid+downFinishReduce.
+- Item 3: decode-full with grid in threadgroups (not threads) wrote zeros: `expected 47816, found 0`. Green after `set_grid(out_tiles * 128, ...)`.
 
 ## Suite counts
 
 - Item 0 filtered `-Dtest-filter="exl3"`: 22 passed.
 - Item 1 filtered `-Dtest-filter="exl3"`: 23 passed, 0 failed (includes new identity test). SIMD-arm rerun of sorted GEMM tests: 4/4.
 - Item 2 filtered `-Dtest-filter="exl3"`: 24 passed, 0 failed.
+- Item 3 filtered `-Dtest-filter="exl3"`: 27 passed, 0 failed.
 
 ## Commit sha
 
@@ -61,6 +65,21 @@ Ratio 1464.5 / 2100.6 = **0.697x**. Bar 1580 tok/s (0.75x of 2109, or 0.75x of 2
 
 Ratio 1454.4 / 2097.4 = **0.693x**. Still short of 1580. Item 3 is required.
 
+### After item 3 (decode-once wired into moePrefill — not kept)
+
+Load averages are 1-minute from `uptime` at Model ready.
+
+| arm | boot1 | boot2 | boot3 | median tok/s | chunk | loadavg 1m | engagement |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| EXL3 | 191.5 | 215.0 | 229.5 | **215.0** | 8192 (1 chunk) | 2.24 / 2.35 / 2.78 | kv8; `[expert-exl3] engaged`; MTP head loaded not armed; `path=serial`; `[prefill-trace] tokens=4088 chunks=1 chunk_size=8192 chunked=21300ms`; `[model-settings]` absent; `[spec-stats] mode=` absent |
+| affine-ab | 2083.4 | 2092.9 | 1693.0 | **2083.4** | 8192 (1 chunk) | 2.51 / 2.23 / 3.46 | kv8; serial; MTP head loaded not armed; `[prefill-trace] chunked=1929ms` |
+
+Ratio 215 / 2083 = **0.103x**. Regression vs item 2 (1454 tok/s). moePrefill restored to the 16-row window path. `decodeFull` / `innerGemmByRuns` stay in-tree and tested.
+
+Transient bytes (bound per group, production H=2560 I=640): **64 * 2560 * 640 * 2 = 104857600 (100.0 MiB)**. Independent of chunk width once any long run exists; C=512 typically all-short so 0; C=2048 and C=4096 hit the 100 MiB cap.
+
+KLD: production path is item 2 (windows). Decode-once was not left in moePrefill, so logits are unchanged vs the 0.0693 / 0.921 reference. KLD compare was not re-run on the 215 tok/s wiring.
+
 Hermetic serialized 512-row prefill dispatch (E=16 / top-k 10 / H=2560 / I=640):
 
 | dispatch | 4-row ms | 16-row ms |
@@ -95,6 +114,7 @@ none added
 
 - 16-row NAX fill of the existing 16x32x16 `matmul2d` tile (`act[4+c]` = row `origin.y+8`); run walk one pass per distinct expert in the window.
 - Prefill mid/finish fused onto the existing decode mid + down-finish-reduce leaves (no new arithmetic).
+- Full-trellis K4 MUL1 decode into a dense f16 [out, in] buffer (ExLlamaV3 codec / EXL3 Metal decode-full leaf); stock `mlx_matmul` over a padded expert group.
 
 ## Item 0 — Measurement
 
@@ -110,4 +130,4 @@ Status: done. Live median 1454 tok/s (flat vs item 1 within boot noise). Below 1
 
 ## Item 3 — decode-once + dense f16 GEMM
 
-Status: required (still < 1580 after 1+2).
+Status: arm implemented and tested; live 4k **215 tok/s** when wired (loadavg 2.2–3.5). Not selected for `moePrefill`. Production remains item 2 windows at **1454 tok/s**. Bar 1580 not met.
